@@ -17,11 +17,22 @@ written next is decided by the corpus rather than by intuition.
   spelling `jalr x0,Y(rd)` would stop writing that register and needs a
   liveness proof this check does not have.
 
-  Population: 89,860 sites across the corpus -- 89,804 of them in Rust
-  binaries, roughly 4.9% of that text, and **0** in C++, because
-  libLLVM's text segment is far past `jal`'s reach so every one of its
-  679,812 call pairs is forced. It is a linker-relaxation finding rather
-  than a compiler one.
+  Population: 292,299 sites -- 171,665 Rust, 120,578 C++, 56 Go. It is a
+  linker-relaxation finding rather than a compiler one.
+
+  The C++ figure used to be 0, and the explanation given for it was
+  wrong. libLLVM really does contribute 0 of its 679,812 call pairs, but
+  not because its text segment is too large: every one of those pairs is
+  `auipc ra,0x31ad` + `jalr`, which lands in the PLT about 52 MB away, so
+  the distance is to the PLT rather than to any code. libxul's `.text` is
+  105 MB -- twice libLLVM's -- and 120,568 of its call pairs still reach,
+  because they are local intra-module calls that were never relaxed. Two
+  binaries agreeing on zero was a property of those two binaries.
+
+  7 of libxul's sites are `auipc ra,0` + `jalr ra,0(ra)`, a call to its
+  own address, which is what a call to an undefined weak symbol
+  degenerates into. Folding one changes nothing, and at 7 sites it is not
+  worth a rule.
 
 * **slli + add foldable to shNadd** -- `slli rd,rs,{1,2,3}` +
   `add rd,rd,rs2` computes a scaled-index address in two dependent
@@ -63,10 +74,17 @@ written next is decided by the corpus rather than by intuition.
   the instruction's whole effect is already in force, which is what
   separates it from a dead definition.
 
-  Population: 111,445 sites -- 100,716 in libLLVM, 10,729 in Rust, and
-  **0 in libQt6Core**, which is the finding. GCC emits an sp-relative
-  epilogue; clang and rustc restore sp from the frame pointer whether or
-  not the frame moved. Go has none of this shape at all. Every site is a
+  Population: 112,401 sites -- 100,716 libLLVM, 11,683 Rust, and **0 in
+  both libQt6Core and libxul**, which is the finding.
+
+  It takes two things to occur, and each zero shows one of them missing.
+  GCC emits an sp-relative epilogue, so Qt6Core has none even though
+  Ubuntu builds it with frame pointers. Debian does not default to
+  `-fno-omit-frame-pointer`, so libxul has no frame pointers to restore
+  from -- 52 sites in 35.6M instructions, all of them frames that really
+  moved. What produces the finding is Ubuntu's frame-pointer policy and
+  an LLVM-family compiler together; it is not a property of clang alone.
+  Go has none of this shape at all. Every site is a
   four-byte encoding -- `c.addi16sp` can only spell `sp,sp` -- so it is
   111,445 instructions and about 435 KB, the one check here whose byte
   count is simply four times its finding count.
@@ -258,21 +276,36 @@ model, and the checker itself should decode raw encodings.
 
 ## Corpus
 
-The figures in TODO.md come from 34,444,156 instructions of riscv64 code
-taken from Ubuntu 26.04 (resolute) packages -- three toolchains, so a
-finding can be attributed to one rather than assumed universal:
+The figures in TODO.md come from 73,139,165 instructions of riscv64 code
+-- three toolchains, so a finding can be attributed to one rather than
+assumed universal:
 
 | language | binaries | source packages |
 |---|---|---|
-| C++ | 2 | `libllvm20`, `libqt6core6t64` |
-| Rust | 4 | `ripgrep`, `fd-find`, `bat`, `hyperfine` |
+| C++ | 11 | `libllvm20`, `libqt6core6t64`, `firefox-esr` |
+| Rust | 6 | `ripgrep`, `fd-find`, `bat`, `hyperfine`, `rust-coreutils` |
 | Go | 12 | `golang-1.26-go`, `gh`, `restic` |
 
-Ubuntu 26.04 riscv64 targets RVA23, so this is not a baseline-rv64gc
-corpus: `Tag_RISCV_arch` carries `zba1p0_zbb1p0_zbs1p0_v1p0_zicond1p0`
-and the code uses it. That matters for reading the Zba families in
-TODO.md -- those are compiler misses on a target that has the
-instructions, not the absence of an extension.
+All but one come from Ubuntu 26.04 (resolute). Firefox is the exception:
+Ubuntu ships it as a snap and has no riscv64 deb, so `libxul.so` comes
+from Debian -- and that turns out to be the most useful thing about it.
+
+Ubuntu 26.04 riscv64 targets RVA23, so most of this is not a
+baseline-rv64gc corpus: `Tag_RISCV_arch` carries
+`zba1p0_zbb1p0_zbs1p0_v1p0_zicond1p0_zcb1p0` and the code uses it. Read
+the Zba families in TODO.md accordingly -- those are compiler misses on a
+target that has the instructions, not the absence of an extension.
+
+`libxul.so` is the counterweight: Debian riscv64 targets the rv64gc
+baseline, so it declares no `zba`, `zbb`, `zbs`, `zicond` or `zcb` at
+all. It is the only corpus member for which `-m rva23` answers anything,
+and what it answers is large -- 70,697 extra findings from the two Zba
+checks alone. Every "GCC and LLVM already take that extension" result in
+TODO.md is a statement about an RVA23 target, and libxul is where you
+can see what the same compilers do without one.
+
+At 35,581,433 instructions it is also half the corpus by itself, which is
+worth remembering before reading any pooled figure as representative.
 
 `corpus/` is not checked in. Fetch it with
 `tools/fetch_corpus.py`, then:

@@ -1,9 +1,13 @@
 # Candidate checks, ranked by measured population
 
 Every figure below comes from `tools/pairscan`, `tools/defuse` and
-`tools/candscan` over the corpus described in README.md: 34,444,156
-instructions of riscv64 code from Ubuntu 26.04 (C++, Rust and Go), 0 of
-them undecodable.
+`tools/candscan` over the corpus described in README.md: 73,139,165
+instructions of riscv64 code (C++, Rust and Go), 0 of them undecodable.
+
+Figures below were re-measured after `firefox-esr` (libxul.so) and
+`rust-coreutils` (uutils) joined the corpus, which more than doubled it
+and overturned three results outright -- see "What the second corpus
+changed" at the bottom.
 
 `candscan` is the one that reports populations rather than shapes: it
 applies each candidate's own operand, immediate and encodability
@@ -20,16 +24,16 @@ which also records where the first figure was wrong and why.
 
 | # | opportunity | actionable | raw pattern | status |
 |---|---|---:|---:|---|
-| 1 | `auipc`+`jalr` within `jal` reach | 89,860 | 801,519 | **implemented** |
+| 1 | `auipc`+`jalr` within `jal` reach | 292,299 | 801,519 | **implemented** |
 | 2 | Zba shift-add | 13,249 | 48,270 | **implemented** |
 | 3 | Zba `zext.w` | 18,073 | 25,672 | **implemented** |
 | 4 | redundant reloads | 10,079 | - | region-sound |
 | 5 | dead register definitions | 14,458 | 47,655 | **implemented** |
 | 6 | constant re-materialization | 4,580 | 193,398 | size test applied |
 | 7 | compare-then-branch folding | 1,978 | 21,986 | liveness applied |
-| 8 | frame-pointer teardown over a static frame | 111,445 | 133,670 | **implemented** |
-| 9 | extension the producer already guarantees | 6,139 | - | **implemented** |
-| 10 | dead store to a frame slot | 10,131 | - | candscan-sized |
+| 8 | frame-pointer teardown over a static frame | 112,401 | 133,670 | **implemented** |
+| 9 | extension the producer already guarantees | 8,515 | - | **implemented** |
+| 10 | dead store to a frame slot | 15,199 | - | candscan-sized |
 
 ### 6. Constant re-materialization -- 4,580 of 193,398
 
@@ -92,14 +96,17 @@ reaches +/-1MB in 4. Measured by `check_call_pair_to_jal` itself:
 
 | corpus | foldable | instructions | bytes saved |
 |---|---:|---:|---:|
-| C++ | 0 | 17,848,524 | 0 |
-| Rust | 89,804 | 2,285,426 | ~359 KB |
+| C++ | 120,578 | 55,085,770 | ~471 KB |
+| Rust | 171,665 | 3,743,189 | ~670 KB |
 | Go | 56 | 14,310,206 | 224 |
 
-The C++ zero is the whole point: libLLVM's text segment is far larger
-than `jal`'s reach, so every one of its 679,812 call pairs is forced. The
-Rust population is a linker-relaxation finding, not a compiler one, and
-it is large -- roughly 4.9% of the Rust corpus's text.
+All of the C++ population is libxul; libLLVM and libQt6Core contribute 0.
+All of the Rust population is spread evenly -- uutils 79,664, ripgrep
+31,420, fd 24,041, bat 22,065, hyperfine 12,278 -- which at 4.6% of that
+text makes it a large finding for Rust binaries specifically.
+
+It is a linker-relaxation finding, not a compiler one. The C++ half was
+recorded as 0 until libxul arrived; see "What the second corpus changed".
 
 This supersedes the 30,175 first reported here, which was three times too
 low; see "Raw fields versus decoded values" below.
@@ -246,8 +253,8 @@ Measured by `check_redundant_sp_restore` itself:
 
 | corpus | findings | shapes candscan counted |
 |---|---:|---:|
-| C++ | 100,716 | 119,584 |
-| Rust | 10,729 | 14,086 |
+| C++ | 100,718 | 119,584 |
+| Rust | 11,683 | 14,086 |
 | Go | 0 | 0 |
 
 The C++ figure is 100,716 from libLLVM and **0 from libQt6Core**, and
@@ -313,9 +320,13 @@ Measured by `check_redundant_extension` itself:
 
 | corpus | findings | shapes candscan counted |
 |---|---:|---:|
-| C++ | 4,250 | 4,232 |
-| Rust | 296 | 208 |
+| C++ | 6,589 | 4,232 |
+| Rust | 333 | 208 |
 | Go | 1,593 | 1,593 |
+
+libxul contributes 2,253 of the C++ figure, measured after the fact --
+the check was written against the first corpus and neither its rules nor
+its numbers needed adjusting for the second.
 
 C++ is 3,433 Qt6Core and 817 libLLVM, so this is GCC's residue where
 candidate 8 is LLVM's -- each toolchain leaves a different thing behind,
@@ -346,7 +357,7 @@ the `lbu`/`andi` half alone is 680, and the family it belongs to is
 precondition cut every other candidate, but widening the window from a
 pair to a region grew this one 40-fold.
 
-### 10. Dead store to a frame slot -- 10,131
+### 10. Dead store to a frame slot -- 15,199
 
 The store analogue of the dead-definition check: the same
 (base, displacement, width) written twice with no load from it, call,
@@ -357,8 +368,8 @@ encoding says it does not.
 | corpus | findings |
 |---|---:|
 | Go | 8,279 |
-| C++ | 1,599 |
-| Rust | 253 |
+| C++ | 6,618 |
+| Rust | 302 |
 
 For C++ and Rust this sits below compare-then-branch and is not worth
 writing on its own. What makes it worth recording is that it wants
@@ -506,7 +517,7 @@ can be applied without writing the check applied:
 | # | candidate | population | machinery needed |
 |---|---|---:|---|
 | 1 | `addi` + memory-op offset folding | see below | liveness walk (exists) |
-| 2 | dead store to a frame slot | 10,131 | windowed memory table (new) |
+| 2 | dead store to a frame slot | 15,199 | windowed memory table (new) |
 | 3 | redundant reloads | 9,030 | the same table |
 | 4 | constant re-materialization | 4,580 | the same table + size test |
 | 5 | compare-then-branch | 1,942 | liveness walk (exists) |
@@ -702,3 +713,75 @@ tools lean on capstone's model, and capstone's model of RISC-V control
 flow has holes in exactly the places that matter. `is_call` now treats
 any surviving `jal`/`jalr` mnemonic as linking, since the `rd == x0`
 spellings print as `j` and `jr`.
+
+# What the second corpus changed
+
+`firefox-esr` (libxul.so, 35,581,433 instructions) and `rust-coreutils`
+(uutils) were added after everything above was first measured. The
+corpus went from 34.4M instructions to 73.1M, and three results did not
+survive it.
+
+## The C++ zero in the call-pair family
+
+Reported here as "0 in C++, because libLLVM's text segment is far past
+`jal`'s reach so every one of its 679,812 call pairs is forced." The
+first half is right and the second is not. libLLVM's pairs are all
+`auipc ra,0x31ad` + `jalr`, which lands in the PLT about 52 MB away: the
+distance that matters is to the PLT, not to the end of `.text`.
+
+libxul's `.text` is 105 MB, twice libLLVM's, and 120,568 of its call
+pairs are inside `jal`'s reach and unrelaxed -- local intra-module calls
+rather than PLT stubs. C++ now contributes 120,578 to a family it was
+recorded as contributing nothing to, and the corrected figure for the
+check is 292,299 rather than 89,860.
+
+Two binaries agreeing on zero is not a property of a language, and the
+explanation offered for it was reasoning from a number rather than from
+the code that produced it.
+
+7 of libxul's sites are `auipc ra,0` + `jalr ra,0(ra)`, a call to the
+site's own address -- what a call to an undefined weak symbol
+degenerates into. Folding one changes nothing and 7 does not earn a rule.
+
+## What the frame-pointer restore actually requires
+
+libxul has 0 findings and 52 forced sites in 35.6M instructions, because
+Debian does not default to `-fno-omit-frame-pointer` and there is no
+frame pointer to restore from. Ubuntu's Qt6Core has 0 for the other
+reason: GCC emits an sp-relative epilogue.
+
+So the finding needs Ubuntu's frame-pointer policy **and** an LLVM-family
+compiler, and calling it "an LLVM code-generation finding" was half of
+it. Each zero in the corpus fails a different one of the two conditions,
+which is only visible because the corpus now contains both kinds.
+
+## The Zbb, Zbs and Zcb rejections were about the target, not the compilers
+
+Recorded here as 521 sites in C++ and Rust, on the reasoning that GCC and
+LLVM already take these extensions. True -- of an RVA23 target. libxul is
+the first baseline rv64gc member of the corpus, and the same families on
+it are:
+
+| idiom | libxul | RVA23 C++/Rust |
+|---|---:|---:|
+| 4-byte encodings a Zcb form would spell in 2 | 301,607 | 402 |
+| `not`+logic -> `andn`/`orn`/`xnor` | 14,874 | 34 |
+| `slli`+`srli` -> `zext.h`, `slli`+`srai` -> `sext.h`/`sext.b` | 12,084 | 0 |
+| `slli`+`srli`+`or` -> `rori` | 1,068 | 0 |
+
+None of it is reportable as things stand: libxul declares none of those
+extensions, and the gate correctly stays shut. What it sizes is the
+other question -- `riscvlint -m rva23 libxul.so` adds 45,309 `zext.w`
+and 25,388 shift-add findings on top of what is reported today, 70,697
+instructions from the two implemented Zba checks alone.
+
+That is the first time `-m` has had anything to say about a real binary,
+and it is why a baseline-target member was worth adding: every
+"the compilers already do that" result here was a statement about RVA23.
+
+## What did not change
+
+The two checks added most recently were measured before libxul existed
+and hold up: the extension check found 2,253 sites in it and the
+stack-restore check found none, both for reasons the corpus explains
+rather than for reasons that needed the numbers adjusted.
