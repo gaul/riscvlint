@@ -30,6 +30,15 @@ static int64_t sign_extend(uint64_t v, unsigned bits)
     return (int64_t)((v ^ m) - m);
 }
 
+// The three-bit register fields of the compressed formats name x8-x15.
+static bool rvc_reg(unsigned r) { return r >= 8 && r <= 15; }
+
+// Sign-extended 6-bit immediate of the CI-format compressed forms.
+static int64_t ci_imm6(uint32_t w)
+{
+    return sign_extend((((w >> 12) & 1u) << 5) | ((w >> 2) & 0x1fu), 6);
+}
+
 bool rv_decode_auipc(uint32_t w, unsigned *rd, int64_t *imm)
 {
     if (RV_OPCODE(w) != RV_OP_AUIPC) return false;
@@ -248,10 +257,210 @@ unsigned riscvlint_parse_arch(const char *arch)
 
 // ---- state ----
 
-// ---- Zcb encodability ----
+// ---- memory accesses ----
 
-// The three-bit register fields of the compressed formats name x8-x15.
-static bool rvc_reg(unsigned r) { return r >= 8 && r <= 15; }
+static const struct {
+    rv_mem_kind kind;
+    const char *name;
+    bool store, fp;
+    unsigned width;          // access bytes, for the compressed offset scale
+} rv_mem_table[] = {
+    { RV_MEM_LB,  "lb",  false, false, 1 },
+    { RV_MEM_LH,  "lh",  false, false, 2 },
+    { RV_MEM_LW,  "lw",  false, false, 4 },
+    { RV_MEM_LD,  "ld",  false, false, 8 },
+    { RV_MEM_LBU, "lbu", false, false, 1 },
+    { RV_MEM_LHU, "lhu", false, false, 2 },
+    { RV_MEM_LWU, "lwu", false, false, 4 },
+    { RV_MEM_SB,  "sb",  true,  false, 1 },
+    { RV_MEM_SH,  "sh",  true,  false, 2 },
+    { RV_MEM_SW,  "sw",  true,  false, 4 },
+    { RV_MEM_SD,  "sd",  true,  false, 8 },
+    { RV_MEM_FLW, "flw", false, true,  4 },
+    { RV_MEM_FLD, "fld", false, true,  8 },
+    { RV_MEM_FSW, "fsw", true,  true,  4 },
+    { RV_MEM_FSD, "fsd", true,  true,  8 },
+};
+
+static const char *fp_reg_names[32] = {
+    "ft0", "ft1", "ft2",  "ft3",  "ft4", "ft5", "ft6",  "ft7",
+    "fs0", "fs1", "fa0",  "fa1",  "fa2", "fa3", "fa4",  "fa5",
+    "fa6", "fa7", "fs2",  "fs3",  "fs4", "fs5", "fs6",  "fs7",
+    "fs8", "fs9", "fs10", "fs11", "ft8", "ft9", "ft10", "ft11",
+};
+
+static int mem_index(rv_mem_kind k)
+{
+    for (size_t i = 0; i < sizeof rv_mem_table / sizeof rv_mem_table[0]; i++)
+        if (rv_mem_table[i].kind == k) return (int)i;
+    return -1;
+}
+
+bool rv_mem_is_store(rv_mem_kind k)
+{
+    int i = mem_index(k);
+    return i >= 0 && rv_mem_table[i].store;
+}
+
+bool rv_mem_is_fp(rv_mem_kind k)
+{
+    int i = mem_index(k);
+    return i >= 0 && rv_mem_table[i].fp;
+}
+
+const char *rv_mem_name(rv_mem_kind k)
+{
+    int i = mem_index(k);
+    return i >= 0 ? rv_mem_table[i].name : "?";
+}
+
+bool rv_decode_mem(uint32_t w, unsigned size, rv_mem_kind *kind,
+                   unsigned *data, unsigned *base, int64_t *off)
+{
+    if (size == 4) {
+        unsigned op = RV_OPCODE(w), f3 = (w >> 12) & 0x7u;
+        unsigned rd = (w >> 7) & 0x1fu, rs1 = (w >> 15) & 0x1fu;
+        unsigned rs2 = (w >> 20) & 0x1fu, f7 = (w >> 25) & 0x7fu;
+        static const rv_mem_kind load3[8] = {
+            RV_MEM_LB, RV_MEM_LH, RV_MEM_LW, RV_MEM_LD,
+            RV_MEM_LBU, RV_MEM_LHU, RV_MEM_LWU, RV_MEM_NONE };
+        static const rv_mem_kind store3[8] = {
+            RV_MEM_SB, RV_MEM_SH, RV_MEM_SW, RV_MEM_SD,
+            RV_MEM_NONE, RV_MEM_NONE, RV_MEM_NONE, RV_MEM_NONE };
+        switch (op) {
+        case 0x03u:                                   // LOAD
+            if (load3[f3] == RV_MEM_NONE) return false;
+            *kind = load3[f3]; *data = rd; *base = rs1;
+            *off = sign_extend((uint64_t)(w >> 20) & 0xfffu, 12);
+            return true;
+        case 0x07u:                                   // LOAD-FP
+            if (f3 != 2 && f3 != 3) return false;      // flw, fld only
+            *kind = f3 == 2 ? RV_MEM_FLW : RV_MEM_FLD;
+            *data = rd; *base = rs1;
+            *off = sign_extend((uint64_t)(w >> 20) & 0xfffu, 12);
+            return true;
+        case 0x23u:                                   // STORE
+            if (store3[f3] == RV_MEM_NONE) return false;
+            *kind = store3[f3]; *data = rs2; *base = rs1;
+            *off = sign_extend(((uint64_t)f7 << 5) | rd, 12);
+            return true;
+        case 0x27u:                                   // STORE-FP
+            if (f3 != 2 && f3 != 3) return false;
+            *kind = f3 == 2 ? RV_MEM_FSW : RV_MEM_FSD;
+            *data = rs2; *base = rs1;
+            *off = sign_extend(((uint64_t)f7 << 5) | rd, 12);
+            return true;
+        default:
+            return false;
+        }
+    }
+    if (size != 2) return false;
+    // Quadrant 0 only: every form here names both registers with a
+    // three-bit field, so x8-x15, and carries a scaled unsigned offset.
+    if ((w & 0x3u) != 0) return false;
+    unsigned f3 = (w >> 13) & 0x7u;
+    unsigned rd_ = 8u + ((w >> 2) & 0x7u), rs1_ = 8u + ((w >> 7) & 0x7u);
+    // The word and doubleword forms share two immediate layouts.
+    unsigned off_w = (((w >> 10) & 0x7u) << 3) | (((w >> 6) & 1u) << 2) |
+                     (((w >> 5) & 1u) << 6);
+    unsigned off_d = (((w >> 10) & 0x7u) << 3) | (((w >> 5) & 0x3u) << 6);
+    *base = rs1_;
+    *data = rd_;
+    switch (f3) {
+    case 1: *kind = RV_MEM_FLD; *off = off_d; return true;   // c.fld
+    case 2: *kind = RV_MEM_LW;  *off = off_w; return true;   // c.lw
+    case 3: *kind = RV_MEM_LD;  *off = off_d; return true;   // c.ld
+    case 5: *kind = RV_MEM_FSD; *off = off_d; return true;   // c.fsd
+    case 6: *kind = RV_MEM_SW;  *off = off_w; return true;   // c.sw
+    case 7: *kind = RV_MEM_SD;  *off = off_d; return true;   // c.sd
+    case 4: {                                                // Zcb
+        // uimm[0] is bit 6 and uimm[1] is bit 5 for the byte forms; the
+        // halfword forms carry only uimm[1], with bit 6 selecting the
+        // signed load.
+        unsigned sel = (w >> 10) & 0x7u;
+        unsigned b6 = (w >> 6) & 1u, b5 = (w >> 5) & 1u;
+        switch (sel) {
+        case 0: *kind = RV_MEM_LBU; *off = (b5 << 1) | b6; return true;
+        case 1: *kind = b6 ? RV_MEM_LH : RV_MEM_LHU; *off = b5 << 1;
+                return true;
+        case 2: *kind = RV_MEM_SB;  *off = (b5 << 1) | b6; return true;
+        case 3: *kind = RV_MEM_SH;  *off = b5 << 1; return true;
+        default: return false;
+        }
+    }
+    default:
+        return false;
+    }
+}
+
+unsigned rv_mem_encoded_size(rv_mem_kind kind, unsigned data, unsigned base,
+                             int64_t off, bool zcb)
+{
+    int i = mem_index(kind);
+    if (i < 0) return 4;
+    unsigned width = rv_mem_table[i].width;
+    bool fp = rv_mem_table[i].fp;
+
+    // Quadrant 2: base is sp, the register may be any of the 32, and the
+    // offset is scaled by the access width. Only the word and wider
+    // forms have one.
+    if (base == 2 && (width == 4 || width == 8) &&
+        kind != RV_MEM_LWU && !(fp && width == 4)) {
+        int64_t limit = width == 8 ? 504 : 252;
+        // c.lwsp and c.ldsp cannot name x0 as the destination, since
+        // that encoding is reserved. The float file has no such hole, so
+        // `c.fldsp ft0` is a legal two bytes.
+        bool load_ok = rv_mem_table[i].store || fp || data != 0;
+        if (off >= 0 && off <= limit && off % width == 0 && load_ok) return 2;
+    }
+    // Quadrant 0: both registers in x8-x15.
+    if (!rvc_reg(base)) return 4;
+    if (!rvc_reg(data)) return 4;
+    switch (kind) {
+    case RV_MEM_LW: case RV_MEM_SW:
+        return (off >= 0 && off <= 124 && off % 4 == 0) ? 2 : 4;
+    case RV_MEM_LD: case RV_MEM_SD:
+    case RV_MEM_FLD: case RV_MEM_FSD:
+        return (off >= 0 && off <= 248 && off % 8 == 0) ? 2 : 4;
+    case RV_MEM_LBU: case RV_MEM_SB:
+        return (zcb && off >= 0 && off <= 3) ? 2 : 4;
+    case RV_MEM_LHU: case RV_MEM_LH: case RV_MEM_SH:
+        return (zcb && (off == 0 || off == 2)) ? 2 : 4;
+    default:
+        // lb, lwu, flw and fsw have no compressed spelling on RV64.
+        return 4;
+    }
+}
+
+bool rv_decode_base_add(uint32_t w, unsigned size, unsigned *rd,
+                        unsigned *rs1, int64_t *imm)
+{
+    if (rv_decode_addi(w, size, rd, rs1, imm)) return true;
+    if (size != 2) return false;
+    // c.addi: rd is also rs1, so `addi a5,a5,8` -- adjusting a base in
+    // place is as much an address computation as forming a new one.
+    if ((w & 0xe003u) == 0x0001u) {
+        unsigned r = (w >> 7) & 0x1fu;
+        int64_t v = ci_imm6(w);
+        if (r == 0 || v == 0) return false;            // c.nop and hints
+        *rd = *rs1 = r;
+        *imm = v;
+        return true;
+    }
+    // c.mv: `add rd,x0,rs2`, which is an addition of zero. c.add sits in
+    // the same funct3 and is separated by bit 12.
+    if ((w & 0xf003u) == 0x8002u) {
+        unsigned r = (w >> 7) & 0x1fu, s = (w >> 2) & 0x1fu;
+        if (r == 0 || s == 0) return false;            // c.jr, hints
+        *rd = r;
+        *rs1 = s;
+        *imm = 0;
+        return true;
+    }
+    return false;
+}
+
+// ---- Zcb encodability ----
 
 const char *rv_zcb_form(uint32_t w, unsigned size)
 {
@@ -342,12 +551,6 @@ static unsigned guarantees_for_range(int64_t lo, int64_t hi)
     if (lo >= 0 && hi <= 65535) g |= G_Z16;
     if (lo >= 0 && hi <= 4294967295LL) g |= G_Z32;
     return g;
-}
-
-// Sign-extended 6-bit immediate of the CI-format compressed forms.
-static int64_t ci_imm6(uint32_t w)
-{
-    return sign_extend((((w >> 12) & 1u) << 5) | ((w >> 2) & 0x1fu), 6);
 }
 
 unsigned rv_result_guarantees(uint32_t w, unsigned size, unsigned *rd)
@@ -1156,6 +1359,71 @@ bool check_zcb_compressible(riscvlint_state *state, const cs_insn *insn,
     finding->insn_count = 1;
     snprintf(finding->replacement, sizeof finding->replacement,
              "%s (4 -> 2 bytes)", form);
+    return true;
+}
+
+// ---- an address computation folded into the access that uses it ----
+
+bool check_base_add_to_offset(riscvlint_state *state, const cs_insn *insn,
+                              riscvlint_finding *finding)
+{
+    if (insn->size != 2 && insn->size != 4) return false;
+    uint32_t w1;
+    if (!riscvlint_word_at(state, insn->address, &w1)) return false;
+    unsigned rd, rs1;
+    int64_t imm1;
+    if (!rv_decode_base_add(w1, insn->size, &rd, &rs1, &imm1)) return false;
+    // x0 as the source makes this `li`, a constant rather than an
+    // address; sp, gp and tp are established by convention and are never
+    // dead, so folding one away is not on offer.
+    if (rs1 == 0 || rd == 0) return false;
+    if (rd == 2 || rd == 3 || rd == 4) return false;
+
+    uint64_t second = insn->address + insn->size;
+    uint32_t w2;
+    if (!riscvlint_word_at(state, second, &w2)) return false;
+    unsigned len2 = rv_insn_len(w2);
+    rv_mem_kind kind;
+    unsigned data, base;
+    int64_t imm2;
+    if (!rv_decode_mem(w2, len2, &kind, &data, &base, &imm2)) return false;
+    if (base != rd) return false;
+
+    int64_t sum = imm1 + imm2;
+    if (sum < -2048 || sum > 2047) return false;
+
+    // A store whose data register is the computed address reads it for
+    // the value as well as for the base, so the address computation is
+    // still needed after the fold.
+    if (rv_mem_is_store(kind) && !rv_mem_is_fp(kind) && data == rd)
+        return false;
+
+    if (riscvlint_is_branch_target(state, second)) return false;
+    if (riscvlint_is_relocated(state, insn->address) ||
+        riscvlint_is_relocated(state, second))
+        return false;
+
+    // A load that overwrites its own base kills the computed address by
+    // construction, and that is half the population. Everything else
+    // asks the walk, which answers DEAD only when every path leaving the
+    // access redefines the register before reading it.
+    bool self_killing = !rv_mem_is_store(kind) && !rv_mem_is_fp(kind) &&
+                        data == rd;
+    if (!self_killing &&
+        riscvlint_liveness(state, second + len2, rd) != RISCVLINT_LIVE_DEAD)
+        return false;
+
+    unsigned before = insn->size + len2;
+    unsigned after = rv_mem_encoded_size(kind, data, rs1, sum,
+                                         riscvlint_may_use(state,
+                                                           RISCVLINT_EXT_ZCB));
+    finding->title = "base add foldable into memory offset";
+    finding->address = insn->address;
+    finding->insn_count = 2;
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "%s %s, %" PRId64 "(%s) (%u -> %u bytes)", rv_mem_name(kind),
+             rv_mem_is_fp(kind) ? fp_reg_names[data] : rv_reg_name(data),
+             sum, rv_reg_name(rs1), before, after);
     return true;
 }
 

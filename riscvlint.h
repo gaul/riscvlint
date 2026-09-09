@@ -112,6 +112,52 @@ bool rv_decode_extension(uint32_t w, unsigned size, unsigned *rd,
 // transfer, in any of their spellings.
 bool rv_ends_region(uint32_t w, unsigned size);
 
+// ---- memory accesses ----
+
+typedef enum {
+    RV_MEM_NONE = 0,
+    RV_MEM_LB, RV_MEM_LH, RV_MEM_LW, RV_MEM_LD,
+    RV_MEM_LBU, RV_MEM_LHU, RV_MEM_LWU,
+    RV_MEM_SB, RV_MEM_SH, RV_MEM_SW, RV_MEM_SD,
+    RV_MEM_FLW, RV_MEM_FLD, RV_MEM_FSW, RV_MEM_FSD,
+} rv_mem_kind;
+
+bool rv_mem_is_store(rv_mem_kind k);
+bool rv_mem_is_fp(rv_mem_kind k);
+const char *rv_mem_name(rv_mem_kind k);
+
+// A load or store, in the four-byte spelling or in a quadrant-0
+// compressed one. `data` is the loaded or stored register, in its own
+// file: a GPR number for the integer forms and an f-register number for
+// the floating-point ones.
+//
+// The quadrant-2 forms -- `c.ldsp` and its family -- are deliberately
+// not decoded. Their base is always sp, so the only way one could pair
+// with a preceding address computation is if that computation wrote sp,
+// and a check that folds an address into an access has to refuse sp as
+// a destination anyway. Skipping them costs nothing.
+bool rv_decode_mem(uint32_t w, unsigned size, rv_mem_kind *kind,
+                   unsigned *data, unsigned *base, int64_t *off);
+
+// Bytes the access would assemble to with this data register, base and
+// offset: 2 when some compressed form can encode it, 4 otherwise. Unlike
+// the decoder this does model the quadrant-2 forms, because folding an
+// address can *produce* an sp-relative access even though it can never
+// consume one -- and reporting such a site as four bytes when the
+// assembler will spell it in two understates the finding.
+//
+// `zcb` says whether the byte and halfword compressed forms are
+// available; without them `lbu` and its family are always four bytes.
+unsigned rv_mem_encoded_size(rv_mem_kind kind, unsigned data, unsigned base,
+                             int64_t off, bool zcb);
+
+// An addition that forms an address, in every spelling that can express
+// one: the four-byte `addi`, `c.addi4spn`, `c.addi`, and `c.mv`, which
+// is an addition of zero. `c.addi16sp` is left out because it writes sp,
+// which the check that uses this refuses as a destination.
+bool rv_decode_base_add(uint32_t w, unsigned size, unsigned *rd,
+                        unsigned *rs1, int64_t *imm);
+
 // The name of the Zcb two-byte form `w` could be spelled as, or NULL
 // when it has none. Only asked of four-byte encodings: the question is
 // whether a wide encoding was left wide.
@@ -370,6 +416,17 @@ bool check_redundant_extension(riscvlint_state *state, const cs_insn *insn,
 // instruction was legal to compress and was not.
 bool check_zcb_compressible(riscvlint_state *state, const cs_insn *insn,
                             riscvlint_finding *finding);
+
+// `addi rd,rs,imm1` + `<load|store> rt,imm2(rd)` is one access at
+// `imm1+imm2` from rs whenever the sum fits the 12-bit field and nothing
+// goes on to read rd. The direct analogue of armlint's `add` + `ldr`
+// check, and its largest.
+//
+// Where the access is a load that overwrites its own base the value is
+// dead by construction and no liveness query is needed; that is half the
+// population. Everything else asks the walk, and takes only DEAD.
+bool check_base_add_to_offset(riscvlint_state *state, const cs_insn *insn,
+                              riscvlint_finding *finding);
 
 bool check_dead_def(riscvlint_state *state, const cs_insn *insn,
                     riscvlint_finding *finding);

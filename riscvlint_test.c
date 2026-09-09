@@ -955,6 +955,111 @@ static void test_zcb_check(csh handle)
     riscvlint_state_destroy(state);
 }
 
+// ---- memory accesses ----
+
+static void test_decode_mem(void)
+{
+    rv_mem_kind k;
+    unsigned data, base;
+    int64_t off;
+
+    // Every encoding here is the assembler's own. The decoder was
+    // checked exhaustively against `clang -march=rv64gc_zba_zbb_zcb`
+    // over 1,668 loads and stores -- every width, both files, offsets
+    // in and out of each compressed field's range -- and agrees on all
+    // of them; these are the shapes worth pinning in the suite.
+    CHECK(rv_decode_mem(0x0005b503u, 4, &k, &data, &base, &off));   // ld a0,0(a1)
+    CHECK(k == RV_MEM_LD && data == 10 && base == 11 && off == 0);
+
+    // A store's immediate is split across two fields, which is its own
+    // chance to decode the offset wrongly.
+    CHECK(rv_decode_mem(0x00a5b423u, 4, &k, &data, &base, &off));   // sd a0,8(a1)
+    CHECK(k == RV_MEM_SD && data == 10 && base == 11 && off == 8);
+    CHECK(rv_decode_mem(0xfea5bc23u, 4, &k, &data, &base, &off));   // sd a0,-8(a1)
+    CHECK(k == RV_MEM_SD && off == -8);
+
+    // The floating-point forms name a register in the other file.
+    CHECK(rv_decode_mem(0x00c5a507u, 4, &k, &data, &base, &off));   // flw fa0,12(a1)
+    CHECK(k == RV_MEM_FLW && rv_mem_is_fp(k) && data == 10 && base == 11);
+    CHECK(off == 12);
+
+    // Quadrant-0 compressed forms, whose offsets are scaled.
+    CHECK(rv_decode_mem(0x6188u, 2, &k, &data, &base, &off));       // c.ld a0,0(a1)
+    CHECK(k == RV_MEM_LD && data == 10 && base == 11 && off == 0);
+    CHECK(rv_decode_mem(0x41c8u, 2, &k, &data, &base, &off));       // c.lw a0,4(a1)
+    CHECK(k == RV_MEM_LW && off == 4);
+
+    // Zcb's byte and halfword forms, where the corpus keeps 141,746 of
+    // its compressed accesses.
+    CHECK(rv_decode_mem(0x81e8u, 2, &k, &data, &base, &off));       // c.lbu a0,3(a1)
+    CHECK(k == RV_MEM_LBU && data == 10 && base == 11 && off == 3);
+    CHECK(rv_decode_mem(0x85a8u, 2, &k, &data, &base, &off));       // c.lhu a0,2(a1)
+    CHECK(k == RV_MEM_LHU && off == 2);
+    CHECK(rv_decode_mem(0x85e8u, 2, &k, &data, &base, &off));       // c.lh a0,2(a1)
+    CHECK(k == RV_MEM_LH && off == 2);
+
+    // Quadrant 2 is not claimed. Its base is always sp, so the only
+    // address computation it could pair with is one that writes sp, and
+    // the check refuses sp as a destination anyway.
+    CHECK(!rv_decode_mem(0x6522u, 2, &k, &data, &base, &off));      // c.ldsp a0,8(sp)
+    CHECK(!rv_decode_mem(0xe42au, 2, &k, &data, &base, &off));      // c.sdsp a0,8(sp)
+
+    // Not memory at all.
+    CHECK(!rv_decode_mem(0x00b50533u, 4, &k, &data, &base, &off));  // add a0,a0,a1
+}
+
+static void test_mem_encoded_size(void)
+{
+    // Quadrant 0: both registers in x8-x15, offset scaled by the width.
+    CHECK(rv_mem_encoded_size(RV_MEM_LD, 10, 11, 8, true) == 2);
+    CHECK(rv_mem_encoded_size(RV_MEM_LD, 10, 11, 4, true) == 4);   // misaligned
+    CHECK(rv_mem_encoded_size(RV_MEM_LD, 10, 11, 256, true) == 4); // out of range
+    CHECK(rv_mem_encoded_size(RV_MEM_LD, 16, 11, 8, true) == 4);   // a6
+    CHECK(rv_mem_encoded_size(RV_MEM_LD, 10, 16, 8, true) == 4);
+
+    // Quadrant 2 reaches further and names any register, which is why a
+    // fold onto sp can still come out at two bytes.
+    CHECK(rv_mem_encoded_size(RV_MEM_SD, 14, 2, 24, true) == 2);   // c.sdsp
+    CHECK(rv_mem_encoded_size(RV_MEM_LD, 16, 2, 504, true) == 2);  // c.ldsp a6
+    CHECK(rv_mem_encoded_size(RV_MEM_LD, 16, 2, 512, true) == 4);
+    // c.lwsp and c.ldsp cannot name x0; the float file has no such hole.
+    CHECK(rv_mem_encoded_size(RV_MEM_LD, 0, 2, 8, true) == 4);
+    CHECK(rv_mem_encoded_size(RV_MEM_FLD, 0, 2, 8, true) == 2);
+
+    // The Zcb forms are two bytes only where the target has Zcb.
+    CHECK(rv_mem_encoded_size(RV_MEM_LBU, 10, 11, 3, true) == 2);
+    CHECK(rv_mem_encoded_size(RV_MEM_LBU, 10, 11, 3, false) == 4);
+    CHECK(rv_mem_encoded_size(RV_MEM_LBU, 10, 11, 4, true) == 4);
+
+    // lb, lwu, flw and fsw have no compressed spelling on RV64.
+    CHECK(rv_mem_encoded_size(RV_MEM_LB, 10, 11, 0, true) == 4);
+    CHECK(rv_mem_encoded_size(RV_MEM_LWU, 10, 11, 0, true) == 4);
+    CHECK(rv_mem_encoded_size(RV_MEM_FLW, 10, 11, 0, true) == 4);
+}
+
+static void test_decode_base_add(void)
+{
+    unsigned rd, rs1;
+    int64_t imm;
+
+    CHECK(rv_decode_base_add(0x01158793u, 4, &rd, &rs1, &imm));  // addi a5,a1,17
+    CHECK(rd == 15 && rs1 == 11 && imm == 17);
+    // c.addi adjusts a base in place, which is as much an address
+    // computation as forming a new one.
+    CHECK(rv_decode_base_add(0x07a1u, 2, &rd, &rs1, &imm));      // c.addi a5,8
+    CHECK(rd == 15 && rs1 == 15 && imm == 8);
+    // c.mv is an addition of zero.
+    CHECK(rv_decode_base_add(0x87bau, 2, &rd, &rs1, &imm));      // c.mv a5,a4
+    CHECK(rd == 15 && rs1 == 14 && imm == 0);
+    CHECK(rv_decode_base_add(0x1800u, 2, &rd, &rs1, &imm));      // c.addi4spn s0,sp,48
+    CHECK(rd == 8 && rs1 == 2 && imm == 48);
+
+    // c.add reads its destination as an operand, so it is not this.
+    CHECK(!rv_decode_base_add(0x97bau, 2, &rd, &rs1, &imm));     // c.add a5,a4
+    // addiw sign-extends from 32 bits, so its result is not rs + imm.
+    CHECK(!rv_decode_base_add(0x0085079bu, 4, &rd, &rs1, &imm)); // addiw a5,a0,8
+}
+
 int main(void)
 {
     csh handle;
@@ -972,6 +1077,9 @@ int main(void)
     test_result_guarantees();
     test_decode_extension();
     test_arch_gate();
+    test_decode_mem();
+    test_mem_encoded_size();
+    test_decode_base_add();
     test_zcb_form();
     test_zcb_gate();
     test_check(handle);

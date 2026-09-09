@@ -15,6 +15,11 @@
 // rv_decode_mem does not claim at all -- so a natural-looking prologue
 // would be rejected before the sp test it is meant to exercise ever ran.
 // The unaligned offset forces the four-byte spelling instead.
+//
+// That omission is about the access being *read*. Sizing the access the
+// fold would *write* is a different question, and rv_mem_encoded_size
+// does model the quadrant-2 forms -- see sequence 3, where the folded
+// store lands on sp and c.sdsp spells it in two bytes.
 
     .text
     .globl  _start
@@ -22,8 +27,10 @@
 _start:
     // Positives:
     // 1) The load overwrites its own base, so the addi's value is dead
-    //    by construction and no liveness query is needed. This is 52% of
-    //    the corpus population.
+    //    by construction and no liveness query is needed. This is about
+    //    two thirds of the corpus population -- 67% of the C++ findings,
+    //    72% of the Rust ones, 68% of the Go ones -- so the liveness
+    //    walk still earns the remaining third.
     addi    a5, a1, 17
     lb      a5, 0(a5)
 
@@ -33,9 +40,11 @@ _start:
     sd      a4, 0(a5)
     li      a5, 0
 
-    // 3) c.addi4spn. The new base is sp, which a quadrant-0 form's
-    //    three-bit register field cannot name, so the access grows to
-    //    four bytes and the win is the instruction rather than space.
+    // 3) c.addi4spn, folding onto sp. A quadrant-0 form's three-bit
+    //    register field cannot name sp, but c.sdsp can: the store keeps
+    //    its two bytes and the addi's two go. Reporting this as 4 -> 4
+    //    on the strength of the quadrant-0 rule alone would understate
+    //    it, which is why the size model carries quadrant 2.
     addi    a5, sp, 16
     sd      a4, 8(a5)
     li      a5, 0

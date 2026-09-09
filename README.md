@@ -102,6 +102,39 @@ written next is decided by the corpus rather than by intuition.
   pointer. Ubuntu builds with `-fno-omit-frame-pointer` deliberately, and
   the frame pointer stays.
 
+* **base add foldable into memory offset** -- `addi rd,rs,imm1` followed by
+  `<load|store> rt,imm2(rd)` is one access at `imm1+imm2` from `rs`
+  whenever the sum fits the 12-bit field and nothing goes on to read
+  `rd`. The direct analogue of armlint's `add` + `ldr` check.
+
+  Population: 6,344 sites -- C++ 2,922, Go 2,993, Rust 429.
+
+  This is the check the corpus warned about. Sampling the *shapes* --
+  pairs where the access's base really is the addi's destination and the
+  sum fits -- gave 12,530 in libQt6Core alone and 24,705 in one Go
+  binary. Applying the liveness condition leaves 1,393 and 684. A shape
+  count is not a population, and here it overstated by roughly nine
+  times.
+
+  Where the access is a load that overwrites its own base the computed
+  address is dead by construction and no liveness query is needed. That
+  is about two thirds of the findings and it is steady across
+  toolchains -- C++ 67%, Rust 72%, Go 68% -- while varying widely
+  between binaries within one (libQt6Core 80%, gh 25%). So the rest of
+  the check, the liveness walk, earns the remaining third everywhere.
+
+  The byte figure needs the compressed encodings on both sides. `addi`
+  and the access may each be two or four bytes going in, and what comes
+  out depends on whether some compressed form can hold the folded
+  offset -- which is a different question for the new base than it was
+  for the old one. A fold onto `sp` is the case worth naming: no
+  quadrant-0 form can name `sp`, but `c.sdsp` and `c.ldsp` can, so those
+  sites still come out at two bytes. `rv_mem_encoded_size` and
+  `rv_decode_mem` were checked against `clang -march=rv64gc_zba_zbb_zcb`
+  over 3,632 loads and stores -- every width, both register files,
+  offsets in and out of each compressed field's range -- and agree with
+  the assembler on all of them.
+
 * **instruction compressible to a Zcb form** -- a four-byte encoding that
   Zcb spells in two. Unlike every other check here this one reports an
   assembler's choice rather than a compiler's: RVC selection happens at

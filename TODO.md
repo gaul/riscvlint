@@ -35,6 +35,7 @@ which also records where the first figure was wrong and why.
 | 9 | extension the producer already guarantees | 8,515 | - | **implemented** |
 | 10 | dead store to a frame slot | 15,199 | - | candscan-sized |
 | 11 | Zcb-compressible 4-byte encodings | 30,648 | 351,198 | **implemented** |
+| 12 | `addi` folded into a memory offset | 6,344 | ~54,000 shapes | **implemented** |
 
 ### 6. Constant re-materialization -- 4,580 of 193,398
 
@@ -410,6 +411,70 @@ instruction mix rather than a shortfall.
 Zcb is the part of this that is not settled by that argument, and it gets
 its own section below.
 
+### 12. `addi` folded into a memory offset -- 6,344  [implemented]
+
+`addi rd,rs,imm1` + `<load|store> rt,imm2(rd)` is one access at
+`imm1+imm2` from rs whenever the sum fits the 12-bit immediate and
+nothing goes on to read rd. The direct analogue of armlint's `add` +
+`ldr` check, its largest.
+
+Measured by `check_base_add_to_offset` itself:
+
+| corpus | findings |
+|---|---:|
+| Go | 2,993 |
+| C++ | 2,922 |
+| Rust | 429 |
+
+This entry used to carry a shape count and a warning that the shape
+count was not a population. The warning was right and it was not
+pessimistic enough:
+
+| binary | shapes whose sum fits | findings |
+|---|---:|---:|
+| C++ Qt6Core | 12,530 | 1,393 |
+| Go gh | 24,705 | 684 |
+| Rust ripgrep | 16,332 | 11 |
+
+Roughly nine times over across the corpus, and 1,485 times over for
+ripgrep. The precedent this entry cited -- a liveness condition cutting a
+shape count elevenfold -- turned out to be the mild case.
+
+Where the access is a load that overwrites its own base, the computed
+address is dead by construction and no query is needed:
+
+| corpus | self-killing | needed the walk |
+|---|---:|---:|
+| C++ | 1,961 (67%) | 962 |
+| Rust | 309 (72%) | 121 |
+| Go | 2,041 (68%) | 953 |
+
+Steady at about two thirds across all three toolchains, and much less
+steady between binaries inside one -- Qt6Core 80%, gh 25%. The fixture's
+comments first put it at 52%; the shape of the claim was right and the
+number was low. The liveness walk earns the remaining third everywhere,
+so neither half of the check carries this on its own.
+
+### Sizing the fold
+
+Both halves may be two or four bytes going in, and what comes out
+depends on whether a compressed form can hold the folded offset -- a
+different question for the new base than for the old one, since the
+offset changed and so did the register.
+
+The case worth naming is a fold onto sp. No quadrant-0 form can name sp,
+which is what the fixture first assumed settled it; but `c.sdsp` and
+`c.ldsp` can, and they reach 504 bytes rather than 248. Those sites come
+out at two bytes, and reporting them as four would understate the check.
+
+`rv_decode_mem` and `rv_mem_encoded_size` were checked against
+`clang -march=rv64gc_zba_zbb_zcb` over 3,632 loads and stores -- every
+width, both register files, offsets in and out of each compressed
+field's range -- and agree with the assembler on every one. The decoder
+does not claim the quadrant-2 forms as *input*, which costs nothing:
+their base is always sp, so the only address computation one could pair
+with is a write to sp, and the check refuses sp as a destination.
+
 ## Zcb -- 30,648 reportable, 320,550 more behind the gate  [implemented]
 
 Zcb adds two-byte spellings for byte and halfword memory access
@@ -601,22 +666,23 @@ Measured with `candscan` so the operand conditions are applied:
 | `srli`+`andi 1` -> `bexti` | 32 | 295 |
 | `zext.w`/`slli.uw` + `add` -> `add.uw`/`sh#add.uw` | 44 | 0 |
 | `li` of a mask + `and` -> `zext.h`/`andi` | 9 | 4 |
-| 4-byte encodings a Zcb form would spell in 2 | 402 | 28,806 |
+| 4-byte encodings a Zcb form would spell in 2 | 705 | 29,762 |
 
 The Zcb row has its own section above; on a baseline target it is
-301,607 in libxul alone, and the 402 here turned out to be a single gap
-in GNU as rather than anything a compiler chose.
+320,550 in libxul alone, and the 705 here turned out to be two gaps in
+GNU as rather than anything a compiler chose.
 
 The Go column is not the same finding. Go emits no `.riscv.attributes`
 and its assembler does not select Zcb, so those rows are the toolchain's
 own compression and extension selection -- the entry under "Missed
 compression" -- rather than a peephole either compiler missed.
 
-The C++/Rust Zcb residue is 402 sites and **all of it is `c.not`**;
-`c.zext.b`, `c.sext.b`, `c.zext.h`, `c.sext.h`, `c.zext.w`, `c.mul`,
-`c.lbu`, `c.lhu`, `c.lh`, `c.sb` and `c.sh` come back at zero. That
-matches the earlier `c.mv`/`c.li` census: RVC selection is an assembler
-pass and GNU as takes it wherever it is legal, with one gap.
+The C++/Rust Zcb residue is 705 sites and all of it is `c.not` and
+`c.mul`; `c.zext.b`, `c.sext.b`, `c.zext.h`, `c.sext.h`, `c.zext.w`,
+`c.lbu`, `c.lhu`, `c.lh`, `c.sb` and `c.sh` come back at zero on targets
+that declare the extension. That matches the earlier `c.mv`/`c.li`
+census: RVC selection is an assembler pass and GNU as takes it wherever
+it is legal, with two gaps.
 
 ### `slli rd,rs,a` + `srli rd,rd,a` with a >= 53 -> `andi` -- 0
 
@@ -653,61 +719,23 @@ second instruction writes it is one dominant idiom plus nothing.
 
 # Remaining candidates, ranked
 
-Six checks are implemented. What is left, with every precondition that
+Eight checks are implemented. What is left, with every precondition that
 can be applied without writing the check applied:
 
 | # | candidate | population | machinery needed |
 |---|---|---:|---|
-| 1 | `addi` + memory-op offset folding | see below | liveness walk (exists) |
-| 2 | dead store to a frame slot | 15,199 | windowed memory table (new) |
-| 3 | redundant reloads | 9,030 | the same table |
-| 4 | constant re-materialization | 4,580 | the same table + size test |
-| 5 | compare-then-branch | 1,942 | liveness walk (exists) |
-| 6 | Zcb-shrinkable encodings | 581 declared / 330,413 not | Zcb bit in the gate |
-| 7 | missed compression, base C | 93 | RVC encodability pass (new) |
+| 1 | dead store to a frame slot | 15,199 | windowed memory table (new) |
+| 2 | redundant reloads | 9,030 | the same table |
+| 3 | constant re-materialization | 4,580 | the same table + size test |
+| 4 | compare-then-branch | 1,942 | liveness walk (exists) |
+| 5 | missed compression, base C | 93 | RVC encodability pass (new) |
 
-The two candidates that needed nothing new -- the frame-pointer restore
-and the redundant extension -- are both implemented, and they were
-written first for that reason rather than for their size. Both delete an
-instruction whose effect is already in force, which is the one rewrite
-that requires nothing to be proved about what comes after it. What is
-left all wants either the liveness walk or a windowed memory table, and
-three of the six want the same table.
+Everything that needed nothing new is now written. What is left splits
+cleanly: three of the five want the same windowed memory table -- a
+region-local record of what is already in a register, invalidated by
+stores, calls and fences -- and building it once serves all three.
 
-### 1. `addi` + memory-op offset folding
-
-`addi rd,rs,imm1` + `<load|store> rt,imm2(rd)` folds to
-`<load|store> rt,(imm1+imm2)(rs)` whenever the sum fits the 12-bit
-immediate and rd is dead afterwards. This is the direct analogue of
-armlint's `add` + `ldr` check, its largest.
-
-Sampled per binary, counting only pairs where the memory operand's base
-really is the addi's destination:
-
-| binary | instructions | sites | sum fits imm12 |
-|---|---:|---:|---:|
-| C++ Qt6Core | 955,382 | 12,711 | 12,530 |
-| Rust ripgrep | 819,303 | 16,380 | 16,332 |
-| Go gh | 819,303 | 24,705 | 24,705 |
-
-Around 99% of sums fit, and this is the only remaining family that is
-large in all three toolchains -- checks 2 and 3 are Go's alone and check
-1 is Rust's.
-
-What is not known is how much survives the liveness condition. Where the
-load overwrites the base the fold is exact and needs no proof, but that
-is only 769 of Qt6Core's 12,530 and 3 of gh's 24,705; everything else
-needs the walk to prove the base dead. The one precedent for applying a
-liveness condition to a shape count cut it elevenfold, so the shape
-figures above should not be read as a population.
-
-Found by going back to raw pair frequencies rather than through
-`rank.py`, whose family list did not cover it: `addi ;; sd` at 501,776
-and `addi ;; ld` at 165,767 sat at the top of the uncovered list from the
-first scan. The families a ranking script knows about decide what gets
-looked at, which makes an unclassified remainder worth reading directly.
-
-### 2-6
+### 1-3
 
 Reloads, dead stores and re-materialization all want the same new machinery: a
 region-local table of what is already in a register, invalidated by

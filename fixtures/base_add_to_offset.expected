@@ -1,17 +1,45 @@
+base add foldable into memory offset at offset: 0x0: -> lb a5, 17(a1) (8 -> 4 bytes) (2 instructions)
+  addi a5, a1, 0x11
+  lb a5, 0(a5)
+
+base add foldable into memory offset at offset: 0x8: -> sd a4, 8(a5) (4 -> 2 bytes) (2 instructions)
+  addi a5, a5, 8
+  sd a4, 0(a5)
+
 dead register definition at offset: 0xc: -> delete; nothing reads a5 (2 bytes) (1 instructions)
   li a5, 0
+
+base add foldable into memory offset at offset: 0xe: -> sd a4, 24(sp) (4 -> 2 bytes) (2 instructions)
+  addi a5, sp, 0x10
+  sd a4, 8(a5)
 
 dead register definition at offset: 0x12: -> delete; nothing reads a5 (2 bytes) (1 instructions)
   li a5, 0
 
+base add foldable into memory offset at offset: 0x14: -> ld a3, 8(a4) (4 -> 2 bytes) (2 instructions)
+  mv a5, a4
+  ld a3, 8(a5)
+
 dead register definition at offset: 0x18: -> delete; nothing reads a5 (2 bytes) (1 instructions)
   li a5, 0
+
+base add foldable into memory offset at offset: 0x1a: -> lbu a4, 3(a0) (6 -> 2 bytes) (2 instructions)
+  addi a5, a0, 1
+  lbu a4, 2(a5)
 
 dead register definition at offset: 0x20: -> delete; nothing reads a5 (2 bytes) (1 instructions)
   li a5, 0
 
+base add foldable into memory offset at offset: 0x22: -> flw fa0, 20(a0) (8 -> 4 bytes) (2 instructions)
+  addi a5, a0, 8
+  flw fa0, 0xc(a5)
+
 dead register definition at offset: 0x2a: -> delete; nothing reads a5 (2 bytes) (1 instructions)
   li a5, 0
+
+base add foldable into memory offset at offset: 0x2c: -> ld a4, 24(a0) (6 -> 2 bytes) (2 instructions)
+  addi a5, a0, 0x18
+  ld a4, 0(a5)
 
 dead register definition at offset: 0x42: -> delete; nothing reads a5 (2 bytes) (1 instructions)
   li a5, 0
@@ -30,5 +58,6 @@ dead register definition at offset: 0x76: -> delete; nothing reads a5 (2 bytes) 
 
 Optimization opportunities by type:
       10  dead register definition
+       7  base add foldable into memory offset
 
-10 optimization opportunities in 49 instructions
+17 optimization opportunities in 49 instructions
