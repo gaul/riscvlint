@@ -266,6 +266,7 @@ static const riscvlint_check_fn checks[] = {
     check_dead_def,
     check_redundant_sp_restore,
     check_redundant_extension,
+    check_zcb_compressible,
 };
 
 static void scan_section(csh handle, riscvlint_state *state,

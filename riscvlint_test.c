@@ -160,8 +160,13 @@ static void test_arch_gate(void)
     CHECK(riscvlint_parse_ext_name("rva20", &m) && m == 0);
     CHECK(riscvlint_parse_ext_name("rva22", &m) &&
           m == (RISCVLINT_EXT_ZBA | RISCVLINT_EXT_ZBB | RISCVLINT_EXT_ZBS));
+    // The two profiles used to expand alike. Zcb missed RVA22's
+    // ratification window and is mandatory in RVA23U64, so it is the
+    // first extension gated here that separates them; test_zcb_gate
+    // covers the difference from the other side.
     CHECK(riscvlint_parse_ext_name("rva23", &m) &&
-          m == (RISCVLINT_EXT_ZBA | RISCVLINT_EXT_ZBB | RISCVLINT_EXT_ZBS));
+          m == (RISCVLINT_EXT_ZBA | RISCVLINT_EXT_ZBB | RISCVLINT_EXT_ZBS |
+                RISCVLINT_EXT_ZCB));
     CHECK(!riscvlint_parse_ext_name("zbq", &m));
     CHECK(!riscvlint_parse_ext_name("", &m));
 
@@ -823,6 +828,133 @@ static void test_redundant_ext_check(csh handle)
     CHECK(run_redundant_ext(handle, side, sizeof side, 0x1000, NULL) == 0);
 }
 
+// ---- Zcb encodability ----
+
+static void test_zcb_form(void)
+{
+    // Every encoding below came out of `riscv64-linux-gnu-as
+    // -march=rv64gc_zba_zbb_zcb` with `.option norvc`, so the wide forms
+    // are the assembler's own rather than hand-assembled -- and the
+    // compressed answers were checked against both GNU as and clang
+    // without norvc.
+
+    // c.lbu carries an unsigned two-bit byte offset.
+    CHECK(!strcmp(rv_zcb_form(0x0005c503u, 4), "c.lbu"));   // lbu a0,0(a1)
+    CHECK(!strcmp(rv_zcb_form(0x0035c503u, 4), "c.lbu"));   // lbu a0,3(a1)
+    CHECK(rv_zcb_form(0x0045c503u, 4) == NULL);             // lbu a0,4(a1)
+    CHECK(rv_zcb_form(0xfff5c503u, 4) == NULL);             // lbu a0,-1(a1)
+
+    // Both registers have to be nameable by a three-bit field.
+    CHECK(rv_zcb_form(0x00084503u, 4) == NULL);             // lbu a0,0(a6)
+    CHECK(rv_zcb_form(0x0005c803u, 4) == NULL);             // lbu a6,0(a1)
+
+    // c.lhu and c.lh share a one-bit field naming the halfword.
+    CHECK(!strcmp(rv_zcb_form(0x0025d503u, 4), "c.lhu"));   // lhu a0,2(a1)
+    CHECK(rv_zcb_form(0x0045d503u, 4) == NULL);             // lhu a0,4(a1)
+    CHECK(!strcmp(rv_zcb_form(0x00259503u, 4), "c.lh"));    // lh a0,2(a1)
+
+    // The stores split their immediate across two fields, which is its
+    // own chance to decode the offset wrongly.
+    CHECK(!strcmp(rv_zcb_form(0x00a581a3u, 4), "c.sb"));    // sb a0,3(a1)
+    CHECK(rv_zcb_form(0x00a58223u, 4) == NULL);             // sb a0,4(a1)
+    CHECK(!strcmp(rv_zcb_form(0x00a59123u, 4), "c.sh"));    // sh a0,2(a1)
+
+    // The unary forms write the register they read.
+    CHECK(!strcmp(rv_zcb_form(0x0ff57513u, 4), "c.zext.b")); // andi a0,a0,255
+    CHECK(rv_zcb_form(0x0ff5f513u, 4) == NULL);              // andi a0,a1,255
+    CHECK(!strcmp(rv_zcb_form(0xfff54513u, 4), "c.not"));    // xori a0,a0,-1
+    CHECK(rv_zcb_form(0xfff84813u, 4) == NULL);              // xori a6,a6,-1
+    CHECK(!strcmp(rv_zcb_form(0x60451513u, 4), "c.sext.b"));
+    CHECK(!strcmp(rv_zcb_form(0x60551513u, 4), "c.sext.h"));
+    CHECK(!strcmp(rv_zcb_form(0x0805453bu, 4), "c.zext.h"));
+    CHECK(!strcmp(rv_zcb_form(0x0805053bu, 4), "c.zext.w"));
+
+    // Zcb has no c.sext.w, so `sext.w a0,a0` is not a finding however it
+    // is spelled.
+    CHECK(rv_zcb_form(0x0005051bu, 4) == NULL);              // addiw a0,a0,0
+
+    // c.mul is `rd = rd * rs2'`, and multiplication commutes, so either
+    // source may be the destination. clang compresses both orders and
+    // GNU as only the first; both are encodable and both are reported.
+    CHECK(!strcmp(rv_zcb_form(0x02b50533u, 4), "c.mul"));   // mul a0,a0,a1
+    CHECK(!strcmp(rv_zcb_form(0x02a58533u, 4), "c.mul"));   // mul a0,a1,a0
+    CHECK(rv_zcb_form(0x02c58533u, 4) == NULL);             // mul a0,a1,a2
+    CHECK(rv_zcb_form(0x02b80833u, 4) == NULL);             // mul a6,a6,a1
+
+    // Instructions with no Zcb spelling at all, and the two-byte
+    // encodings the question is not asked of.
+    CHECK(rv_zcb_form(0x00b50533u, 4) == NULL);   // add a0,a0,a1
+    CHECK(rv_zcb_form(0x0005b503u, 4) == NULL);   // ld  a0,0(a1)
+    CHECK(rv_zcb_form(0x9d61u, 2) == NULL);       // already c.zext.b
+}
+
+static void test_zcb_gate(void)
+{
+    unsigned e;
+
+    // The arch string is where it usually comes from.
+    CHECK(riscvlint_parse_arch("rv64i2p1_m2p0_zca1p0_zcb1p0_zcd1p0") &
+          RISCVLINT_EXT_ZCB);
+    // zcd and zca are not zcb, and neither is a bare rv64gc.
+    CHECK(!(riscvlint_parse_arch("rv64i2p1_m2p0_zca1p0_zcd1p0") &
+            RISCVLINT_EXT_ZCB));
+    CHECK(!(riscvlint_parse_arch("rv64i2p1_m2p0_a2p1_f2p2_d2p2_c2p0") &
+            RISCVLINT_EXT_ZCB));
+
+    // Zcb is the first extension gated here that tells RVA22 and RVA23
+    // apart: it missed RVA22's ratification window.
+    CHECK(riscvlint_parse_ext_name("zcb", &e) && e == RISCVLINT_EXT_ZCB);
+    CHECK(riscvlint_parse_ext_name("rva22", &e) && !(e & RISCVLINT_EXT_ZCB));
+    CHECK(riscvlint_parse_ext_name("rva23", &e) && (e & RISCVLINT_EXT_ZCB));
+    CHECK(riscvlint_parse_ext_name("rva20", &e) && e == 0);
+}
+
+static void test_zcb_check(csh handle)
+{
+    riscvlint_finding f;
+
+    // A four-byte lbu that c.lbu could spell, in an object that declares
+    // Zcb: reported. The ret keeps riscvlint_word_at in bounds.
+    static const uint8_t wide[] = {
+        0x03, 0xc5, 0x35, 0x00,        // lbu a0,3(a1)
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    riscvlint_state *state = riscvlint_state_create();
+    CHECK(state != NULL);
+    riscvlint_state_set_extensions(state,
+                                   RISCVLINT_EXT_ZCB | RISCVLINT_EXT_DECLARED);
+    static uint8_t buf[64];
+    memcpy(buf, wide, sizeof wide);
+    CHECK(riscvlint_state_set_section(state, handle, buf, sizeof wide, 0x1000));
+    cs_insn *insn = cs_malloc(handle);
+    const uint8_t *p = buf;
+    size_t remain = sizeof wide;
+    uint64_t addr = 0x1000;
+    CHECK(insn && cs_disasm_iter(handle, &p, &remain, &addr, insn));
+    memset(&f, 0, sizeof f);
+    CHECK(check_zcb_compressible(state, insn, &f));
+    CHECK(!strcmp(f.replacement, "c.lbu (4 -> 2 bytes)"));
+    CHECK(f.insn_count == 1 && f.address == 0x1000);
+
+    // The same instruction in an object that declares an arch without
+    // Zcb: silent. Suggesting an instruction the target does not
+    // implement is worse than saying nothing.
+    riscvlint_state_set_extensions(state, RISCVLINT_EXT_ZBA |
+                                   RISCVLINT_EXT_DECLARED);
+    memset(&f, 0, sizeof f);
+    CHECK(!check_zcb_compressible(state, insn, &f));
+
+    // And in an object that declares nothing at all -- Go emits no
+    // attributes -- the gate stays open, as it does for every other
+    // extension here.
+    riscvlint_state_set_extensions(state, 0);
+    memset(&f, 0, sizeof f);
+    CHECK(check_zcb_compressible(state, insn, &f));
+
+    if (insn) cs_free(insn, 1);
+    riscvlint_state_destroy(state);
+}
+
 int main(void)
 {
     csh handle;
@@ -840,11 +972,14 @@ int main(void)
     test_result_guarantees();
     test_decode_extension();
     test_arch_gate();
+    test_zcb_form();
+    test_zcb_gate();
     test_check(handle);
     test_shadd_check(handle);
     test_zext_check(handle);
     test_sp_restore_check(handle);
     test_redundant_ext_check(handle);
+    test_zcb_check(handle);
 
     cs_close(&handle);
     if (failures) {

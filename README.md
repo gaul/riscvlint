@@ -102,6 +102,34 @@ written next is decided by the corpus rather than by intuition.
   pointer. Ubuntu builds with `-fno-omit-frame-pointer` deliberately, and
   the frame pointer stays.
 
+* **instruction compressible to a Zcb form** -- a four-byte encoding that
+  Zcb spells in two. Unlike every other check here this one reports an
+  assembler's choice rather than a compiler's: RVC selection happens at
+  assembly time, so a finding means the instruction was legal to compress
+  and was not.
+
+  Population: 30,648 with the gate in force -- 29,762 Go, 705 libQt6Core,
+  181 uutils, and 0 everywhere else. libxul contributes nothing because
+  it declares no Zcb and the gate is right to stay shut; `-m zcb` over it
+  reports 320,550, which is 626 KB and the largest thing `-m` has to say
+  about any binary in the corpus.
+
+  The two figures answer different questions and should not be added.
+  30,648 is what the assemblers left on targets that have the extension;
+  320,550 is what enabling it on a baseline build would buy.
+
+  Every Zcb form names its registers with a three-bit field, so x8-x15
+  only, and the memory forms carry an unsigned two-bit byte offset or a
+  one-bit halfword offset. Those rules were checked against GNU as and
+  clang before being written down. The two agree except on
+  `mul rd,rs1,rd`: multiplication commutes, so clang swaps the operands
+  and compresses it while GNU as leaves it wide. That single gap is 303
+  of libQt6Core's 705 findings, and the other 402 are its sibling --
+  GNU as compresses `not rd,rd` but not the `xori rd,rd,-1` it expands
+  to. Both are binutils gaps rather than anything a compiler chose, and a
+  binary cannot tell the spellings apart because they assemble
+  identically.
+
 * **redundant sign or zero extension** -- an extension applied to a value
   that already has that form: `sext.w` after `lw`, `andi rd,rd,255` after
   `lbu`, `sext.h` after `lb`. Where it writes back the register it read,
@@ -161,6 +189,12 @@ declaration:
 riscvlint -m rva23 ./app     # what would rebuilding for RVA23 buy me?
 riscvlint -m rva20 ./app     # this is going on rv64gc hardware; stay quiet
 ```
+
+`rva22` and `rva23` no longer expand alike. Zcb missed RVA22's
+ratification window and is mandatory in RVA23U64, so it is the first
+extension gated here that tells the two profiles apart -- and on the
+corpus's one baseline build it is by far the largest difference between
+them.
 
 Without `-m`, the arch string decides, and a file that carries none is
 reported as such rather than silently assumed permissive.

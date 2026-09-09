@@ -1,0 +1,64 @@
+note: zcb_compressible.o: -m overrides the arch declared in the object
+instruction compressible to a Zcb form at offset: 0x0: -> c.lbu (4 -> 2 bytes) (1 instructions)
+  lbu a0, 0(a1)
+
+instruction compressible to a Zcb form at offset: 0x4: -> c.lbu (4 -> 2 bytes) (1 instructions)
+  lbu a0, 3(a1)
+
+instruction compressible to a Zcb form at offset: 0x8: -> c.lhu (4 -> 2 bytes) (1 instructions)
+  lhu a0, 2(a1)
+
+instruction compressible to a Zcb form at offset: 0xc: -> c.lh (4 -> 2 bytes) (1 instructions)
+  lh a0, 2(a1)
+
+instruction compressible to a Zcb form at offset: 0x10: -> c.sb (4 -> 2 bytes) (1 instructions)
+  sb a0, 3(a1)
+
+instruction compressible to a Zcb form at offset: 0x14: -> c.sh (4 -> 2 bytes) (1 instructions)
+  sh a0, 2(a1)
+
+redundant sign or zero extension at offset: 0x30: -> delete; a0 is already zext.b (4 bytes) (1 instructions)
+  andi a0, a0, 0xff
+
+instruction compressible to a Zcb form at offset: 0x30: -> c.zext.b (4 -> 2 bytes) (1 instructions)
+  andi a0, a0, 0xff
+
+instruction compressible to a Zcb form at offset: 0x34: -> c.not (4 -> 2 bytes) (1 instructions)
+  not a0, a0
+
+instruction compressible to a Zcb form at offset: 0x38: -> c.sext.b (4 -> 2 bytes) (1 instructions)
+  sext.b a0, a0
+
+redundant sign or zero extension at offset: 0x3c: -> delete; a0 is already sext.h (4 bytes) (1 instructions)
+  sext.h a0, a0
+
+instruction compressible to a Zcb form at offset: 0x3c: -> c.sext.h (4 -> 2 bytes) (1 instructions)
+  sext.h a0, a0
+
+instruction compressible to a Zcb form at offset: 0x40: -> c.zext.h (4 -> 2 bytes) (1 instructions)
+  zext.h a0, a0
+
+dead register definition at offset: 0x44: -> delete; nothing reads a0 (4 bytes) (1 instructions)
+  zext.w a0, a0
+
+redundant sign or zero extension at offset: 0x44: -> delete; a0 is already zext.w (4 bytes) (1 instructions)
+  zext.w a0, a0
+
+instruction compressible to a Zcb form at offset: 0x44: -> c.zext.w (4 -> 2 bytes) (1 instructions)
+  zext.w a0, a0
+
+instruction compressible to a Zcb form at offset: 0x50: -> c.mul (4 -> 2 bytes) (1 instructions)
+  mul a0, a0, a1
+
+dead register definition at offset: 0x54: -> delete; nothing reads a0 (4 bytes) (1 instructions)
+  mul a0, a1, a0
+
+instruction compressible to a Zcb form at offset: 0x54: -> c.mul (4 -> 2 bytes) (1 instructions)
+  mul a0, a1, a0
+
+Optimization opportunities by type:
+      14  instruction compressible to a Zcb form
+       3  redundant sign or zero extension
+       2  dead register definition
+
+19 optimization opportunities in 26 instructions

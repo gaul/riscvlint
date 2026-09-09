@@ -242,10 +242,71 @@ unsigned riscvlint_parse_arch(const char *arch)
     if (strstr(arch, "_zba")) exts |= RISCVLINT_EXT_ZBA;
     if (strstr(arch, "_zbb")) exts |= RISCVLINT_EXT_ZBB;
     if (strstr(arch, "_zbs")) exts |= RISCVLINT_EXT_ZBS;
+    if (strstr(arch, "_zcb")) exts |= RISCVLINT_EXT_ZCB;
     return exts;
 }
 
 // ---- state ----
+
+// ---- Zcb encodability ----
+
+// The three-bit register fields of the compressed formats name x8-x15.
+static bool rvc_reg(unsigned r) { return r >= 8 && r <= 15; }
+
+const char *rv_zcb_form(uint32_t w, unsigned size)
+{
+    if (size != 4) return NULL;
+    unsigned op = RV_OPCODE(w), f3 = (w >> 12) & 0x7u;
+    unsigned rd = (w >> 7) & 0x1fu, rs1 = (w >> 15) & 0x1fu;
+    unsigned rs2 = (w >> 20) & 0x1fu, f7 = (w >> 25) & 0x7fu;
+    unsigned field = (w >> 20) & 0xfffu;
+
+    switch (op) {
+    case 0x03u: {                                     // LOAD
+        int64_t off = sign_extend(field, 12);
+        if (!rvc_reg(rd) || !rvc_reg(rs1)) return NULL;
+        // c.lbu's offset field is two bits and unsigned; c.lhu and c.lh
+        // share a one-bit field that names the halfword, so 0 or 2.
+        if (f3 == 4 && off >= 0 && off <= 3) return "c.lbu";
+        if (f3 == 5 && (off == 0 || off == 2)) return "c.lhu";
+        if (f3 == 1 && (off == 0 || off == 2)) return "c.lh";
+        return NULL;
+    }
+    case 0x23u: {                                     // STORE
+        // S-type splits the immediate across two fields.
+        int64_t off = sign_extend(((uint64_t)f7 << 5) | rd, 12);
+        if (!rvc_reg(rs2) || !rvc_reg(rs1)) return NULL;
+        if (f3 == 0 && off >= 0 && off <= 3) return "c.sb";
+        if (f3 == 1 && (off == 0 || off == 2)) return "c.sh";
+        return NULL;
+    }
+    case 0x13u:                                       // OP-IMM
+        // The unary forms all write the register they read.
+        if (rd != rs1 || !rvc_reg(rd)) return NULL;
+        if (f3 == 7 && field == 255) return "c.zext.b";
+        if (f3 == 4 && field == 0xfffu) return "c.not";   // xori rd,rd,-1
+        if (f3 == 1 && field == 0x604u) return "c.sext.b";
+        if (f3 == 1 && field == 0x605u) return "c.sext.h";
+        return NULL;
+    case 0x3bu:                                       // OP-32
+        if (f7 != 0x04u || rs2 != 0) return NULL;
+        if (rd != rs1 || !rvc_reg(rd)) return NULL;
+        if (f3 == 0) return "c.zext.w";               // add.uw rd,rd,x0
+        if (f3 == 4) return "c.zext.h";
+        return NULL;
+    case 0x33u:                                       // OP
+        if (f7 != 0x01u || f3 != 0) return NULL;      // mul only
+        if (!rvc_reg(rd)) return NULL;
+        // c.mul is `rd = rd * rs2'`. Multiplication commutes, so the
+        // operands can be swapped to fit -- clang does, GNU as does not,
+        // and the site is compressible either way.
+        if (rd == rs1 && rvc_reg(rs2)) return "c.mul";
+        if (rd == rs2 && rvc_reg(rs1)) return "c.mul";
+        return NULL;
+    default:
+        return NULL;
+    }
+}
 
 // ---- what a result guarantees about its own high bits ----
 
@@ -691,9 +752,13 @@ bool riscvlint_parse_ext_name(const char *name, unsigned *exts)
         { "zba",   RISCVLINT_EXT_ZBA },
         { "zbb",   RISCVLINT_EXT_ZBB },
         { "zbs",   RISCVLINT_EXT_ZBS },
+        { "zcb",   RISCVLINT_EXT_ZCB },
         { "rva20", 0 },
         { "rva22", RISCVLINT_EXT_ZBA | RISCVLINT_EXT_ZBB | RISCVLINT_EXT_ZBS },
-        { "rva23", RISCVLINT_EXT_ZBA | RISCVLINT_EXT_ZBB | RISCVLINT_EXT_ZBS },
+        // Zcb missed RVA22's ratification window and is mandatory in
+        // RVA23U64, so this is where the two profiles part.
+        { "rva23", RISCVLINT_EXT_ZBA | RISCVLINT_EXT_ZBB | RISCVLINT_EXT_ZBS |
+                   RISCVLINT_EXT_ZCB },
     };
     for (size_t i = 0; i < sizeof table / sizeof table[0]; i++) {
         if (strcmp(name, table[i].name) == 0) {
@@ -1068,6 +1133,30 @@ bool check_redundant_extension(riscvlint_state *state, const cs_insn *insn,
     if (rv_ends_region(w, insn->size))
         memset(state->guarantees, 0, sizeof state->guarantees);
     return found;
+}
+
+// ---- a four-byte encoding Zcb spells in two ----
+
+bool check_zcb_compressible(riscvlint_state *state, const cs_insn *insn,
+                            riscvlint_finding *finding)
+{
+    if (!riscvlint_may_use(state, RISCVLINT_EXT_ZCB)) return false;
+    if (insn->size != 4) return false;
+    uint32_t w;
+    if (!riscvlint_word_at(state, insn->address, &w)) return false;
+    const char *form = rv_zcb_form(w, insn->size);
+    if (!form) return false;
+    // A relocated instruction's immediate is a placeholder the linker
+    // fills, so whether the offset fits the compressed field is not yet
+    // decided here.
+    if (riscvlint_is_relocated(state, insn->address)) return false;
+
+    finding->title = "instruction compressible to a Zcb form";
+    finding->address = insn->address;
+    finding->insn_count = 1;
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "%s (4 -> 2 bytes)", form);
+    return true;
 }
 
 bool check_dead_def(riscvlint_state *state, const cs_insn *insn,

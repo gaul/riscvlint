@@ -868,7 +868,7 @@ static void scan_section(csh handle, const char *path, const uint8_t *code,
         // two bytes the assembler left on the table. Zcb's register
         // fields are three bits: x8-x15 only.
         if (insn->size == 4) {
-            bool r0 = d0 >= 8 && d0 <= 15;
+            bool r0 = d0 >= 8 && d0 <= 15, rs = s1 >= 8 && s1 <= 15;
             bool r2 = s2 >= 8 && s2 <= 15;
             const char *form = NULL;
             if (r0 && d0 == s1) {
@@ -880,8 +880,16 @@ static void scan_section(csh handle, const char *path, const uint8_t *code,
                 else if (!strcmp(m, "not")) form = "c.not";
                 else if (!strcmp(m, "andi") && hasi2 && i2 == 255)
                     form = "c.zext.b (andi rd,rd,255)";
-                else if (!strcmp(m, "mul") && r2) form = "c.mul";
             }
+            // c.mul is `rd = rd * rs2'`, and multiplication commutes, so
+            // either source may be the destination. This probe first
+            // required the destination to be the *first* source and
+            // undercounted every corpus by the commuted form -- 303
+            // sites in libQt6Core, 18,943 in libxul. check_zcb_compressible
+            // decodes it correctly and is what found the gap.
+            if (!form && !strcmp(m, "mul") && r0 &&
+                ((d0 == s1 && r2) || (d0 == s2 && rs)))
+                form = "c.mul";
             if (form) {
                 char key[96];
                 snprintf(key, sizeof key, "zcb|%s", form);

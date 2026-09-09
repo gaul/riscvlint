@@ -112,6 +112,18 @@ bool rv_decode_extension(uint32_t w, unsigned size, unsigned *rd,
 // transfer, in any of their spellings.
 bool rv_ends_region(uint32_t w, unsigned size);
 
+// The name of the Zcb two-byte form `w` could be spelled as, or NULL
+// when it has none. Only asked of four-byte encodings: the question is
+// whether a wide encoding was left wide.
+//
+// Every Zcb form names its registers with a three-bit field, so x8-x15
+// only, and the memory forms carry an unsigned two-bit byte offset or a
+// one-bit halfword offset. Those constraints were checked against both
+// GNU as and clang before being written down; the two agree everywhere
+// except `mul rd,rs1,rd`, which clang compresses by commuting the
+// operands and GNU as leaves wide.
+const char *rv_zcb_form(uint32_t w, unsigned size);
+
 // True when `w` is an instruction whose only effect is to write one
 // general register: the ALU opcodes and their compressed spellings.
 // Deleting such an instruction is observationally free once its result
@@ -157,6 +169,7 @@ typedef enum {
     RISCVLINT_EXT_ZBA = 1u << 0,
     RISCVLINT_EXT_ZBB = 1u << 1,
     RISCVLINT_EXT_ZBS = 1u << 2,
+    RISCVLINT_EXT_ZCB = 1u << 3,
     RISCVLINT_EXT_DECLARED = 1u << 31,
 } riscvlint_ext;
 
@@ -191,12 +204,15 @@ unsigned riscvlint_state_extensions(const riscvlint_state *state);
 // True unless the object positively declares an arch without `ext`.
 bool riscvlint_may_use(const riscvlint_state *state, unsigned ext);
 
-// One -m argument: an extension name (zba, zbb, zbs) or a profile name
-// (rva20, rva22, rva23) naming a bundle of them. Returns false for an
-// unrecognised name; a recognised name may still yield no bits, since
+// One -m argument: an extension name (zba, zbb, zbs, zcb) or a profile
+// name (rva20, rva22, rva23) naming a bundle of them. Returns false for
+// an unrecognised name; a recognised name may still yield no bits, since
 // rva20 is the baseline and mandates none of the extensions gated here.
-// rva22 and rva23 differ only in extensions this checker does not yet
-// gate on, so they expand alike.
+//
+// rva22 and rva23 no longer expand alike. Zcb was not ratified in time
+// for RVA22 and is mandatory in RVA23U64, so it is the first extension
+// gated here that tells the two profiles apart -- and on a baseline
+// build it is also the largest thing -m has to say.
 bool riscvlint_parse_ext_name(const char *name, unsigned *exts);
 
 // True when something branches to `addr`, making it a side entry.
@@ -347,6 +363,13 @@ bool check_redundant_sp_restore(riscvlint_state *state, const cs_insn *insn,
 // that established it.
 bool check_redundant_extension(riscvlint_state *state, const cs_insn *insn,
                                riscvlint_finding *finding);
+
+// A four-byte encoding that Zcb spells in two. Unlike the other checks
+// this one reports an assembler's choice rather than a compiler's: RVC
+// selection happens at assembly time, so a finding here means the
+// instruction was legal to compress and was not.
+bool check_zcb_compressible(riscvlint_state *state, const cs_insn *insn,
+                            riscvlint_finding *finding);
 
 bool check_dead_def(riscvlint_state *state, const cs_insn *insn,
                     riscvlint_finding *finding);

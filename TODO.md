@@ -34,7 +34,7 @@ which also records where the first figure was wrong and why.
 | 8 | frame-pointer teardown over a static frame | 112,401 | 133,670 | **implemented** |
 | 9 | extension the producer already guarantees | 8,515 | - | **implemented** |
 | 10 | dead store to a frame slot | 15,199 | - | candscan-sized |
-| 11 | Zcb-shrinkable 4-byte encodings | 330,994 | - | gated off on 99.8% of it |
+| 11 | Zcb-compressible 4-byte encodings | 30,648 | 351,198 | **implemented** |
 
 ### 6. Constant re-materialization -- 4,580 of 193,398
 
@@ -410,7 +410,7 @@ instruction mix rather than a shortfall.
 Zcb is the part of this that is not settled by that argument, and it gets
 its own section below.
 
-## Zcb -- 330,994, and almost all of it is one binary's target
+## Zcb -- 30,648 reportable, 320,550 more behind the gate  [implemented]
 
 Zcb adds two-byte spellings for byte and halfword memory access
 (`c.lbu`, `c.lhu`, `c.lh`, `c.sb`, `c.sh`), for the extension pseudo-ops
@@ -421,36 +421,57 @@ or a one-bit halfword offset. Those constraints are the whole check:
 `candscan` counts four-byte encodings that satisfy them.
 
 The count splits on something other than the compiler, so read it in two
-halves:
+halves. Measured by `check_zcb_compressible` itself:
 
-| target | declares zcb | shrinkable | bytes |
+| target | declares zcb | findings | bytes |
 |---|---|---:|---:|
-| libxul (Debian, rv64gc) | no | 301,607 | ~589 KB |
-| Go (no attributes) | unknown | 28,806 | ~56 KB |
-| libQt6Core | yes | 402 | 804 |
-| uutils | yes | 179 | 358 |
+| Go (no attributes) | unknown | 29,762 | ~58 KB |
+| libQt6Core | yes | 705 | 1,410 |
+| uutils | yes | 181 | 362 |
 | libLLVM, ripgrep, fd, bat, hyperfine | yes | 0 | 0 |
+| libxul (Debian, rv64gc) | **no** | 0 | 0 |
+| libxul under `-m zcb` | forced | 320,550 | ~626 KB |
+
+The last two rows are the same binary and the two figures must not be
+added: 30,648 is what the assemblers left on targets that have Zcb, and
+320,550 is what enabling it on a baseline build would buy.
+
+These are higher than the figures this section first carried
+(301,607 / 28,806 / 402 / 179), and the difference is one rule the
+mining probe did not have -- see the `c.mul` note below. With that rule
+added, `candscan` and the check agree exactly, form by form, on every
+binary here.
 
 By form, where the population is:
 
-| form | libxul | Go |
+| form | libxul (`-m zcb`) | Go |
 |---|---:|---:|
 | `c.lbu` | 152,976 | 15,714 |
 | `c.sb` | 76,633 | 4,900 |
-| `c.mul` | 24,915 | 1,064 |
+| `c.mul` | 43,858 | 2,020 |
 | `c.not` | 15,727 | 491 |
 | `c.zext.b` (`andi rd,rd,255`) | 12,754 | 5,328 |
 | `c.lhu` / `c.sh` / `c.lh` | 18,602 | 1,309 |
 
-Nothing in the first two rows is reportable as things stand and the gate
-is right to keep it that way: libxul declares no Zcb, Go declares
-nothing at all, and suggesting an instruction the target may not
-implement is advice that does not assemble. What those rows size is the
-other question -- `riscvlint -m` over a baseline build -- where 589 KB
-off one shared object is the largest single figure this project has
-measured.
+Nothing in the libxul column is reportable as things stand and the gate
+is right to keep it that way: it declares no Zcb, and suggesting an
+instruction the target may not implement is advice that does not
+assemble. What that column sizes is the other question -- `riscvlint -m
+zcb` over a baseline build -- where 626 KB off one shared object is the
+largest single figure this project has measured, and the largest thing
+`-m` has to say about any binary in the corpus.
 
-### The 402 in libQt6Core are one gap in GNU as
+Go declares nothing at all, so the three-valued gate leaves it open and
+its 29,762 are reported. Whether Go's linker would accept them is a
+question the object cannot answer.
+
+### The 705 in libQt6Core are two gaps in GNU as
+
+402 of them are `not`, and 303 are `c.mul`. Both are the same shape: a
+pair of spellings that assemble to the same instruction, one of which
+GNU as compresses and the other of which it does not.
+
+#### `not` against `xori`
 
 Every site is `not rd,rd` with rd in x8-x15, left at four bytes in an
 object that declares Zcb -- and the same binary contains 21 of the
@@ -478,6 +499,27 @@ A binary cannot tell the two spellings apart -- they assemble to the same
 four bytes -- so the check reports the site and the reader takes it up
 with the assembler.
 
+#### `mul rd,rs1,rd`
+
+`c.mul` is `rd = rd * rs2'`, and multiplication commutes, so either
+source may be the destination:
+
+| source | GNU as | clang |
+|---|---|---|
+| `mul a0, a0, a1` | `9d4d` (2 bytes) | `9d4d` |
+| `mul a0, a1, a0` | `02a58533` (4 bytes) | `9d4d` |
+
+clang swaps the operands to fit the format; GNU as does not try. That is
+303 of libQt6Core's findings, 956 of Go's, and 18,943 of libxul's.
+
+`candscan` had this wrong: its probe required the destination to be the
+*first* source, so it undercounted every corpus by the commuted form.
+The check found what the mining tool missed, which is the first time
+that has happened in this direction -- and it only happened because the
+two are separate implementations of the same rule rather than shared
+code. The probe now carries the corrected rule and the two agree form by
+form on every binary in the corpus.
+
 ### The 179 in uutils are one binary with two targets
 
 uutils declares `zcb1p0` and still has 179 shrinkable sites, mostly
@@ -490,14 +532,13 @@ which does not inherit the target features rustc passes to LLVM.
 Worth remembering wherever the arch gate is read as a property of a
 whole binary: it is a property of the loudest object in it.
 
-### Is it worth a check?
+### The gate
 
-On a target that declares Zcb, 581 sites in 73.1M instructions. On one
-that does not, 330,413. So not as a compiler-miss check, and yes as part
-of the `-m` story, where it would be the largest thing `-m` can say. The
-encodability rules are already written and validated against both
-assemblers in `candscan`; what a check needs beyond them is the Zcb bit
-in the extension gate, which `riscvlint_parse_arch` does not yet carry.
+`RISCVLINT_EXT_ZCB` is read from `_zcb` in `Tag_RISCV_arch` and is
+settable with `-m zcb`. It is also the first extension gated here that
+tells `rva22` and `rva23` apart -- Zcb missed RVA22's ratification window
+and is mandatory in RVA23U64 -- so the two profile names stopped
+expanding alike when this landed.
 
 ## Measured and rejected
 
