@@ -289,6 +289,42 @@ int riscvlint_liveness(riscvlint_state *state, uint64_t addr, unsigned rd);
 bool riscvlint_word_at(const riscvlint_state *state, uint64_t addr,
                        uint32_t *out);
 
+// ---- conditions and branches ----
+//
+// RISC-V has no condition flags, so the shape armlint spells `cmp #0`
+// is here a comparison materialized into a register and then tested.
+// These are the producers that a branch can absorb.
+typedef enum {
+    RV_COND_NONE = 0,
+    RV_COND_SLT,        // rd = a <s b
+    RV_COND_SLTU,       // rd = a <u b
+    RV_COND_EQ,         // rd == 0 iff a == b: `xor` and `sub` alike
+    RV_COND_SEQZ,       // rd = (a == 0)
+    RV_COND_SNEZ,       // rd = (a != 0)
+} rv_cond_kind;
+
+// A condition written into `rd` from `rs1` and `rs2`. The single-source
+// forms set rs2 to x0. `seqz` is `sltiu rd,rs,1` and `snez` is
+// `sltu rd,x0,rs`, so both are aliases the raw decode has to recognise
+// rather than mnemonics -- and `snez` has to be picked out before the
+// general `sltu`, which would otherwise claim it.
+bool rv_decode_condition(uint32_t w, unsigned size, unsigned *rd,
+                         unsigned *rs1, unsigned *rs2, rv_cond_kind *kind);
+
+// A conditional branch: `funct3` selects which comparison (0 beq, 1 bne,
+// 4 blt, 5 bge, 6 bltu, 7 bgeu) and `off` is the signed byte
+// displacement from this instruction. `beqz` and `bnez` are `beq` and
+// `bne` against x0, in either operand order, and c.beqz/c.bnez are the
+// two-byte spellings of those.
+bool rv_decode_cond_branch(uint32_t w, unsigned size, unsigned *rs1,
+                           unsigned *rs2, unsigned *funct3, int64_t *off);
+
+// Bytes the branch would assemble to. Only `beqz` and `bnez` have a
+// compressed spelling, and only for a register in x8-x15 with a
+// displacement inside the nine-bit field.
+unsigned rv_branch_encoded_size(unsigned funct3, unsigned rs1, unsigned rs2,
+                                int64_t off);
+
 // ---- the windowed memory and constant table ----
 //
 // Three checks -- redundant reload, dead store, constant
@@ -481,6 +517,17 @@ bool check_dead_store(riscvlint_state *state, const cs_insn *insn,
 // for a dependent one, so it is not reported.
 bool check_const_remat(riscvlint_state *state, const cs_insn *insn,
                        riscvlint_finding *finding);
+
+// A comparison materialized into a register and then tested with
+// `beqz`/`bnez`, where one branch would do both. The flagless analogue
+// of armlint's `cmp #0` check.
+//
+// The fold only removes an instruction if the condition register is dead
+// on **both** successors, which is why this needs a walk rather than a
+// scan: the taken path is elsewhere in the section, and half of the raw
+// population is a difference the code goes on to use.
+bool check_cond_to_branch(riscvlint_state *state, const cs_insn *insn,
+                          riscvlint_finding *finding);
 
 bool check_dead_def(riscvlint_state *state, const cs_insn *insn,
                     riscvlint_finding *finding);

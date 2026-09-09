@@ -271,6 +271,7 @@ static const riscvlint_check_fn checks[] = {
     check_redundant_reload,
     check_dead_store,
     check_const_remat,
+    check_cond_to_branch,
 };
 
 static void scan_section(csh handle, riscvlint_state *state,

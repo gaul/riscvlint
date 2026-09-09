@@ -769,6 +769,102 @@ bool rv_ends_region(uint32_t w, unsigned size)
     return false;
 }
 
+// ---- conditions and branches ----
+
+bool rv_decode_condition(uint32_t w, unsigned size, unsigned *rd,
+                         unsigned *rs1, unsigned *rs2, rv_cond_kind *kind)
+{
+    if (size == 4) {
+        unsigned op = RV_OPCODE(w), f3 = (w >> 12) & 0x7u;
+        unsigned f7 = (w >> 25) & 0x7fu;
+        unsigned d = (w >> 7) & 0x1fu, a = (w >> 15) & 0x1fu;
+        unsigned b = (w >> 20) & 0x1fu;
+        if (d == 0) return false;
+        if (op == 0x13u && f3 == 3u && ((w >> 20) & 0xfffu) == 1u) {
+            *rd = d; *rs1 = a; *rs2 = 0; *kind = RV_COND_SEQZ;  // sltiu rd,a,1
+            return true;
+        }
+        if (op != 0x33u) return false;
+        if (f7 == 0x20u && f3 == 0u) {                          // sub
+            *rd = d; *rs1 = a; *rs2 = b; *kind = RV_COND_EQ;
+            return true;
+        }
+        if (f7 != 0u) return false;
+        if (f3 == 3u && a == 0) {                               // sltu rd,x0,b
+            *rd = d; *rs1 = b; *rs2 = 0; *kind = RV_COND_SNEZ;
+            return true;
+        }
+        switch (f3) {
+        case 2: *kind = RV_COND_SLT;  break;
+        case 3: *kind = RV_COND_SLTU; break;
+        case 4: *kind = RV_COND_EQ;   break;                    // xor
+        default: return false;
+        }
+        *rd = d; *rs1 = a; *rs2 = b;
+        return true;
+    }
+    if (size != 2) return false;
+    // c.sub and c.xor are `sub rd',rd',rs2'` and `xor rd',rd',rs2'`.
+    // Both share funct6 100011 and are separated by the two bits below
+    // it; the same field's other values are c.or and c.and, which say
+    // nothing about equality.
+    if ((w & 0xfc03u) == 0x8c01u) {
+        unsigned sel = (w >> 5) & 0x3u;
+        if (sel != 0 && sel != 1) return false;                 // c.sub, c.xor
+        *rd = *rs1 = 8u + ((w >> 7) & 0x7u);
+        *rs2 = 8u + ((w >> 2) & 0x7u);
+        *kind = RV_COND_EQ;
+        return true;
+    }
+    return false;
+}
+
+bool rv_decode_cond_branch(uint32_t w, unsigned size, unsigned *rs1,
+                           unsigned *rs2, unsigned *funct3, int64_t *off)
+{
+    if (size == 4) {
+        if (RV_OPCODE(w) != 0x63u) return false;
+        unsigned f3 = (w >> 12) & 0x7u;
+        if (f3 == 2u || f3 == 3u) return false;                 // reserved
+        *funct3 = f3;
+        *rs1 = (w >> 15) & 0x1fu;
+        *rs2 = (w >> 20) & 0x1fu;
+        uint64_t imm = (((uint64_t)(w >> 31) & 1u) << 12) |
+                       (((uint64_t)(w >> 7) & 1u) << 11) |
+                       (((uint64_t)(w >> 25) & 0x3fu) << 5) |
+                       (((uint64_t)(w >> 8) & 0xfu) << 1);
+        *off = sign_extend(imm, 13);
+        return true;
+    }
+    if (size != 2) return false;
+    // CB-format c.beqz and c.bnez, whose register field names x8-x15.
+    if ((w & 0xe003u) != 0xc001u && (w & 0xe003u) != 0xe001u) return false;
+    *funct3 = ((w >> 13) & 0x7u) == 6u ? 0u : 1u;
+    *rs1 = 8u + ((w >> 7) & 0x7u);
+    *rs2 = 0;
+    // CB packs the displacement as imm[8|4:3] in bits 12:10 and
+    // imm[7:6|2:1|5] in bits 6:2. Reading 11:10 as imm[7:6] and 6:5 as
+    // imm[4:3] -- the two fields swapped -- decodes most short branches
+    // to a plausible wrong address rather than to nothing, which is how
+    // it survived until a finding was read against the disassembly.
+    uint64_t imm = (((uint64_t)(w >> 12) & 1u) << 8) |
+                   (((uint64_t)(w >> 10) & 0x3u) << 3) |
+                   (((uint64_t)(w >> 5) & 0x3u) << 6) |
+                   (((uint64_t)(w >> 3) & 0x3u) << 1) |
+                   (((uint64_t)(w >> 2) & 1u) << 5);
+    *off = sign_extend(imm, 9);
+    return true;
+}
+
+unsigned rv_branch_encoded_size(unsigned funct3, unsigned rs1, unsigned rs2,
+                                int64_t off)
+{
+    if (funct3 != 0u && funct3 != 1u) return 4;                 // not beq/bne
+    if (rs2 != 0 || !rvc_reg(rs1)) return 4;
+    if (off < -256 || off > 254 || (off & 1)) return 4;
+    return 2;
+}
+
 // ---- the windowed memory and constant table ----
 
 // A location the region has touched. One record serves two questions
@@ -1839,6 +1935,108 @@ bool check_const_remat(riscvlint_state *state, const cs_insn *insn,
         return true;
     }
     return false;
+}
+
+// ---- a comparison a branch could have made ----
+
+static const char *branch_name(unsigned funct3, unsigned rs2)
+{
+    if (rs2 == 0 && funct3 == 0) return "beqz";
+    if (rs2 == 0 && funct3 == 1) return "bnez";
+    switch (funct3) {
+    case 0: return "beq";
+    case 1: return "bne";
+    case 4: return "blt";
+    case 5: return "bge";
+    case 6: return "bltu";
+    default: return "bgeu";
+    }
+}
+
+// Which branch absorbs this condition, given whether the test was
+// `bnez` (the condition held) or `beqz` (it did not).
+static unsigned folded_funct3(rv_cond_kind kind, bool on_nonzero)
+{
+    switch (kind) {
+    case RV_COND_SLT:  return on_nonzero ? 4u : 5u;    // blt  : bge
+    case RV_COND_SLTU: return on_nonzero ? 6u : 7u;    // bltu : bgeu
+    case RV_COND_EQ:   return on_nonzero ? 1u : 0u;    // bne  : beq
+    case RV_COND_SEQZ: return on_nonzero ? 0u : 1u;    // beqz : bnez
+    default:           return on_nonzero ? 1u : 0u;    // snez: bnez : beqz
+    }
+}
+
+bool check_cond_to_branch(riscvlint_state *state, const cs_insn *insn,
+                          riscvlint_finding *finding)
+{
+    if (insn->size != 2 && insn->size != 4) return false;
+    uint32_t w1;
+    if (!riscvlint_word_at(state, insn->address, &w1)) return false;
+    unsigned rd, a, b;
+    rv_cond_kind kind;
+    if (!rv_decode_condition(w1, insn->size, &rd, &a, &b, &kind)) return false;
+
+    uint64_t second = insn->address + insn->size;
+    uint32_t w2;
+    if (!riscvlint_word_at(state, second, &w2)) return false;
+    unsigned len2 = rv_insn_len(w2);
+    unsigned brs1, brs2, bf3;
+    int64_t off;
+    if (!rv_decode_cond_branch(w2, len2, &brs1, &brs2, &bf3, &off))
+        return false;
+    // The branch has to be the zero test of the condition: `beqz rd` or
+    // `bnez rd`, in either operand order.
+    if (bf3 != 0u && bf3 != 1u) return false;
+    unsigned tested;
+    if (brs2 == 0) tested = brs1;
+    else if (brs1 == 0) tested = brs2;
+    else return false;
+    if (tested != rd) return false;
+
+    // Folding deletes the comparison, so the branch must not be somewhere
+    // else can arrive at with rd set by something other than what
+    // precedes it here.
+    if (riscvlint_is_branch_target(state, second)) return false;
+    if (riscvlint_is_relocated(state, insn->address) ||
+        riscvlint_is_relocated(state, second))
+        return false;
+
+    // The rewrite reads a and b at the branch instead of at the
+    // comparison, which is the same value only if nothing between them
+    // wrote either -- and nothing is between them.
+    //
+    // The condition register has to be dead on *both* successors. A scan
+    // can see the fall-through and not the taken path, which is where
+    // half of the raw population turns out to be live.
+    uint64_t fallthrough = second + len2;
+    uint64_t taken = second + (uint64_t)off;
+    if (riscvlint_liveness(state, fallthrough, rd) != RISCVLINT_LIVE_DEAD)
+        return false;
+    if (riscvlint_liveness(state, taken, rd) != RISCVLINT_LIVE_DEAD)
+        return false;
+
+    unsigned f3 = folded_funct3(kind, bf3 == 1u);
+    unsigned ra = a, rb = (kind == RV_COND_SEQZ || kind == RV_COND_SNEZ) ? 0 : b;
+    unsigned before = insn->size + len2;
+    // The branch keeps its own displacement, so its reach is unchanged;
+    // only the two bytes the comparison took can go, plus whatever the
+    // folded branch gives back if it cannot take the compressed form the
+    // original had.
+    unsigned after = rv_branch_encoded_size(f3, ra, rb, off);
+
+    finding->title = "comparison a branch could have made";
+    finding->address = insn->address;
+    finding->insn_count = 2;
+    if (rb == 0 && (f3 == 0u || f3 == 1u))
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "%s %s, 0x%" PRIx64 " (%u -> %u bytes)",
+                 branch_name(f3, rb), rv_reg_name(ra), taken, before, after);
+    else
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "%s %s, %s, 0x%" PRIx64 " (%u -> %u bytes)",
+                 branch_name(f3, rb), rv_reg_name(ra), rv_reg_name(rb),
+                 taken, before, after);
+    return true;
 }
 
 bool check_dead_def(riscvlint_state *state, const cs_insn *insn,

@@ -30,7 +30,7 @@ which also records where the first figure was wrong and why.
 | 4 | redundant reloads | 5,028 | 10,079 | **implemented** |
 | 5 | dead register definitions | 14,458 | 47,655 | **implemented** |
 | 6 | constant re-materialization | 10,998 | 193,398 | **implemented** |
-| 7 | compare-then-branch folding | 1,978 | 21,986 | liveness applied |
+| 7 | compare-then-branch folding | 2,937 | 21,986 | **implemented** |
 | 8 | frame-pointer teardown over a static frame | 112,401 | 133,670 | **implemented** |
 | 9 | extension the producer already guarantees | 8,515 | - | **implemented** |
 | 10 | dead store to a frame slot | 4,376 | 15,199 | **implemented** |
@@ -113,50 +113,61 @@ recorded as 0 until libxul arrived; see "What the second corpus changed".
 This supersedes the 30,175 first reported here, which was three times too
 low; see "Raw fields versus decoded values" below.
 
-### 7. Compare-then-branch folding -- 1,978 of 21,986
+### 7. A comparison a branch could have made -- 2,937  [implemented]
 
-`slt`/`sltu`/`xor`/`sub` producing a condition into a GPR, then
-`beqz`/`bnez` on it, where one `blt`/`bgeu`/`beq`/`bne` would do both.
-The flagless analogue of armlint's `cmp #0` check.
+`slt`/`sltu`/`xor`/`sub` writing a condition into a GPR, then
+`beqz`/`bnez` testing it, where one `blt`/`bgeu`/`beq`/`bne` would have
+done both. The flagless analogue of armlint's `cmp #0` check: RISC-V has
+no condition codes, so the comparison is a value and the test is a
+branch on it.
 
-Two filters separate the population from the pattern. The fold only
-removes an instruction if the condition register is dead on *both*
-successors, which a linear scan cannot answer -- the taken path is
-elsewhere. `defuse` now runs a bounded breadth-first liveness walk from
-both successors, answering `fold` only when every reachable path
-redefines the register before reading it, `live` when a read is found,
-and `unk` when anything is ambiguous (budget exhausted, indirect jump,
-branch out of section, or a call that might read it as an argument):
+Measured by `check_cond_to_branch` itself:
 
-| verdict | pooled | share |
-|---|---:|---:|
-| `live` -- provably not foldable | 11,384 | 51.8% |
-| `unk` -- not provable either way | 8,374 | 38.1% |
-| `fold` | 2,228 | 10.1% |
-
-Then only the reg-reg producers can fold at all, since RISC-V has no
-compare-immediate-and-branch; `slti`/`sltiu`/`xori` account for 250 of
-the `fold` verdicts and are not candidates. That leaves **1,978**:
-
-| producer | count |
+| corpus | findings |
 |---|---:|
-| `sltu` | 1,608 |
-| `seqz` | 131 |
-| `snez` | 114 |
-| `sub` | 99 |
-| `xor` | 23 |
+| C++ | 2,895 |
+| Rust | 42 |
+| Go | 0 |
 
-The two verdicts confirm what the shapes suggested. `sub->bnez` is 10,957
-`live`: the difference is usually needed after the branch
-(`sub s10,s10,s11; beqz s10; add s8,s10,a3`). `xor->bnez` is 6,564
-`unk`, almost all of it the stack-canary idiom, which ends in
-`jal __stack_chk_fail` -- and since the canary sits in an argument
-register rather than a caller-saved temporary, the walk correctly refuses
-to decide. Go contributes 0 of the 1,978.
+libLLVM is 1,796 of the C++ figure and libxul 1,069; libQt6Core has
+none at all. Go's zero is what `defuse` predicted.
 
-The liveness walk is validated against hand-built cases including one
-where the register is read only on the taken path, which is exactly what
-a linear scan misses.
+`seqz` and `snez` fold although they are immediate forms -- `seqz` is
+`sltiu rd,rs,1` and `snez` is `sltu rd,x0,rs`, and both compare against
+zero, which `beqz` and `bnez` already do. Everything else with an
+immediate is out, since RISC-V has no compare-immediate-and-branch.
+`snez` has to be recognised before the general `sltu` rule, which would
+otherwise fold it to `bltu zero,a0` -- correct, and not what anyone
+wrote.
+
+The fold only removes an instruction if the condition register is dead
+on **both** successors, which is why this needs the walk and not a scan:
+the taken path is elsewhere in the section. `defuse` sized that filter
+at `live` 51.8%, `unk` 38.1%, `fold` 10.1%, and the shapes explain it --
+`sub rd,a,b; beqz rd` is usually a subtraction whose difference is
+wanted, and `xor rd,a,b; bnez rd` is usually the stack-canary idiom,
+whose walk correctly refuses to decide because the canary sits in an
+argument register.
+
+### The CB immediate, and why it survived a decoder that was wrong
+
+The two-byte `c.beqz` and `c.bnez` pack their displacement as
+`imm[8|4:3]` in bits 12:10 and `imm[7:6|2:1|5]` in bits 6:2. The first
+decoder here read those two fields swapped.
+
+That does not fail loudly. A swapped pair still yields a displacement in
+range and still points at an instruction, so the check kept working and
+reported plausible wrong addresses -- and, worse, ran the taken-path
+liveness walk over the wrong code. It came out in the first finding read
+against the disassembly: the replacement named `0x287016` where the
+branch went to `0x28704e`. Fixing it moved libLLVM from 1,167 findings
+to 1,796.
+
+The decoders are now checked against `riscv64-linux-gnu-as` over 168
+branches -- both encodings, both directions, displacements in and out of
+the compressed field's range -- and agree on every one, as does the size
+model that decides whether the folded branch keeps two bytes or takes
+four.
 
 ### 5. Zba shift-add (`sh1add`/`sh2add`/`sh3add`) -- 13,249  [implemented]
 
@@ -807,23 +818,25 @@ second instruction writes it is one dominant idiom plus nothing.
 
 # Remaining candidates, ranked
 
-Eleven checks are implemented. What is left:
+Twelve checks are implemented. What is left is one entry:
 
 | # | candidate | population | machinery needed |
 |---|---|---:|---|
-| 1 | compare-then-branch | 1,942 | liveness walk (exists) |
-| 2 | missed compression, base C | 93 | RVC encodability pass (new) |
+| 1 | missed compression, base C | 93 | RVC encodability pass (new) |
 
-The windowed memory table is built and the three checks that wanted it
-are written, so what is left is two entries that share nothing with each
-other. Compare-then-branch needs no new machinery at all; base-C
-compression needs an encodability pass over the whole C extension and is
-worth writing only for Go-built binaries.
+Everything this file has ever sized is written except that one, and it
+is the weakest entry in the corpus: 93 sites across 20M instructions of
+GCC and LLVM output, because RVC selection is an assembler pass and both
+assemblers take it wherever it is legal. It is worth writing for
+Go-built binaries, whose assembler does not, and sizing it means an
+encodability pass over the whole C extension rather than the dozen forms
+Zcb needed.
 
-### 1-2
+What would come next is not on this list, because nothing here has
+measured it. `candscan` still carries the probes for the shapes that
+came back empty, which is where a new candidate would start.
 
-Compare-then-branch needs nothing new; the walk the dead-definition
-check uses answers it, and 1,942 is what it answers.
+### 1
 
 Missed compression in the base C extension is Go's alone. The two RVC
 rules a shape token can decide showed GCC and LLVM leaving essentially
@@ -845,8 +858,8 @@ them compressed, 53,690,808 pairs:
 | 4 | constant re-materialization | 9,541 | 94,445 |
 | 5 | extension the producer already guarantees | 6,922 | - |
 | 6 | `addi` folded into a memory offset | 3,351 | ~29,000 |
-| 7 | redundant reloads | 2,191 | 5,781 |
-| 8 | compare-then-branch folding | 1,978 | 21,890 |
+| 7 | a comparison a branch could have made | 2,937 | 21,890 |
+| 8 | redundant reloads | 2,191 | 5,781 |
 | 9 | Zcb-compressible, target declares Zcb | 886 | - |
 | 10 | dead store to a frame slot | 204 | 1,852 |
 | - | Zba shift-add | 232 | 26,264 |
@@ -856,11 +869,11 @@ them compressed, 53,690,808 pairs:
 | - | missed compression, base C (provable) | 93 | - |
 | - | equal shift pair foldable to `andi` | 0 | 0 |
 
-Every implemented row is the check's own count over the current corpus,
-so the table moved when libxul and uutils joined it and again when each
-check landed. The `raw pattern` column is what a shape scan saw, where
-one was taken; row 8 is the only entry left whose figure is still a
-mining tool's.
+Every row above the rule is the check's own count over the current
+corpus, so the table moved when libxul and uutils joined it and again
+with each check that landed. The `raw pattern` column is what a shape
+scan saw, where one was taken -- and no row's figure is a mining tool's
+any more.
 
 The `redundant mask after lbu` row is gone from this table: it was 142
 here and is now part of candidate 5, which subsumes it at 659 in this

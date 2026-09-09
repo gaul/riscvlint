@@ -102,6 +102,24 @@ written next is decided by the corpus rather than by intuition.
   pointer. Ubuntu builds with `-fno-omit-frame-pointer` deliberately, and
   the frame pointer stays.
 
+* **comparison a branch could have made** -- `slt`/`sltu`/`xor`/`sub`
+  writing a condition into a register, then `beqz`/`bnez` testing it,
+  where one `blt`/`bgeu`/`beq`/`bne` would have done both. The flagless
+  analogue of armlint's `cmp #0` check: RISC-V has no condition codes,
+  so the comparison is a value and the test is a branch on it.
+
+  `seqz` and `snez` fold too, though they are immediate forms -- `seqz`
+  is `sltiu rd,rs,1` and `snez` is `sltu rd,x0,rs`, and both compare
+  against zero, which `beqz` and `bnez` already do. Everything else with
+  an immediate is out: RISC-V has no compare-immediate-and-branch.
+
+  The fold only removes an instruction if the condition register is dead
+  on **both** successors, which is why this needs the walk rather than a
+  scan -- the taken path is elsewhere in the section, and about half of
+  the raw population is a difference the code goes on to use.
+  `sub rd,a,b; beqz rd` is usually a subtraction whose result is wanted,
+  not a comparison.
+
 * **redundant reload** -- the same (base, displacement, width,
   signedness) loaded twice with nothing in between that could have
   changed it. The second load is a `mv` from wherever the first put the

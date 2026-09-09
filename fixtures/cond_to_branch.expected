@@ -1,0 +1,32 @@
+comparison a branch could have made at offset: 0x0: -> bltu a0, a1, 0xa (6 -> 4 bytes) (2 instructions)
+  sltu a5, a0, a1
+  bnez a5, 0xa
+
+comparison a branch could have made at offset: 0xe: -> bgeu a0, a1, 0x18 (6 -> 4 bytes) (2 instructions)
+  sltu a5, a0, a1
+  beqz a5, 0x18
+
+comparison a branch could have made at offset: 0x1c: -> blt a0, a1, 0x26 (6 -> 4 bytes) (2 instructions)
+  slt a5, a0, a1
+  bnez a5, 0x26
+
+comparison a branch could have made at offset: 0x2a: -> beq a0, a1, 0x34 (6 -> 4 bytes) (2 instructions)
+  xor a5, a0, a1
+  beqz a5, 0x34
+
+comparison a branch could have made at offset: 0x38: -> bnez a0, 0x42 (6 -> 2 bytes) (2 instructions)
+  seqz a4, a0
+  beqz a4, 0x42
+
+comparison a branch could have made at offset: 0x46: -> bnez a0, 0x50 (6 -> 2 bytes) (2 instructions)
+  snez a4, a0
+  bnez a4, 0x50
+
+dead register definition at offset: 0x70: -> delete; nothing reads a5 (4 bytes) (1 instructions)
+  sltu a5, a0, a1
+
+Optimization opportunities by type:
+       6  comparison a branch could have made
+       1  dead register definition
+
+7 optimization opportunities in 67 instructions

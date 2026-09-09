@@ -1202,6 +1202,76 @@ static void test_window_checks(csh handle)
                      0x1000, NULL) == 0);
 }
 
+// ---- conditions and branches ----
+
+static void test_decode_condition(void)
+{
+    unsigned rd, a, b;
+    rv_cond_kind k;
+
+    // Encodings from `riscv64-linux-gnu-as -march=rv64gc`.
+    CHECK(rv_decode_condition(0x00b527b3u, 4, &rd, &a, &b, &k)); // slt a5,a0,a1
+    CHECK(rd == 15 && a == 10 && b == 11 && k == RV_COND_SLT);
+    CHECK(rv_decode_condition(0x00b537b3u, 4, &rd, &a, &b, &k)); // sltu
+    CHECK(k == RV_COND_SLTU);
+    CHECK(rv_decode_condition(0x00b547b3u, 4, &rd, &a, &b, &k)); // xor
+    CHECK(k == RV_COND_EQ);
+    CHECK(rv_decode_condition(0x40b507b3u, 4, &rd, &a, &b, &k)); // sub
+    CHECK(k == RV_COND_EQ);
+
+    // seqz is `sltiu rd,rs,1` and snez is `sltu rd,x0,rs`. Both are
+    // aliases rather than mnemonics, and snez has to be picked out
+    // before the general sltu rule, which would otherwise claim it and
+    // fold to `bltu zero,a0` -- correct, but not what the source said.
+    CHECK(rv_decode_condition(0x00153793u, 4, &rd, &a, &b, &k)); // seqz a5,a0
+    CHECK(rd == 15 && a == 10 && b == 0 && k == RV_COND_SEQZ);
+    CHECK(rv_decode_condition(0x00a037b3u, 4, &rd, &a, &b, &k)); // snez a5,a0
+    CHECK(rd == 15 && a == 10 && b == 0 && k == RV_COND_SNEZ);
+
+    // `sltiu rd,rs,2` is a comparison against a constant no branch can
+    // make; only the value 1 is seqz.
+    CHECK(!rv_decode_condition(0x00253793u, 4, &rd, &a, &b, &k));
+    // `and` says nothing a branch can say on its own.
+    CHECK(!rv_decode_condition(0x00b577b3u, 4, &rd, &a, &b, &k));
+    // A condition written into x0 is discarded, not a condition.
+    CHECK(!rv_decode_condition(0x00b53033u, 4, &rd, &a, &b, &k));
+}
+
+static void test_decode_cond_branch(void)
+{
+    unsigned rs1, rs2, f3;
+    int64_t off;
+
+    // Four-byte B-type, forward and backward.
+    CHECK(rv_decode_cond_branch(0x02078063u, 4, &rs1, &rs2, &f3, &off));
+    CHECK(f3 == 0 && rs1 == 15 && rs2 == 0 && off == 32);      // beqz a5,+32
+    CHECK(rv_decode_cond_branch(0x00b54c63u, 4, &rs1, &rs2, &f3, &off));
+    CHECK(f3 == 4 && rs1 == 10 && rs2 == 11 && off == 24);     // blt a0,a1,+24
+
+    // The two-byte CB forms. `c13d` is `beqz a0,+102` at 0x286fe8 in
+    // libQt6Core, and it is the encoding that caught the bug: CB packs
+    // imm[8|4:3] in bits 12:10 and imm[7:6|2:1|5] in bits 6:2, and
+    // reading those two fields swapped decodes most short branches to a
+    // plausible wrong address rather than to nothing.
+    CHECK(rv_decode_cond_branch(0xc13du, 2, &rs1, &rs2, &f3, &off));
+    CHECK(f3 == 0 && rs1 == 10 && rs2 == 0 && off == 102);
+    CHECK(rv_decode_cond_branch(0xc789u, 2, &rs1, &rs2, &f3, &off));
+    CHECK(f3 == 0 && rs1 == 15 && rs2 == 0 && off == 10);      // c.beqz a5,+10
+    CHECK(rv_decode_cond_branch(0xe781u, 2, &rs1, &rs2, &f3, &off));
+    CHECK(f3 == 1 && rs1 == 15 && rs2 == 0 && off == 8);       // c.bnez a5,+8
+
+    CHECK(!rv_decode_cond_branch(0x00008067u, 4, &rs1, &rs2, &f3, &off));
+
+    // Only beqz and bnez have a compressed spelling, and only for a
+    // register in x8-x15 with a displacement inside the nine-bit field.
+    CHECK(rv_branch_encoded_size(0, 10, 0, 8) == 2);
+    CHECK(rv_branch_encoded_size(1, 10, 0, -256) == 2);
+    CHECK(rv_branch_encoded_size(1, 10, 0, 256) == 4);
+    CHECK(rv_branch_encoded_size(0, 16, 0, 8) == 4);           // a6
+    CHECK(rv_branch_encoded_size(0, 10, 11, 8) == 4);          // two registers
+    CHECK(rv_branch_encoded_size(4, 10, 0, 8) == 4);           // blt
+}
+
 int main(void)
 {
     csh handle;
@@ -1222,6 +1292,8 @@ int main(void)
     test_decode_mem();
     test_mem_encoded_size();
     test_decode_base_add();
+    test_decode_condition();
+    test_decode_cond_branch();
     test_zcb_form();
     test_zcb_gate();
     test_check(handle);
