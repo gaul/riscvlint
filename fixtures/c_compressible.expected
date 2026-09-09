@@ -1,0 +1,143 @@
+dead register definition at offset: 0x0: -> delete; nothing reads a5 (4 bytes) (1 instructions)
+  addi a5, a5, 8
+
+instruction compressible to a base C form at offset: 0x0: -> c.addi (4 -> 2 bytes) (1 instructions)
+  addi a5, a5, 8
+
+dead register definition at offset: 0x4: -> delete; nothing reads a5 (4 bytes) (1 instructions)
+  li a5, 8
+
+instruction compressible to a base C form at offset: 0x4: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a5, 8
+
+instruction compressible to a base C form at offset: 0x8: -> c.addi4spn (4 -> 2 bytes) (1 instructions)
+  addi a5, sp, 0x10
+
+instruction compressible to a base C form at offset: 0xc: -> c.addi16sp (4 -> 2 bytes) (1 instructions)
+  addi sp, sp, -0x20
+
+dead register definition at offset: 0x10: -> delete; nothing reads a5 (4 bytes) (1 instructions)
+  addiw a5, a5, 8
+
+instruction compressible to a base C form at offset: 0x10: -> c.addiw (4 -> 2 bytes) (1 instructions)
+  addiw a5, a5, 8
+
+instruction compressible to a base C form at offset: 0x14: -> c.lui (4 -> 2 bytes) (1 instructions)
+  lui a5, 4
+
+dead register definition at offset: 0x18: -> delete; nothing reads a5 (4 bytes) (1 instructions)
+  slli a5, a5, 4
+
+instruction compressible to a base C form at offset: 0x18: -> c.slli (4 -> 2 bytes) (1 instructions)
+  slli a5, a5, 4
+
+instruction compressible to a base C form at offset: 0x1c: -> c.srli (4 -> 2 bytes) (1 instructions)
+  srli a0, a0, 4
+
+instruction compressible to a base C form at offset: 0x20: -> c.srai (4 -> 2 bytes) (1 instructions)
+  srai a0, a0, 4
+
+instruction compressible to a base C form at offset: 0x24: -> c.andi (4 -> 2 bytes) (1 instructions)
+  andi a0, a0, 8
+
+dead register definition at offset: 0x28: -> delete; nothing reads a5 (4 bytes) (1 instructions)
+  add a5, zero, a4
+
+instruction compressible to a base C form at offset: 0x28: -> c.mv (4 -> 2 bytes) (1 instructions)
+  add a5, zero, a4
+
+instruction compressible to a base C form at offset: 0x2c: -> c.mv (4 -> 2 bytes) (1 instructions)
+  mv a5, a4
+
+instruction compressible to a base C form at offset: 0x30: -> c.add (4 -> 2 bytes) (1 instructions)
+  add a5, a5, a4
+
+instruction compressible to a base C form at offset: 0x34: -> c.sub (4 -> 2 bytes) (1 instructions)
+  sub a0, a0, a1
+
+instruction compressible to a base C form at offset: 0x38: -> c.xor (4 -> 2 bytes) (1 instructions)
+  xor a0, a0, a1
+
+instruction compressible to a base C form at offset: 0x3c: -> c.or (4 -> 2 bytes) (1 instructions)
+  or a0, a0, a1
+
+instruction compressible to a base C form at offset: 0x40: -> c.and (4 -> 2 bytes) (1 instructions)
+  and a0, a0, a1
+
+instruction compressible to a base C form at offset: 0x44: -> c.subw (4 -> 2 bytes) (1 instructions)
+  subw a0, a0, a1
+
+instruction compressible to a base C form at offset: 0x48: -> c.addw (4 -> 2 bytes) (1 instructions)
+  addw a0, a0, a1
+
+dead register definition at offset: 0x4c: -> delete; nothing reads a0 (4 bytes) (1 instructions)
+  addw a0, a1, a0
+
+instruction compressible to a base C form at offset: 0x4c: -> c.addw (4 -> 2 bytes) (1 instructions)
+  addw a0, a1, a0
+
+instruction compressible to a base C form at offset: 0x50: -> c.ld (4 -> 2 bytes) (1 instructions)
+  ld a0, 8(a1)
+
+instruction compressible to a base C form at offset: 0x54: -> c.ldsp (4 -> 2 bytes) (1 instructions)
+  ld a0, 8(sp)
+
+instruction compressible to a base C form at offset: 0x58: -> c.sd (4 -> 2 bytes) (1 instructions)
+  sd a0, 8(a1)
+
+instruction compressible to a base C form at offset: 0x5c: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a0, 8(sp)
+
+instruction compressible to a base C form at offset: 0x60: -> c.lw (4 -> 2 bytes) (1 instructions)
+  lw a0, 4(a1)
+
+instruction compressible to a base C form at offset: 0x64: -> c.fld (4 -> 2 bytes) (1 instructions)
+  fld fa0, 8(a1)
+
+instruction compressible to a base C form at offset: 0x68: -> c.beqz (4 -> 2 bytes) (1 instructions)
+  beqz a0, 0x80
+
+instruction compressible to a base C form at offset: 0x6c: -> c.bnez (4 -> 2 bytes) (1 instructions)
+  bnez a0, 0x80
+
+instruction compressible to a base C form at offset: 0x70: -> c.j (4 -> 2 bytes) (1 instructions)
+  j 0x80
+
+instruction compressible to a base C form at offset: 0x74: -> c.ebreak (4 -> 2 bytes) (1 instructions)
+  ebreak 
+
+instruction compressible to a base C form at offset: 0x78: -> c.addi (4 -> 2 bytes) (1 instructions)
+  addi sp, sp, -8
+
+instruction compressible to a base C form at offset: 0x7c: -> c.mv (4 -> 2 bytes) (1 instructions)
+  mv a5, a5
+
+instruction compressible to a base C form at offset: 0x80: -> c.jr (4 -> 2 bytes) (1 instructions)
+  jr a5
+
+instruction compressible to a base C form at offset: 0x84: -> c.jalr (4 -> 2 bytes) (1 instructions)
+  jalr a5
+
+dead register definition at offset: 0x8c: -> delete; nothing reads a6 (4 bytes) (1 instructions)
+  and a6, a6, a1
+
+dead register definition at offset: 0x94: -> delete; nothing reads a5 (4 bytes) (1 instructions)
+  addi a5, a5, 0x20
+
+dead register definition at offset: 0x98: -> delete; nothing reads a0 (4 bytes) (1 instructions)
+  andi a0, a0, 0x20
+
+dead register definition at offset: 0x9c: -> delete; nothing reads a5 (4 bytes) (1 instructions)
+  lui a5, 0x20
+
+dead register definition at offset: 0xb0: -> delete; nothing reads a5 (4 bytes) (1 instructions)
+  addi a5, a4, 8
+
+instruction compressible to a base C form at offset: 0xc4: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+Optimization opportunities by type:
+      35  instruction compressible to a base C form
+      11  dead register definition
+
+46 optimization opportunities in 50 instructions

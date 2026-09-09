@@ -159,6 +159,22 @@ unsigned rv_mem_encoded_size(rv_mem_kind kind, unsigned data, unsigned base,
 bool rv_decode_base_add(uint32_t w, unsigned size, unsigned *rd,
                         unsigned *rs1, int64_t *imm);
 
+// The name of the base C extension's two-byte form for `w`, written into
+// `out`, or false when it has none. Only asked of four-byte encodings.
+//
+// This is the whole of C on RV64 rather than the dozen forms Zcb needed,
+// and the forms disagree about almost everything: which registers they
+// can name, whether the destination must also be a source, whether the
+// immediate is scaled, signed, or forbidden from being zero. The rules
+// were checked against `riscv64-linux-gnu-as` over a matrix that sweeps
+// each of those boundaries.
+//
+// Zcb's forms are left to rv_zcb_form. The two do not overlap: `c.andi`
+// cannot hold 255, there is no base-C form for `xori`, and the widths
+// `c.lbu` and its family carry are exactly the ones the base memory
+// forms do not.
+bool rv_c_form(uint32_t w, unsigned size, char *out, size_t outsz);
+
 // The name of the Zcb two-byte form `w` could be spelled as, or NULL
 // when it has none. Only asked of four-byte encodings: the question is
 // whether a wide encoding was left wide.
@@ -217,6 +233,7 @@ typedef enum {
     RISCVLINT_EXT_ZBB = 1u << 1,
     RISCVLINT_EXT_ZBS = 1u << 2,
     RISCVLINT_EXT_ZCB = 1u << 3,
+    RISCVLINT_EXT_C   = 1u << 4,
     RISCVLINT_EXT_DECLARED = 1u << 31,
 } riscvlint_ext;
 
@@ -527,6 +544,13 @@ bool check_const_remat(riscvlint_state *state, const cs_insn *insn,
 // scan: the taken path is elsewhere in the section, and half of the raw
 // population is a difference the code goes on to use.
 bool check_cond_to_branch(riscvlint_state *state, const cs_insn *insn,
+                          riscvlint_finding *finding);
+
+// A four-byte encoding the base C extension spells in two. Like the Zcb
+// check this reports an assembler's choice rather than a compiler's, and
+// on a toolchain that selects RVC at all the residue is nearly nothing:
+// what it finds is the shape of an assembler that does not.
+bool check_c_compressible(riscvlint_state *state, const cs_insn *insn,
                           riscvlint_finding *finding);
 
 bool check_dead_def(riscvlint_state *state, const cs_insn *insn,

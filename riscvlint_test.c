@@ -157,16 +157,20 @@ static void test_arch_gate(void)
     CHECK(riscvlint_parse_ext_name("zbs", &m) && m == RISCVLINT_EXT_ZBS);
     // rva20 is the baseline: a valid name that mandates none of the
     // extensions gated here, which is how -m rva20 silences them.
-    CHECK(riscvlint_parse_ext_name("rva20", &m) && m == 0);
+    // Every profile from RVA20 up mandates C, so rva20 is no longer the
+    // name that silences everything -- it silences the Zb* families and
+    // leaves the compression check on.
+    CHECK(riscvlint_parse_ext_name("rva20", &m) && m == RISCVLINT_EXT_C);
     CHECK(riscvlint_parse_ext_name("rva22", &m) &&
-          m == (RISCVLINT_EXT_ZBA | RISCVLINT_EXT_ZBB | RISCVLINT_EXT_ZBS));
+          m == (RISCVLINT_EXT_ZBA | RISCVLINT_EXT_ZBB | RISCVLINT_EXT_ZBS |
+                RISCVLINT_EXT_C));
     // The two profiles used to expand alike. Zcb missed RVA22's
     // ratification window and is mandatory in RVA23U64, so it is the
     // first extension gated here that separates them; test_zcb_gate
     // covers the difference from the other side.
     CHECK(riscvlint_parse_ext_name("rva23", &m) &&
           m == (RISCVLINT_EXT_ZBA | RISCVLINT_EXT_ZBB | RISCVLINT_EXT_ZBS |
-                RISCVLINT_EXT_ZCB));
+                RISCVLINT_EXT_ZCB | RISCVLINT_EXT_C));
     CHECK(!riscvlint_parse_ext_name("zbq", &m));
     CHECK(!riscvlint_parse_ext_name("", &m));
 
@@ -906,7 +910,7 @@ static void test_zcb_gate(void)
     CHECK(riscvlint_parse_ext_name("zcb", &e) && e == RISCVLINT_EXT_ZCB);
     CHECK(riscvlint_parse_ext_name("rva22", &e) && !(e & RISCVLINT_EXT_ZCB));
     CHECK(riscvlint_parse_ext_name("rva23", &e) && (e & RISCVLINT_EXT_ZCB));
-    CHECK(riscvlint_parse_ext_name("rva20", &e) && e == 0);
+    CHECK(riscvlint_parse_ext_name("rva20", &e) && e == RISCVLINT_EXT_C);
 }
 
 static void test_zcb_check(csh handle)
@@ -1272,6 +1276,82 @@ static void test_decode_cond_branch(void)
     CHECK(rv_branch_encoded_size(4, 10, 0, 8) == 4);           // blt
 }
 
+// ---- base C encodability ----
+
+static void test_c_form(void)
+{
+    char f[24];
+    // Encodings from `riscv64-linux-gnu-as -march=rv64gc` with
+    // `.option norvc`. The rules behind them were checked against that
+    // assembler over a matrix of 2,922 instructions assembled twice,
+    // with RVC and without, comparing this decoder's answer to the
+    // assembler's choice.
+
+    // The addi family, which is four different compressed forms picked
+    // apart by which registers appear and what the immediate is.
+    CHECK(rv_c_form(0x00878793u, 4, f, sizeof f) && !strcmp(f, "c.addi"));
+    CHECK(rv_c_form(0x00800793u, 4, f, sizeof f) && !strcmp(f, "c.li"));
+    CHECK(rv_c_form(0x01010793u, 4, f, sizeof f) && !strcmp(f, "c.addi4spn"));
+    CHECK(rv_c_form(0xfe010113u, 4, f, sizeof f) && !strcmp(f, "c.addi16sp"));
+    // An addi of zero is a move, and c.mv takes it -- c.addi is the form
+    // that cannot hold zero.
+    CHECK(rv_c_form(0x00070793u, 4, f, sizeof f) && !strcmp(f, "c.mv"));
+    // Out of the six-bit field, and a destination whose result is
+    // discarded.
+    CHECK(!rv_c_form(0x02078793u, 4, f, sizeof f));   // addi a5,a5,32
+    CHECK(!rv_c_form(0x00878013u, 4, f, sizeof f));   // addi zero,a5,8
+
+    // c.lui carries imm[17:12], so the twenty-bit field has to be a
+    // sign-extension of its own low six bits, and neither zero nor sp.
+    CHECK(rv_c_form(0x000047b7u, 4, f, sizeof f) && !strcmp(f, "c.lui"));
+    CHECK(!rv_c_form(0x000207b7u, 4, f, sizeof f));   // lui a5,32
+    CHECK(!rv_c_form(0x000007b7u, 4, f, sizeof f));   // lui a5,0
+    CHECK(!rv_c_form(0x00004137u, 4, f, sizeof f));   // lui sp,4
+
+    // The shifts and andi name x8-x15 only, except c.slli which reaches
+    // the whole file.
+    CHECK(rv_c_form(0x00479793u, 4, f, sizeof f) && !strcmp(f, "c.slli"));
+    CHECK(rv_c_form(0x00455513u, 4, f, sizeof f) && !strcmp(f, "c.srli"));
+    CHECK(rv_c_form(0x40455513u, 4, f, sizeof f) && !strcmp(f, "c.srai"));
+    CHECK(rv_c_form(0x00857513u, 4, f, sizeof f) && !strcmp(f, "c.andi"));
+    CHECK(!rv_c_form(0x00455813u, 4, f, sizeof f));   // srli a6,a0,4 -- rd!=rs1
+    CHECK(!rv_c_form(0x02057513u, 4, f, sizeof f));   // andi a0,a0,32
+
+    // The two-register forms put the destination in one source slot.
+    // The commutative ones reach either, because the assembler swaps
+    // them; subtraction reaches only the first.
+    CHECK(rv_c_form(0x40b50533u, 4, f, sizeof f) && !strcmp(f, "c.sub"));
+    CHECK(rv_c_form(0x00b54533u, 4, f, sizeof f) && !strcmp(f, "c.xor"));
+    CHECK(rv_c_form(0x00a5c533u, 4, f, sizeof f) && !strcmp(f, "c.xor"));
+    CHECK(rv_c_form(0x00f587bbu, 4, f, sizeof f) && !strcmp(f, "c.addw"));
+    CHECK(!rv_c_form(0x40a587bbu, 4, f, sizeof f));   // subw a5,a1,a0
+    CHECK(rv_c_form(0x00b787b3u, 4, f, sizeof f) && !strcmp(f, "c.add"));
+    CHECK(rv_c_form(0x00b007b3u, 4, f, sizeof f) && !strcmp(f, "c.mv"));
+
+    // c.jr and c.jalr, which GNU as reaches from `jr a5` and not from
+    // `jalr zero, 0(a5)` -- the same instruction, and the fourth
+    // spelling-sensitive gap the corpus has turned up in it.
+    CHECK(rv_c_form(0x00078067u, 4, f, sizeof f) && !strcmp(f, "c.jr"));
+    CHECK(rv_c_form(0x000780e7u, 4, f, sizeof f) && !strcmp(f, "c.jalr"));
+    CHECK(!rv_c_form(0x00478067u, 4, f, sizeof f));   // a displacement
+    CHECK(rv_c_form(0x00008067u, 4, f, sizeof f) && !strcmp(f, "c.jr"));
+
+    // A four-byte nop is alignment padding or dead code, and this check
+    // has nothing useful to say about either.
+    CHECK(!rv_c_form(0x00000013u, 4, f, sizeof f));
+
+    CHECK(rv_c_form(0x00100073u, 4, f, sizeof f) && !strcmp(f, "c.ebreak"));
+    CHECK(!rv_c_form(0x00000073u, 4, f, sizeof f));   // ecall
+
+    // The memory and branch families come from the models the fold and
+    // compare checks already use, so this only pins the delegation.
+    CHECK(rv_c_form(0x0085b503u, 4, f, sizeof f) && !strcmp(f, "c.ld"));
+    CHECK(rv_c_form(0x00813503u, 4, f, sizeof f) && !strcmp(f, "c.ldsp"));
+    CHECK(!rv_c_form(0x0045b503u, 4, f, sizeof f));   // ld a0,4(a1)
+
+    CHECK(!rv_c_form(0x6588u, 2, f, sizeof f));       // already two bytes
+}
+
 int main(void)
 {
     csh handle;
@@ -1294,6 +1374,7 @@ int main(void)
     test_decode_base_add();
     test_decode_condition();
     test_decode_cond_branch();
+    test_c_form();
     test_zcb_form();
     test_zcb_gate();
     test_check(handle);

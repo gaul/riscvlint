@@ -252,6 +252,12 @@ unsigned riscvlint_parse_arch(const char *arch)
     if (strstr(arch, "_zbb")) exts |= RISCVLINT_EXT_ZBB;
     if (strstr(arch, "_zbs")) exts |= RISCVLINT_EXT_ZBS;
     if (strstr(arch, "_zcb")) exts |= RISCVLINT_EXT_ZCB;
+    // C is spelled `_c2p0` in the base run and `_zca1p0` once the
+    // Zc* split gave it a name of its own; a conforming string carries
+    // whichever the assembler wrote, and some carry both.
+    for (const char *p = arch; (p = strstr(p, "_c")) != NULL; p += 2)
+        if (p[2] >= '0' && p[2] <= '9') { exts |= RISCVLINT_EXT_C; break; }
+    if (strstr(arch, "_zca")) exts |= RISCVLINT_EXT_C;
     return exts;
 }
 
@@ -499,6 +505,161 @@ bool rv_decode_base_add(uint32_t w, unsigned size, unsigned *rd,
         return true;
     }
     return false;
+}
+
+// ---- base C encodability ----
+
+// True when the value fits the six-bit signed immediate the CI forms
+// carry.
+static bool fits6(int64_t v) { return v >= -32 && v <= 31; }
+
+// A commutative two-register form fits whenever the destination is one
+// of the sources and the other is nameable; which source it is does not
+// matter, because the assembler will swap them.
+static bool c_commutes(unsigned rd, unsigned rs1, unsigned rs2)
+{
+    if (rd == rs1 && rvc_reg(rs2)) return true;
+    if (rd == rs2 && rvc_reg(rs1)) return true;
+    return false;
+}
+
+bool rv_c_form(uint32_t w, unsigned size, char *out, size_t outsz)
+{
+    if (size != 4) return false;
+    unsigned op = RV_OPCODE(w), f3 = (w >> 12) & 0x7u;
+    unsigned rd = (w >> 7) & 0x1fu, rs1 = (w >> 15) & 0x1fu;
+    unsigned rs2 = (w >> 20) & 0x1fu, f7 = (w >> 25) & 0x7fu;
+    int64_t imm12 = sign_extend((uint64_t)(w >> 20) & 0xfffu, 12);
+    const char *name = NULL;
+
+    // The loads and stores, whose rules the memory model already holds.
+    // Passing zcb = false keeps this to the base forms and leaves the
+    // byte and halfword accesses to rv_zcb_form.
+    rv_mem_kind kind;
+    unsigned data, base;
+    int64_t off;
+    if (rv_decode_mem(w, 4, &kind, &data, &base, &off)) {
+        if (rv_mem_encoded_size(kind, data, base, off, false) != 2)
+            return false;
+        snprintf(out, outsz, "c.%s%s", rv_mem_name(kind),
+                 base == 2 ? "sp" : "");
+        return true;
+    }
+
+    // The conditional branches, likewise.
+    unsigned brs1, brs2, bf3;
+    int64_t boff;
+    if (rv_decode_cond_branch(w, 4, &brs1, &brs2, &bf3, &boff)) {
+        if (rv_branch_encoded_size(bf3, brs1, brs2, boff) != 2) return false;
+        snprintf(out, outsz, "c.%s", bf3 == 0 ? "beqz" : "bnez");
+        return true;
+    }
+
+    switch (op) {
+    case 0x13u:                                       // OP-IMM
+        if (f3 == 0u) {                               // addi and its aliases
+            // `nop` is left alone. A four-byte one is either alignment
+            // padding, which exists for its width and would stop working
+            // if it shrank, or it is dead and wants deleting rather than
+            // compressing. Neither is what this check has to say, and it
+            // is 1,621 sites in the GCC/LLVM cohort.
+            if (rd == 0 && rs1 == 0) return false;
+            if (rd == 0) return false;                 // discards its result
+            else if (rs1 == 0 && fits6(imm12)) name = "c.li";
+            else if (rd == 2 && rs1 == 2 && imm12 != 0 && imm12 % 16 == 0 &&
+                     imm12 >= -512 && imm12 <= 496) name = "c.addi16sp";
+            else if (rs1 == 2 && rvc_reg(rd) && imm12 > 0 &&
+                     imm12 % 4 == 0 && imm12 <= 1020) name = "c.addi4spn";
+            else if (rd == rs1 && imm12 != 0 && fits6(imm12)) name = "c.addi";
+            // `mv rd,rs` is `addi rd,rs,0`, and c.mv is `add rd,x0,rs2`
+            // -- a different encoding of the same move, which the
+            // assembler reaches from either spelling.
+            else if (imm12 == 0 && rs1 != 0) name = "c.mv";
+            break;
+        }
+        if (f3 == 1u && ((w >> 26) & 0x3fu) == 0u) {  // slli
+            unsigned sh = (w >> 20) & 0x3fu;
+            if (rd != 0 && rd == rs1 && sh != 0) name = "c.slli";
+            break;
+        }
+        if (f3 == 5u) {                               // srli, srai
+            unsigned f6 = (w >> 26) & 0x3fu, sh = (w >> 20) & 0x3fu;
+            if ((f6 != 0u && f6 != 0x10u) || sh == 0) break;
+            if (rd == rs1 && rvc_reg(rd))
+                name = f6 == 0u ? "c.srli" : "c.srai";
+            break;
+        }
+        if (f3 == 7u && rd == rs1 && rvc_reg(rd) && fits6(imm12))
+            name = "c.andi";
+        break;
+    case 0x1bu:                                       // OP-IMM-32
+        if (f3 == 0u && rd != 0 && rd == rs1 && fits6(imm12))
+            name = "c.addiw";                         // imm 0 is sext.w
+        break;
+    case 0x37u: {                                     // lui
+        // c.lui carries imm[17:12], so the twenty-bit field has to be a
+        // sign-extension of its own low six bits, and neither zero nor a
+        // destination of x0 or sp.
+        int64_t f = sign_extend((uint64_t)(w >> 12) & 0xfffffu, 20);
+        if (rd != 0 && rd != 2 && f != 0 && fits6(f)) name = "c.lui";
+        break;
+    }
+    case 0x33u:                                       // OP
+        if (f7 == 0u && f3 == 0u) {                   // add, and its mv alias
+            if (rs1 == 0 && rd != 0 && rs2 != 0) name = "c.mv";
+            else if (rd != 0 && ((rd == rs1 && rs2 != 0) ||
+                                 (rd == rs2 && rs1 != 0)))
+                name = "c.add";                       // commutes
+            break;
+        }
+        if (!rvc_reg(rd)) break;
+        // The two-register forms put the destination in one source slot.
+        // The commutative ones reach either slot, since the assembler
+        // will swap the operands to fit; `sub` reaches only the first.
+        if (f7 == 0x20u && f3 == 0u) {
+            if (rd == rs1 && rvc_reg(rs2)) name = "c.sub";
+            break;
+        }
+        if (f7 != 0u) break;
+        if (!c_commutes(rd, rs1, rs2)) break;
+        if (f3 == 4u) name = "c.xor";
+        else if (f3 == 6u) name = "c.or";
+        else if (f3 == 7u) name = "c.and";
+        break;
+    case 0x3bu:                                       // OP-32
+        if (!rvc_reg(rd)) break;
+        if (f7 == 0x20u && f3 == 0u) {
+            if (rd == rs1 && rvc_reg(rs2)) name = "c.subw";
+            break;
+        }
+        if (f7 == 0u && f3 == 0u && c_commutes(rd, rs1, rs2))
+            name = "c.addw";
+        break;
+    case 0x67u:                                       // jalr
+        if (f3 != 0u || imm12 != 0 || rs1 == 0) break;
+        if (rd == 0) name = "c.jr";
+        else if (rd == 1) name = "c.jalr";
+        break;
+    case 0x6fu: {                                     // jal
+        // c.jal is RV32-only, so only the x0 link compresses here.
+        if (rd != 0) break;
+        uint64_t imm = (((uint64_t)(w >> 31) & 1u) << 20) |
+                       (((uint64_t)(w >> 12) & 0xffu) << 12) |
+                       (((uint64_t)(w >> 20) & 1u) << 11) |
+                       (((uint64_t)(w >> 21) & 0x3ffu) << 1);
+        int64_t o = sign_extend(imm, 21);
+        if (o >= -2048 && o <= 2046) name = "c.j";
+        break;
+    }
+    case 0x73u:                                       // system
+        if (w == 0x00100073u) name = "c.ebreak";
+        break;
+    default:
+        break;
+    }
+    if (!name) return false;
+    snprintf(out, outsz, "%s", name);
+    return true;
 }
 
 // ---- Zcb encodability ----
@@ -1126,12 +1287,15 @@ bool riscvlint_parse_ext_name(const char *name, unsigned *exts)
         { "zbb",   RISCVLINT_EXT_ZBB },
         { "zbs",   RISCVLINT_EXT_ZBS },
         { "zcb",   RISCVLINT_EXT_ZCB },
-        { "rva20", 0 },
-        { "rva22", RISCVLINT_EXT_ZBA | RISCVLINT_EXT_ZBB | RISCVLINT_EXT_ZBS },
+        { "c",     RISCVLINT_EXT_C },
+        // Every profile from RVA20 up mandates C.
+        { "rva20", RISCVLINT_EXT_C },
+        { "rva22", RISCVLINT_EXT_ZBA | RISCVLINT_EXT_ZBB | RISCVLINT_EXT_ZBS |
+                   RISCVLINT_EXT_C },
         // Zcb missed RVA22's ratification window and is mandatory in
         // RVA23U64, so this is where the two profiles part.
         { "rva23", RISCVLINT_EXT_ZBA | RISCVLINT_EXT_ZBB | RISCVLINT_EXT_ZBS |
-                   RISCVLINT_EXT_ZCB },
+                   RISCVLINT_EXT_ZCB | RISCVLINT_EXT_C },
     };
     for (size_t i = 0; i < sizeof table / sizeof table[0]; i++) {
         if (strcmp(name, table[i].name) == 0) {
@@ -2036,6 +2200,27 @@ bool check_cond_to_branch(riscvlint_state *state, const cs_insn *insn,
                  "%s %s, %s, 0x%" PRIx64 " (%u -> %u bytes)",
                  branch_name(f3, rb), rv_reg_name(ra), rv_reg_name(rb),
                  taken, before, after);
+    return true;
+}
+
+// ---- a four-byte encoding the base C extension spells in two ----
+
+bool check_c_compressible(riscvlint_state *state, const cs_insn *insn,
+                          riscvlint_finding *finding)
+{
+    if (!riscvlint_may_use(state, RISCVLINT_EXT_C)) return false;
+    if (insn->size != 4) return false;
+    uint32_t w;
+    if (!riscvlint_word_at(state, insn->address, &w)) return false;
+    char form[24];
+    if (!rv_c_form(w, insn->size, form, sizeof form)) return false;
+    if (riscvlint_is_relocated(state, insn->address)) return false;
+
+    finding->title = "instruction compressible to a base C form";
+    finding->address = insn->address;
+    finding->insn_count = 1;
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "%s (4 -> 2 bytes)", form);
     return true;
 }
 

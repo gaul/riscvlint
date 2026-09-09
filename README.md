@@ -207,6 +207,41 @@ written next is decided by the corpus rather than by intuition.
   offsets in and out of each compressed field's range -- and agree with
   the assembler on all of them.
 
+* **instruction compressible to a base C form** -- a four-byte encoding
+  the base C extension spells in two. The sibling of the Zcb check, and
+  the same kind of finding: RVC selection is an assembler pass, so a
+  finding means the instruction was legal to compress and was not.
+
+  Population: 22,596 in C++ and Rust -- 21,361 of it C++ -- and
+  **2,961,593 in Go**, 21% of its instructions. Those are two different
+  results wearing one name.
+
+  Go's assembler does not select RVC at all, and the number is what that
+  looks like from the outside: not a list of sites anybody will fix one
+  at a time, but the size of what a compressing assembler would buy,
+  about 5.6 MB.
+
+  The GCC and LLVM residue is smaller and more interesting, because both
+  assemblers do select RVC. What is left is what they could not know at
+  assembly time:
+
+  - `addi` and `ld` halves of an `auipc` pair, whose immediate was a
+    relocation when the assembler saw it and a small number after the
+    linker resolved it.
+  - branches and jumps whose final displacement landed inside the
+    compressed field only once relaxation was done -- one of libQt6Core's
+    is a `beqz` at exactly -256, the furthest `c.beqz` reaches.
+
+  So on a toolchain that compresses, this is a linker-level finding, the
+  way the `auipc`+`jalr` check is. It is also where a fourth
+  spelling-sensitive gap in GNU as turned up: `jr a5` compresses and
+  `jalr zero, 0(a5)`, the same instruction, does not.
+
+  A four-byte `nop` is never reported. It is either alignment padding,
+  which exists for its width and stops working if it shrinks, or it is
+  dead and wants deleting -- and that is 1,621 sites in the GCC/LLVM
+  cohort that would otherwise be noise.
+
 * **instruction compressible to a Zcb form** -- a four-byte encoding that
   Zcb spells in two. Unlike every other check here this one reports an
   assembler's choice rather than a compiler's: RVC selection happens at
@@ -294,6 +329,11 @@ declaration:
 riscvlint -m rva23 ./app     # what would rebuilding for RVA23 buy me?
 riscvlint -m rva20 ./app     # this is going on rv64gc hardware; stay quiet
 ```
+
+Every profile from RVA20 up mandates C, so `-m rva20` silences the Zb
+families and leaves the compression check on -- rv64gc hardware does
+have the C extension, and an instruction that could be two bytes on it
+still could be.
 
 `rva22` and `rva23` no longer expand alike. Zcb missed RVA22's
 ratification window and is mandatory in RVA23U64, so it is the first

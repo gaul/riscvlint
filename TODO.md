@@ -35,6 +35,7 @@ which also records where the first figure was wrong and why.
 | 9 | extension the producer already guarantees | 8,515 | - | **implemented** |
 | 10 | dead store to a frame slot | 4,376 | 15,199 | **implemented** |
 | 11 | Zcb-compressible 4-byte encodings | 30,648 | 351,198 | **implemented** |
+| 13 | base-C-compressible 4-byte encodings | 2,984,189 | - | **implemented** |
 | 12 | `addi` folded into a memory offset | 6,344 | ~54,000 shapes | **implemented** |
 
 ### 6. Constant re-materialization -- 4,580 of 193,398
@@ -421,6 +422,79 @@ instruction mix rather than a shortfall.
 
 Zcb is the part of this that is not settled by that argument, and it gets
 its own section below.
+
+## Base C compression -- 22,596 in C++ and Rust, 2,961,593 in Go  [implemented]
+
+A four-byte encoding the base C extension spells in two. The sibling of
+the Zcb check, and the same kind of finding: RVC selection is an
+assembler pass, so a finding means the instruction was legal to compress
+and was not.
+
+| corpus | findings | share of instructions |
+|---|---:|---:|
+| Go | 2,961,593 | 20.7% |
+| C++ | 21,361 | 0.04% |
+| Rust | 1,235 | 0.03% |
+
+Those are two results wearing one name. Go's assembler does not select
+RVC at all, and its figure is not a list anybody will work through -- it
+is the size of what a compressing assembler would buy, about 5.6 MB. The
+GCC and LLVM residue is the interesting one, because both of those do
+select RVC.
+
+### What an assembler that compresses still leaves behind
+
+This entry was recorded at 93 sites, from the two RVC rules a shape
+token could decide on its own (`c.mv` needs both registers non-zero,
+`c.li` a non-zero destination and an immediate in [-32,31]). The full
+pass finds 22,596 in the same cohort, and every class of the difference
+is an immediate the assembler did not yet know:
+
+* The `addi` or `ld` half of an `auipc` pair. Its immediate was a
+  relocation at assembly time and a small number after the linker
+  resolved it -- `addi a2,a2,-26` completing a `%pcrel_hi`, or
+  `ld s1,8(s1)` loading through the GOT.
+* A branch or jump whose displacement landed inside the compressed field
+  only once relaxation had run. One of libQt6Core's is a `beqz` at
+  exactly -256, the furthest `c.beqz` reaches.
+
+So on a toolchain that compresses, this is a linker-level finding, in
+the same family as the `auipc`+`jalr` check rather than the Zcb one. A
+census that can only ask about `mv` and `li` cannot see a `%pcrel_lo`
+addi, which is why the first figure was two orders of magnitude low.
+
+### `nop` is not reported
+
+A four-byte `nop` is alignment padding, which exists for its width and
+stops working if it shrinks, or it is dead and wants deleting. Neither
+is what this check has to say, and it is 1,621 sites in the GCC/LLVM
+cohort that would otherwise be noise.
+
+### The fourth spelling-sensitive gap in GNU as
+
+`jr a5` compresses to `c.jr`; `jalr zero, 0(a5)`, the same instruction,
+does not. Written as `c.jr a5` the assembler emits it happily, so the
+encoding is not in question -- only which spelling reaches it.
+
+That makes four, all found the same way and all in the same assembler:
+`not` against `xori`, `mul rd,rs1,rd` against `mul rd,rd,rs2`, `ret`
+against `jalr zero,0(ra)`, and now `jr` against its own long form.
+
+### How the rules were checked
+
+The same 2,922 instructions are assembled twice, once with RVC and once
+under `.option norvc`, and this decoder's answer for each wide encoding
+is compared against the assembler's own choice. They agree on 2,904 and
+disagree on 18, all of them the `jalr` spelling above -- so the decoder
+claims nothing the assembler would refuse, and misses nothing it takes.
+
+The matrix sweeps each form's boundaries deliberately: registers inside
+and outside x8-x15, immediates one step either side of every field, the
+scaled offsets at and past their limits, and the commutative
+two-register forms with the destination in each source slot. That last
+one earned its place -- `addw a5,a1,a5` compresses because the assembler
+swaps the operands, and a first version of this decoder missed 25 sites
+by requiring the destination to be the first source.
 
 ## The windowed memory table, and the three checks it serves  [implemented]
 
@@ -818,25 +892,20 @@ second instruction writes it is one dominant idiom plus nothing.
 
 # Remaining candidates, ranked
 
-Twelve checks are implemented. What is left is one entry:
+Thirteen checks are implemented, and the backlog is empty.
 
-| # | candidate | population | machinery needed |
-|---|---|---:|---|
-| 1 | missed compression, base C | 93 | RVC encodability pass (new) |
-
-Everything this file has ever sized is written except that one, and it
-is the weakest entry in the corpus: 93 sites across 20M instructions of
-GCC and LLVM output, because RVC selection is an assembler pass and both
-assemblers take it wherever it is legal. It is worth writing for
-Go-built binaries, whose assembler does not, and sizing it means an
-encodability pass over the whole C extension rather than the dozen forms
-Zcb needed.
+Everything this file ever sized is written. The last entry, base-C
+compression, was recorded at 93 sites on the strength of the two RVC
+rules a shape token could decide; the full encodability pass found
+22,596 in the same cohort, and the difference is entirely instructions
+whose immediates were relocations when the assembler saw them. A census
+that can only ask about `mv` and `li` cannot see a `%pcrel_lo` addi.
 
 What would come next is not on this list, because nothing here has
 measured it. `candscan` still carries the probes for the shapes that
 came back empty, which is where a new candidate would start.
 
-### 1
+### Missed compression in the base C extension  [implemented]
 
 Missed compression in the base C extension is Go's alone. The two RVC
 rules a shape token can decide showed GCC and LLVM leaving essentially
@@ -854,19 +923,19 @@ them compressed, 53,690,808 pairs:
 |---|---|---:|---:|
 | 1 | `auipc`+`jalr` within `jal` reach | 292,243 | 121,543+ |
 | 2 | frame-pointer teardown over a static frame | 112,401 | 133,670 |
-| 3 | dead register definitions | 11,989 | 44,546 |
-| 4 | constant re-materialization | 9,541 | 94,445 |
-| 5 | extension the producer already guarantees | 6,922 | - |
-| 6 | `addi` folded into a memory offset | 3,351 | ~29,000 |
-| 7 | a comparison a branch could have made | 2,937 | 21,890 |
-| 8 | redundant reloads | 2,191 | 5,781 |
-| 9 | Zcb-compressible, target declares Zcb | 886 | - |
-| 10 | dead store to a frame slot | 204 | 1,852 |
+| 3 | base-C-compressible, on a toolchain that compresses | 22,596 | 93 |
+| 4 | dead register definitions | 11,989 | 44,546 |
+| 5 | constant re-materialization | 9,541 | 94,445 |
+| 6 | extension the producer already guarantees | 6,922 | - |
+| 7 | `addi` folded into a memory offset | 3,351 | ~29,000 |
+| 8 | a comparison a branch could have made | 2,937 | 21,890 |
+| 9 | redundant reloads | 2,191 | 5,781 |
+| 10 | Zcb-compressible, target declares Zcb | 886 | - |
+| 11 | dead store to a frame slot | 204 | 1,852 |
 | - | Zba shift-add | 232 | 26,264 |
 | - | Zbb/Zbs/Zcb idioms on an RVA23 target | 521 | - |
 | - | move coalescing | 79 | 24,346 |
 | - | Zba `zext.w` | 54 | 2 |
-| - | missed compression, base C (provable) | 93 | - |
 | - | equal shift pair foldable to `andi` | 0 | 0 |
 
 Every row above the rule is the check's own count over the current

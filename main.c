@@ -267,6 +267,7 @@ static const riscvlint_check_fn checks[] = {
     check_redundant_sp_restore,
     check_redundant_extension,
     check_zcb_compressible,
+    check_c_compressible,
     check_base_add_to_offset,
     check_redundant_reload,
     check_dead_store,
