@@ -3,6 +3,7 @@ riscvlint_test
 libriscvlint.a
 tools/pairscan
 tools/defuse
+tools/candscan
 corpus/
 results/
 *.o

@@ -34,6 +34,7 @@ which also records where the first figure was wrong and why.
 | 8 | frame-pointer teardown over a static frame | 112,401 | 133,670 | **implemented** |
 | 9 | extension the producer already guarantees | 8,515 | - | **implemented** |
 | 10 | dead store to a frame slot | 15,199 | - | candscan-sized |
+| 11 | Zcb-shrinkable 4-byte encodings | 330,994 | - | gated off on 99.8% of it |
 
 ### 6. Constant re-materialization -- 4,580 of 193,398
 
@@ -377,13 +378,17 @@ exactly the windowed memory table candidate 4 (redundant reloads) wants,
 so the machinery pays for two checks, and Go's 8,279 is where the second
 one lands.
 
-## Missed compression -- a Go-only opportunity
+## Missed compression -- base C is Go's alone, Zcb is not
 
 | corpus | instructions | 2-byte encodings |
 |---|---|---:|
-| C++ | 17,848,524 | 45.9% |
-| Rust | 2,285,426 | 40.3% |
+| C++ | 55,085,770 | 50.5% |
+| Rust | 3,743,189 | 45.0% |
 | Go | 14,310,206 | 25.5% |
+
+The C++ and Rust shares rose with the second corpus -- 45.9% to 50.5%
+and 40.3% to 45.0% -- because libxul and uutils are both denser than
+what they joined. Go's is unchanged; its corpus did not grow.
 
 Capstone prints `c.mv` as `mv`, so this axis is invisible unless the
 instruction size is carried explicitly; `pairscan` marks 2-byte encodings
@@ -397,10 +402,102 @@ destination and an immediate in [-32,31]; both checked against the
 assembler first), the GCC/LLVM cohort leaves 93 of 1,815,725 `mv` and 0
 of 1,084,536 in-range `li` uncompressed.
 
-So this is not a general opportunity. RVC selection is an assembler pass
-and GNU as / LLVM MC take it whenever it is legal; the 20-point spread is
-Go's toolchain alone, and the C++/Rust 45.3% is the instruction mix
-rather than a shortfall. Worth a check aimed at Go-built binaries.
+So the base C extension is not a general opportunity. RVC selection is
+an assembler pass and GNU as / LLVM MC take it whenever it is legal; the
+25-point spread is Go's toolchain alone, and the C++/Rust 50.2% is the
+instruction mix rather than a shortfall.
+
+Zcb is the part of this that is not settled by that argument, and it gets
+its own section below.
+
+## Zcb -- 330,994, and almost all of it is one binary's target
+
+Zcb adds two-byte spellings for byte and halfword memory access
+(`c.lbu`, `c.lhu`, `c.lh`, `c.sb`, `c.sh`), for the extension pseudo-ops
+(`c.zext.b`, `c.sext.b`, `c.zext.h`, `c.sext.h`, `c.zext.w`), and for
+`c.not` and `c.mul`. Every one of them names registers with a three-bit
+field, so x8-x15 only, and the memory forms carry a two-bit byte offset
+or a one-bit halfword offset. Those constraints are the whole check:
+`candscan` counts four-byte encodings that satisfy them.
+
+The count splits on something other than the compiler, so read it in two
+halves:
+
+| target | declares zcb | shrinkable | bytes |
+|---|---|---:|---:|
+| libxul (Debian, rv64gc) | no | 301,607 | ~589 KB |
+| Go (no attributes) | unknown | 28,806 | ~56 KB |
+| libQt6Core | yes | 402 | 804 |
+| uutils | yes | 179 | 358 |
+| libLLVM, ripgrep, fd, bat, hyperfine | yes | 0 | 0 |
+
+By form, where the population is:
+
+| form | libxul | Go |
+|---|---:|---:|
+| `c.lbu` | 152,976 | 15,714 |
+| `c.sb` | 76,633 | 4,900 |
+| `c.mul` | 24,915 | 1,064 |
+| `c.not` | 15,727 | 491 |
+| `c.zext.b` (`andi rd,rd,255`) | 12,754 | 5,328 |
+| `c.lhu` / `c.sh` / `c.lh` | 18,602 | 1,309 |
+
+Nothing in the first two rows is reportable as things stand and the gate
+is right to keep it that way: libxul declares no Zcb, Go declares
+nothing at all, and suggesting an instruction the target may not
+implement is advice that does not assemble. What those rows size is the
+other question -- `riscvlint -m` over a baseline build -- where 589 KB
+off one shared object is the largest single figure this project has
+measured.
+
+### The 402 in libQt6Core are one gap in GNU as
+
+Every site is `not rd,rd` with rd in x8-x15, left at four bytes in an
+object that declares Zcb -- and the same binary contains 21 of the
+compressed form, interleaved with them by address, so it is not a
+per-object `-march` split.
+
+Assembling both spellings settles it:
+
+| source | GNU as | clang |
+|---|---|---|
+| `not a5, a5` | `9ff5` (2 bytes) | `9ff5` |
+| `xori a5, a5, -1` | `fff7c793` (4 bytes) | `9ff5` |
+| `andi a5, a5, 255` | `9fe1` | `9fe1` |
+| `zext.b a5, a5` | `9fe1` | `9fe1` |
+
+The two `not` spellings are the same instruction. GNU as compresses the
+pseudo-op and not the `xori` it expands to; clang's integrated assembler
+compresses both. The gap is specific to that pair -- `andi rd,rd,255` and
+`zext.b rd,rd` are also the same instruction under two spellings, and
+both assemblers compress both. So GCC emitting `xori rd,rd,-1` rather
+than `not rd,rd` costs two bytes a site, and that is the entire C++
+residue on a Zcb target.
+
+A binary cannot tell the two spellings apart -- they assemble to the same
+four bytes -- so the check reports the site and the reader takes it up
+with the assembler.
+
+### The 179 in uutils are one binary with two targets
+
+uutils declares `zcb1p0` and still has 179 shrinkable sites, mostly
+`c.lbu` and `c.sb`, where the other four Rust binaries have none. GNU ld
+merges `Tag_RISCV_arch` by taking the union of extensions, so a declared
+extension means *some* object used it, not all of them. The shape of the
+residue -- byte loads and stores -- points at C compiled through cc-rs,
+which does not inherit the target features rustc passes to LLVM.
+
+Worth remembering wherever the arch gate is read as a property of a
+whole binary: it is a property of the loudest object in it.
+
+### Is it worth a check?
+
+On a target that declares Zcb, 581 sites in 73.1M instructions. On one
+that does not, 330,413. So not as a compiler-miss check, and yes as part
+of the `-m` story, where it would be the largest thing `-m` can say. The
+encodability rules are already written and validated against both
+assemblers in `candscan`; what a check needs beyond them is the Zcb bit
+in the extension gate, which `riscvlint_parse_arch` does not yet carry.
 
 ## Measured and rejected
 
@@ -465,6 +562,10 @@ Measured with `candscan` so the operand conditions are applied:
 | `li` of a mask + `and` -> `zext.h`/`andi` | 9 | 4 |
 | 4-byte encodings a Zcb form would spell in 2 | 402 | 28,806 |
 
+The Zcb row has its own section above; on a baseline target it is
+301,607 in libxul alone, and the 402 here turned out to be a single gap
+in GNU as rather than anything a compiler chose.
+
 The Go column is not the same finding. Go emits no `.riscv.attributes`
 and its assembler does not select Zcb, so those rows are the toolchain's
 own compression and extension selection -- the entry under "Missed
@@ -521,7 +622,8 @@ can be applied without writing the check applied:
 | 3 | redundant reloads | 9,030 | the same table |
 | 4 | constant re-materialization | 4,580 | the same table + size test |
 | 5 | compare-then-branch | 1,942 | liveness walk (exists) |
-| 6 | missed compression | unsized | RVC encodability pass (new) |
+| 6 | Zcb-shrinkable encodings | 581 declared / 330,413 not | Zcb bit in the gate |
+| 7 | missed compression, base C | 93 | RVC encodability pass (new) |
 
 The two candidates that needed nothing new -- the frame-pointer restore
 and the redundant extension -- are both implemented, and they were
@@ -585,8 +687,8 @@ encodability pass over the whole C extension.
 
 # Ranked for C++ and Rust specifically
 
-Restricted to the GCC/LLVM cohort -- 20,133,950 instructions, 45.3% of
-them compressed, 18,313,847 pairs:
+Restricted to the GCC/LLVM cohort -- 58,828,959 instructions, 50.1% of
+them compressed, 53,690,808 pairs:
 
 | # | opportunity | actionable | raw pattern |
 |---|---|---:|---:|
@@ -601,7 +703,8 @@ them compressed, 18,313,847 pairs:
 | - | Zbb/Zbs/Zcb idioms, all of them | 521 | - |
 | - | move coalescing | 79 | 24,346 |
 | - | Zba shift-add | 69 | 26,264 |
-| - | missed compression (provable) | 93 | - |
+| - | Zcb-shrinkable, target declares Zcb | 581 | - |
+| - | missed compression, base C (provable) | 93 | - |
 | - | Zba `zext.w` | 2 | 2 |
 | - | equal shift pair foldable to `andi` | 0 | 0 |
 
