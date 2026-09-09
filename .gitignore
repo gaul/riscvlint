@@ -1,0 +1,5 @@
+tools/pairscan
+tools/defuse
+corpus/
+results/
+*.o
