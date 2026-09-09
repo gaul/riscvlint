@@ -278,6 +278,69 @@ PC-relative addressing genuinely costs 8 bytes. gp-relative relaxation
 only reaches +/-2KB around `__global_pointer$`, nowhere near this
 population.
 
+# Remaining candidates, ranked
+
+Four checks are implemented. What is left, with every precondition that
+can be applied without writing the check applied:
+
+| # | candidate | population | machinery needed |
+|---|---|---:|---|
+| 1 | `addi` + memory-op offset folding | see below | liveness walk (exists) |
+| 2 | redundant reloads | 9,030 | windowed memory table (new) |
+| 3 | constant re-materialization | 4,580 | windowed table + size test |
+| 4 | compare-then-branch | 1,942 | liveness walk (exists) |
+| 5 | missed compression | unsized | RVC encodability pass (new) |
+
+### 1. `addi` + memory-op offset folding
+
+`addi rd,rs,imm1` + `<load|store> rt,imm2(rd)` folds to
+`<load|store> rt,(imm1+imm2)(rs)` whenever the sum fits the 12-bit
+immediate and rd is dead afterwards. This is the direct analogue of
+armlint's `add` + `ldr` check, its largest.
+
+Sampled per binary, counting only pairs where the memory operand's base
+really is the addi's destination:
+
+| binary | instructions | sites | sum fits imm12 |
+|---|---:|---:|---:|
+| C++ Qt6Core | 955,382 | 12,711 | 12,530 |
+| Rust ripgrep | 819,303 | 16,380 | 16,332 |
+| Go gh | 819,303 | 24,705 | 24,705 |
+
+Around 99% of sums fit, and this is the only remaining family that is
+large in all three toolchains -- checks 2 and 3 are Go's alone and check
+1 is Rust's.
+
+What is not known is how much survives the liveness condition. Where the
+load overwrites the base the fold is exact and needs no proof, but that
+is only 769 of Qt6Core's 12,530 and 3 of gh's 24,705; everything else
+needs the walk to prove the base dead. The one precedent for applying a
+liveness condition to a shape count cut it elevenfold, so the shape
+figures above should not be read as a population.
+
+Found by going back to raw pair frequencies rather than through
+`rank.py`, whose family list did not cover it: `addi ;; sd` at 501,776
+and `addi ;; ld` at 165,767 sat at the top of the uncovered list from the
+first scan. The families a ranking script knows about decide what gets
+looked at, which makes an unclassified remainder worth reading directly.
+
+### 2-5
+
+Reloads and re-materialization both want the same new machinery: a
+region-local table of what is already in a register, invalidated by
+stores, calls and fences. Reloads carry a soundness caveat no binary can
+resolve -- a load from a volatile or device address is not redundant, and
+nothing in the encoding says which it is.
+
+Compare-then-branch needs nothing new; the walk from check 4 answers it,
+and 1,942 is what it answers.
+
+Missed compression is Go's alone. The two RVC rules that a shape token
+can decide showed GCC and LLVM leaving essentially nothing on the table
+(93 of 1,815,725 `mv`, 0 of 1,084,536 in-range `li`), so a check here is
+worth writing only for Go-built binaries, and sizing it means an
+encodability pass over the whole C extension.
+
 # Ranked for C++ and Rust specifically
 
 Restricted to the GCC/LLVM cohort -- 20,133,950 instructions, 45.3% of
