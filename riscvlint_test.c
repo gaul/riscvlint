@@ -75,6 +75,73 @@ static void test_decode_jalr(void)
     CHECK(!rv_decode_jalr(0x00000097u, &rd, &rs1, &imm));
 }
 
+static void test_decode_shift_add(void)
+{
+    unsigned rd, rs1, rs2, sh;
+
+    // 4-byte forms taken from gh: `slli s0,t2,0x2` / `add s0,s0,t2`.
+    CHECK(rv_decode_slli(0x00239413u, 4, &rd, &rs1, &sh));
+    CHECK(rd == 8 && rs1 == 7 && sh == 2);          // s0, t2
+    CHECK(rv_decode_add(0x00740433u, 4, &rd, &rs1, &rs2));
+    CHECK(rd == 8 && rs1 == 8 && rs2 == 7);
+
+    // 2-byte forms, assembled and read back: `c.slli s0,2` is 0x040a,
+    // `c.add s0,t2` is 0x941e, `c.slli a5,3` is 0x078e, `c.add a5,a4`
+    // is 0x97ba.
+    CHECK(rv_decode_slli(0x040au, 2, &rd, &rs1, &sh));
+    CHECK(rd == 8 && rs1 == 8 && sh == 2);          // c.slli implies rd == rs1
+    CHECK(rv_decode_add(0x941eu, 2, &rd, &rs1, &rs2));
+    CHECK(rd == 8 && rs1 == 8 && rs2 == 7);
+    CHECK(rv_decode_slli(0x078eu, 2, &rd, &rs1, &sh));
+    CHECK(rd == 15 && sh == 3);                     // a5
+    CHECK(rv_decode_add(0x97bau, 2, &rd, &rs1, &rs2));
+    CHECK(rd == 15 && rs2 == 14);                   // a5, a4
+
+    CHECK(rv_insn_len(0x00239413u) == 4);
+    CHECK(rv_insn_len(0x040au) == 2);
+
+    // srli shares the opcode and differs only in funct3 (5, not 1); the
+    // 64-bit shifts use funct6, so a set bit above shamt is srai.
+    CHECK(!rv_decode_slli(0x00239413u | (1u << 14), 4, &rd, &rs1, &sh));
+    CHECK(!rv_decode_slli(0x00239413u | (1u << 30), 4, &rd, &rs1, &sh));
+    // sub shares add's opcode and funct3, differing in funct7.
+    CHECK(!rv_decode_add(0x00740433u | (0x20u << 25), 4, &rd, &rs1, &rs2));
+    // c.jalr and c.ebreak share c.add's funct4 with a zero register.
+    CHECK(!rv_decode_add(0x9002u, 2, &rd, &rs1, &rs2));       // c.ebreak
+    CHECK(!rv_decode_add(0x9402u, 2, &rd, &rs1, &rs2));       // c.jalr s0
+    // c.slli with a zero shift or into x0 is a hint, not a shift.
+    CHECK(!rv_decode_slli(0x0402u, 2, &rd, &rs1, &sh));
+}
+
+static void test_arch_gate(void)
+{
+    // Rust and C++ objects in the corpus carry this; Go objects carry no
+    // attributes section at all.
+    const char *rva23 = "rv64i2p1_m2p0_a2p1_f2p2_d2p2_c2p0_b1p0_v1p0_"
+                        "zba1p0_zbb1p0_zbs1p0_zvl128b1p0";
+    unsigned e = riscvlint_parse_arch(rva23);
+    CHECK(e & RISCVLINT_EXT_ZBA);
+    CHECK(e & RISCVLINT_EXT_ZBB);
+    CHECK(e & RISCVLINT_EXT_ZBS);
+    CHECK(e & RISCVLINT_EXT_DECLARED);
+
+    unsigned g = riscvlint_parse_arch("rv64i2p1_m2p0_a2p1_f2p2_d2p2_c2p0");
+    CHECK(!(g & RISCVLINT_EXT_ZBA));
+    CHECK(g & RISCVLINT_EXT_DECLARED);
+
+    // No attributes at all: nothing is known, and DECLARED stays clear.
+    CHECK(riscvlint_parse_arch(NULL) == 0);
+
+    riscvlint_state *st = riscvlint_state_create();
+    riscvlint_state_set_extensions(st, e);
+    CHECK(riscvlint_may_use(st, RISCVLINT_EXT_ZBA));
+    riscvlint_state_set_extensions(st, g);
+    CHECK(!riscvlint_may_use(st, RISCVLINT_EXT_ZBA));
+    riscvlint_state_set_extensions(st, 0);          // the Go case
+    CHECK(riscvlint_may_use(st, RISCVLINT_EXT_ZBA));
+    riscvlint_state_destroy(st);
+}
+
 static void test_jal_reach(void)
 {
     CHECK(rv_jal_reaches(0));
@@ -223,6 +290,78 @@ static void test_check(csh handle)
     riscvlint_state_destroy(state);
 }
 
+// Runs check_slli_add_to_shadd over a byte sequence, so the compressed
+// spellings can be tested alongside the 4-byte ones.
+static bool run_shadd(csh handle, const uint8_t *bytes, size_t len,
+                      unsigned exts, riscvlint_finding *out)
+{
+    static uint8_t buf[256];
+    memcpy(buf, bytes, len);
+    riscvlint_state *state = riscvlint_state_create();
+    if (!state) return false;
+    bool fired = false;
+    riscvlint_state_set_extensions(state, exts);
+    if (riscvlint_state_set_section(state, handle, buf, len, 0x1000)) {
+        cs_insn *insn = cs_malloc(handle);
+        const uint8_t *p = buf;
+        size_t remain = len;
+        uint64_t addr = 0x1000;
+        if (insn && cs_disasm_iter(handle, &p, &remain, &addr, insn)) {
+            riscvlint_finding f;
+            memset(&f, 0, sizeof f);
+            fired = check_slli_add_to_shadd(state, insn, &f);
+            if (fired && out) *out = f;
+        }
+        if (insn) cs_free(insn, 1);
+    }
+    riscvlint_state_destroy(state);
+    return fired;
+}
+
+static void test_shadd_check(csh handle)
+{
+    riscvlint_finding f;
+    // c.slli s0,2 ; c.add s0,t2 -- the commonest spelling, four bytes
+    // before and after, so the win is one instruction rather than space.
+    const uint8_t cc[] = { 0x0a, 0x04, 0x1e, 0x94, 0x82, 0x80 };
+    CHECK(run_shadd(handle, cc, sizeof cc, 0, &f));
+    CHECK(strcmp(f.replacement, "sh2add s0, s0, t2 (4 -> 4 bytes)") == 0);
+
+    // slli s0,t2,2 ; c.add s0,t2 -- six bytes down to four.
+    const uint8_t mixed[] = { 0x13, 0x94, 0x23, 0x00, 0x1e, 0x94, 0x82, 0x80 };
+    CHECK(run_shadd(handle, mixed, sizeof mixed, 0, &f));
+    CHECK(strcmp(f.replacement, "sh2add s0, t2, t2 (6 -> 4 bytes)") == 0);
+
+    // Declared without Zba: the object says the instruction does not
+    // exist on its target, so nothing is reported.
+    CHECK(!run_shadd(handle, cc, sizeof cc,
+                     RISCVLINT_EXT_DECLARED | RISCVLINT_EXT_ZBB, NULL));
+    // Declared with it, and the Go case of nothing declared at all.
+    CHECK(run_shadd(handle, cc, sizeof cc,
+                    RISCVLINT_EXT_DECLARED | RISCVLINT_EXT_ZBA, NULL));
+
+    // Shift of 4 has no shNadd.
+    const uint8_t sh4[] = { 0x12, 0x04, 0x1e, 0x94, 0x82, 0x80 };
+    CHECK(!run_shadd(handle, sh4, sizeof sh4, 0, NULL));
+
+    // add rd,rd,rd doubles the shifted value: a wider shift, not a
+    // shift-add. c.add s0,s0 is 0x9422.
+    const uint8_t dbl[] = { 0x0a, 0x04, 0x22, 0x94, 0x82, 0x80 };
+    CHECK(!run_shadd(handle, dbl, sizeof dbl, 0, NULL));
+
+    // The add does not overwrite the shifted register: folding would
+    // drop a value that survives, which needs liveness.
+    // slli s0,t2,2 ; add a5,s0,t2  (0x007407b3)
+    const uint8_t other[] = { 0x13, 0x94, 0x23, 0x00,
+                              0xb3, 0x07, 0x74, 0x00, 0x82, 0x80 };
+    CHECK(!run_shadd(handle, other, sizeof other, 0, NULL));
+
+    // sub in place of add.
+    const uint8_t sub[] = { 0x13, 0x94, 0x23, 0x00,
+                            0x33, 0x04, 0x74, 0x40, 0x82, 0x80 };
+    CHECK(!run_shadd(handle, sub, sizeof sub, 0, NULL));
+}
+
 int main(void)
 {
     csh handle;
@@ -235,7 +374,10 @@ int main(void)
     test_decode_auipc();
     test_decode_jalr();
     test_jal_reach();
+    test_decode_shift_add();
+    test_arch_gate();
     test_check(handle);
+    test_shadd_check(handle);
 
     cs_close(&handle);
     if (failures) {

@@ -25,6 +25,7 @@
 #define SHT_RELA      4
 #define SHF_EXECINSTR 0x4
 #define STT_FUNC      2
+#define SHT_RISCV_ATTRIBUTES 0x70000003
 
 typedef struct {
     unsigned char e_ident[EI_NIDENT];
@@ -70,6 +71,86 @@ typedef struct {
     uint64_t r_info;
     int64_t  r_addend;
 } Elf64_Rela;
+
+// ---- Tag_RISCV_arch ----
+//
+// The build attributes say which extensions the object was compiled for.
+// Suggesting a Zba instruction to something built for plain rv64gc would
+// be advice that does not assemble, so the Zb-shaped checks are gated on
+// this rather than on what the corpus happened to use.
+//
+// Layout: 'A', then per-vendor subsections of
+//   uint32 length, vendor name, then tagged sub-subsections of
+//   byte tag, uint32 size, attributes.
+// An attribute is a ULEB128 tag followed by a ULEB128 value when the tag
+// is even and a NUL-terminated string when it is odd; Tag_RISCV_arch is
+// 5, so it is a string.
+
+static uint64_t read_uleb(const uint8_t **p, const uint8_t *end)
+{
+    uint64_t v = 0;
+    unsigned shift = 0;
+    while (*p < end) {
+        uint8_t b = *(*p)++;
+        if (shift < 64) v |= (uint64_t)(b & 0x7f) << shift;
+        shift += 7;
+        if (!(b & 0x80)) break;
+    }
+    return v;
+}
+
+static const char *find_arch_string(const uint8_t *base, size_t map_len,
+                                    const Elf64_Ehdr *eh)
+{
+    const Elf64_Shdr *sh = (const Elf64_Shdr *)(base + eh->e_shoff);
+    for (unsigned i = 0; i < eh->e_shnum; i++) {
+        if (sh[i].sh_type != SHT_RISCV_ATTRIBUTES) continue;
+        if (sh[i].sh_offset > map_len ||
+            sh[i].sh_size > map_len - sh[i].sh_offset || sh[i].sh_size < 5)
+            continue;
+        const uint8_t *p = base + sh[i].sh_offset;
+        const uint8_t *end = p + sh[i].sh_size;
+        if (*p++ != 'A') continue;
+        while (p + 4 <= end) {
+            uint32_t sublen;
+            memcpy(&sublen, p, 4);
+            if (sublen < 5 || p + sublen > end) break;
+            const uint8_t *sub_end = p + sublen;
+            const uint8_t *q = p + 4;
+            const uint8_t *vendor = q;
+            while (q < sub_end && *q) q++;
+            if (q >= sub_end) break;
+            q++;  // past the NUL
+            if (strcmp((const char *)vendor, "riscv") != 0) {
+                p = sub_end;
+                continue;
+            }
+            while (q + 5 <= sub_end) {
+                uint8_t tag = *q;
+                uint32_t size;
+                memcpy(&size, q + 1, 4);
+                if (size < 5 || q + size > sub_end) break;
+                const uint8_t *attr_end = q + size;
+                const uint8_t *a = q + 5;
+                if (tag != 1) { q = attr_end; continue; }   // Tag_File only
+                while (a < attr_end) {
+                    uint64_t t = read_uleb(&a, attr_end);
+                    if (t & 1) {                    // odd tags carry a string
+                        const char *str = (const char *)a;
+                        while (a < attr_end && *a) a++;
+                        if (a < attr_end) a++;
+                        if (t == 5) return str;     // Tag_RISCV_arch
+                    } else {
+                        read_uleb(&a, attr_end);
+                    }
+                }
+                q = attr_end;
+            }
+            p = sub_end;
+        }
+    }
+    return NULL;
+}
 
 // ---- reporting ----
 
@@ -173,6 +254,7 @@ static void report(const riscvlint_finding *f, csh handle,
 
 static const riscvlint_check_fn checks[] = {
     check_call_pair_to_jal,
+    check_slli_add_to_shadd,
 };
 
 static void scan_section(csh handle, riscvlint_state *state,
@@ -253,6 +335,9 @@ static int scan_file(csh handle, const char *path)
     } else {
         riscvlint_state *state = riscvlint_state_create();
         if (!state) { munmap((void *)base, map_len); return -1; }
+        riscvlint_state_set_extensions(state,
+                                       riscvlint_parse_arch(
+                                           find_arch_string(base, map_len, eh)));
         const Elf64_Shdr *sh = (const Elf64_Shdr *)(base + eh->e_shoff);
         for (unsigned i = 0; i < eh->e_shnum; i++) {
             if ((sh[i].sh_flags & SHF_EXECINSTR) == 0 ||

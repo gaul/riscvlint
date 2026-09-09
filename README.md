@@ -23,6 +23,24 @@ written next is decided by the corpus rather than by intuition.
   679,812 call pairs is forced. It is a linker-relaxation finding rather
   than a compiler one.
 
+* **slli + add foldable to shNadd** -- `slli rd,rs,{1,2,3}` +
+  `add rd,rd,rs2` computes a scaled-index address in two dependent
+  instructions; Zba's `sh1add`/`sh2add`/`sh3add` does it in one. Reported
+  only when the add writes back the register the slli wrote and reads it
+  exactly once, which makes the shifted value dead by construction.
+
+  Population: 13,249 sites, 13,180 of them in Go binaries -- GCC and LLVM
+  already use the extension. Both halves have compressed spellings, and
+  41% of the sites are `c.slli` + `c.add`, which is four bytes either
+  way: there the rewrite buys an instruction and a dependency rather than
+  space. Across the corpus it is 13,249 instructions and about 23 KB.
+
+  The check reads `Tag_RISCV_arch` so it never suggests an instruction
+  the target lacks. That gate is three-valued: Go emits no attributes
+  section at all, and Go holds almost the whole population, so a check
+  suppresses itself only on positive evidence of absence -- an arch
+  string that is present and does not name the extension.
+
 ## Building
 
 Requires Capstone 6. Capstone 5.0.x decodes RISC-V too thinly to be

@@ -15,7 +15,7 @@ which also records where the first figure was wrong and why.
 | # | opportunity | actionable | raw pattern | status |
 |---|---|---:|---:|---|
 | 1 | `auipc`+`jalr` within `jal` reach | 89,860 | 801,519 | **implemented** |
-| 2 | Zba shift-add | 19,933 | 48,270 | immediate applied |
+| 2 | Zba shift-add | 13,249 | 48,270 | **implemented** |
 | 3 | Zba `zext.w` | 18,073 | 25,672 | immediate applied |
 | 4 | redundant reloads | 10,079 | - | region-sound |
 | 5 | dead register definitions | 4,808 | 47,659 | verified on sites |
@@ -139,9 +139,44 @@ The liveness walk is validated against hand-built cases including one
 where the register is read only on the taken path, which is exactly what
 a linear scan misses.
 
-### 5. Zba shift-add (`sh1add`/`sh2add`/`sh3add`) -- 19,933
+### 5. Zba shift-add (`sh1add`/`sh2add`/`sh3add`) -- 13,249  [implemented]
 
-`slli rd,rs,{1,2,3}` + `add`. Go 19,671, C++ 195, Rust 67.
+`slli rd,rs,{1,2,3}` + `add rd,rd,rs2` in two dependent instructions,
+where `sh1add`/`sh2add`/`sh3add` does it in one.
+
+`check_slli_add_to_shadd` reports only the pairs whose add writes back
+the register the slli wrote and reads it exactly once. That makes the
+shifted value dead by construction, so no liveness query is needed --
+and it is what separates 13,249 from the 19,933 the pair shapes counted,
+the difference being adds that write elsewhere and leave the shifted
+value alive.
+
+| corpus | foldable |
+|---|---:|
+| Go | 13,180 |
+| C++ | 67 |
+| Rust | 2 |
+
+Both halves have compressed spellings, and c.slli + c.add is the
+commonest form, which matters for what the fix is worth:
+
+| spelling | count | saving |
+|---|---:|---|
+| `c.slli` + `c.add` | 5,419 | one instruction, no bytes |
+| mixed | 3,796 | one instruction, 2 bytes |
+| both 4-byte | 4,034 | one instruction, 4 bytes |
+
+So the win is 13,249 instructions and about 23 KB, not 13,249 x 4 bytes.
+Reporting it as space alone would overstate it by more than twice.
+
+Gating: suggesting a Zba instruction to an object built without Zba is
+advice that does not assemble, so the check reads `Tag_RISCV_arch`. The
+gate has to be three-valued rather than two, because **Go emits no
+`.riscv.attributes` section at all** -- and Go holds 99% of this
+population. Treating "absent" as "no" would have silenced the check on
+exactly the binaries it exists for. It suppresses only on positive
+evidence of absence: an arch string that is present and does not name
+Zba.
 
 ### 6. Zba `zext.w` -- 18,073
 
@@ -223,7 +258,7 @@ them compressed, 18,313,847 pairs:
 | 3 | dead register definitions | 4,528 | 44,550 |
 | 4 | constant re-materialization | 2,969 | 94,445 |
 | 5 | compare-then-branch folding | 1,978 | 21,890 |
-| - | Zba shift-add | 262 | 26,264 |
+| - | Zba shift-add | 69 | 26,264 |
 | - | redundant mask after `lbu` | 142 | 50,998 |
 | - | missed compression (provable) | 93 | - |
 | - | Zba `zext.w` | 2 | 2 |

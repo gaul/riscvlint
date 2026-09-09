@@ -41,7 +41,15 @@ fi
 for src in "$ROOT"/fixtures/*.s; do
     name=$(basename "$src" .s)
     obj="$PROBE/$name.o"
-    if ! err=$($CC $CC_FLAGS -c -o "$obj" "$src" 2>&1); then
+    # A fixture may pin extra assembler flags in a sidecar
+    # fixtures/<name>.flags -- an extension-gated check needs the object
+    # to declare that extension in Tag_RISCV_arch, which is a property of
+    # -march at assembly time rather than anything the source can say.
+    extra=""
+    if [ -f "$ROOT/fixtures/$name.flags" ]; then
+        extra=$(cat "$ROOT/fixtures/$name.flags")
+    fi
+    if ! err=$($CC $CC_FLAGS $extra -c -o "$obj" "$src" 2>&1); then
         printf "  ERROR   %s  (assembly failed)\n" "$name"
         echo "$err" | sed 's/^/          /'
         FAIL=$((FAIL + 1))

@@ -57,6 +57,75 @@ bool rv_jal_reaches(int64_t offset)
     return offset >= -1048576 && offset <= 1048574 && (offset & 1) == 0;
 }
 
+unsigned rv_insn_len(uint32_t w)
+{
+    return (w & 3u) == 3u ? 4u : 2u;
+}
+
+bool rv_decode_slli(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
+                    unsigned *shamt)
+{
+    if (size == 4) {
+        // I-type shift, RV64: opcode OP-IMM, funct3 001, funct6 000000.
+        if (RV_OPCODE(w) != 0x13u) return false;
+        if (((w >> 12) & 0x7u) != 1u) return false;
+        if (((w >> 26) & 0x3fu) != 0u) return false;
+        *rd = (w >> 7) & 0x1fu;
+        *rs1 = (w >> 15) & 0x1fu;
+        *shamt = (w >> 20) & 0x3fu;
+        return true;
+    }
+    if (size != 2) return false;
+    // CI-format c.slli: op 10, funct3 000. rd is also rs1, and rd == x0
+    // or shamt == 0 are hints rather than shifts.
+    if ((w & 0xe003u) != 0x0002u) return false;
+    unsigned r = (w >> 7) & 0x1fu;
+    unsigned sh = (((w >> 12) & 1u) << 5) | ((w >> 2) & 0x1fu);
+    if (r == 0 || sh == 0) return false;
+    *rd = *rs1 = r;
+    *shamt = sh;
+    return true;
+}
+
+bool rv_decode_add(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
+                   unsigned *rs2)
+{
+    if (size == 4) {
+        // R-type: opcode OP, funct3 000, funct7 0000000.
+        if (RV_OPCODE(w) != 0x33u) return false;
+        if (((w >> 12) & 0x7u) != 0u) return false;
+        if (((w >> 25) & 0x7fu) != 0u) return false;
+        *rd = (w >> 7) & 0x1fu;
+        *rs1 = (w >> 15) & 0x1fu;
+        *rs2 = (w >> 20) & 0x1fu;
+        return true;
+    }
+    if (size != 2) return false;
+    // CR-format c.add: funct4 1001, op 10, with both registers non-zero.
+    // The same funct4 spells c.jalr (rs2 == 0) and c.ebreak (both zero),
+    // so neither register may be x0.
+    if ((w & 0xf003u) != 0x9002u) return false;
+    unsigned r = (w >> 7) & 0x1fu;
+    unsigned s2 = (w >> 2) & 0x1fu;
+    if (r == 0 || s2 == 0) return false;
+    *rd = *rs1 = r;
+    *rs2 = s2;
+    return true;
+}
+
+unsigned riscvlint_parse_arch(const char *arch)
+{
+    if (!arch) return 0;
+    unsigned exts = RISCVLINT_EXT_DECLARED;
+    // Extensions are underscore-separated and carry a version suffix, so
+    // match on the separator plus name to avoid "zba" inside a longer
+    // token. The leading base ("rv64i2p1") never spells a Zb extension.
+    if (strstr(arch, "_zba")) exts |= RISCVLINT_EXT_ZBA;
+    if (strstr(arch, "_zbb")) exts |= RISCVLINT_EXT_ZBB;
+    if (strstr(arch, "_zbs")) exts |= RISCVLINT_EXT_ZBS;
+    return exts;
+}
+
 // ---- state ----
 
 struct riscvlint_state {
@@ -65,6 +134,7 @@ struct riscvlint_state {
     uint64_t vaddr;
     uint8_t *targets;   // one bit per 2-byte unit
     uint8_t *relocs;    // one bit per 2-byte unit
+    unsigned exts;      // extensions declared by Tag_RISCV_arch
 };
 
 riscvlint_state *riscvlint_state_create(void)
@@ -156,6 +226,16 @@ void riscvlint_state_set_relocs(riscvlint_state *state,
             bit_set(state->relocs, (size_t)offsets[i] / 2);
 }
 
+void riscvlint_state_set_extensions(riscvlint_state *state, unsigned exts)
+{
+    state->exts = exts;
+}
+
+unsigned riscvlint_state_extensions(const riscvlint_state *state)
+{
+    return state->exts;
+}
+
 bool riscvlint_is_branch_target(const riscvlint_state *state, uint64_t addr)
 {
     if (addr < state->vaddr || addr >= state->vaddr + state->size)
@@ -239,5 +319,59 @@ bool check_call_pair_to_jal(riscvlint_state *state, const cs_insn *insn,
     finding->insn_count = 2;
     snprintf(finding->replacement, sizeof finding->replacement,
              "jal %s, 0x%" PRIx64, rv_reg_name(rd1), (uint64_t)target);
+    return true;
+}
+
+bool riscvlint_may_use(const riscvlint_state *state, unsigned ext)
+{
+    unsigned e = riscvlint_state_extensions(state);
+    if (!(e & RISCVLINT_EXT_DECLARED)) return true;   // nothing said
+    return (e & ext) != 0;
+}
+
+bool check_slli_add_to_shadd(riscvlint_state *state, const cs_insn *insn,
+                             riscvlint_finding *finding)
+{
+    if (!riscvlint_may_use(state, RISCVLINT_EXT_ZBA)) return false;
+    if (insn->size != 2 && insn->size != 4) return false;
+
+    uint32_t w1;
+    if (!riscvlint_word_at(state, insn->address, &w1)) return false;
+    unsigned rd1, rs1, shamt;
+    if (!rv_decode_slli(w1, insn->size, &rd1, &rs1, &shamt)) return false;
+    // Only 1, 2 and 3 have a shNadd; x0 is not a shift destination.
+    if (shamt < 1 || shamt > 3 || rd1 == 0) return false;
+
+    uint64_t second = insn->address + insn->size;
+    uint32_t w2;
+    if (!riscvlint_word_at(state, second, &w2)) return false;
+    unsigned len2 = rv_insn_len(w2);
+    unsigned rd2, ars1, ars2;
+    if (!rv_decode_add(w2, len2, &rd2, &ars1, &ars2)) return false;
+
+    // The add must overwrite the shifted register and read it exactly
+    // once. Overwriting it is what makes the intermediate dead without a
+    // liveness query; reading it twice (`add rd,rd,rd`) doubles the
+    // shifted value, which is a wider shift and not this rewrite.
+    if (rd2 != rd1) return false;
+    bool a_is_shift = ars1 == rd1, b_is_shift = ars2 == rd1;
+    if (a_is_shift == b_is_shift) return false;
+    unsigned addend = a_is_shift ? ars2 : ars1;
+
+    if (riscvlint_is_branch_target(state, second)) return false;
+    if (riscvlint_is_relocated(state, insn->address) ||
+        riscvlint_is_relocated(state, second))
+        return false;
+
+    unsigned before = insn->size + len2;
+    finding->title = "slli + add foldable to shNadd";
+    finding->address = insn->address;
+    finding->insn_count = 2;
+    // sh1add/sh2add/sh3add are all four bytes, so the byte delta depends
+    // on which spellings the pair used; at 4 bytes the win is one
+    // instruction and one dependency rather than any space.
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "sh%uadd %s, %s, %s (%u -> 4 bytes)", shamt, rv_reg_name(rd2),
+             rv_reg_name(rs1), rv_reg_name(addend), before);
     return true;
 }
