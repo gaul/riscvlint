@@ -3,11 +3,42 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-One check is implemented so far. [TODO.md](TODO.md) holds the rest of the
-backlog with the measured population behind each entry, so what gets
-written next is decided by the corpus rather than by intuition.
+Thirteen checks are implemented and the backlog is empty.
+[TODO.md](TODO.md) is the ledger behind them: every candidate that was
+measured, the population it came back with, and the ones rejected on
+that evidence. What got written was decided by the corpus rather than by
+intuition, and what did not get written was rejected the same way.
 
 ## Checks
+
+Thirteen of them. Every figure below is what the check itself reports
+over the [corpus](#corpus) -- 73,139,165 instructions of three
+toolchains -- rather than what a mining tool estimated for it. The two
+have differed by an order of magnitude every time both were measured.
+
+| check | C++ | Rust | Go | sites | bytes |
+|---|---:|---:|---:|---:|---:|
+| call pair foldable to jal | 120,578 | 171,665 | 56 | 292,299 | 1,169,196 |
+| slli + add foldable to shNadd | 67 | 165 | 13,180 | 13,412 | 23,840 |
+| slli + srli foldable to zext.w | 2 | 52 | 18,071 | 18,125 | 50,178 |
+| redundant stack-pointer restore | 100,718 | 11,683 | 0 | 112,401 | 449,604 |
+| comparison a branch could have made | 2,895 | 42 | 0 | 2,937 | 7,578 |
+| redundant reload | 1,972 | 219 | 2,837 | 5,028 | 7,068 |
+| dead store to a frame slot | 203 | 1 | 4,172 | 4,376 | 16,714 |
+| constant re-materialization | 8,970 | 571 | 1,457 | 10,998 | 21,996 |
+| base add foldable into memory offset | 2,922 | 429 | 2,993 | 6,344 | 19,574 |
+| instruction compressible to a base C form | 21,361 | 1,235 | 2,961,593 | 2,984,189 | 5,968,378 |
+| instruction compressible to a Zcb form | 705 | 181 | 29,762 | 30,648 | 61,296 |
+| redundant sign or zero extension | 6,589 | 333 | 1,593 | 8,515 | 20,864 |
+| dead register definition | 11,741 | 248 | 7,876 | 19,865 | 54,570 |
+| **total** | **278,723** | **186,824** | **3,043,590** | **3,509,137** | **7,870,856** |
+
+Do not read the total row as a result. One row is 85% of it, and that
+row is Go's assembler declining to select RVC at all, which is a
+different kind of finding from the twelve around it. The byte column for
+the call-pair row is arithmetic rather than measurement: that check does
+not print a size, and every site is eight bytes in and four out except a
+handful of `jalr ra,0(ra)` that were already two.
 
 * **call pair foldable to jal** -- `auipc rd,X` + `jalr rd,Y(rd)` builds a
   call with +/-2GB of reach out of eight bytes and a register dependency.
@@ -25,7 +56,7 @@ written next is decided by the corpus rather than by intuition.
   not because its text segment is too large: every one of those pairs is
   `auipc ra,0x31ad` + `jalr`, which lands in the PLT about 52 MB away, so
   the distance is to the PLT rather than to any code. libxul's `.text` is
-  105 MB -- twice libLLVM's -- and 120,568 of its call pairs still reach,
+  105 MB -- twice libLLVM's -- and 120,578 of its call pairs still reach,
   because they are local intra-module calls that were never relaxed. Two
   binaries agreeing on zero was a property of those two binaries.
 
@@ -40,11 +71,12 @@ written next is decided by the corpus rather than by intuition.
   only when the add writes back the register the slli wrote and reads it
   exactly once, which makes the shifted value dead by construction.
 
-  Population: 13,249 sites, 13,180 of them in Go binaries -- GCC and LLVM
-  already use the extension. Both halves have compressed spellings, and
-  41% of the sites are `c.slli` + `c.add`, which is four bytes either
-  way: there the rewrite buys an instruction and a dependency rather than
-  space. Across the corpus it is 13,249 instructions and about 23 KB.
+  Population: 13,412 sites, 13,180 of them in Go binaries -- GCC and LLVM
+  already use the extension. Of the 232 that are not, 163 are uutils and
+  67 libLLVM. Both halves have compressed spellings, and 41% of the sites
+  are `c.slli` + `c.add`, which is four bytes either way: there the
+  rewrite buys an instruction and a dependency rather than space. Across
+  the corpus it is 13,412 instructions and about 23 KB.
 
   The check reads `Tag_RISCV_arch` so it never suggests an instruction
   the target lacks. That gate is three-valued: Go emits no attributes
@@ -61,8 +93,8 @@ written next is decided by the corpus rather than by intuition.
   every site in the corpus is written that way, so the precondition costs
   nothing.
 
-  Population: 18,073 sites, 18,071 of them in Go, worth about 49 KB and
-  18,073 instructions. Only 8% are `c.slli` + `c.srli` -- far fewer than
+  Population: 18,125 sites, 18,071 of them in Go, worth about 49 KB and
+  18,125 instructions. Only 8% are `c.slli` + `c.srli` -- far fewer than
   the shift-add family's 41%, because `c.srli` is CB-format and can name
   only x8-x15. `sext.w` is the same shape with `srai` and a different
   rewrite, which the check rejects rather than folds.
@@ -74,8 +106,9 @@ written next is decided by the corpus rather than by intuition.
   the instruction's whole effect is already in force, which is what
   separates it from a dead definition.
 
-  Population: 112,401 sites -- 100,716 libLLVM, 11,683 Rust, and **0 in
-  both libQt6Core and libxul**, which is the finding.
+  Population: 112,401 sites -- 100,716 libLLVM, 11,683 Rust, 2 in
+  libgkcodecs.so, and **0 in both libQt6Core and libxul**, which is the
+  finding.
 
   It takes two things to occur, and each zero shows one of them missing.
   GCC emits an sp-relative epilogue, so Qt6Core has none even though
@@ -86,8 +119,8 @@ written next is decided by the corpus rather than by intuition.
   an LLVM-family compiler together; it is not a property of clang alone.
   Go has none of this shape at all. Every site is a
   four-byte encoding -- `c.addi16sp` can only spell `sp,sp` -- so it is
-  111,445 instructions and about 435 KB, the one check here whose byte
-  count is simply four times its finding count.
+  112,401 instructions and 439 KB, the one check here whose byte count is
+  simply four times its finding count.
 
   This is the only check that cannot be decided from the instruction
   under the cursor and what follows it: the prologue that makes the
@@ -277,8 +310,9 @@ written next is decided by the corpus rather than by intuition.
   check and unlike everything else here it needs no liveness query at
   all; where it writes elsewhere it becomes a `mv`.
 
-  Population: 4,546 sites in C++ and Rust and 1,593 in Go. The C++ half
-  is 3,433 libQt6Core against 817 libLLVM, which makes it GCC's residue
+  Population: 8,515 sites -- 6,589 C++, 1,593 Go, 333 Rust. Within C++
+  it is 3,433 libQt6Core, 2,253 libxul and 817 libLLVM, and libQt6Core
+  against libLLVM is the contrast worth keeping: this is GCC's residue
   where the stack-restore check is clang's -- the same corpus, the other
   compiler's habit, and neither would have been visible with one C++
   compiler in it.
@@ -308,18 +342,18 @@ written next is decided by the corpus rather than by intuition.
   what that proves dead. The commonest shape is a frame pointer
   established and never used.
 
-  Population: 14,458 sites -- Go 7,876, C++ 6,459, Rust 123 -- and the
-  first check here that fires meaningfully on C++. The walk makes no ABI
-  assumptions: what a call may read and what a return exposes both differ
-  between the C and Go conventions, and riscvlint cannot tell which it is
-  looking at, so both answer "unknown" rather than guessing.
+  Population: 19,865 sites -- C++ 11,741, Go 7,876, Rust 248 -- and the
+  first check here that fires meaningfully on C++, where libxul's 5,239
+  and libQt6Core's 5,203 nearly tie. The walk makes no ABI assumptions:
+  what a call may read and what a return exposes both differ between the
+  C and Go conventions, and riscvlint cannot tell which it is looking at,
+  so both answer "unknown" rather than guessing.
 
 ## Selecting the target
 
 `-m <name>` pins the extensions the checks may assume, and may be
-repeated. Names are either extensions (`zba`, `zbb`, `zbs`) or profiles
-that bundle them (`rva20`, `rva22`, `rva23`); `rva22` and `rva23` expand
-alike, differing only in extensions nothing here gates on yet.
+repeated. Names are either extensions (`zba`, `zbb`, `zbs`, `zcb`, `c`)
+or profiles that bundle them (`rva20`, `rva22`, `rva23`).
 
 `-m` replaces what the object declares, in both directions, because both
 are useful and neither is expressible if the flag merely adds to the
@@ -331,11 +365,11 @@ riscvlint -m rva20 ./app     # this is going on rv64gc hardware; stay quiet
 ```
 
 Every profile from RVA20 up mandates C, so `-m rva20` silences the Zb
-families and leaves the compression check on -- rv64gc hardware does
-have the C extension, and an instruction that could be two bytes on it
-still could be.
+families and the Zcb check but leaves the base C one on -- rv64gc
+hardware does have the C extension, and an instruction that could be two
+bytes on it still could be.
 
-`rva22` and `rva23` no longer expand alike. Zcb missed RVA22's
+`rva22` and `rva23` do not expand alike. Zcb missed RVA22's
 ratification window and is mandatory in RVA23U64, so it is the first
 extension gated here that tells the two profiles apart -- and on the
 corpus's one baseline build it is by far the largest difference between

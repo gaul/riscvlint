@@ -406,7 +406,8 @@ static int cmp_tally(const void *a, const void *b)
 int main(int argc, char **argv)
 {
     static const char usage[] =
-        "usage: %s [-q] [-m zba|zbb|zbs|rva20|rva22|rva23]... <binary>...\n";
+        "usage: %s [-q] [-m zba|zbb|zbs|zcb|c|rva20|rva22|rva23]... "
+        "<binary>...\n";
     int argi = 1;
     while (argi < argc && argv[argi][0] == '-' && argv[argi][1]) {
         if (strcmp(argv[argi], "-q") == 0) {
