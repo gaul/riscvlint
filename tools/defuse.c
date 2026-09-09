@@ -188,6 +188,9 @@ typedef struct {
     int base;           // slot
     int64_t disp;
     int size;           // access bytes
+    char mn[12];        // exact mnemonic: lb and lbu are the same width
+                        // but not the same value, so a reload of one
+                        // after the other is not redundant
     int dest;           // slot loaded into
 } loadrec;
 
@@ -599,7 +602,7 @@ static void scan_section(csh handle, const char *path, const uint8_t *code,
                     loadrec *L = &loads[k];
                     if (L->live && L->base == bs &&
                         L->disp == a->operands[1].mem.disp &&
-                        L->size == ldsize) {
+                        L->size == ldsize && strcmp(L->mn, mn) == 0) {
                         char key[64];
                         snprintf(key, sizeof key, "reload|%s|sz%d",
                                  bs == 2 ? "sp" : bs == 3 ? "gp" :
@@ -619,8 +622,10 @@ static void scan_section(csh handle, const char *path, const uint8_t *code,
                     }
                 }
                 if (!matched && nloads < 64) {
-                    loads[nloads++] = (loadrec){true, idx, bs,
-                        a->operands[1].mem.disp, ldsize, dest};
+                    loadrec *L = &loads[nloads++];
+                    *L = (loadrec){true, idx, bs,
+                                   a->operands[1].mem.disp, ldsize, "", dest};
+                    snprintf(L->mn, sizeof L->mn, "%s", mn);
                 }
             }
         }
