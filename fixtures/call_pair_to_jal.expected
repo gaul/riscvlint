@@ -14,7 +14,11 @@ call pair foldable to jal at offset: 0x18: -> jal t0, 0x38 (2 instructions)
   auipc t0, 0
   jalr t0, 0x20(t0)
 
+dead register definition at offset: 0x38: -> delete; nothing reads ra (4 bytes) (1 instructions)
+  auipc ra, 0
+
 Optimization opportunities by type:
        4  call pair foldable to jal
+       1  dead register definition
 
-4 optimization opportunities in 27 instructions
+5 optimization opportunities in 27 instructions

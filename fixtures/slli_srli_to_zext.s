@@ -3,6 +3,9 @@
 // Assembled with -march=rv64gc_zba (see the .flags sidecar) so the object
 // declares Zba; the gate itself is covered by the slli_add_no_zba and
 // slli_add_forced_zba pair.
+//
+// Each block reuses a4 and s0, so the previous block's result dies at
+// the next block's first write; check_dead_def reports those too.
 
     .text
     .globl  _start

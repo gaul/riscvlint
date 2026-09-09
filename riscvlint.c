@@ -141,6 +141,69 @@ bool rv_decode_srli(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
     return true;
 }
 
+bool rv_pure_def(uint32_t w, unsigned size, unsigned *rd)
+{
+    if (size == 4) {
+        // Every instruction under these opcodes writes rd and does
+        // nothing else: OP-IMM, OP-IMM-32, OP, OP-32, LUI, AUIPC. That
+        // covers the M and Zb extensions too, which reuse OP and OP-32,
+        // so the rule needs no list of mnemonics to stay complete.
+        switch (RV_OPCODE(w)) {
+        case 0x13u: case 0x1bu: case 0x33u: case 0x3bu:
+        case 0x37u: case 0x17u:
+            *rd = (w >> 7) & 0x1fu;
+            return *rd != 0;
+        default:
+            return false;
+        }
+    }
+    if (size != 2) return false;
+    unsigned quad = w & 3u;
+    unsigned f3 = (w >> 13) & 7u;
+    unsigned r = (w >> 7) & 0x1fu;
+    unsigned rp = 8u + ((w >> 7) & 7u);
+    if (quad == 0u) {
+        // c.addi4spn is the only register-writing ALU op in this
+        // quadrant; the rest are loads and stores.
+        if (f3 == 0u && ((w >> 5) & 0xffu) != 0u) {
+            *rd = 8u + ((w >> 2) & 7u);
+            return true;
+        }
+        return false;
+    }
+    if (quad == 1u) {
+        switch (f3) {
+        case 0u:                       // c.addi / c.nop
+        case 1u:                       // c.addiw
+        case 2u:                       // c.li
+        case 3u:                       // c.lui, or c.addi16sp when rd==2
+            if (r == 0u) return false;
+            *rd = r;
+            return true;
+        case 4u:                       // misc-ALU on the popular set
+            *rd = rp;
+            return true;
+        default:
+            return false;              // c.j, c.beqz, c.bnez
+        }
+    }
+    // quad == 2
+    if (f3 == 0u) {                    // c.slli
+        if (r == 0u) return false;
+        *rd = r;
+        return true;
+    }
+    if (f3 == 4u) {
+        // c.mv and c.add write rd; c.jr, c.jalr and c.ebreak share the
+        // funct4 and are separated by a zero rs2.
+        unsigned rs2 = (w >> 2) & 0x1fu;
+        if (r == 0u || rs2 == 0u) return false;
+        *rd = r;
+        return true;
+    }
+    return false;                      // c.lwsp/c.ldsp, c.swsp/c.sdsp
+}
+
 unsigned riscvlint_parse_arch(const char *arch)
 {
     if (!arch) return 0;
@@ -163,6 +226,9 @@ struct riscvlint_state {
     uint8_t *targets;   // one bit per 2-byte unit
     uint8_t *relocs;    // one bit per 2-byte unit
     unsigned exts;      // extensions declared by Tag_RISCV_arch
+    csh handle;         // for the liveness walk, which must disassemble
+                        // ahead of the caller's own cursor
+    cs_insn *probe;
 };
 
 riscvlint_state *riscvlint_state_create(void)
@@ -173,6 +239,7 @@ riscvlint_state *riscvlint_state_create(void)
 void riscvlint_state_destroy(riscvlint_state *state)
 {
     if (!state) return;
+    if (state->probe) cs_free(state->probe, 1);
     free(state->targets);
     free(state->relocs);
     free(state);
@@ -206,6 +273,9 @@ bool riscvlint_state_set_section(riscvlint_state *state, csh handle,
     state->code = code;
     state->size = size;
     state->vaddr = vaddr;
+    state->handle = handle;
+    if (!state->probe) state->probe = cs_malloc(handle);
+    if (!state->probe) return false;
 
     size_t nbytes = size / 2 / 8 + 1;
     state->targets = calloc(nbytes, 1);
@@ -459,5 +529,150 @@ bool check_slli_srli_to_zext(riscvlint_state *state, const cs_insn *insn,
     snprintf(finding->replacement, sizeof finding->replacement,
              "zext.w %s, %s (%u -> 4 bytes)", rv_reg_name(rd1),
              rv_reg_name(rs1), before);
+    return true;
+}
+
+// ---- bounded liveness ----
+
+#define LIVE_BUDGET 96   // instructions examined per query
+#define LIVE_PATHS  16   // distinct path starts before giving up
+
+static unsigned cs_reg_to_num(unsigned r)
+{
+    if (r >= RISCV_REG_X0 && r <= RISCV_REG_X31)
+        return (unsigned)(r - RISCV_REG_X0);
+    return 32;   // not a general register
+}
+
+static bool insn_in_group(const cs_insn *insn, unsigned g)
+{
+    for (int i = 0; i < insn->detail->groups_count; i++)
+        if (insn->detail->groups[i] == g) return true;
+    return false;
+}
+
+// Absolute target of a relative transfer, or 0 when it has none.
+static uint64_t relative_target(const cs_insn *insn)
+{
+    if (!insn_in_group(insn, RISCV_GRP_BRANCH_RELATIVE)) return 0;
+    const cs_riscv *a = &insn->detail->riscv;
+    for (int i = 0; i < a->op_count; i++)
+        if (a->operands[i].type == RISCV_OP_IMM)
+            return (uint64_t)a->operands[i].imm;
+    return 0;
+}
+
+int riscvlint_liveness(riscvlint_state *state, uint64_t addr, unsigned rd)
+{
+    if (!state->probe) return RISCVLINT_LIVE_UNKNOWN;
+    uint64_t queue[LIVE_PATHS], seen[LIVE_PATHS];
+    int nq = 0, nseen = 0, budget = LIVE_BUDGET;
+    queue[nq++] = addr;
+
+    while (nq > 0) {
+        uint64_t at = queue[--nq];
+        bool dup = false;
+        for (int i = 0; i < nseen; i++)
+            if (seen[i] == at) dup = true;
+        if (dup) continue;
+        if (nseen >= LIVE_PATHS) return RISCVLINT_LIVE_UNKNOWN;
+        seen[nseen++] = at;
+        if (at < state->vaddr || at >= state->vaddr + state->size)
+            return RISCVLINT_LIVE_UNKNOWN;
+
+        const uint8_t *p = state->code + (at - state->vaddr);
+        size_t remain = state->size - (size_t)(at - state->vaddr);
+        uint64_t a = at;
+        for (;;) {
+            if (budget-- <= 0) return RISCVLINT_LIVE_UNKNOWN;
+            if (remain < 2 ||
+                !cs_disasm_iter(state->handle, &p, &remain, &a, state->probe))
+                return RISCVLINT_LIVE_UNKNOWN;
+            const cs_insn *in = state->probe;
+            const char *m = in->mnemonic;
+
+            cs_regs rr, rw;
+            uint8_t nr = 0, nw = 0;
+            cs_regs_access(state->handle, in, rr, &nr, rw, &nw);
+            // capstone leaves the ra-implicit link aliases writing
+            // nothing and `ret` reading nothing.
+            if ((!strcmp(m, "jal") || !strcmp(m, "jalr")) && nw == 0)
+                rw[nw++] = RISCV_REG_X1;
+            else if (!strcmp(m, "ret") && nr == 0)
+                rr[nr++] = RISCV_REG_X1;
+
+            for (int i = 0; i < nr; i++)
+                if (cs_reg_to_num(rr[i]) == rd) return RISCVLINT_LIVE_READ;
+            bool written = false;
+            for (int i = 0; i < nw; i++)
+                if (cs_reg_to_num(rw[i]) == rd) written = true;
+            if (written) break;                 // redefined before any read
+
+            bool call = insn_in_group(in, RISCV_GRP_CALL) ||
+                        !strcmp(m, "jal") || !strcmp(m, "jalr");
+            if (call) {
+                // No shortcut here for the caller-saved temporaries.
+                // That a callee cannot read t0-t6 is a property of the C
+                // ABI, not of the architecture, and riscvlint cannot tell
+                // which ABI a binary was built for: Go's runtime calling
+                // sequences pass arguments in t0 and t1, where the
+                // shortcut turned tens of thousands of argument set-ups
+                // into "dead" definitions.
+                return RISCVLINT_LIVE_UNKNOWN;
+            }
+            if (!strcmp(m, "ret")) {
+                // Which registers a return makes observable is an ABI
+                // question -- a0/a1 under the C ABI, a0-a7 under Go's,
+                // plus every callee-saved register the caller expects
+                // restored. The walk does not know which ABI it is
+                // looking at, so it declines rather than guessing. What
+                // survives is deadness proved by redefinition before
+                // any read, which holds under any convention.
+                return RISCVLINT_LIVE_UNKNOWN;
+            }
+            uint64_t t = relative_target(in);
+            bool uncond = !strcmp(m, "j") || !strcmp(m, "jr") ||
+                          !strcmp(m, "mret") || !strcmp(m, "sret");
+            if (uncond) {
+                if (!t) return RISCVLINT_LIVE_UNKNOWN;   // indirect
+                if (nq >= LIVE_PATHS) return RISCVLINT_LIVE_UNKNOWN;
+                queue[nq++] = t;
+                break;
+            }
+            if (t) {                             // conditional branch
+                if (nq >= LIVE_PATHS) return RISCVLINT_LIVE_UNKNOWN;
+                queue[nq++] = t;
+            }
+        }
+    }
+    return RISCVLINT_LIVE_DEAD;
+}
+
+bool check_dead_def(riscvlint_state *state, const cs_insn *insn,
+                    riscvlint_finding *finding)
+{
+    if (insn->size != 2 && insn->size != 4) return false;
+    uint32_t w;
+    if (!riscvlint_word_at(state, insn->address, &w)) return false;
+    unsigned rd;
+    if (!rv_pure_def(w, insn->size, &rd)) return false;
+    // sp and the thread pointer are established by convention rather
+    // than for a reader in this function; a prologue's stack adjustment
+    // is not a dead definition even where nothing reads sp again.
+    if (rd == 2 || rd == 3 || rd == 4) return false;
+    // A relocated instruction's operands are placeholders, and the
+    // sequence it belongs to is decided at link time.
+    if (riscvlint_is_relocated(state, insn->address)) return false;
+
+    if (riscvlint_liveness(state, insn->address + insn->size, rd) !=
+        RISCVLINT_LIVE_DEAD)
+        return false;
+
+    finding->title = "dead register definition";
+    finding->address = insn->address;
+    finding->insn_count = 1;
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "delete; nothing reads %s (%u bytes)", rv_reg_name(rd),
+             insn->size);
     return true;
 }

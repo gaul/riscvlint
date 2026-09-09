@@ -4,6 +4,10 @@
 // declares Zba in Tag_RISCV_arch. The companion fixture
 // slli_add_no_zba.s is the same shape without it, and must report
 // nothing.
+//
+// Each block reuses s0, so the previous block's result dies at the next
+// block's first write. check_dead_def reports those, which is correct and
+// an artefact of a synthetic sequence rather than of this check.
 
     .text
     .globl  _start

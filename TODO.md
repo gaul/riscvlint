@@ -18,7 +18,7 @@ which also records where the first figure was wrong and why.
 | 2 | Zba shift-add | 13,249 | 48,270 | **implemented** |
 | 3 | Zba `zext.w` | 18,073 | 25,672 | **implemented** |
 | 4 | redundant reloads | 10,079 | - | region-sound |
-| 5 | dead register definitions | 4,808 | 47,659 | verified on sites |
+| 5 | dead register definitions | 14,458 | 47,655 | **implemented** |
 | 6 | constant re-materialization | 4,580 | 193,398 | size test applied |
 | 7 | compare-then-branch folding | 1,978 | 21,986 | liveness applied |
 
@@ -43,37 +43,38 @@ are 0 and another 16% are 1. Compilers re-load small constants freely
 because it costs them nothing, which is exactly why the raw count is a
 bad guide. Actionable population is 4,580, not 198,221.
 
-### 2. Dead register definitions -- 47,659, of which 4,808 are clean
+### 2. Dead register definitions -- 14,458  [implemented]
 
-A pure def (`mv`, `addi`, `li`, `add`, ...) overwritten with no
-intervening read, inside one straight-line region.
+An instruction whose only effect is to write a register nothing goes on
+to read. Deleting it is free.
 
-Per language: C++ 41,255 (0.231% of its instructions), Rust 3,295
-(0.144%), Go 3,109 (0.022%).
+| corpus | findings |
+|---|---:|
+| Go | 7,876 |
+| C++ | 6,459 |
+| Rust | 123 |
 
-The `xbr` split matters more here than anywhere else. 24,352 of the
-population is dead `mv` *with a conditional branch between the def and
-the killing write*, which means the value may well be used on the other
-path -- those are candidates for path reasoning, not findings. Only 4,808
-are killed with no branch crossed, and those are what a check can act on
-today. The characteristic clean case is a frame pointer set up and never
-read:
+`check_dead_def` finds three times what `defuse` called clean (4,806),
+because the bounded liveness walk proves deadness across branches and
+jumps that a region-local redefinition test cannot follow. The commonest
+shape is a frame pointer established and never used.
 
-```
-    sd    s0,0(sp)
-    sd    ra,8(sp)
-    addi  s0,sp,16        <- dead: nothing reads s0
-    auipc a5,0x49c
-    addi  a5,a5,-1400
-    vse64.v v1,(a5)
-    ld    s0,0(sp)        <- killed here
-```
+The walk carries **no ABI assumptions**, and arriving there cost two
+rounds of false positives:
 
-Soundness: `defuse` only counts a def killed by a later write in the same
-region, so calls and side entries suppress rather than invent findings.
-The known remaining false-positive source is `ecall`, whose implicit
-reads of a0-a7 capstone does not report; there are 870 `ecall` sites in
-the whole corpus.
+* It first treated the caller-saved temporaries as unreadable across a
+  call, which is true of the C ABI. Go's runtime calling sequences pass
+  arguments in t0 and t1, so 22,452 argument set-ups in one binary were
+  reported as dead definitions.
+* It then treated a return as exposing only a0/a1. Go returns multiple
+  values in a0-a7, so return-value set-up was reported the same way.
+
+Both now answer UNKNOWN, and UNKNOWN is not a finding. What survives is
+deadness proved by redefinition before any read, which holds under any
+convention. Validated mechanically against an independent linear pass
+over the disassembly of one C++ and one Go binary: 0 false positives,
+with 75% of the C++ findings and 14% of the Go ones confirmable without
+following a branch at all.
 
 ### 3. Call pairs that fit in `jal` -- 89,860  [implemented]
 
@@ -286,7 +287,7 @@ them compressed, 18,313,847 pairs:
 |---|---|---:|---:|
 | 1 | `auipc`+`jalr` within `jal` reach | 89,804 | 121,543 |
 | 2 | redundant reloads | 5,781 | - |
-| 3 | dead register definitions | 4,528 | 44,550 |
+| 3 | dead register definitions | 6,582 | 44,546 |
 | 4 | constant re-materialization | 2,969 | 94,445 |
 | 5 | compare-then-branch folding | 1,978 | 21,890 |
 | - | Zba shift-add | 69 | 26,264 |
@@ -326,6 +327,20 @@ The shift pairs that are *not* foldable -- shift amounts other than 32,
 which are bitfield extracts -- number 42,592 on their own, more than the
 real `zext.w` and `sh#add` populations combined. Any check in this area
 has to read the shift amount, and any sizing that does not is fiction.
+
+## Extensions that share encoding space
+
+`RISCVLINT_CS_MODE` originally enabled Zcmp alongside the FD extension.
+Zcmp is mutually exclusive with Zcd and occupies the same encodings, so
+capstone read `fsd fs0,24(sp)` as `cm.mvsa01 s0,s0` -- an instruction
+that writes s0 where the real one writes no register at all. That put two
+false positives into the dead-definition check, both of the form "s0 is
+redefined here" where nothing of the sort happened.
+
+The corpus settles it: `Tag_RISCV_arch` names `zcd1p0` and never names
+zcmp. Zcmp is out of the mode in the checker and in both mining tools.
+Nothing ever failed to decode -- the wrong reading was a valid
+instruction, which is why the "0 undecodable" figure never caught it.
 
 ## Raw fields versus decoded values
 

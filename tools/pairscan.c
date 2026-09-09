@@ -103,8 +103,7 @@ typedef struct {
                  CS_MODE_RISCV_ZBA |                                       \
                  CS_MODE_RISCV_ZBB | CS_MODE_RISCV_ZBC |                   \
                  CS_MODE_RISCV_ZBS | CS_MODE_RISCV_ZBKB |                  \
-                 CS_MODE_RISCV_ZBKC | CS_MODE_RISCV_ZBKX |                 \
-                 CS_MODE_RISCV_ZCMP_ZCMT_ZCE)
+                 CS_MODE_RISCV_ZBKC | CS_MODE_RISCV_ZBKX)
 
 #define HASH_BITS 22
 #define HASH_SIZE (1u << HASH_BITS)

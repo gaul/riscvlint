@@ -11,6 +11,10 @@
 // at a realistic address instead. And `jalr rd, 0(rd)` assembles to the
 // two-byte c.jalr, which this check does not claim, so every jalr below
 // carries a non-zero offset.
+//
+// The auipc in each negative writes a register the next block
+// overwrites, so check_dead_def reports some of them; that is correct and
+// an artefact of a synthetic sequence.
 
     .text
     .globl  _start

@@ -6,15 +6,31 @@ slli + add foldable to shNadd at offset: 0x6: -> sh2add s0, s0, t2 (4 -> 4 bytes
   slli s0, s0, 2
   add s0, s0, t2
 
+dead register definition at offset: 0x8: -> delete; nothing reads s0 (2 bytes) (1 instructions)
+  add s0, s0, t2
+
 slli + add foldable to shNadd at offset: 0xa: -> sh1add s0, t2, t2 (6 -> 4 bytes) (2 instructions)
   slli s0, t2, 1
+  add s0, s0, t2
+
+dead register definition at offset: 0xe: -> delete; nothing reads s0 (2 bytes) (1 instructions)
   add s0, s0, t2
 
 slli + add foldable to shNadd at offset: 0x10: -> sh3add s0, t2, t2 (6 -> 4 bytes) (2 instructions)
   slli s0, t2, 3
   add s0, s0, t2
 
+dead register definition at offset: 0x14: -> delete; nothing reads s0 (2 bytes) (1 instructions)
+  add s0, s0, t2
+
+dead register definition at offset: 0x1e: -> delete; nothing reads s0 (2 bytes) (1 instructions)
+  add s0, s0, s0
+
+dead register definition at offset: 0x36: -> delete; nothing reads s0 (2 bytes) (1 instructions)
+  add s0, s0, t2
+
 Optimization opportunities by type:
+       5  dead register definition
        4  slli + add foldable to shNadd
 
-4 optimization opportunities in 23 instructions
+9 optimization opportunities in 23 instructions

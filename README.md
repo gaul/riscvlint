@@ -56,6 +56,19 @@ written next is decided by the corpus rather than by intuition.
   only x8-x15. `sext.w` is the same shape with `srai` and a different
   rewrite, which the check rejects rather than folds.
 
+* **dead register definition** -- an instruction whose only effect is to
+  write a register nothing goes on to read; deleting it is free. Unlike
+  the others this cannot be decided from a pair, so it runs a bounded
+  liveness walk over every path leaving the definition and reports only
+  what that proves dead. The commonest shape is a frame pointer
+  established and never used.
+
+  Population: 14,458 sites -- Go 7,876, C++ 6,459, Rust 123 -- and the
+  first check here that fires meaningfully on C++. The walk makes no ABI
+  assumptions: what a call may read and what a return exposes both differ
+  between the C and Go conventions, and riscvlint cannot tell which it is
+  looking at, so both answer "unknown" rather than guessing.
+
 ## Selecting the target
 
 `-m <name>` pins the extensions the checks may assume, and may be

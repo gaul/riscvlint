@@ -97,8 +97,7 @@ typedef struct {
                  CS_MODE_RISCV_ZBA |                                       \
                  CS_MODE_RISCV_ZBB | CS_MODE_RISCV_ZBC |                   \
                  CS_MODE_RISCV_ZBS | CS_MODE_RISCV_ZBKB |                  \
-                 CS_MODE_RISCV_ZBKC | CS_MODE_RISCV_ZBKX |                 \
-                 CS_MODE_RISCV_ZCMP_ZCMT_ZCE)
+                 CS_MODE_RISCV_ZBKC | CS_MODE_RISCV_ZBKX)
 
 #define NSLOT 96  // 1-31 GPR, 32+ FP, 64+ vector
 
@@ -384,13 +383,6 @@ enum { LIVE_DEAD, LIVE_READ, LIVE_UNKNOWN };
 #define LIVE_BUDGET 96   // instructions examined per query
 #define LIVE_PATHS  16   // distinct path starts before giving up
 
-// t0-t2 and t3-t6 are caller-saved and are never argument registers, so
-// a call both clobbers them and cannot read them.
-static bool slot_is_temp(int s)
-{
-    return (s >= 5 && s <= 7) || (s >= 28 && s <= 31);
-}
-
 // Absolute target of a relative branch/jump, or 0 if it has none.
 static uint64_t branch_target(const cs_insn *insn)
 {
@@ -441,13 +433,16 @@ static int liveness(csh handle, cs_insn *probe, const uint8_t *code,
 
             const char *m = probe->mnemonic;
             if (is_call(probe)) {
-                if (slot_is_temp(slot)) break;   // clobbered, unreadable
-                return LIVE_UNKNOWN;             // may be an argument
+                // No shortcut for the caller-saved temporaries: that a
+                // callee cannot read t0-t6 holds for the C ABI, not for
+                // every ABI, and Go passes arguments in t0/t1.
+                return LIVE_UNKNOWN;
             }
             if (!strcmp(m, "ret")) {
-                // a0/a1 leave the function carrying the return value.
-                if (slot == 10 || slot == 11) return LIVE_READ;
-                break;
+                // Which registers a return exposes is ABI-specific --
+                // a0/a1 under the C ABI, a0-a7 under Go's -- so the walk
+                // declines rather than guessing.
+                return LIVE_UNKNOWN;
             }
             if (is_cond_branch(probe)) {
                 uint64_t t = branch_target(probe);

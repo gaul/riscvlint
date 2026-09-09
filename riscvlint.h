@@ -20,15 +20,18 @@
 #include <stdint.h>
 
 // Every extension a distro riscv64 binary can plausibly contain; the
-// vendor sets are excluded because they reuse encoding space. Kept
+// vendor sets are excluded because they reuse encoding space, and so is
+// Zcmp: it is mutually exclusive with Zcd and occupies the same
+// encodings, so enabling both makes capstone read `fsd fs0,24(sp)` as
+// `cm.mvsa01 s0,s0` -- an instruction that writes s0 where the real one
+// writes no register at all. The corpus declares zcd and not zcmp. Kept
 // identical to the mining tools so the checker and the measurements see
 // the same instruction stream.
 #define RISCVLINT_CS_MODE                                                  \
     (CS_MODE_RISCV64 | CS_MODE_RISCV_C | CS_MODE_RISCV_FD |                \
      CS_MODE_RISCV_A | CS_MODE_RISCV_V | CS_MODE_RISCV_ZBA |               \
      CS_MODE_RISCV_ZBB | CS_MODE_RISCV_ZBC | CS_MODE_RISCV_ZBS |           \
-     CS_MODE_RISCV_ZBKB | CS_MODE_RISCV_ZBKC | CS_MODE_RISCV_ZBKX |        \
-     CS_MODE_RISCV_ZCMP_ZCMT_ZCE)
+     CS_MODE_RISCV_ZBKB | CS_MODE_RISCV_ZBKC | CS_MODE_RISCV_ZBKX)
 
 // ---- raw encoding helpers ----
 
@@ -61,6 +64,12 @@ bool rv_decode_slli(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
                     unsigned *shamt);
 bool rv_decode_add(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
                    unsigned *rs2);
+
+// True when `w` is an instruction whose only effect is to write one
+// general register: the ALU opcodes and their compressed spellings.
+// Deleting such an instruction is observationally free once its result
+// is known to be dead, which is what makes it a candidate.
+bool rv_pure_def(uint32_t w, unsigned size, unsigned *rd);
 
 // srli, in either spelling. The compressed form is CB-format and can
 // only name x8-x15, so `srli a6,a6,32` stays four bytes where
@@ -137,6 +146,22 @@ bool riscvlint_is_branch_target(const riscvlint_state *state, uint64_t addr);
 
 // True when the four bytes at `addr` carry a relocation.
 bool riscvlint_is_relocated(const riscvlint_state *state, uint64_t addr);
+
+// Liveness of `slot` on every path leaving `addr`, bounded. DEAD only
+// when every reachable path redefines the register before reading it;
+// READ when a read is found; UNKNOWN for anything ambiguous -- an
+// exhausted budget, an indirect jump, a branch out of the section, or a
+// call that might read the register as an argument. Only DEAD licenses a
+// rewrite.
+//
+// This is the one place a check consults capstone's register model
+// rather than the raw encoding, because answering it by raw decode would
+// mean decoding every instruction form in the ISA. The model's known
+// RISC-V gap -- no register write on the ra-implicit link aliases, no
+// read of ra by `ret` -- is corrected here, and any jal/jalr is treated
+// as a call regardless of the group capstone assigns it.
+enum { RISCVLINT_LIVE_DEAD, RISCVLINT_LIVE_READ, RISCVLINT_LIVE_UNKNOWN };
+int riscvlint_liveness(riscvlint_state *state, uint64_t addr, unsigned rd);
 
 // Reads the 32-bit word at `addr`, or false if it lies outside the
 // section or would straddle its end.
@@ -218,5 +243,23 @@ bool check_slli_add_to_shadd(riscvlint_state *state, const cs_insn *insn,
 // Go binaries. See TODO.md.
 bool check_slli_srli_to_zext(riscvlint_state *state, const cs_insn *insn,
                              riscvlint_finding *finding);
+
+// An instruction whose only effect is to write a register nothing goes
+// on to read. Deleting it is free. The commonest shape in the corpus is
+// a frame pointer established and never used:
+//
+//     sd    s0,0(sp)
+//     addi  s0,sp,16      <- nothing reads s0
+//     ...
+//     ld    s0,0(sp)
+//
+// Unlike the first three checks this one cannot be decided from the pair
+// alone; it needs the liveness walk, and reports only what the walk
+// proves dead on every path. UNKNOWN is not a finding.
+//
+// Needs no extension and is the first check here that fires on C++ code,
+// where the earlier three find almost nothing.
+bool check_dead_def(riscvlint_state *state, const cs_insn *insn,
+                    riscvlint_finding *finding);
 
 #endif  // RISCVLINT_H
