@@ -27,13 +27,13 @@ which also records where the first figure was wrong and why.
 | 1 | `auipc`+`jalr` within `jal` reach | 292,299 | 801,519 | **implemented** |
 | 2 | Zba shift-add | 13,249 | 48,270 | **implemented** |
 | 3 | Zba `zext.w` | 18,073 | 25,672 | **implemented** |
-| 4 | redundant reloads | 10,079 | - | region-sound |
+| 4 | redundant reloads | 5,028 | 10,079 | **implemented** |
 | 5 | dead register definitions | 14,458 | 47,655 | **implemented** |
-| 6 | constant re-materialization | 4,580 | 193,398 | size test applied |
+| 6 | constant re-materialization | 10,998 | 193,398 | **implemented** |
 | 7 | compare-then-branch folding | 1,978 | 21,986 | liveness applied |
 | 8 | frame-pointer teardown over a static frame | 112,401 | 133,670 | **implemented** |
 | 9 | extension the producer already guarantees | 8,515 | - | **implemented** |
-| 10 | dead store to a frame slot | 15,199 | - | candscan-sized |
+| 10 | dead store to a frame slot | 4,376 | 15,199 | **implemented** |
 | 11 | Zcb-compressible 4-byte encodings | 30,648 | 351,198 | **implemented** |
 | 12 | `addi` folded into a memory offset | 6,344 | ~54,000 shapes | **implemented** |
 
@@ -411,6 +411,94 @@ instruction mix rather than a shortfall.
 Zcb is the part of this that is not settled by that argument, and it gets
 its own section below.
 
+## The windowed memory table, and the three checks it serves  [implemented]
+
+`check_redundant_reload`, `check_dead_store` and `check_const_remat` all
+need the same thing: a region-local record of what is already in a
+register and what is already in a frame slot. `riscvlint_state_observe`
+owns it and the driver calls it once per instruction **after** the
+checks, so each of the three judges the instruction under the cursor
+against the table as it stood before it.
+
+Measured by the checks themselves:
+
+| corpus | reload | dead store | re-materialization |
+|---|---:|---:|---:|
+| C++ | 1,972 | 203 | 8,970 |
+| Go | 2,837 | 4,172 | 1,457 |
+| Rust | 219 | 1 | 571 |
+| **total** | **5,028** | **4,376** | **10,998** |
+
+### What the mining tools had wrong
+
+The entries these replace said 10,079 reloads and 15,199 dead stores.
+The checks find half and a third of that, and the difference is not a
+precondition being applied -- it is three rules `defuse` and `candscan`
+did not have. Each was found by reading the disassembly around a
+finding, and none by any test:
+
+* **A load that overwrites its own base.** `ld a1,0(a1)` walks a
+  pointer, so the `ld a2,0(a1)` after it reads somewhere else entirely.
+  The record was keyed on the base *register*, and that register no
+  longer names the address the first load used. 67 of ripgrep's first
+  151 reload findings.
+* **A conditional branch between two stores.** "Dead" means the
+  overwrite is certain to happen before anyone reads the slot, and on
+  the taken path it does not happen at all -- the shape is
+  `sd a1,-624(s0); beqz a1,L; ...; sd a0,-624(s0)`. 32 of ripgrep's
+  first 37 dead-store findings. Held values are unaffected: the
+  instruction that reads one is reached by falling through, and if it can
+  also be branched to it is a side entry the window already drops at.
+* **A memory access the decoder cannot place.** The vector loads share
+  LOAD-FP with `flw` and `fld` and are told apart by a width field
+  `rv_decode_mem` does not model, so a `vle64.v` through an address
+  taken with `addi a0,s0,-272` was read as touching nothing at all. It
+  reads the frame slot a store had just written. Anything that touches
+  memory and cannot be placed now drops the whole window.
+
+All three are fixtures now. The lesson is the one this file keeps
+learning from the other end: a mining tool's figure is an upper bound
+even when it looks like a population, and the way to find out is to read
+the code under a finding rather than to trust the count.
+
+What survives was checked against an independent pass over objdump's
+output -- all 83 of ripgrep's reload findings, and each of its
+dead-store findings by hand.
+
+### Re-materialization went up, and the corpus is why
+
+4,580 became 10,998, which is the one figure here that grew. 6,107 of it
+is libxul, which was not in the corpus when the first number was taken;
+C++ without it is 2,863 against the 2,969 first measured for C++ and
+Rust together.
+
+The rule changed too, and in the direction that reports less. `defuse`
+asked whether the constant fits `c.li`; the check first asked whether
+the *encoding* was four bytes, which are the same question wherever the
+assembler selects RVC and not the same question in Go, whose assembler
+does not. Keyed on width it reported 41,813 Go sites whose constants all
+fit `c.li` -- and on a toolchain that left the `li` wide to begin with,
+rewriting it as `mv` saves nothing. The magnitude is what decides.
+
+### What the window will not claim
+
+Reloads carry a caveat no binary can resolve: a load from a volatile or
+device address must be repeated, and nothing in the encoding says which
+loads those are. Dead stores carry the mirror of it, which is why only
+sp- and fp-relative slots are counted -- a heap address may alias
+anything.
+
+Two accesses through the same base with disjoint byte ranges provably
+miss each other, and that is the only aliasing question the window
+answers positively. Through different bases it answers nothing: any
+store at all ends every held value, and any load through another base
+takes away every claim that a store was unread.
+
+Store-to-load forwarding -- `sd a0,8(sp)` then `ld a1,8(sp)` becoming
+`mv a1,a0` -- is a real redundancy this window could see and does not
+claim. It is a different rewrite from collapsing two loads and nothing
+here has measured it.
+
 ### 12. `addi` folded into a memory offset -- 6,344  [implemented]
 
 `addi rd,rs,imm1` + `<load|store> rt,imm2(rd)` is one access at
@@ -719,40 +807,30 @@ second instruction writes it is one dominant idiom plus nothing.
 
 # Remaining candidates, ranked
 
-Eight checks are implemented. What is left, with every precondition that
-can be applied without writing the check applied:
+Eleven checks are implemented. What is left:
 
 | # | candidate | population | machinery needed |
 |---|---|---:|---|
-| 1 | dead store to a frame slot | 15,199 | windowed memory table (new) |
-| 2 | redundant reloads | 9,030 | the same table |
-| 3 | constant re-materialization | 4,580 | the same table + size test |
-| 4 | compare-then-branch | 1,942 | liveness walk (exists) |
-| 5 | missed compression, base C | 93 | RVC encodability pass (new) |
+| 1 | compare-then-branch | 1,942 | liveness walk (exists) |
+| 2 | missed compression, base C | 93 | RVC encodability pass (new) |
 
-Everything that needed nothing new is now written. What is left splits
-cleanly: three of the five want the same windowed memory table -- a
-region-local record of what is already in a register, invalidated by
-stores, calls and fences -- and building it once serves all three.
+The windowed memory table is built and the three checks that wanted it
+are written, so what is left is two entries that share nothing with each
+other. Compare-then-branch needs no new machinery at all; base-C
+compression needs an encodability pass over the whole C extension and is
+worth writing only for Go-built binaries.
 
-### 1-3
+### 1-2
 
-Reloads, dead stores and re-materialization all want the same new machinery: a
-region-local table of what is already in a register, invalidated by
-stores, calls and fences. Reloads carry a soundness caveat no binary can
-resolve -- a load from a volatile or device address is not redundant, and
-nothing in the encoding says which it is. Dead stores carry the mirror of
-it, which is why only sp- and fp-relative slots are counted: a heap
-address may alias anything.
+Compare-then-branch needs nothing new; the walk the dead-definition
+check uses answers it, and 1,942 is what it answers.
 
-Compare-then-branch needs nothing new; the walk from check 4 answers it,
-and 1,942 is what it answers.
-
-Missed compression is Go's alone. The two RVC rules that a shape token
-can decide showed GCC and LLVM leaving essentially nothing on the table
-(93 of 1,815,725 `mv`, 0 of 1,084,536 in-range `li`), so a check here is
-worth writing only for Go-built binaries, and sizing it means an
-encodability pass over the whole C extension.
+Missed compression in the base C extension is Go's alone. The two RVC
+rules a shape token can decide showed GCC and LLVM leaving essentially
+nothing on the table (93 of 1,815,725 `mv`, 0 of 1,084,536 in-range
+`li`), so a check here is worth writing only for Go-built binaries, and
+sizing it means an encodability pass over the whole C extension rather
+than the handful of forms Zcb needed.
 
 # Ranked for C++ and Rust specifically
 
@@ -761,37 +839,42 @@ them compressed, 53,690,808 pairs:
 
 | # | opportunity | actionable | raw pattern |
 |---|---|---:|---:|
-| 1 | frame-pointer teardown over a static frame | 111,445 | 133,670 |
-| 2 | `auipc`+`jalr` within `jal` reach | 89,804 | 121,543 |
-| 3 | dead register definitions | 6,582 | 44,546 |
-| 4 | redundant reloads | 5,781 | - |
-| 5 | extension the producer already guarantees | 4,546 | - |
-| 6 | constant re-materialization | 2,969 | 94,445 |
-| 7 | compare-then-branch folding | 1,978 | 21,890 |
-| 8 | dead store to a frame slot | 1,852 | - |
-| - | Zbb/Zbs/Zcb idioms, all of them | 521 | - |
+| 1 | `auipc`+`jalr` within `jal` reach | 292,243 | 121,543+ |
+| 2 | frame-pointer teardown over a static frame | 112,401 | 133,670 |
+| 3 | dead register definitions | 11,989 | 44,546 |
+| 4 | constant re-materialization | 9,541 | 94,445 |
+| 5 | extension the producer already guarantees | 6,922 | - |
+| 6 | `addi` folded into a memory offset | 3,351 | ~29,000 |
+| 7 | redundant reloads | 2,191 | 5,781 |
+| 8 | compare-then-branch folding | 1,978 | 21,890 |
+| 9 | Zcb-compressible, target declares Zcb | 886 | - |
+| 10 | dead store to a frame slot | 204 | 1,852 |
+| - | Zba shift-add | 232 | 26,264 |
+| - | Zbb/Zbs/Zcb idioms on an RVA23 target | 521 | - |
 | - | move coalescing | 79 | 24,346 |
-| - | Zba shift-add | 69 | 26,264 |
-| - | Zcb-shrinkable, target declares Zcb | 581 | - |
+| - | Zba `zext.w` | 54 | 2 |
 | - | missed compression, base C (provable) | 93 | - |
-| - | Zba `zext.w` | 2 | 2 |
 | - | equal shift pair foldable to `andi` | 0 | 0 |
+
+Every implemented row is the check's own count over the current corpus,
+so the table moved when libxul and uutils joined it and again when each
+check landed. The `raw pattern` column is what a shape scan saw, where
+one was taken; row 8 is the only entry left whose figure is still a
+mining tool's.
 
 The `redundant mask after lbu` row is gone from this table: it was 142
 here and is now part of candidate 5, which subsumes it at 659 in this
 cohort once the window is a region rather than a pair.
 
-Items 1 and 5 are the two toolchains taking turns. Candidate 1 is
+Items 2 and 5 are the two toolchains taking turns. Candidate 2 is
 100,716 libLLVM and 0 libQt6Core -- clang and rustc restore sp from the
-frame pointer unconditionally, GCC does not. Candidate 5 is 3,433
+frame pointer unconditionally, GCC does not. Candidate 5 is 4,336
 Qt6Core against 817 libLLVM -- GCC re-extends a value its own load
 already extended, clang mostly does not. Neither would have been visible
 in a corpus with one C++ compiler in it.
 
-Item 2 is entirely Rust -- C++ contributes 0 of its 679,812 call pairs --
-and against Rust's own 2,285,426 instructions it is 1.3%, which makes it
-a large finding for Rust binaries specifically rather than a small one
-overall.
+Item 1 is 171,665 Rust and 120,578 C++, all of the latter in libxul; see
+"What the second corpus changed" for why C++ was once recorded at 0.
 
 "actionable" applies each family's real precondition: the target being
 inside `jal`'s reach, the killing write not sitting past a conditional

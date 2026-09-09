@@ -126,16 +126,17 @@ bool rv_mem_is_store(rv_mem_kind k);
 bool rv_mem_is_fp(rv_mem_kind k);
 const char *rv_mem_name(rv_mem_kind k);
 
-// A load or store, in the four-byte spelling or in a quadrant-0
-// compressed one. `data` is the loaded or stored register, in its own
-// file: a GPR number for the integer forms and an f-register number for
-// the floating-point ones.
+// A load or store, in the four-byte spelling or in either compressed
+// quadrant. `data` is the loaded or stored register, in its own file: a
+// GPR number for the integer forms and an f-register number for the
+// floating-point ones.
 //
-// The quadrant-2 forms -- `c.ldsp` and its family -- are deliberately
-// not decoded. Their base is always sp, so the only way one could pair
-// with a preceding address computation is if that computation wrote sp,
-// and a check that folds an address into an access has to refuse sp as
-// a destination anyway. Skipping them costs nothing.
+// The quadrant-2 forms -- `c.ldsp` and its family, whose base is always
+// sp -- are decoded because the windowed memory table cannot do without
+// them: a frame slot stored twice is spelled `c.sdsp` far more often
+// than it is spelled `sd`. They are inert for the check that folds an
+// address into an access, which refuses sp as a destination and so can
+// never pair with one.
 bool rv_decode_mem(uint32_t w, unsigned size, rv_mem_kind *kind,
                    unsigned *data, unsigned *base, int64_t *off);
 
@@ -288,6 +289,31 @@ int riscvlint_liveness(riscvlint_state *state, uint64_t addr, unsigned rd);
 bool riscvlint_word_at(const riscvlint_state *state, uint64_t addr,
                        uint32_t *out);
 
+// ---- the windowed memory and constant table ----
+//
+// Three checks -- redundant reload, dead store, constant
+// re-materialization -- need the same thing: a region-local record of
+// what is already in a register and what is already in a frame slot.
+// None of them can be decided from a pair, which is why the distances
+// cluster at 4-15 instructions and why no pair scan ever saw them.
+//
+// The driver calls this once per instruction, **after** the checks have
+// run, because each of the three judges the instruction under the cursor
+// against the table as it stood before it. Recording an instruction also
+// clears the table when the *next* address is a side entry, which is
+// what keeps a check from reading a value across a branch into the
+// middle of a region.
+//
+// The two other stateful checks carry a scalar or two and update it
+// inline. This one is a table three checks read, so it gets a single
+// owner rather than three writers racing to keep it consistent.
+void riscvlint_state_observe(riscvlint_state *state, const cs_insn *insn);
+
+// Drops the whole window. The driver calls it where it cannot keep the
+// record honest -- an undecodable halfword, which it resynchronises past
+// without knowing what it skipped.
+void riscvlint_state_drop_window(riscvlint_state *state);
+
 // ---- findings ----
 
 typedef struct {
@@ -427,6 +453,34 @@ bool check_zcb_compressible(riscvlint_state *state, const cs_insn *insn,
 // population. Everything else asks the walk, and takes only DEAD.
 bool check_base_add_to_offset(riscvlint_state *state, const cs_insn *insn,
                               riscvlint_finding *finding);
+
+// The same (base, displacement, width, signedness) loaded twice with
+// nothing in between that could have changed it. The second load is a
+// `mv` from wherever the first one put the value.
+//
+// This one carries a soundness caveat no binary can resolve: a load from
+// a volatile or device address must be repeated, and nothing in the
+// encoding says which loads those are. The window is otherwise strict --
+// any store, call, fence, atomic or system instruction ends it, as does
+// a write to either the base or the register holding the value.
+bool check_redundant_reload(riscvlint_state *state, const cs_insn *insn,
+                            riscvlint_finding *finding);
+
+// A frame slot stored twice with nothing reading it in between. The
+// store analogue of a dead register definition, and it is limited to sp-
+// and fp-relative slots for the mirror of the reload caveat: a heap
+// address may alias anything, and nothing in the encoding says it does
+// not.
+bool check_dead_store(riscvlint_state *state, const cs_insn *insn,
+                      riscvlint_finding *finding);
+
+// A constant materialized into a register while the same value is still
+// live in another, where the duplicate takes four bytes and the `mv`
+// that would replace it takes two. Where the duplicate already fits
+// `c.li` the rewrite saves nothing and trades an independent instruction
+// for a dependent one, so it is not reported.
+bool check_const_remat(riscvlint_state *state, const cs_insn *insn,
+                       riscvlint_finding *finding);
 
 bool check_dead_def(riscvlint_state *state, const cs_insn *insn,
                     riscvlint_finding *finding);

@@ -102,6 +102,60 @@ written next is decided by the corpus rather than by intuition.
   pointer. Ubuntu builds with `-fno-omit-frame-pointer` deliberately, and
   the frame pointer stays.
 
+* **redundant reload** -- the same (base, displacement, width,
+  signedness) loaded twice with nothing in between that could have
+  changed it. The second load is a `mv` from wherever the first put the
+  value.
+
+  This one carries a caveat no binary can resolve: a load from a volatile
+  or device address must be repeated, and nothing in the encoding says
+  which loads those are. The window is otherwise strict -- any store,
+  call, fence, atomic or system instruction ends it, as does a write to
+  either the base or the register holding the value.
+
+* **dead store to a frame slot** -- the same slot stored twice with
+  nothing reading it in between. The store analogue of a dead register
+  definition, limited to sp- and fp-relative slots for the mirror of the
+  reload caveat: a heap address may alias anything.
+
+* **constant re-materialization** -- a constant built into a register
+  while the same value is still live in another, where the constant is
+  too wide for `c.li`. Inside `c.li`'s range the materialization is two
+  bytes and so is the `mv`, so the rewrite would trade an instruction
+  that depends on nothing for one that depends on another register.
+
+  The test is the constant's magnitude, not the encoding's width. Those
+  agree wherever the assembler selects RVC, and Go's does not: keyed on
+  width this reported 41,813 sites in the Go corpus whose constants all
+  fit `c.li`, and on a toolchain that left the `li` wide to begin with
+  the rewrite saves nothing.
+
+  These three read one table, filled by `riscvlint_state_observe`, which
+  the driver calls once per instruction *after* the checks -- each of
+  them judges the instruction under the cursor against the table as it
+  stood before it. None can be decided from a pair; the distances cluster
+  at 4-15 instructions, which is why no pair scan ever saw them.
+
+  The first corpus run produced three classes of false positive, each
+  found by reading the disassembly around a finding rather than by any
+  test, and each now a fixture:
+
+  - A load that overwrites its own base. `ld a1,0(a1)` walks a pointer,
+    so the following `ld a2,0(a1)` reads somewhere else entirely. 67 of
+    ripgrep's first 151 reload findings.
+  - A conditional branch between the two stores. "Dead" means the
+    overwrite is certain, and on the taken path it does not happen. 32 of
+    ripgrep's first 37 dead-store findings.
+  - A memory access the decoder cannot place. The vector loads share
+    LOAD-FP with `flw` and `fld` and are told apart by a width field the
+    decoder does not model, so a `vle64.v` through an address taken with
+    `addi a0,s0,-272` was read as touching nothing. It reads the frame
+    slot a store just wrote.
+
+  What survives is checked against an independent pass over objdump's
+  output: all 83 of ripgrep's reload findings, and every one of its
+  dead-store findings by hand.
+
 * **base add foldable into memory offset** -- `addi rd,rs,imm1` followed by
   `<load|store> rt,imm2(rd)` is one access at `imm1+imm2` from `rs`
   whenever the sum fits the 12-bit field and nothing goes on to read

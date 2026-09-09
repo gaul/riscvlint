@@ -998,11 +998,20 @@ static void test_decode_mem(void)
     CHECK(rv_decode_mem(0x85e8u, 2, &k, &data, &base, &off));       // c.lh a0,2(a1)
     CHECK(k == RV_MEM_LH && off == 2);
 
-    // Quadrant 2 is not claimed. Its base is always sp, so the only
-    // address computation it could pair with is one that writes sp, and
-    // the check refuses sp as a destination anyway.
-    CHECK(!rv_decode_mem(0x6522u, 2, &k, &data, &base, &off));      // c.ldsp a0,8(sp)
-    CHECK(!rv_decode_mem(0xe42au, 2, &k, &data, &base, &off));      // c.sdsp a0,8(sp)
+    // Quadrant 2, whose base is always sp and whose register field is
+    // the full five bits. The windowed memory table cannot do without
+    // these: a frame slot stored twice is spelled c.sdsp far more often
+    // than sd. They are inert for the fold check, which refuses sp as a
+    // destination and so can never pair with one.
+    CHECK(rv_decode_mem(0x6522u, 2, &k, &data, &base, &off));       // c.ldsp a0,8(sp)
+    CHECK(k == RV_MEM_LD && data == 10 && base == 2 && off == 8);
+    CHECK(rv_decode_mem(0xe42au, 2, &k, &data, &base, &off));       // c.sdsp a0,8(sp)
+    CHECK(k == RV_MEM_SD && data == 10 && base == 2 && off == 8);
+    // Its offsets reach further than quadrant 0's and are assembled out
+    // of fields in a different order, which is its own chance to be
+    // wrong: this one is 504, the largest c.sdsp can express.
+    CHECK(rv_decode_mem(0xffaau, 2, &k, &data, &base, &off));       // c.sdsp a0,504(sp)
+    CHECK(k == RV_MEM_SD && data == 10 && base == 2 && off == 504);
 
     // Not memory at all.
     CHECK(!rv_decode_mem(0x00b50533u, 4, &k, &data, &base, &off));  // add a0,a0,a1
@@ -1060,6 +1069,139 @@ static void test_decode_base_add(void)
     CHECK(!rv_decode_base_add(0x0085079bu, 4, &rd, &rs1, &imm)); // addiw a5,a0,8
 }
 
+// ---- the windowed memory and constant table ----
+
+// These three read a table the driver fills, so unlike every other
+// runner here this one has to call riscvlint_state_observe -- and after
+// the checks, which is the order the driver uses and the order the
+// answers depend on.
+static int run_window(csh handle, riscvlint_check_fn fn, const uint8_t *code,
+                      size_t len, uint64_t vaddr, riscvlint_finding *out)
+{
+    static uint8_t buf[256];
+    memcpy(buf, code, len);
+    riscvlint_state *state = riscvlint_state_create();
+    if (!state) return -1;
+    int fired = 0;
+    if (riscvlint_state_set_section(state, handle, buf, len, vaddr)) {
+        cs_insn *insn = cs_malloc(handle);
+        const uint8_t *p = buf;
+        size_t remain = len;
+        uint64_t addr = vaddr;
+        while (insn && remain >= 2 &&
+               cs_disasm_iter(handle, &p, &remain, &addr, insn)) {
+            riscvlint_finding f;
+            memset(&f, 0, sizeof f);
+            if (fn(state, insn, &f)) {
+                if (out && !fired) *out = f;
+                fired++;
+            }
+            riscvlint_state_observe(state, insn);
+        }
+        if (insn) cs_free(insn, 1);
+    }
+    riscvlint_state_destroy(state);
+    return fired;
+}
+
+static void test_window_checks(csh handle)
+{
+    riscvlint_finding f;
+
+    // The same address loaded twice with only arithmetic between them.
+    static const uint8_t reload[] = {
+        0x88, 0x65,                    // c.ld a0,8(a1)
+        0x05, 0x06,                    // c.addi a2,1
+        0x94, 0x65,                    // c.ld a3,8(a1)
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_redundant_reload, reload, sizeof reload,
+                     0x1000, &f) == 1);
+    CHECK(f.address == 0x1004 && f.insn_count == 1);
+    CHECK(strstr(f.replacement, "mv a3, a0") != NULL);
+
+    // A store in between. Proving it lands elsewhere needs more than the
+    // encoding gives, so every held value goes.
+    static const uint8_t stored[] = {
+        0x88, 0x65,                    // c.ld a0,8(a1)
+        0x98, 0xe2,                    // c.sd a4,0(a3)
+        0x94, 0x65,                    // c.ld a3,8(a1)
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_redundant_reload, stored, sizeof stored,
+                     0x1000, NULL) == 0);
+
+    // A frame slot stored twice with nothing reading it.
+    static const uint8_t deadst[] = {
+        0x2a, 0xe8,                    // c.sdsp a0,16(sp)
+        0x05, 0x06,                    // c.addi a2,1
+        0x3a, 0xe8,                    // c.sdsp a4,16(sp)
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_dead_store, deadst, sizeof deadst,
+                     0x1000, &f) == 1);
+    CHECK(f.address == 0x1000 && f.insn_count == 1);
+    CHECK(strstr(f.replacement, "16(sp) is overwritten") != NULL);
+
+    // A load from the same slot is the read that keeps it alive.
+    static const uint8_t readback[] = {
+        0x2a, 0xe8,                    // c.sdsp a0,16(sp)
+        0xc2, 0x67,                    // c.ldsp a5,16(sp)
+        0x3a, 0xe8,                    // c.sdsp a4,16(sp)
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_dead_store, readback, sizeof readback,
+                     0x1000, NULL) == 0);
+
+    // A constant materialized twice, both four bytes wide.
+    static const uint8_t remat[] = {
+        0x93, 0x07, 0x20, 0x4d,        // li a5,1234
+        0x05, 0x06,                    // c.addi a2,1
+        0x13, 0x08, 0x20, 0x4d,        // li a6,1234
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_const_remat, remat, sizeof remat,
+                     0x1000, &f) == 1);
+    CHECK(f.address == 0x1006);
+    CHECK(strstr(f.replacement, "mv a6, a5") != NULL);
+
+    // The load overwrites its own base, so the address the second one
+    // computes is not the address the first one used. This was a false
+    // positive on the first corpus run -- `ld a1,0(a1)` walks a pointer
+    // -- and 67 of ripgrep's 151 reload findings were it.
+    static const uint8_t walk[] = {
+        0x8c, 0x61,                    // c.ld a1,0(a1)
+        0x90, 0x61,                    // c.ld a2,0(a1)
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_redundant_reload, walk, sizeof walk,
+                     0x1000, NULL) == 0);
+
+    // A conditional branch between the two stores. "Dead" means the
+    // overwrite is certain, and on the taken path it does not happen at
+    // all. 32 of ripgrep's 37 first dead-store findings were this.
+    static const uint8_t skipped[] = {
+        0x2a, 0xe8,                    // c.sdsp a0,16(sp)
+        0x11, 0xe2,                    // c.beqz a2,.+4
+        0x3a, 0xe8,                    // c.sdsp a4,16(sp)
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_dead_store, skipped, sizeof skipped,
+                     0x1000, NULL) == 0);
+
+    // The same value in a two-byte c.li. Replacing it with c.mv saves
+    // nothing and makes an independent instruction depend on another
+    // register, so it is not reported.
+    static const uint8_t narrow[] = {
+        0xbd, 0x47,                    // c.li a5,15
+        0x05, 0x06,                    // c.addi a2,1
+        0x3d, 0x48,                    // c.li a6,15
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_const_remat, narrow, sizeof narrow,
+                     0x1000, NULL) == 0);
+}
+
 int main(void)
 {
     csh handle;
@@ -1088,6 +1230,7 @@ int main(void)
     test_sp_restore_check(handle);
     test_redundant_ext_check(handle);
     test_zcb_check(handle);
+    test_window_checks(handle);
 
     cs_close(&handle);
     if (failures) {

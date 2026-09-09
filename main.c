@@ -268,6 +268,9 @@ static const riscvlint_check_fn checks[] = {
     check_redundant_extension,
     check_zcb_compressible,
     check_base_add_to_offset,
+    check_redundant_reload,
+    check_dead_store,
+    check_const_remat,
 };
 
 static void scan_section(csh handle, riscvlint_state *state,
@@ -305,6 +308,9 @@ static void scan_section(csh handle, riscvlint_state *state,
     uint64_t addr = vaddr;
     while (remain >= 2) {
         if (!cs_disasm_iter(handle, &p, &remain, &addr, insn)) {
+            // Resynchronising past a halfword we could not read means we
+            // do not know what it did to memory.
+            riscvlint_state_drop_window(state);
             p += 2; remain -= 2; addr += 2;
             continue;
         }
@@ -315,6 +321,9 @@ static void scan_section(csh handle, riscvlint_state *state,
             if (checks[i](state, insn, &f))
                 report(&f, handle, state, base, map_len, eh);
         }
+        // After the checks: the three that read the window judge this
+        // instruction against the table as it stood before it.
+        riscvlint_state_observe(state, insn);
     }
     cs_free(insn, 1);
 }

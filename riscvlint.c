@@ -355,10 +355,51 @@ bool rv_decode_mem(uint32_t w, unsigned size, rv_mem_kind *kind,
         }
     }
     if (size != 2) return false;
-    // Quadrant 0 only: every form here names both registers with a
-    // three-bit field, so x8-x15, and carries a scaled unsigned offset.
-    if ((w & 0x3u) != 0) return false;
     unsigned f3 = (w >> 13) & 0x7u;
+    if ((w & 0x3u) == 2u) {
+        // Quadrant 2: the base is sp and the register field is the full
+        // five bits. These are the frame accesses, so the window that
+        // looks for a slot stored twice cannot do without them.
+        unsigned r = (w >> 7) & 0x1fu, rs2 = (w >> 2) & 0x1fu;
+        unsigned b12 = (w >> 12) & 1u;
+        *base = 2;
+        switch (f3) {
+        case 1:  // c.fldsp: uimm[5]=12, uimm[4:3]=6:5, uimm[8:6]=4:2
+            *kind = RV_MEM_FLD; *data = r;
+            *off = (b12 << 5) | (((w >> 5) & 0x3u) << 3) |
+                   (((w >> 2) & 0x7u) << 6);
+            return true;
+        case 2:  // c.lwsp: uimm[5]=12, uimm[4:2]=6:4, uimm[7:6]=3:2
+            if (r == 0) return false;
+            *kind = RV_MEM_LW; *data = r;
+            *off = (b12 << 5) | (((w >> 4) & 0x7u) << 2) |
+                   (((w >> 2) & 0x3u) << 6);
+            return true;
+        case 3:  // c.ldsp: uimm[5]=12, uimm[4:3]=6:5, uimm[8:6]=4:2
+            if (r == 0) return false;
+            *kind = RV_MEM_LD; *data = r;
+            *off = (b12 << 5) | (((w >> 5) & 0x3u) << 3) |
+                   (((w >> 2) & 0x7u) << 6);
+            return true;
+        case 5:  // c.fsdsp: uimm[5:3]=12:10, uimm[8:6]=9:7
+            *kind = RV_MEM_FSD; *data = rs2;
+            *off = (((w >> 10) & 0x7u) << 3) | (((w >> 7) & 0x7u) << 6);
+            return true;
+        case 6:  // c.swsp: uimm[5:2]=12:9, uimm[7:6]=8:7
+            *kind = RV_MEM_SW; *data = rs2;
+            *off = (((w >> 9) & 0xfu) << 2) | (((w >> 7) & 0x3u) << 6);
+            return true;
+        case 7:  // c.sdsp: uimm[5:3]=12:10, uimm[8:6]=9:7
+            *kind = RV_MEM_SD; *data = rs2;
+            *off = (((w >> 10) & 0x7u) << 3) | (((w >> 7) & 0x7u) << 6);
+            return true;
+        default:
+            return false;
+        }
+    }
+    // Quadrant 0: every form here names both registers with a three-bit
+    // field, so x8-x15, and carries a scaled unsigned offset.
+    if ((w & 0x3u) != 0) return false;
     unsigned rd_ = 8u + ((w >> 2) & 0x7u), rs1_ = 8u + ((w >> 7) & 0x7u);
     // The word and doubleword forms share two immediate layouts.
     unsigned off_w = (((w >> 10) & 0x7u) << 3) | (((w >> 6) & 1u) << 2) |
@@ -728,6 +769,28 @@ bool rv_ends_region(uint32_t w, unsigned size)
     return false;
 }
 
+// ---- the windowed memory and constant table ----
+
+// A location the region has touched. One record serves two questions
+// that have different lifetimes, so each carries its own flag: `held`
+// says the value at (base, disp) is still in `data`, which is what makes
+// a second load redundant; `unread` says a store put it there and
+// nothing has read it since, which is what makes that store dead.
+#define RVL_SLOTS 24
+typedef struct {
+    bool held;
+    bool unread;
+    unsigned base;
+    int64_t disp;
+    unsigned width;
+    rv_mem_kind kind;    // lb and lbu are the same width and not the same
+                         // value, so a reload of one after the other is
+                         // not redundant
+    unsigned data;
+    uint64_t addr;
+    unsigned size;       // encoded bytes of the access that made the record
+} rvl_slot;
+
 struct riscvlint_state {
     const uint8_t *code;
     size_t size;
@@ -756,6 +819,16 @@ struct riscvlint_state {
     // region boundary, so a guarantee is only read on the straight-line
     // path that established it.
     unsigned guarantees[32];
+
+    // The windowed memory and constant table. See
+    // riscvlint_state_observe.
+    struct {
+        rvl_slot slots[RVL_SLOTS];
+        int nslots;
+        bool const_live[32];
+        int64_t const_val[32];
+        uint64_t const_addr[32];
+    } win;
 };
 
 riscvlint_state *riscvlint_state_create(void)
@@ -803,6 +876,7 @@ bool riscvlint_state_set_section(riscvlint_state *state, csh handle,
     state->handle = handle;
     memset(&state->fp, 0, sizeof state->fp);
     memset(state->guarantees, 0, sizeof state->guarantees);
+    memset(&state->win, 0, sizeof state->win);
     if (!state->probe) state->probe = cs_malloc(handle);
     if (!state->probe) return false;
 
@@ -1338,6 +1412,234 @@ bool check_redundant_extension(riscvlint_state *state, const cs_insn *insn,
     return found;
 }
 
+// ---- the windowed memory and constant table ----
+
+static unsigned mem_width(rv_mem_kind k)
+{
+    int i = mem_index(k);
+    return i >= 0 ? rv_mem_table[i].width : 0;
+}
+
+// Two frame-relative accesses through the same base provably miss each
+// other when their byte ranges do not overlap. Through different bases
+// nothing is provable, so the caller treats that as "may alias".
+static bool ranges_overlap(int64_t a, unsigned aw, int64_t b, unsigned bw)
+{
+    return a < b + (int64_t)bw && b < a + (int64_t)aw;
+}
+
+// True when the instruction reads or writes memory, whether or not
+// rv_decode_mem can say where. The vector loads and stores share LOAD-FP
+// and STORE-FP with `flw` and `fld` and are told apart by a width field
+// the decoder does not model, so they land here -- and they matter: a
+// `vle64.v` through an address taken with `addi a0,s0,-272` reads a
+// frame slot that a store just wrote, which is exactly the claim this
+// window would otherwise make wrongly.
+static bool touches_memory(uint32_t w, unsigned size)
+{
+    if (size == 4) {
+        unsigned op = RV_OPCODE(w);
+        return op == 0x03u || op == 0x07u || op == 0x23u || op == 0x27u ||
+               op == 0x2fu;
+    }
+    if (size != 2) return false;
+    unsigned q = w & 0x3u, f3 = (w >> 13) & 0x7u;
+    if (q == 0) return f3 != 0;                    // all but c.addi4spn
+    if (q == 2) return f3 != 0 && f3 != 4;         // all but c.slli, c.jr/mv
+    return false;
+}
+
+static bool is_cond_branch_raw(uint32_t w, unsigned size)
+{
+    if (size == 4) return RV_OPCODE(w) == 0x63u;
+    if (size != 2) return false;
+    unsigned f3 = (w >> 13) & 0x7u;         // c.beqz, c.bnez
+    return (w & 0x3u) == 1u && (f3 == 6 || f3 == 7);
+}
+
+// A fence, an atomic or a system instruction can make any location
+// change under us, and a call can do anything at all.
+static bool ends_memory_window(uint32_t w, unsigned size)
+{
+    if (rv_ends_region(w, size)) return true;
+    if (size != 4) return false;
+    unsigned op = RV_OPCODE(w);
+    return op == 0x0fu || op == 0x2fu || op == 0x73u;  // fence, AMO, system
+}
+
+void riscvlint_state_drop_window(riscvlint_state *state)
+{
+    state->win.nslots = 0;
+    memset(state->win.const_live, 0, sizeof state->win.const_live);
+}
+
+static rvl_slot *slot_for(riscvlint_state *state, unsigned base, int64_t disp,
+                          rv_mem_kind kind)
+{
+    for (int i = 0; i < state->win.nslots; i++) {
+        rvl_slot *sl = &state->win.slots[i];
+        if (sl->base == base && sl->disp == disp && sl->kind == kind)
+            return sl;
+    }
+    if (state->win.nslots < RVL_SLOTS)
+        return &state->win.slots[state->win.nslots++];
+    return NULL;                    // window full: stop recording, stay sound
+}
+
+// The value a constant materialization leaves in its destination, or
+// false when the instruction is not one.
+static bool decode_const(uint32_t w, unsigned size, unsigned *rd, int64_t *val)
+{
+    if (size == 4) {
+        if (RV_OPCODE(w) == 0x13u && ((w >> 12) & 0x7u) == 0 &&
+            ((w >> 15) & 0x1fu) == 0) {                 // li = addi rd,x0,imm
+            *rd = (w >> 7) & 0x1fu;
+            *val = sign_extend((uint64_t)(w >> 20) & 0xfffu, 12);
+            return *rd != 0;
+        }
+        if (RV_OPCODE(w) == 0x37u) {                    // lui
+            *rd = (w >> 7) & 0x1fu;
+            *val = sign_extend(w & 0xfffff000u, 32);
+            return *rd != 0;
+        }
+        return false;
+    }
+    if (size != 2) return false;
+    if ((w & 0xe003u) == 0x4001u) {                     // c.li
+        *rd = (w >> 7) & 0x1fu;
+        *val = ci_imm6(w);
+        return *rd != 0;
+    }
+    if ((w & 0xe003u) == 0x6001u) {                     // c.lui (not addi16sp)
+        *rd = (w >> 7) & 0x1fu;
+        *val = ci_imm6(w) << 12;
+        return *rd != 0 && *rd != 2 && ci_imm6(w) != 0;
+    }
+    return false;
+}
+
+void riscvlint_state_observe(riscvlint_state *state, const cs_insn *insn)
+{
+    uint32_t w;
+    if (insn->size > 4 || !riscvlint_word_at(state, insn->address, &w)) {
+        riscvlint_state_drop_window(state);
+        return;
+    }
+
+    // 1. Register writes first, so a load's own destination is cleared
+    //    before the load records itself into it.
+    cs_regs rr, rw;
+    uint8_t nr = 0, nw = 0;
+    if (cs_regs_access(state->handle, insn, rr, &nr, rw, &nw) != CS_ERR_OK) {
+        riscvlint_state_drop_window(state);
+        return;
+    }
+    for (int i = 0; i < nw; i++) {
+        unsigned n = cs_reg_to_num(rw[i]);
+        if (n >= 32) continue;
+        state->win.const_live[n] = false;
+        for (int j = 0; j < state->win.nslots; j++) {
+            rvl_slot *sl = &state->win.slots[j];
+            if (sl->data == n) sl->held = false;
+            // Losing the base loses the address, and with it any claim
+            // about what is or is not at that address.
+            if (sl->base == n) sl->held = sl->unread = false;
+        }
+    }
+
+    // 2. The access itself.
+    rv_mem_kind kind;
+    unsigned data, base;
+    int64_t off;
+    bool decoded = rv_decode_mem(w, insn->size, &kind, &data, &base, &off);
+    if (!decoded && touches_memory(w, insn->size)) {
+        // Something touched memory and we cannot say where. Every claim
+        // in the window is about a place, so none of them survive.
+        riscvlint_state_drop_window(state);
+        return;
+    }
+    if (decoded) {
+        unsigned width = mem_width(kind);
+        bool store = rv_mem_is_store(kind);
+        bool fp = rv_mem_is_fp(kind);
+        for (int j = 0; j < state->win.nslots; j++) {
+            rvl_slot *sl = &state->win.slots[j];
+            if (store) {
+                // Any store at all ends every held value. Proving two
+                // addresses distinct needs more than the encoding gives,
+                // and the reload rewrite is only worth having if it is
+                // certainly right.
+                sl->held = false;
+                // A store that lands on the same bytes supersedes an
+                // unread one; anywhere else it neither reads nor
+                // overwrites, so the earlier claim stands.
+                if (sl->base == base && sl->disp == off && sl->width == width)
+                    sl->unread = false;
+            } else if (sl->unread) {
+                // A load may be the read that keeps the earlier store
+                // alive. Through the same base a disjoint range provably
+                // is not; through any other base nothing is provable.
+                if (sl->base != base ||
+                    ranges_overlap(sl->disp, sl->width, off, width))
+                    sl->unread = false;
+            }
+        }
+        // A load that overwrites its own base leaves the record
+        // meaningless: the address it used was the old value of that
+        // register, and nothing can name it any more. `ld a1,0(a1)`
+        // followed by `ld a2,0(a1)` reads two different places.
+        bool base_written = false;
+        for (int i = 0; i < nw; i++)
+            if (cs_reg_to_num(rw[i]) == base) base_written = true;
+        rvl_slot *sl = base_written ? NULL : slot_for(state, base, off, kind);
+        if (sl) {
+            sl->base = base; sl->disp = off; sl->kind = kind;
+            sl->width = width; sl->data = data; sl->addr = insn->address;
+            sl->size = insn->size;
+            // A store leaves the value in a register too, but forwarding
+            // it to a later load is a different rewrite than collapsing
+            // two loads, and one this corpus has never measured. Only
+            // loads arm `held`.
+            sl->held = !store && !fp;
+            sl->unread = store && (base == 2 || base == 8);
+        }
+    }
+
+    // 3. Constants, after the register invalidation above.
+    unsigned crd;
+    int64_t cval;
+    if (decode_const(w, insn->size, &crd, &cval)) {
+        state->win.const_live[crd] = true;
+        state->win.const_val[crd] = cval;
+        state->win.const_addr[crd] = insn->address;
+    }
+
+    // 4. A conditional branch takes away every claim that a store is
+    //    dead, and only those. "Dead" means the overwrite is certain to
+    //    happen before anyone reads the slot, and a branch is a path on
+    //    which it does not happen at all -- the shape is
+    //    `sd a1,-624(s0); beqz a1,L; ...; sd a0,-624(s0)`, and on the
+    //    taken path the first store is the one that survives.
+    //
+    //    A held value is not affected. The instruction that would read
+    //    it is reached by falling through, so everything recorded here
+    //    ran; and if it can also be reached by a branch, it is a side
+    //    entry and step 5 drops the window at it.
+    if (is_cond_branch_raw(w, insn->size))
+        for (int j = 0; j < state->win.nslots; j++)
+            state->win.slots[j].unread = false;
+
+    // 5. Anything that can change memory or control behind our back.
+    if (ends_memory_window(w, insn->size)) {
+        riscvlint_state_drop_window(state);
+        return;
+    }
+    // 6. A side entry on the next instruction means what follows is not
+    //    reached only from here.
+    if (riscvlint_is_branch_target(state, insn->address + insn->size))
+        riscvlint_state_drop_window(state);
+}
+
 // ---- a four-byte encoding Zcb spells in two ----
 
 bool check_zcb_compressible(riscvlint_state *state, const cs_insn *insn,
@@ -1425,6 +1727,118 @@ bool check_base_add_to_offset(riscvlint_state *state, const cs_insn *insn,
              rv_mem_is_fp(kind) ? fp_reg_names[data] : rv_reg_name(data),
              sum, rv_reg_name(rs1), before, after);
     return true;
+}
+
+// ---- the three checks the window serves ----
+
+// `mv rd, rs` is two bytes whenever neither register is x0, which both
+// of these rewrites can rely on.
+static unsigned mv_bytes(void) { return 2; }
+
+bool check_redundant_reload(riscvlint_state *state, const cs_insn *insn,
+                            riscvlint_finding *finding)
+{
+    if (insn->size != 2 && insn->size != 4) return false;
+    uint32_t w;
+    if (!riscvlint_word_at(state, insn->address, &w)) return false;
+    rv_mem_kind kind;
+    unsigned data, base;
+    int64_t off;
+    if (!rv_decode_mem(w, insn->size, &kind, &data, &base, &off)) return false;
+    if (rv_mem_is_store(kind) || rv_mem_is_fp(kind)) return false;
+    if (data == 0) return false;
+    if (riscvlint_is_relocated(state, insn->address)) return false;
+
+    for (int i = 0; i < state->win.nslots; i++) {
+        const rvl_slot *sl = &state->win.slots[i];
+        if (!sl->held || sl->kind != kind) continue;
+        if (sl->base != base || sl->disp != off) continue;
+        if (sl->data == 0 || sl->data == data) return false;  // same register
+        finding->title = "redundant reload";
+        finding->address = insn->address;
+        finding->insn_count = 1;
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "mv %s, %s; loaded at 0x%" PRIx64 " (%u -> %u bytes)",
+                 rv_reg_name(data), rv_reg_name(sl->data), sl->addr,
+                 insn->size, mv_bytes());
+        return true;
+    }
+    return false;
+}
+
+bool check_dead_store(riscvlint_state *state, const cs_insn *insn,
+                      riscvlint_finding *finding)
+{
+    if (insn->size != 2 && insn->size != 4) return false;
+    uint32_t w;
+    if (!riscvlint_word_at(state, insn->address, &w)) return false;
+    rv_mem_kind kind;
+    unsigned data, base;
+    int64_t off;
+    if (!rv_decode_mem(w, insn->size, &kind, &data, &base, &off)) return false;
+    if (!rv_mem_is_store(kind)) return false;
+    if (base != 2 && base != 8) return false;
+    if (riscvlint_is_relocated(state, insn->address)) return false;
+
+    unsigned width = mem_width(kind);
+    for (int i = 0; i < state->win.nslots; i++) {
+        const rvl_slot *sl = &state->win.slots[i];
+        if (!sl->unread) continue;
+        // Only an exact overwrite proves the earlier store dead. A wider
+        // store covering it would too, but the corpus has none and an
+        // untested rule is worth less than the sites it would add.
+        if (sl->base != base || sl->disp != off || sl->width != width)
+            continue;
+        if (riscvlint_is_branch_target(state, insn->address)) return false;
+        finding->title = "dead store to a frame slot";
+        finding->address = sl->addr;
+        finding->insn_count = 1;
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "delete; %" PRId64 "(%s) is overwritten at 0x%" PRIx64
+                 " (%u bytes)", off, rv_reg_name(base), insn->address,
+                 sl->size);
+        return true;
+    }
+    return false;
+}
+
+bool check_const_remat(riscvlint_state *state, const cs_insn *insn,
+                       riscvlint_finding *finding)
+{
+    if (insn->size != 4) return false;
+    uint32_t w;
+    if (!riscvlint_word_at(state, insn->address, &w)) return false;
+    unsigned rd;
+    int64_t val;
+    if (!decode_const(w, insn->size, &rd, &val)) return false;
+    // The rewrite only saves anything when the constant is too wide for
+    // `c.li`. Inside that range the materialization is two bytes and so
+    // is the `mv`, so the trade is an instruction that depends on
+    // nothing for one that depends on another register -- a small
+    // pessimization, and 97% of the raw population.
+    //
+    // The test is the constant's magnitude, not the encoding's width.
+    // Those agree wherever the assembler selects RVC, and Go's does not:
+    // keyed on width this reported 41,813 sites in the Go corpus whose
+    // constants all fit c.li, where the rewrite would save nothing on
+    // any toolchain that left the `li` wide in the first place.
+    if (val >= -32 && val <= 31) return false;
+    if (rd == 0 || rd == 2 || rd == 3 || rd == 4) return false;
+    if (riscvlint_is_relocated(state, insn->address)) return false;
+
+    for (unsigned r = 1; r < 32; r++) {
+        if (r == rd || !state->win.const_live[r]) continue;
+        if (state->win.const_val[r] != val) continue;
+        finding->title = "constant re-materialization";
+        finding->address = insn->address;
+        finding->insn_count = 1;
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "mv %s, %s; %" PRId64 " set at 0x%" PRIx64 " (4 -> %u bytes)",
+                 rv_reg_name(rd), rv_reg_name(r), val,
+                 state->win.const_addr[r], mv_bytes());
+        return true;
+    }
+    return false;
 }
 
 bool check_dead_def(riscvlint_state *state, const cs_insn *insn,

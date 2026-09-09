@@ -1,0 +1,33 @@
+redundant reload at offset: 0x4: -> mv a3, a0; loaded at 0x0 (2 -> 2 bytes) (1 instructions)
+  ld a3, 8(a1)
+
+dead store to a frame slot at offset: 0x6: -> delete; 16(sp) is overwritten at 0xa (2 bytes) (1 instructions)
+  sd a0, 0x10(sp)
+
+constant re-materialization at offset: 0x12: -> mv a6, a5; 1234 set at 0xc (4 -> 2 bytes) (1 instructions)
+  li a6, 0x4d2
+
+dead store to a frame slot at offset: 0x16: -> delete; 32(sp) is overwritten at 0x1a (2 bytes) (1 instructions)
+  sd a0, 0x20(sp)
+
+dead register definition at offset: 0x2a: -> delete; nothing reads a0 (2 bytes) (1 instructions)
+  li a0, 0
+
+call pair foldable to jal at offset: 0x48: -> jal ra, 0x86 (2 instructions)
+  auipc ra, 0
+  jalr 0x3e(ra)
+
+dead register definition at offset: 0x52: -> delete; nothing reads a5 (2 bytes) (1 instructions)
+  li a5, 7
+
+dead register definition at offset: 0x56: -> delete; nothing reads a6 (2 bytes) (1 instructions)
+  li a6, 7
+
+Optimization opportunities by type:
+       3  dead register definition
+       2  dead store to a frame slot
+       1  call pair foldable to jal
+       1  constant re-materialization
+       1  redundant reload
+
+8 optimization opportunities in 57 instructions
