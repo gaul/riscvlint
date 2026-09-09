@@ -32,7 +32,9 @@
 //   remat : li/lui of a value already live in another register, split by
 //           whether the duplicate already fits c.li (no size win) or not
 //   br    : beqz/bnez on a value produced by slt/sltu/xor/sub/seqz/snez,
-//           which a blt/bgeu/beq/bne would have computed and branched on
+//           which a blt/bgeu/beq/bne would have computed and branched on,
+//           split by whether the condition register is provably dead on
+//           both successors (fold), provably read (live), or neither (unk)
 //
 // Usage: defuse [-e CAT -n MAX] <binary>...
 //        (CAT: ext load mov dead reload remat br)
@@ -204,6 +206,7 @@ static constrec consts[48];
 static int nconsts;
 // Slot holding a materialized condition, and how it was produced. The
 // flagless stand-in for armlint's flags_def_slot.
+static csh probe_handle;
 static int cond_slot = -1;
 static long cond_idx = -1;
 static char cond_mn[32];
@@ -359,6 +362,109 @@ static uint8_t *mark_branch_targets(csh handle, const uint8_t *code,
     return bits;
 }
 
+// ---- bounded liveness, for the compare-then-branch category ----
+//
+// Folding `slt rd,a,b` + `bnez rd,L` into `blt a,b,L` only removes an
+// instruction if rd is dead on every path leaving the branch. defuse
+// scans linearly and cannot see the taken path, so this walks it: a
+// bounded breadth-first search from both successors, answering DEAD only
+// when every path redefines rd (or discards it) before reading it.
+//
+// Everything ambiguous answers UNKNOWN rather than guessing: an
+// exhausted budget, an indirect jump, a branch out of the section, or a
+// call that might read rd as an argument. UNKNOWN is counted separately
+// from LIVE so the split between "provably not foldable" and "not
+// provable either way" stays visible.
+
+enum { LIVE_DEAD, LIVE_READ, LIVE_UNKNOWN };
+
+#define LIVE_BUDGET 96   // instructions examined per query
+#define LIVE_PATHS  16   // distinct path starts before giving up
+
+// t0-t2 and t3-t6 are caller-saved and are never argument registers, so
+// a call both clobbers them and cannot read them.
+static bool slot_is_temp(int s)
+{
+    return (s >= 5 && s <= 7) || (s >= 28 && s <= 31);
+}
+
+// Absolute target of a relative branch/jump, or 0 if it has none.
+static uint64_t branch_target(const cs_insn *insn)
+{
+    const cs_riscv *a = &insn->detail->riscv;
+    for (int i = 0; i < a->op_count; i++)
+        if (a->operands[i].type == RISCV_OP_IMM)
+            return (uint64_t)a->operands[i].imm;
+    return 0;
+}
+
+static int liveness(csh handle, cs_insn *probe, const uint8_t *code,
+                    size_t size, uint64_t vaddr, const uint64_t *starts,
+                    int nstarts, int slot)
+{
+    uint64_t queue[LIVE_PATHS], seen[LIVE_PATHS];
+    int nq = 0, nseen = 0, budget = LIVE_BUDGET;
+    for (int i = 0; i < nstarts && nq < LIVE_PATHS; i++)
+        queue[nq++] = starts[i];
+
+    while (nq > 0) {
+        uint64_t addr = queue[--nq];
+        bool dup = false;
+        for (int i = 0; i < nseen; i++)
+            if (seen[i] == addr) dup = true;
+        if (dup) continue;
+        if (nseen >= LIVE_PATHS) return LIVE_UNKNOWN;
+        seen[nseen++] = addr;
+        if (addr < vaddr || addr >= vaddr + size) return LIVE_UNKNOWN;
+
+        const uint8_t *p = code + (addr - vaddr);
+        size_t remain = size - (size_t)(addr - vaddr);
+        uint64_t a = addr;
+        for (;;) {
+            if (budget-- <= 0) return LIVE_UNKNOWN;
+            if (remain < 2 ||
+                !cs_disasm_iter(handle, &p, &remain, &a, probe))
+                return LIVE_UNKNOWN;
+
+            cs_regs rr, rw; uint8_t nr = 0, nw = 0;
+            cs_regs_access(handle, probe, rr, &nr, rw, &nw);
+            fix_implicit_ra(probe, rr, &nr, rw, &nw);
+            for (int i = 0; i < nr; i++)
+                if (reg_slot(rr[i]) == slot) return LIVE_READ;
+            bool written = false;
+            for (int i = 0; i < nw; i++)
+                if (reg_slot(rw[i]) == slot) written = true;
+            if (written) break;          // redefined before any read
+
+            const char *m = probe->mnemonic;
+            if (is_call(probe)) {
+                if (slot_is_temp(slot)) break;   // clobbered, unreadable
+                return LIVE_UNKNOWN;             // may be an argument
+            }
+            if (!strcmp(m, "ret")) {
+                // a0/a1 leave the function carrying the return value.
+                if (slot == 10 || slot == 11) return LIVE_READ;
+                break;
+            }
+            if (is_cond_branch(probe)) {
+                uint64_t t = branch_target(probe);
+                if (!t) return LIVE_UNKNOWN;
+                if (nq >= LIVE_PATHS) return LIVE_UNKNOWN;
+                queue[nq++] = t;
+                continue;                        // and fall through
+            }
+            if (uncond_transfer(probe)) {
+                uint64_t t = branch_target(probe);
+                if (!t) return LIVE_UNKNOWN;     // jr/ret-like: indirect
+                if (nq >= LIVE_PATHS) return LIVE_UNKNOWN;
+                queue[nq++] = t;
+                break;
+            }
+        }
+    }
+    return LIVE_DEAD;
+}
+
 static int load_size(const char *m)
 {
     if (!strcmp(m, "lb") || !strcmp(m, "lbu")) return 1;
@@ -373,7 +479,10 @@ static void scan_section(csh handle, const char *path, const uint8_t *code,
 {
     uint8_t *bits = mark_branch_targets(handle, code, size, vaddr);
     cs_insn *insn = cs_malloc(handle);
-    if (!insn) { free(bits); return; }
+    // The liveness walk disassembles ahead of the main cursor, so it gets
+    // its own handle rather than interleaving iterator state on this one.
+    cs_insn *probe = cs_malloc(probe_handle);
+    if (!insn || !probe) { free(bits); return; }
     const uint8_t *p = code;
     size_t remain = size;
     uint64_t addr = vaddr;
@@ -452,8 +561,16 @@ static void scan_section(csh handle, const char *path, const uint8_t *code,
             a->operands[0].type == RISCV_OP_REG) {
             int s = reg_slot(a->operands[0].reg);
             if (s >= 0 && s == cond_slot) {
+                uint64_t starts[2] = { insn->address + insn->size,
+                                       branch_target(insn) };
+                int live = starts[1]
+                    ? liveness(probe_handle, probe, code, size, vaddr,
+                               starts, 2, s)
+                    : LIVE_UNKNOWN;
                 char key[96];
-                snprintf(key, sizeof key, "br|%s->%s", cond_mn, mn);
+                snprintf(key, sizeof key, "br|%s->%s|%s", cond_mn, mn,
+                         live == LIVE_DEAD ? "fold" :
+                         live == LIVE_READ ? "live" : "unk");
                 bump(key, idx - cond_idx);
                 if (example_cat && !strcmp(example_cat, "br") &&
                     example_printed < example_max) {
@@ -620,6 +737,7 @@ static void scan_section(csh handle, const char *path, const uint8_t *code,
             region_reset();
     }
     cs_free(insn, 1);
+    cs_free(probe, 1);
     free(bits);
 }
 
@@ -708,9 +826,15 @@ int main(int argc, char **argv)
         return 2;
     }
     cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
+    if (cs_open(CS_ARCH_RISCV, RV_MODE, &probe_handle) != CS_ERR_OK) {
+        fprintf(stderr, "capstone: cs_open failed\n");
+        return 2;
+    }
+    cs_option(probe_handle, CS_OPT_DETAIL, CS_OPT_ON);
     for (; argi < argc; argi++)
         scan_file(handle, argv[argi]);
     cs_close(&handle);
+    cs_close(&probe_handle);
 
     size_t n = 0;
     for (size_t i = 0; i < HS; i++)

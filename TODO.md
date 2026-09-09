@@ -20,7 +20,7 @@ which also records where the first figure was wrong and why.
 | 4 | redundant reloads | 10,079 | - | region-sound |
 | 5 | dead register definitions | 4,808 | 47,659 | verified on sites |
 | 6 | constant re-materialization | 4,580 | 193,398 | size test applied |
-| ? | compare-then-branch folding | ? | 21,986 | **precondition not applied** |
+| 7 | compare-then-branch folding | 1,978 | 21,986 | liveness applied |
 
 ### 6. Constant re-materialization -- 4,580 of 193,398
 
@@ -90,29 +90,50 @@ The C++ zero is the whole point: libLLVM's text segment is far larger
 than `jal`'s reach, so every one of its 679,812 call pairs is forced.
 The Rust population is a linker-relaxation finding, not a compiler one.
 
-### Compare-then-branch folding -- 21,986 pattern sites, population unknown
+### 7. Compare-then-branch folding -- 1,978 of 21,986
 
 `slt`/`sltu`/`xor`/`sub` producing a condition into a GPR, then
 `beqz`/`bnez` on it, where one `blt`/`bgeu`/`beq`/`bne` would do both.
-This is the flagless analogue of armlint's `cmp #0` check. Almost all of
-it is C++ (20,951); Go contributes 96.
+The flagless analogue of armlint's `cmp #0` check.
 
-This is **not sized**. The fold only removes an instruction if the
-condition register is dead after the branch, and `defuse` does not check
-that. Spot checks say the failure rate is high:
+Two filters separate the population from the pattern. The fold only
+removes an instruction if the condition register is dead on *both*
+successors, which a linear scan cannot answer -- the taken path is
+elsewhere. `defuse` now runs a bounded breadth-first liveness walk from
+both successors, answering `fold` only when every reachable path
+redefines the register before reading it, `live` when a read is found,
+and `unk` when anything is ambiguous (budget exhausted, indirect jump,
+branch out of section, or a call that might read it as an argument):
 
-* `xor->beqz`/`bnez` (7,550 in C++/Rust) is dominated by the stack-canary
-  idiom -- `ld a5,0(s2); xor a5,a5,a4; li a4,0; beqz a5`. `beq a5,a4`
-  folds the compare, but the `li a4,0` that scrubs the canary has to run
-  on both paths, so the rewrite is not free.
-* `sub->beqz`/`bnez` (11,585, the largest producer) frequently needs the
-  difference afterwards: `sub s10,s10,s11; beqz s10; add s8,s10,a3`.
+| verdict | pooled | share |
+|---|---:|---:|
+| `live` -- provably not foldable | 11,384 | 51.8% |
+| `unk` -- not provable either way | 8,374 | 38.1% |
+| `fold` | 2,228 | 10.1% |
 
-Only the reg-reg producers can fold at all -- `slt`, `sltu`, `xor`,
-`sub` -- since RISC-V has no compare-immediate-and-branch, so the
-`slti`/`sltiu`/`xori` rows (196 between them) are out regardless. Adding
-a post-branch liveness test to `defuse` is the next measurement to make;
-until then this family has no number worth ranking.
+Then only the reg-reg producers can fold at all, since RISC-V has no
+compare-immediate-and-branch; `slti`/`sltiu`/`xori` account for 250 of
+the `fold` verdicts and are not candidates. That leaves **1,978**:
+
+| producer | count |
+|---|---:|
+| `sltu` | 1,608 |
+| `seqz` | 131 |
+| `snez` | 114 |
+| `sub` | 99 |
+| `xor` | 23 |
+
+The two verdicts confirm what the shapes suggested. `sub->bnez` is 10,957
+`live`: the difference is usually needed after the branch
+(`sub s10,s10,s11; beqz s10; add s8,s10,a3`). `xor->bnez` is 6,564
+`unk`, almost all of it the stack-canary idiom, which ends in
+`jal __stack_chk_fail` -- and since the canary sits in an argument
+register rather than a caller-saved temporary, the walk correctly refuses
+to decide. Go contributes 0 of the 1,978.
+
+The liveness walk is validated against hand-built cases including one
+where the register is read only on the taken path, which is exactly what
+a linear scan misses.
 
 ### 5. Zba shift-add (`sh1add`/`sh2add`/`sh3add`) -- 19,933
 
@@ -197,7 +218,7 @@ them compressed, 18,313,847 pairs:
 | 2 | redundant reloads | 5,781 | - |
 | 3 | dead register definitions | 4,528 | 44,550 |
 | 4 | constant re-materialization | 2,969 | 94,445 |
-| ? | compare-then-branch folding | ? | 21,890 |
+| 5 | compare-then-branch folding | 1,978 | 21,890 |
 | - | Zba shift-add | 262 | 26,264 |
 | - | redundant mask after `lbu` | 142 | 50,998 |
 | - | missed compression (provable) | 93 | - |
