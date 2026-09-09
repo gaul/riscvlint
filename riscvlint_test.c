@@ -132,6 +132,21 @@ static void test_arch_gate(void)
     // No attributes at all: nothing is known, and DECLARED stays clear.
     CHECK(riscvlint_parse_arch(NULL) == 0);
 
+    // -m names: extensions, profiles, and a rejection.
+    unsigned m = 0;
+    CHECK(riscvlint_parse_ext_name("zba", &m) && m == RISCVLINT_EXT_ZBA);
+    CHECK(riscvlint_parse_ext_name("zbb", &m) && m == RISCVLINT_EXT_ZBB);
+    CHECK(riscvlint_parse_ext_name("zbs", &m) && m == RISCVLINT_EXT_ZBS);
+    // rva20 is the baseline: a valid name that mandates none of the
+    // extensions gated here, which is how -m rva20 silences them.
+    CHECK(riscvlint_parse_ext_name("rva20", &m) && m == 0);
+    CHECK(riscvlint_parse_ext_name("rva22", &m) &&
+          m == (RISCVLINT_EXT_ZBA | RISCVLINT_EXT_ZBB | RISCVLINT_EXT_ZBS));
+    CHECK(riscvlint_parse_ext_name("rva23", &m) &&
+          m == (RISCVLINT_EXT_ZBA | RISCVLINT_EXT_ZBB | RISCVLINT_EXT_ZBS));
+    CHECK(!riscvlint_parse_ext_name("zbq", &m));
+    CHECK(!riscvlint_parse_ext_name("", &m));
+
     riscvlint_state *st = riscvlint_state_create();
     riscvlint_state_set_extensions(st, e);
     CHECK(riscvlint_may_use(st, RISCVLINT_EXT_ZBA));

@@ -117,6 +117,14 @@ unsigned riscvlint_state_extensions(const riscvlint_state *state);
 // True unless the object positively declares an arch without `ext`.
 bool riscvlint_may_use(const riscvlint_state *state, unsigned ext);
 
+// One -m argument: an extension name (zba, zbb, zbs) or a profile name
+// (rva20, rva22, rva23) naming a bundle of them. Returns false for an
+// unrecognised name; a recognised name may still yield no bits, since
+// rva20 is the baseline and mandates none of the extensions gated here.
+// rva22 and rva23 differ only in extensions this checker does not yet
+// gate on, so they expand alike.
+bool riscvlint_parse_ext_name(const char *name, unsigned *exts);
+
 // True when something branches to `addr`, making it a side entry.
 bool riscvlint_is_branch_target(const riscvlint_state *state, uint64_t addr);
 

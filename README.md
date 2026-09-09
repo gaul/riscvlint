@@ -39,7 +39,27 @@ written next is decided by the corpus rather than by intuition.
   the target lacks. That gate is three-valued: Go emits no attributes
   section at all, and Go holds almost the whole population, so a check
   suppresses itself only on positive evidence of absence -- an arch
-  string that is present and does not name the extension.
+  string that is present and does not name the extension. When the set
+  had to be assumed rather than read, the run says so.
+
+## Selecting the target
+
+`-m <name>` pins the extensions the checks may assume, and may be
+repeated. Names are either extensions (`zba`, `zbb`, `zbs`) or profiles
+that bundle them (`rva20`, `rva22`, `rva23`); `rva22` and `rva23` expand
+alike, differing only in extensions nothing here gates on yet.
+
+`-m` replaces what the object declares, in both directions, because both
+are useful and neither is expressible if the flag merely adds to the
+declaration:
+
+```sh
+riscvlint -m rva23 ./app     # what would rebuilding for RVA23 buy me?
+riscvlint -m rva20 ./app     # this is going on rv64gc hardware; stay quiet
+```
+
+Without `-m`, the arch string decides, and a file that carries none is
+reported as such rather than silently assumed permissive.
 
 ## Building
 

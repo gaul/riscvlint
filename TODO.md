@@ -176,7 +176,15 @@ gate has to be three-valued rather than two, because **Go emits no
 population. Treating "absent" as "no" would have silenced the check on
 exactly the binaries it exists for. It suppresses only on positive
 evidence of absence: an arch string that is present and does not name
-Zba.
+Zba, and it says so when the set was assumed rather than read.
+
+`-m zba` / `-m rva23` overrides the object either way, which is what
+makes "what would rebuilding for RVA23 buy me?" answerable at all: the
+13,249 figure above is what today's binaries leave on the table, whereas
+`riscvlint -m rva23` over an rv64gc build sizes the gain from switching
+`-march`. The 67 C++ and 2 Rust sites are the residue after GCC and LLVM
+have already taken the extension; running C++ with `-m rva23` does not
+change them, because those objects already declare Zba.
 
 ### 6. Zba `zext.w` -- 18,073
 

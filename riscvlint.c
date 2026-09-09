@@ -322,6 +322,25 @@ bool check_call_pair_to_jal(riscvlint_state *state, const cs_insn *insn,
     return true;
 }
 
+bool riscvlint_parse_ext_name(const char *name, unsigned *exts)
+{
+    static const struct { const char *name; unsigned exts; } table[] = {
+        { "zba",   RISCVLINT_EXT_ZBA },
+        { "zbb",   RISCVLINT_EXT_ZBB },
+        { "zbs",   RISCVLINT_EXT_ZBS },
+        { "rva20", 0 },
+        { "rva22", RISCVLINT_EXT_ZBA | RISCVLINT_EXT_ZBB | RISCVLINT_EXT_ZBS },
+        { "rva23", RISCVLINT_EXT_ZBA | RISCVLINT_EXT_ZBB | RISCVLINT_EXT_ZBS },
+    };
+    for (size_t i = 0; i < sizeof table / sizeof table[0]; i++) {
+        if (strcmp(name, table[i].name) == 0) {
+            *exts = table[i].exts;
+            return true;
+        }
+    }
+    return false;
+}
+
 bool riscvlint_may_use(const riscvlint_state *state, unsigned ext)
 {
     unsigned e = riscvlint_state_extensions(state);

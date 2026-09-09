@@ -164,6 +164,13 @@ typedef struct {
 static tally_entry tally[MAX_TITLES];
 static size_t ntitles;
 static bool quiet;      // -q: summary only, for corpus-scale runs
+// -m replaces what the object declares, in both directions: it enables a
+// gated check against a declaration that omits the extension ("what
+// would rebuilding for RVA23 buy me?") and disables one against an
+// object that declares nothing ("this Go binary is going on rv64gc
+// hardware"). Neither is expressible if the flag merely unions.
+static unsigned forced_exts;
+static bool have_forced;
 static uint64_t total_findings;
 static uint64_t total_insns;
 
@@ -335,9 +342,26 @@ static int scan_file(csh handle, const char *path)
     } else {
         riscvlint_state *state = riscvlint_state_create();
         if (!state) { munmap((void *)base, map_len); return -1; }
-        riscvlint_state_set_extensions(state,
-                                       riscvlint_parse_arch(
-                                           find_arch_string(base, map_len, eh)));
+        // Say which extension set is in force whenever it was not simply
+        // read from the object. Reporting a Zba finding because nothing
+        // said otherwise is a guess, and a guess the reader cannot see is
+        // the shape of every wrong number this project has produced.
+        unsigned declared = riscvlint_parse_arch(
+            find_arch_string(base, map_len, eh));
+        unsigned effective;
+        if (have_forced) {
+            effective = forced_exts | RISCVLINT_EXT_DECLARED;
+            if (declared & RISCVLINT_EXT_DECLARED)
+                printf("note: %s: -m overrides the arch declared in the "
+                       "object\n", path);
+        } else {
+            effective = declared;
+            if (!(declared & RISCVLINT_EXT_DECLARED))
+                printf("note: %s: no RISC-V arch attributes; "
+                       "extension-gated checks left unrestricted "
+                       "(pass -m to pin)\n", path);
+        }
+        riscvlint_state_set_extensions(state, effective);
         const Elf64_Shdr *sh = (const Elf64_Shdr *)(base + eh->e_shoff);
         for (unsigned i = 0; i < eh->e_shnum; i++) {
             if ((sh[i].sh_flags & SHF_EXECINSTR) == 0 ||
@@ -364,10 +388,30 @@ static int cmp_tally(const void *a, const void *b)
 
 int main(int argc, char **argv)
 {
+    static const char usage[] =
+        "usage: %s [-q] [-m zba|zbb|zbs|rva20|rva22|rva23]... <binary>...\n";
     int argi = 1;
-    if (argi < argc && strcmp(argv[argi], "-q") == 0) { quiet = true; argi++; }
+    while (argi < argc && argv[argi][0] == '-' && argv[argi][1]) {
+        if (strcmp(argv[argi], "-q") == 0) {
+            quiet = true;
+        } else if (strcmp(argv[argi], "-m") == 0 && argi + 1 < argc) {
+            unsigned e;
+            if (!riscvlint_parse_ext_name(argv[++argi], &e)) {
+                fprintf(stderr, "%s: unknown -m name '%s'\n", argv[0],
+                        argv[argi]);
+                fprintf(stderr, usage, argv[0]);
+                return 2;
+            }
+            forced_exts |= e;
+            have_forced = true;
+        } else {
+            fprintf(stderr, usage, argv[0]);
+            return 2;
+        }
+        argi++;
+    }
     if (argi >= argc) {
-        fprintf(stderr, "usage: %s [-q] <binary>...\n", argv[0]);
+        fprintf(stderr, usage, argv[0]);
         return 2;
     }
     csh handle;

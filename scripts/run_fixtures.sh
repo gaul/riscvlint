@@ -55,8 +55,20 @@ for src in "$ROOT"/fixtures/*.s; do
         FAIL=$((FAIL + 1))
         continue
     fi
+    # And a fixtures/<name>.args sidecar pins riscvlint's own flags, so
+    # the -m override paths get an end-to-end case rather than only a
+    # unit test of the name table.
+    args=""
+    if [ -f "$ROOT/fixtures/$name.args" ]; then
+        args=$(cat "$ROOT/fixtures/$name.args")
+    fi
     got="$PROBE/$name.out"
-    "$ROOT/riscvlint" "$obj" > "$got" 2>&1 || true
+    "$ROOT/riscvlint" $args "$obj" > "$got" 2>&1 || true
+    # The note lines carry the object path, which is a temporary
+    # directory; keep the fixture stable by reducing it to the basename.
+    # Written through a copy rather than sed -i, whose in-place spelling
+    # differs between GNU and BSD.
+    sed "s|$PROBE/||g" "$got" > "$got.tmp" && mv "$got.tmp" "$got"
     exp="$ROOT/fixtures/$name.expected"
     if [ "$MODE" = regen ]; then
         cp "$got" "$exp"
