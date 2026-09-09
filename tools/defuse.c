@@ -29,7 +29,8 @@
 // Multi-instruction-only categories:
 //   dead  : pure ALU/mv/li def overwritten with zero uses
 //   reload: same (base,disp,size) loaded again, no store/call/fence/redef
-//   remat : li/lui of a value already live in another register
+//   remat : li/lui of a value already live in another register, split by
+//           whether the duplicate already fits c.li (no size win) or not
 //   br    : beqz/bnez on a value produced by slt/sltu/xor/sub/seqz/snez,
 //           which a blt/bgeu/beq/bne would have computed and branched on
 //
@@ -557,11 +558,21 @@ static void scan_section(csh handle, const char *path, const uint8_t *code,
                 for (int j = 1; j < a->op_count; j++)
                     if (a->operands[j].type == RISCV_OP_IMM)
                         v = a->operands[j].imm;
+                // lui's operand is the raw imm20; without the shift a
+                // `lui rd,16` and a `li rd,16` compare equal and match
+                // as the same constant, which they are not.
+                if (!strcmp(mn, "lui")) v <<= 12;
                 for (int k = 0; k < nconsts; k++)
                     if (consts[k].live && consts[k].val == v &&
                         consts[k].slot != dslot) {
                         char key[64];
-                        snprintf(key, sizeof key, "remat|%s", mn);
+                        // Rewriting the duplicate as `mv` only saves
+                        // bytes when the constant did not already fit
+                        // c.li, since mv is 2 bytes either way. Split
+                        // the population so the saving is not assumed.
+                        snprintf(key, sizeof key, "remat|%s|%s", mn,
+                                 (v >= -32 && v <= 31) ? "fits-c.li"
+                                                       : "wide");
                         bump(key, idx - consts[k].idx);
                         if (example_cat && !strcmp(example_cat, "remat") &&
                             example_printed < example_max) {

@@ -12,29 +12,36 @@ which also records where the first figure was wrong and why.
 
 ## Pooled corpus
 
-| # | opportunity | population | share of insns |
-|---|---|---:|---:|
-| 1 | constant re-materialization | 198,221 | 0.575% |
-| 2 | dead register definitions | 47,659 | 0.138% |
-| 3 | `auipc`+`jalr` within `jal` reach | 30,175 | 0.088% |
-| 4 | compare-then-branch folding | 21,986 | 0.064% |
-| 5 | Zba shift-add | 19,933 | 0.058% |
-| 6 | Zba `zext.w` | 18,073 | 0.052% |
-| 7 | redundant reloads | 10,079 | 0.029% |
+| # | opportunity | actionable | raw pattern | status |
+|---|---|---:|---:|---|
+| 1 | `auipc`+`jalr` within `jal` reach | 30,175 | 801,519 | verified on sites |
+| 2 | Zba shift-add | 19,933 | 48,270 | immediate applied |
+| 3 | Zba `zext.w` | 18,073 | 25,672 | immediate applied |
+| 4 | redundant reloads | 10,079 | - | region-sound |
+| 5 | dead register definitions | 4,808 | 47,659 | verified on sites |
+| 6 | constant re-materialization | 4,580 | 193,398 | size test applied |
+| ? | compare-then-branch folding | ? | 21,986 | **precondition not applied** |
 
-### 1. Constant re-materialization -- 198,221
+### 6. Constant re-materialization -- 4,580 of 193,398
 
 A constant loaded into a register while the same value is still live in
-another: `li` 193,080, `lui` 5,141. Per language: Go 101,580, C++ 85,804,
-Rust 10,837. 62,903 of the C++/Rust `li` cases are adjacent (d=1), 17,022
-at d=2. None cross a conditional branch.
+another. Rewriting the duplicate as `mv` only saves bytes when the
+constant did not already fit `c.li`, because `mv` is two bytes either
+way -- and it trades an independent instruction for a dependent one, so
+where it saves nothing it is a small pessimization. `defuse` now splits
+the population on that test rather than assuming it:
 
-Qualifier before this is a size win: replacing the second `li` with `mv`
-only saves bytes when the `li` was not already `c.li` (6-bit signed
-immediate), and it trades an independent instruction for a dependent one.
-The census says 1,084,536 of the C++/Rust `li` are 2-byte against 334,802
-4-byte, so if the duplicates follow the same distribution only about a
-quarter are wins. Size it against the immediate before writing the check.
+| | count | d=1 |
+|---|---:|---:|
+| `remat\|li\|fits-c.li` (no saving) | 188,807 | 123,163 |
+| `remat\|li\|wide` | 3,469 | 1,662 |
+| `remat\|lui\|wide` | 1,111 | 292 |
+| `remat\|lui\|fits-c.li` | 11 | 1 |
+
+The reason the split is so lopsided: 73.8% of re-materialized constants
+are 0 and another 16% are 1. Compilers re-load small constants freely
+because it costs them nothing, which is exactly why the raw count is a
+bad guide. Actionable population is 4,580, not 198,221.
 
 ### 2. Dead register definitions -- 47,659, of which 4,808 are clean
 
@@ -83,21 +90,29 @@ The C++ zero is the whole point: libLLVM's text segment is far larger
 than `jal`'s reach, so every one of its 679,812 call pairs is forced.
 The Rust population is a linker-relaxation finding, not a compiler one.
 
-### 4. Compare-then-branch folding -- 21,986
+### Compare-then-branch folding -- 21,986 pattern sites, population unknown
 
 `slt`/`sltu`/`xor`/`sub` producing a condition into a GPR, then
 `beqz`/`bnez` on it, where one `blt`/`bgeu`/`beq`/`bne` would do both.
 This is the flagless analogue of armlint's `cmp #0` check. Almost all of
 it is C++ (20,951); Go contributes 96.
 
-Two conditions have to be applied before this is a population rather than
-a pattern count. The fold is only free if the condition register is dead
-after the branch, which `defuse` does not check. And only the reg-reg
-producers fold -- `slt`, `sltu`, `xor`, `sub` -- because RISC-V has no
-compare-immediate-and-branch, so the `slti`/`sltiu`/`xori` rows (196
-between them) are not candidates. The distance profile is informative:
-`sltu->bnez` is 1,998 of 2,017 adjacent, while `sub->bnez` sits mostly at
-d=2 and d=4-7.
+This is **not sized**. The fold only removes an instruction if the
+condition register is dead after the branch, and `defuse` does not check
+that. Spot checks say the failure rate is high:
+
+* `xor->beqz`/`bnez` (7,550 in C++/Rust) is dominated by the stack-canary
+  idiom -- `ld a5,0(s2); xor a5,a5,a4; li a4,0; beqz a5`. `beq a5,a4`
+  folds the compare, but the `li a4,0` that scrubs the canary has to run
+  on both paths, so the rewrite is not free.
+* `sub->beqz`/`bnez` (11,585, the largest producer) frequently needs the
+  difference afterwards: `sub s10,s10,s11; beqz s10; add s8,s10,a3`.
+
+Only the reg-reg producers can fold at all -- `slt`, `sltu`, `xor`,
+`sub` -- since RISC-V has no compare-immediate-and-branch, so the
+`slti`/`sltiu`/`xori` rows (196 between them) are out regardless. Adding
+a post-branch liveness test to `defuse` is the next measurement to make;
+until then this family has no number worth ranking.
 
 ### 5. Zba shift-add (`sh1add`/`sh2add`/`sh3add`) -- 19,933
 
@@ -176,25 +191,30 @@ population.
 Restricted to the GCC/LLVM cohort -- 20,133,950 instructions, 45.3% of
 them compressed, 18,313,847 pairs:
 
-| # | opportunity | population | clean | share of insns |
-|---|---|---:|---:|---:|
-| 1 | constant re-materialization | 96,641 | 96,641 | 0.480% |
-| 2 | dead register definitions | 44,550 | 4,528 | 0.221% |
-| 3 | `auipc`+`jalr` within `jal` reach | 30,119 | 30,119 | 0.150% |
-| 4 | compare-then-branch folding | 21,890 | 21,890 | 0.109% |
-| 5 | redundant reloads | 5,781 | 5,781 | 0.029% |
-| - | Zba shift-add | 262 | | ~0 |
-| - | redundant mask after `lbu` | 142 | | ~0 |
-| - | missed compression (provable) | 93 | | ~0 |
-| - | Zba `zext.w` | 2 | | ~0 |
+| # | opportunity | actionable | raw pattern |
+|---|---|---:|---:|
+| 1 | `auipc`+`jalr` within `jal` reach | 30,119 | 121,543 |
+| 2 | redundant reloads | 5,781 | - |
+| 3 | dead register definitions | 4,528 | 44,550 |
+| 4 | constant re-materialization | 2,969 | 94,445 |
+| ? | compare-then-branch folding | ? | 21,890 |
+| - | Zba shift-add | 262 | 26,264 |
+| - | redundant mask after `lbu` | 142 | 50,998 |
+| - | missed compression (provable) | 93 | - |
+| - | Zba `zext.w` | 2 | 2 |
 
-"clean" is the subset with no conditional branch between the def and the
-event that makes it a finding. It only differs for dead definitions, and
-there it differs by a factor of ten.
+Item 1 is entirely Rust -- C++ contributes 0 of its 679,812 call pairs --
+and against Rust's own 2,285,426 instructions it is 1.3%, which makes it
+a large finding for Rust binaries specifically rather than a small one
+overall.
+
+"actionable" applies each family's real precondition: the target being
+inside `jal`'s reach, the killing write not sitting past a conditional
+branch, the duplicated constant not already fitting `c.li`. The gap
+between the two columns is the whole point of the exercise.
 
 The two families that drop out of this cohort -- Zba and compression --
-belong to Go's toolchain, not to RISC-V generally. Item 3 is entirely
-Rust: C++ contributes 0 of its 679,812 call pairs.
+belong to Go's toolchain, not to RISC-V generally.
 
 # What the measurements changed
 
