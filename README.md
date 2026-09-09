@@ -154,6 +154,28 @@ the categories built around them have flagless replacements.
   `slt`/`xor`/`sub` and then tested with `beqz`/`bnez`, where one
   compare-branch would have done both.
 
+* `tools/candscan` sizes a candidate check by counting the shapes it
+  would fire on with the check's own preconditions applied -- decoded
+  operands, immediate ranges, encodability -- and running the same
+  bounded liveness walk where a fold needs one. `pairscan` and `defuse`
+  answer "is there something here?"; this answers "how many findings
+  would the check report?", and the two have differed by an order of
+  magnitude every time both were measured.
+
+  Two splits it reports that a fold count alone would misstate. Sites
+  with a conditional branch between the def and its use are counted
+  apart (`xbr`), because the intermediate may escape on the taken path
+  and no walk starting after the use can see it. And every probe whose
+  verdict depends on a call or a return is run twice, once with the
+  LP64D convention asserted, so a candidate can be told from one whose
+  population only exists because the ABI-agnostic walk said UNKNOWN --
+  move coalescing turned out to be the latter, 22,265 shapes of which
+  21,252 come back *live* once the ABI is named.
+
+  Probes that measured zero stay in the tool. A candidate rejected on
+  evidence is worth as much as one accepted, and leaving the probe there
+  is what stops the shape being re-derived from intuition later.
+
 * `tools/rank.py` groups `pairscan` output into candidate-check families
   and prints each family's population, because raw frequency ranking
   puts the by-design majority (prologue stores, argument moves) on top

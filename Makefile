@@ -51,12 +51,15 @@ integration-test-regen: riscvlint
 
 # Corpus-mining research utilities (see "Mining tools" in README.md);
 # not part of the default build or test targets.
-tools: tools/pairscan tools/defuse
+tools: tools/pairscan tools/defuse tools/candscan
 
 tools/pairscan: tools/pairscan.c
 	$(CC) $(CFLAGS) $(CAPSTONE_CFLAGS) $< $(CAPSTONE_LIBS) -o $@
 
 tools/defuse: tools/defuse.c
+	$(CC) $(CFLAGS) $(CAPSTONE_CFLAGS) $< $(CAPSTONE_LIBS) -o $@
+
+tools/candscan: tools/candscan.c
 	$(CC) $(CFLAGS) $(CAPSTONE_CFLAGS) $< $(CAPSTONE_LIBS) -o $@
 
 # The default goal: everything that ships, without running the suites.
@@ -66,6 +69,6 @@ all: lib riscvlint test
 
 clean:
 	rm -f riscvlint riscvlint_test libriscvlint.a \
-		tools/pairscan tools/defuse *.o
+		tools/pairscan tools/defuse tools/candscan *.o
 
 .PHONY: all build clean lib test integration-test integration-test-regen tools
