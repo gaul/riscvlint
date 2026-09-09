@@ -53,11 +53,19 @@ Capstone prints `c.mv` as `mv`, so this axis is invisible unless the
 instruction size is carried explicitly; `pairscan` marks 2-byte encodings
 with a `:c` suffix for exactly this reason.
 
-Neither mining tool can size this properly -- deciding that a given
-4-byte instruction had a 2-byte form means applying the C-extension
-register and immediate constraints, which is a check, not a shape count.
-It is the largest RISC-V-specific opportunity in the corpus and has no
-armlint analogue. Write it as the first real check.
+Sizing this means applying the C-extension register and immediate
+constraints, which needs an instruction census rather than a pair table
+-- `pairscan -1`. Done for the two rules a shape token can decide on its
+own (`c.mv` needs only both registers non-zero, `c.li` only a non-zero
+destination and an immediate in [-32,31]; both checked against the
+assembler first), the GCC/LLVM cohort leaves 93 of 1,815,725 `mv` and 0
+of 1,084,536 in-range `li` uncompressed.
+
+So this is not a general opportunity. RVC selection is an assembler pass
+and GNU as / LLVM MC take it whenever it is legal; the 20-point spread is
+Go's toolchain alone, and the C++/Rust 45.3% is the instruction mix
+rather than a shortfall. Worth a check aimed at Go-built binaries, but
+not the first check to write.
 
 ### 3. Constant re-materialization -- 208,253 `li`, 6,455 `lui`
 
@@ -147,3 +155,86 @@ The shift pairs that are *not* foldable -- shift amounts other than 32,
 which are bitfield extracts -- number 42,592 on their own, more than the
 real `zext.w` and `sh#add` populations combined. Any check in this area
 has to read the shift amount, and any sizing that does not is fiction.
+
+# Ranked for C++ and Rust specifically
+
+The tiers above pool all three toolchains, which flatters two families
+that turn out to be entirely Go's. Restricted to the GCC/LLVM cohort --
+20,133,950 instructions, 45.3% of them compressed, 18,313,847 pairs --
+the order changes:
+
+| # | opportunity | population | share of insns |
+|---|---|---:|---:|
+| 1 | dead register definitions | 615,633 | 3.06% |
+| 2 | constant re-materialization | 112,146 | 0.56% |
+| 3 | `auipc`+`jalr` within `jal` reach | 30,119 | 0.15% |
+| 4 | redundant reloads | 25,084 | 0.12% |
+| 5 | compare-then-branch folding | 2,669 | 0.01% |
+| - | Zba shift-add | 262 | ~0 |
+| - | missed compression (provable) | 93 | ~0 |
+| - | redundant mask after `lbu` | 142 | ~0 |
+| - | Zba `zext.w` | 2 | ~0 |
+
+At ~3.09 bytes per instruction the cohort's text is about 62 MB, so the
+dead definitions alone are roughly 1.9 MB of it.
+
+### 1. Dead register definitions -- 615,633
+
+dead `mv` 194,929 (+54,763 xbr), dead `addi` 150,108 (+34,070), dead `li`
+117,955 (+39,611), then `slli` 3,606, `add` 3,515, `sh3add` 2,742,
+`zext.w` 2,257, `sub` 1,559, `or` 1,482. Roughly 85% never cross a
+conditional branch, so a check that refuses to reason across branches
+keeps most of the population. Write this one first.
+
+### 2. Constant re-materialization -- 112,146
+
+`li` 109,249 (60,643 adjacent, 16,613 at d=2) and `lui` 2,897.
+
+Qualifier that has to be applied before this is a size win: replacing the
+second `li` with `mv` only saves bytes when the `li` was not already
+`c.li`. The census says 1,084,536 of the cohort's `li` are 2-byte and
+334,802 are 4-byte, so if the duplicates follow the same distribution
+only about 24% -- call it 26,000 -- are wins, and the rest trade an
+independent instruction for a dependent one at no size saving. Size it
+against the immediate before writing the check.
+
+### 3. Call pairs within `jal` reach -- 30,119
+
+All of them Rust; C++ contributes 0 of its 679,812 call pairs, because
+libLLVM's text is far past `jal`'s +/-1MB. 24.8% of the Rust call pairs
+are collapsible, worth ~120 KB against 13.5 MB of Rust binaries. This is
+a linker-relaxation finding, not a compiler one.
+
+### 4. Redundant reloads -- 25,084
+
+heap sz8 18,287, sz4 3,421, sz1 3,130. Distances cluster at 4-15
+instructions, so unlike everything above it this one cannot be reached by
+any adjacent-pair check.
+
+### 5. Compare-then-branch -- 2,669
+
+`defuse` finds the def pattern 21,934 times but only 2,669 are adjacent
+dependent pairs reaching a `beqz`/`bnez`. Low value, as in the pooled
+data.
+
+### What drops out of this cohort
+
+* **Missed compression.** The pooled 20-point spread is Go's alone. RVC
+  selection is an assembler pass, and GNU as / LLVM MC take it whenever
+  it is legal: of 1,815,725 `mv` only 93 were left uncompressed, and of
+  1,084,536 `li` inside `c.li`'s range, none. Both rules were checked
+  against the assembler first (`c.mv` and `c.li` have no prime-register
+  restriction; `li` compresses exactly on `imm` in [-32,31]). The 45.3%
+  aggregate rate is the instruction mix, not a shortfall.
+* **Zba.** 262 shift-add and 2 `zext.w` sites. GCC and LLVM already use
+  the extension; only Go's backend does not.
+
+### Traps in this cohort
+
+* **Consecutive register moves, 589,596 (3.2% of pairs).** The second
+  largest pair family, and almost all of it is by design -- the sound
+  subset is the 249,692 dead `mv` already counted under 1. Ranking off
+  the pair count would put argument shuffling at the top of the backlog.
+* **`auipc`+`addi` address materialization, 246,516.** PC-relative
+  addressing genuinely costs 8 bytes; gp-relative relaxation only reaches
+  +/-2KB around `__global_pointer$`, nowhere near this population.

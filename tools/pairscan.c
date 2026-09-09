@@ -32,6 +32,7 @@
 //   -e: additionally print example sites (file addr: textA ;; textB)
 //   -x: keep small immediates (-256..255) verbatim instead of #i, so that
 //       shift-amount-sensitive families size honestly
+//   -1: count single instructions by shape rather than pairs
 
 #define _GNU_SOURCE
 #include <capstone/capstone.h>
@@ -123,6 +124,12 @@ static uint64_t total_compressed = 0;
 // sh#add whatever the shift is. -x keeps small immediates verbatim, which
 // is what separates a population from a pair count.
 static bool exact_imm = false;
+// -1 counts single instructions by shape instead of pairs. A pair table
+// cannot answer "how many instructions of shape X are there", because
+// each instruction appears in up to two pairs and region boundaries drop
+// some entirely -- and that census is what sizing missed compression
+// needs.
+static bool unigram = false;
 static const char *example_substr = NULL;
 static long example_max = 20;
 static long example_printed = 0;
@@ -357,8 +364,13 @@ static void scan_section(csh handle, const char *path, const uint8_t *code,
         cs_regs_access(handle, insn, regs_read, &nread, regs_write, &nwrite);
         fix_implicit_ra(insn, regs_read, &nread, regs_write, &nwrite);
 
+        if (unigram) {
+            bump(tok);
+            total_pairs++;
+        }
+
         size_t sec_off = (size_t)(insn->address - vaddr);
-        if (have_prev && !is_target(targets, sec_off)) {
+        if (!unigram && have_prev && !is_target(targets, sec_off)) {
             bool dep = false, waw = false;
             for (int i = 0; i < prev_nwrites; i++) {
                 int s = prev_writes[i];
@@ -474,6 +486,8 @@ int main(int argc, char **argv)
     while (argi < argc && argv[argi][0] == '-') {
         if (strcmp(argv[argi], "-x") == 0) {
             exact_imm = true;
+        } else if (strcmp(argv[argi], "-1") == 0) {
+            unigram = true;
         } else if (strcmp(argv[argi], "-e") == 0 && argi + 1 < argc) {
             example_substr = argv[++argi];
         } else if (strcmp(argv[argi], "-E") == 0 && argi + 1 < argc) {
@@ -482,14 +496,14 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[argi], "-n") == 0 && argi + 1 < argc) {
             example_max = atol(argv[++argi]);
         } else {
-            fprintf(stderr, "usage: %s [-x] [-e SUBSTR -n MAX] <binary>...\n",
+            fprintf(stderr, "usage: %s [-x] [-1] [-e SUBSTR -n MAX] <binary>...\n",
                     argv[0]);
             return 2;
         }
         argi++;
     }
     if (argi >= argc) {
-        fprintf(stderr, "usage: %s [-x] [-e SUBSTR -n MAX] <binary>...\n", argv[0]);
+        fprintf(stderr, "usage: %s [-x] [-1] [-e SUBSTR -n MAX] <binary>...\n", argv[0]);
         return 2;
     }
     csh handle;

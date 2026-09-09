@@ -52,6 +52,12 @@ the categories built around them have flagless replacements.
   counts overstate the foldable shift-add family by 2.4x and the
   collapsible call family by 26x.
 
+  `-1` counts single instructions by shape rather than pairs. A pair
+  table cannot answer "how many instructions of shape X are there" --
+  each instruction appears in up to two pairs, and region boundaries
+  drop some entirely -- and that census is what sizing missed
+  compression needs.
+
 * `tools/defuse` profiles block-local def-to-use distances (how far a
   value's sole consumer sits from its producer) and the
   multi-instruction redundancies no pair statistic can see: dead
