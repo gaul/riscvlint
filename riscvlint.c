@@ -247,6 +247,223 @@ unsigned riscvlint_parse_arch(const char *arch)
 
 // ---- state ----
 
+// ---- what a result guarantees about its own high bits ----
+
+#define G_S8  RISCVLINT_G_SEXT8
+#define G_S16 RISCVLINT_G_SEXT16
+#define G_S32 RISCVLINT_G_SEXT32
+#define G_Z8  RISCVLINT_G_ZEXT8
+#define G_Z16 RISCVLINT_G_ZEXT16
+#define G_Z32 RISCVLINT_G_ZEXT32
+
+// The closures, spelled out once. A value that fits 8 bits fits 16 and
+// 32; a value that is zero above bit 15 is also sign-extended from bit
+// 31, since its bit 31 is zero. The one relation that does not hold is
+// zero-extension to 32 implying sign-extension to 32.
+#define G_LB   (G_S8 | G_S16 | G_S32)
+#define G_LH   (G_S16 | G_S32)
+#define G_LW   (G_S32)
+#define G_LBU  (G_Z8 | G_Z16 | G_Z32 | G_S32)
+#define G_LHU  (G_Z16 | G_Z32 | G_S32)
+#define G_LWU  (G_Z32)
+
+// Guarantees implied by a value known to lie in [lo, hi]. Used for the
+// constant materializations and for `andi`, whose mask bounds its
+// result; writing it as a range keeps the closure implicit instead of
+// repeating it per case.
+static unsigned guarantees_for_range(int64_t lo, int64_t hi)
+{
+    unsigned g = 0;
+    if (lo >= -128 && hi <= 127) g |= G_S8;
+    if (lo >= -32768 && hi <= 32767) g |= G_S16;
+    if (lo >= INT32_MIN && hi <= INT32_MAX) g |= G_S32;
+    if (lo >= 0 && hi <= 255) g |= G_Z8;
+    if (lo >= 0 && hi <= 65535) g |= G_Z16;
+    if (lo >= 0 && hi <= 4294967295LL) g |= G_Z32;
+    return g;
+}
+
+// Sign-extended 6-bit immediate of the CI-format compressed forms.
+static int64_t ci_imm6(uint32_t w)
+{
+    return sign_extend((((w >> 12) & 1u) << 5) | ((w >> 2) & 0x1fu), 6);
+}
+
+unsigned rv_result_guarantees(uint32_t w, unsigned size, unsigned *rd)
+{
+    if (size == 4) {
+        unsigned op = RV_OPCODE(w), f3 = (w >> 12) & 0x7u;
+        unsigned f7 = (w >> 25) & 0x7fu, rs2 = (w >> 20) & 0x1fu;
+        int64_t imm12 = sign_extend((uint64_t)(w >> 20) & 0xfffu, 12);
+        *rd = (w >> 7) & 0x1fu;
+        switch (op) {
+        case 0x03u:                                   // LOAD
+            switch (f3) {
+            case 0: return G_LB;
+            case 1: return G_LH;
+            case 2: return G_LW;
+            case 4: return G_LBU;
+            case 5: return G_LHU;
+            case 6: return G_LWU;
+            default: return 0;                        // ld: all 64 bits
+            }
+        case 0x13u:                                   // OP-IMM
+            if (f3 == 0 && ((w >> 15) & 0x1fu) == 0)  // li
+                return guarantees_for_range(imm12, imm12);
+            if (f3 == 7 && imm12 >= 0)                // andi with a mask
+                return guarantees_for_range(0, imm12);
+            if (f3 == 1 && ((w >> 20) & 0xfffu) == 0x604u) return G_LB;
+            if (f3 == 1 && ((w >> 20) & 0xfffu) == 0x605u) return G_LH;
+            return 0;
+        case 0x1bu:                                   // OP-IMM-32
+            return G_S32;                             // addiw/slliw/sr*iw
+        case 0x37u:                                   // lui
+            return guarantees_for_range(sign_extend(w & 0xfffff000u, 32),
+                                        sign_extend(w & 0xfffff000u, 32));
+        case 0x3bu:                                   // OP-32
+            if (f7 == 0x04u) {                        // Zba/Zbb .uw forms
+                if (f3 == 0 && rs2 == 0) return G_LWU;   // zext.w
+                if (f3 == 4 && rs2 == 0) return G_LHU;   // zext.h
+                return 0;                                // add.uw: 64-bit
+            }
+            return G_S32;                             // addw/subw/mulw/...
+        default:
+            return 0;
+        }
+    }
+    if (size != 2) return 0;
+    unsigned cop = w & 0x3u, f3 = (w >> 13) & 0x7u;
+    switch (cop) {
+    case 0:                                           // C0
+        *rd = 8u + ((w >> 2) & 0x7u);
+        if (f3 == 2) return G_LW;                     // c.lw
+        if (f3 == 4) {                                // Zcb loads
+            unsigned sel = (w >> 10) & 0x7u;
+            if (sel == 0) return G_LBU;               // c.lbu
+            if (sel == 1) return ((w >> 6) & 1u) ? G_LH : G_LHU;
+        }
+        return 0;                                     // c.ld, the stores
+    case 1:                                           // C1
+        *rd = (w >> 7) & 0x1fu;
+        if (f3 == 1) return G_S32;                    // c.addiw
+        if (f3 == 2) {                                // c.li
+            int64_t v = ci_imm6(w);
+            return guarantees_for_range(v, v);
+        }
+        if (f3 == 3 && *rd != 0 && *rd != 2) {        // c.lui (not addi16sp)
+            int64_t v = ci_imm6(w) << 12;
+            return guarantees_for_range(v, v);
+        }
+        if (f3 == 4) {
+            unsigned sel = (w >> 10) & 0x3u;
+            *rd = 8u + ((w >> 7) & 0x7u);
+            if (sel == 2) {                           // c.andi
+                int64_t m = ci_imm6(w);
+                return m >= 0 ? guarantees_for_range(0, m) : 0;
+            }
+            // c.addw / c.subw share funct6 100111 with the 64-bit forms
+            // and are separated by bit 12.
+            if (sel == 3 && ((w >> 12) & 1u) && ((w >> 5) & 0x3u) < 2)
+                return G_S32;
+            // Zcb's unary group sits in the two funct2 slots C left
+            // reserved. These are the compressed spellings of the
+            // extensions themselves, and the assembler picks them
+            // whenever the register is in x8-x15 -- so this is where
+            // most of the corpus's extension instructions actually are.
+            if (sel == 3 && ((w >> 12) & 1u) && ((w >> 5) & 0x3u) == 3) {
+                switch ((w >> 2) & 0x7u) {
+                case 0: return G_LBU;                 // c.zext.b
+                case 1: return G_LB;                  // c.sext.b
+                case 2: return G_LHU;                 // c.zext.h
+                case 3: return G_LH;                  // c.sext.h
+                case 4: return G_LWU;                 // c.zext.w
+                default: return 0;                    // c.not, reserved
+                }
+            }
+        }
+        return 0;
+    case 2:                                           // C2
+        *rd = (w >> 7) & 0x1fu;
+        if (f3 == 2) return G_LW;                     // c.lwsp
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+bool rv_decode_extension(uint32_t w, unsigned size, unsigned *rd,
+                         unsigned *rs1, unsigned *guarantee)
+{
+    if (size == 4) {
+        unsigned op = RV_OPCODE(w), f3 = (w >> 12) & 0x7u;
+        unsigned f7 = (w >> 25) & 0x7fu, rs2 = (w >> 20) & 0x1fu;
+        unsigned field = (w >> 20) & 0xfffu;
+        *rd = (w >> 7) & 0x1fu;
+        *rs1 = (w >> 15) & 0x1fu;
+        if (op == 0x1bu && f3 == 0 && field == 0) {   // sext.w = addiw rd,rs,0
+            *guarantee = G_S32;
+            return true;
+        }
+        if (op == 0x13u && f3 == 7 && field == 255) { // zext.b = andi rd,rs,255
+            *guarantee = G_Z8;
+            return true;
+        }
+        if (op == 0x13u && f3 == 1 && field == 0x604u) {
+            *guarantee = G_S8;
+            return true;
+        }
+        if (op == 0x13u && f3 == 1 && field == 0x605u) {
+            *guarantee = G_S16;
+            return true;
+        }
+        if (op == 0x3bu && f7 == 0x04u && rs2 == 0) { // zext.w / zext.h
+            if (f3 == 0) { *guarantee = G_Z32; return true; }
+            if (f3 == 4) { *guarantee = G_Z16; return true; }
+        }
+        return false;
+    }
+    if (size != 2) return false;
+    // c.addiw rd,0 is `sext.w rd,rd`, and it is how the corpus spells
+    // most of them: two bytes, so deleting one saves two rather than
+    // four. c.addiw cannot name x0, which the shape needs anyway.
+    if ((w & 0xe003u) == 0x2001u && ci_imm6(w) == 0) {
+        *rd = *rs1 = (w >> 7) & 0x1fu;
+        *guarantee = G_S32;
+        return *rd != 0;
+    }
+    // Zcb's unary group: c.zext.b and its family, two bytes, rd' both
+    // source and destination. Capstone prints them with the wide
+    // mnemonic, so `andi a2,a2,0xff` in a disassembly is as often this
+    // as it is the four-byte andi.
+    if ((w & 0xe003u) == 0x8001u && ((w >> 10) & 0x3u) == 3 &&
+        ((w >> 12) & 1u) && ((w >> 5) & 0x3u) == 3) {
+        *rd = *rs1 = 8u + ((w >> 7) & 0x7u);
+        switch ((w >> 2) & 0x7u) {
+        case 0: *guarantee = G_Z8; return true;
+        case 1: *guarantee = G_S8; return true;
+        case 2: *guarantee = G_Z16; return true;
+        case 3: *guarantee = G_S16; return true;
+        case 4: *guarantee = G_Z32; return true;
+        default: return false;                        // c.not, reserved
+        }
+    }
+    return false;
+}
+
+bool rv_ends_region(uint32_t w, unsigned size)
+{
+    if (size == 4)
+        return RV_OPCODE(w) == RV_OP_JAL || RV_OPCODE(w) == RV_OP_JALR;
+    if (size != 2) return false;
+    if ((w & 0xe003u) == 0xa001u) return true;        // c.j
+    // c.jr / c.jalr: op 10, funct3 100, rs2 == 0, rd != 0. `ret` is
+    // c.jr ra.
+    if ((w & 0xe003u) == 0x8002u && ((w >> 2) & 0x1fu) == 0 &&
+        ((w >> 7) & 0x1fu) != 0)
+        return true;
+    return false;
+}
+
 struct riscvlint_state {
     const uint8_t *code;
     size_t size;
@@ -269,6 +486,12 @@ struct riscvlint_state {
         uint64_t setup;  // its address, for the finding text
         bool sp_moved;   // something has written sp since
     } fp;
+
+    // What each register's current value is known to guarantee about its
+    // own high bits, for check_redundant_extension. Cleared at every
+    // region boundary, so a guarantee is only read on the straight-line
+    // path that established it.
+    unsigned guarantees[32];
 };
 
 riscvlint_state *riscvlint_state_create(void)
@@ -315,6 +538,7 @@ bool riscvlint_state_set_section(riscvlint_state *state, csh handle,
     state->vaddr = vaddr;
     state->handle = handle;
     memset(&state->fp, 0, sizeof state->fp);
+    memset(state->guarantees, 0, sizeof state->guarantees);
     if (!state->probe) state->probe = cs_malloc(handle);
     if (!state->probe) return false;
 
@@ -759,6 +983,90 @@ bool check_redundant_sp_restore(riscvlint_state *state, const cs_insn *insn,
         state->fp.setup = insn->address;
         state->fp.sp_moved = false;
     }
+    return found;
+}
+
+// ---- redundant sign or zero extension ----
+
+static const char *guarantee_name(unsigned g)
+{
+    switch (g) {
+    case RISCVLINT_G_SEXT8:  return "sext.b";
+    case RISCVLINT_G_SEXT16: return "sext.h";
+    case RISCVLINT_G_SEXT32: return "sext.w";
+    case RISCVLINT_G_ZEXT8:  return "zext.b";
+    case RISCVLINT_G_ZEXT16: return "zext.h";
+    default:                 return "zext.w";
+    }
+}
+
+bool check_redundant_extension(riscvlint_state *state, const cs_insn *insn,
+                               riscvlint_finding *finding)
+{
+    if (insn->size != 2 && insn->size != 4) {
+        memset(state->guarantees, 0, sizeof state->guarantees);
+        return false;
+    }
+    uint32_t w;
+    if (!riscvlint_word_at(state, insn->address, &w)) {
+        memset(state->guarantees, 0, sizeof state->guarantees);
+        return false;
+    }
+    // A side entry means the value reaching this instruction was not
+    // produced by what precedes it in address order.
+    if (riscvlint_is_branch_target(state, insn->address))
+        memset(state->guarantees, 0, sizeof state->guarantees);
+
+    bool found = false;
+    unsigned rd = 0, rs1 = 0, want = 0;
+    if (rv_decode_extension(w, insn->size, &rd, &rs1, &want) && rs1 != 0 &&
+        (state->guarantees[rs1] & want) &&
+        !riscvlint_is_relocated(state, insn->address)) {
+        finding->title = "redundant sign or zero extension";
+        finding->address = insn->address;
+        finding->insn_count = 1;
+        if (rd == rs1)
+            snprintf(finding->replacement, sizeof finding->replacement,
+                     "delete; %s is already %s (%u bytes)",
+                     rv_reg_name(rs1), guarantee_name(want), insn->size);
+        else
+            // The rewrite is a copy, and c.mv can name any two non-zero
+            // registers, so a four-byte extension becomes two bytes.
+            snprintf(finding->replacement, sizeof finding->replacement,
+                     "mv %s, %s; %s is already %s (%u -> 2 bytes)",
+                     rv_reg_name(rd), rv_reg_name(rs1), rv_reg_name(rs1),
+                     guarantee_name(want), insn->size);
+        found = true;
+    }
+
+    // Record what this instruction leaves behind. Capstone decides what
+    // was written and the raw decode decides what is guaranteed: an
+    // under-reported write would leave a stale guarantee and a wrong
+    // finding, so calls and unconditional transfers clear the table
+    // outright rather than relying on the register model at exactly the
+    // places it is known to be thin.
+    unsigned grd = 0;
+    unsigned g = rv_result_guarantees(w, insn->size, &grd);
+    cs_regs rr, rw;
+    uint8_t nr = 0, nw = 0;
+    if (cs_regs_access(state->handle, insn, rr, &nr, rw, &nw) != CS_ERR_OK) {
+        memset(state->guarantees, 0, sizeof state->guarantees);
+        return found;
+    }
+    bool wrote_grd = false;
+    for (int i = 0; i < nw; i++) {
+        unsigned n = cs_reg_to_num(rw[i]);
+        if (n < 32) state->guarantees[n] = 0;
+        if (n == grd) wrote_grd = true;
+    }
+    // The guarantee is only recorded when both models agree the
+    // instruction wrote that register. They are decoding the same bytes
+    // by different routes, and where they disagree the disagreement is a
+    // bug in one of them -- so it costs a finding rather than inventing
+    // a guarantee about a register this instruction never touched.
+    if (g && grd != 0 && grd < 32 && wrote_grd) state->guarantees[grd] = g;
+    if (rv_ends_region(w, insn->size))
+        memset(state->guarantees, 0, sizeof state->guarantees);
     return found;
 }
 

@@ -1,0 +1,27 @@
+redundant sign or zero extension at offset: 0x2: -> delete; a0 is already zext.b (2 bytes) (1 instructions)
+  andi a0, a0, 0xff
+
+redundant sign or zero extension at offset: 0xa: -> delete; a6 is already zext.b (4 bytes) (1 instructions)
+  andi a6, a6, 0xff
+
+redundant sign or zero extension at offset: 0x12: -> delete; a0 is already sext.w (2 bytes) (1 instructions)
+  sext.w a0, a0
+
+redundant sign or zero extension at offset: 0x18: -> mv a2, a0; a0 is already sext.w (4 -> 2 bytes) (1 instructions)
+  sext.w a2, a0
+
+redundant sign or zero extension at offset: 0x24: -> delete; a0 is already zext.b (2 bytes) (1 instructions)
+  andi a0, a0, 0xff
+
+call pair foldable to jal at offset: 0x3a: -> jal ra, 0x58 (2 instructions)
+  auipc ra, 0
+  jalr 0x1e(ra)
+
+redundant sign or zero extension at offset: 0x54: -> delete; a0 is already sext.h (2 bytes) (1 instructions)
+  sext.h a0, a0
+
+Optimization opportunities by type:
+       6  redundant sign or zero extension
+       1  call pair foldable to jal
+
+7 optimization opportunities in 37 instructions

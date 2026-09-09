@@ -28,7 +28,7 @@ which also records where the first figure was wrong and why.
 | 6 | constant re-materialization | 4,580 | 193,398 | size test applied |
 | 7 | compare-then-branch folding | 1,978 | 21,986 | liveness applied |
 | 8 | frame-pointer teardown over a static frame | 111,445 | 133,670 | **implemented** |
-| 9 | extension the producer already guarantees | 6,033 | - | candscan-sized |
+| 9 | extension the producer already guarantees | 6,139 | - | **implemented** |
 | 10 | dead store to a frame slot | 10,131 | - | candscan-sized |
 
 ### 6. Constant re-materialization -- 4,580 of 193,398
@@ -294,7 +294,7 @@ to address locals, `check_dead_def` then reports the setup on its own,
 so the two checks compose to two instructions per exit without either
 having to know about the other.
 
-### 9. An extension whose producer already guarantees it -- 6,033
+### 9. An extension whose producer already guarantees it -- 6,139  [implemented]
 
 `sext.w`/`zext.w`/`sext.b`/`sext.h`/`zext.h`, or `andi rd,rd,255`, on a
 register whose producer already left it in exactly that form.
@@ -309,31 +309,40 @@ register whose producer already left it in exactly that form.
 | `lb` -> `sext.b` | 133 |
 | `lh`, `sraw`, `lui`, `li`, `addiw`, `srliw` ... | 137 |
 
-| corpus | findings |
-|---|---:|
-| C++ | 4,232 |
-| Rust | 208 |
-| Go | 1,593 |
+Measured by `check_redundant_extension` itself:
 
-C++ is 3,430 Qt6Core and 802 libLLVM, so this is GCC's residue where
+| corpus | findings | shapes candscan counted |
+|---|---:|---:|
+| C++ | 4,250 | 4,232 |
+| Rust | 296 | 208 |
+| Go | 1,593 | 1,593 |
+
+C++ is 3,433 Qt6Core and 817 libLLVM, so this is GCC's residue where
 candidate 8 is LLVM's -- each toolchain leaves a different thing behind,
 which is the argument for keeping both in the corpus.
 
 Like the `zext.w` check and unlike everything else here, **it needs no
-liveness query**: 4,464 of the 6,033 write back the register they read,
-so deleting them leaves it bit-identical, and the remaining 1,569 become
-`mv`. Nothing downstream has to be proved about either.
+liveness query**: most of these write back the register they read, so
+deleting them leaves it bit-identical, and the rest become `mv`. Nothing
+downstream has to be proved about either.
+
+The check finds slightly more than the measurement did, which is the
+first time that has happened here. `candscan` keyed the producer on a
+list of mnemonics; the check bounds the value by an `andi` mask as well,
+so `andi a0,a1,1` followed by a `zext.b` is a finding the mining tool
+had no way to see. Three of them were checked against binutils by hand.
 
 Report it as instructions rather than space. `sext.w rd,rd` after `lw`
-assembles to `c.addiw rd,0`, two bytes, and 4,327 of the 4,464 deletions
-are that shape; the 1,569 rewrites to `mv` save two bytes each. So the
-family is 6,033 instructions and about 12 KB -- costing it at four bytes
-a site would overstate it by more than twice.
+assembles to `c.addiw rd,0`, two bytes, and the assembler picks
+`c.zext.b` over the four-byte `andi rd,rd,255` whenever the register is
+in x8-x15, so most deletions save two bytes rather than four. The family
+is about 12 KB -- costing it at four bytes a site would overstate it by
+more than twice.
 
 This supersedes "redundant mask after a zero-extending load -- 148"
 below, which was measured on adjacent pairs only. With the region window
 the `lbu`/`andi` half alone is 680, and the family it belongs to is
-6,033. The lesson is the reverse of the usual one here: applying a
+6,139. The lesson is the reverse of the usual one here: applying a
 precondition cut every other candidate, but widening the window from a
 pair to a region grew this one 40-fold.
 
@@ -491,7 +500,7 @@ second instruction writes it is one dominant idiom plus nothing.
 
 # Remaining candidates, ranked
 
-Four checks are implemented. What is left, with every precondition that
+Six checks are implemented. What is left, with every precondition that
 can be applied without writing the check applied:
 
 | # | candidate | population | machinery needed |
@@ -499,16 +508,17 @@ can be applied without writing the check applied:
 | 1 | `addi` + memory-op offset folding | see below | liveness walk (exists) |
 | 2 | dead store to a frame slot | 10,131 | windowed memory table (new) |
 | 3 | redundant reloads | 9,030 | the same table |
-| 4 | extension the producer already guarantees | 6,033 | nothing new |
-| 5 | constant re-materialization | 4,580 | the same table + size test |
-| 6 | compare-then-branch | 1,942 | liveness walk (exists) |
-| 7 | missed compression | unsized | RVC encodability pass (new) |
+| 4 | constant re-materialization | 4,580 | the same table + size test |
+| 5 | compare-then-branch | 1,942 | liveness walk (exists) |
+| 6 | missed compression | unsized | RVC encodability pass (new) |
 
-Candidate 4 is out of population order deliberately. It needs no
-machinery that does not exist and no liveness query at all -- it deletes
-an instruction whose effect is already in force, which is the one
-rewrite that requires nothing to be proved about what comes after it.
-The frame-pointer restore had the same shape and is now implemented.
+The two candidates that needed nothing new -- the frame-pointer restore
+and the redundant extension -- are both implemented, and they were
+written first for that reason rather than for their size. Both delete an
+instruction whose effect is already in force, which is the one rewrite
+that requires nothing to be proved about what comes after it. What is
+left all wants either the liveness walk or a windowed memory table, and
+three of the six want the same table.
 
 ### 1. `addi` + memory-op offset folding
 
@@ -543,7 +553,7 @@ and `addi ;; ld` at 165,767 sat at the top of the uncovered list from the
 first scan. The families a ranking script knows about decide what gets
 looked at, which makes an unclassified remainder worth reading directly.
 
-### 2-7
+### 2-6
 
 Reloads, dead stores and re-materialization all want the same new machinery: a
 region-local table of what is already in a register, invalidated by
@@ -573,7 +583,7 @@ them compressed, 18,313,847 pairs:
 | 2 | `auipc`+`jalr` within `jal` reach | 89,804 | 121,543 |
 | 3 | dead register definitions | 6,582 | 44,546 |
 | 4 | redundant reloads | 5,781 | - |
-| 5 | extension the producer already guarantees | 4,440 | - |
+| 5 | extension the producer already guarantees | 4,546 | - |
 | 6 | constant re-materialization | 2,969 | 94,445 |
 | 7 | compare-then-branch folding | 1,978 | 21,890 |
 | 8 | dead store to a frame slot | 1,852 | - |
@@ -589,9 +599,9 @@ here and is now part of candidate 5, which subsumes it at 659 in this
 cohort once the window is a region rather than a pair.
 
 Items 1 and 5 are the two toolchains taking turns. Candidate 1 is
-119,584 libLLVM and 0 libQt6Core -- clang and rustc restore sp from the
-frame pointer unconditionally, GCC does not. Candidate 5 is 3,430
-Qt6Core against 802 libLLVM -- GCC re-extends a value its own load
+100,716 libLLVM and 0 libQt6Core -- clang and rustc restore sp from the
+frame pointer unconditionally, GCC does not. Candidate 5 is 3,433
+Qt6Core against 817 libLLVM -- GCC re-extends a value its own load
 already extended, clang mostly does not. Neither would have been visible
 in a corpus with one C++ compiler in it.
 

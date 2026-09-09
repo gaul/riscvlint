@@ -65,6 +65,53 @@ bool rv_decode_slli(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
 bool rv_decode_add(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
                    unsigned *rs2);
 
+// ---- what a result guarantees about its own high bits ----
+//
+// An extension is redundant when the value it is handed already has the
+// form the extension would impose. Deciding that means classifying a
+// producer by what its result guarantees, which is a property of the
+// instruction rather than of anything downstream -- so unlike every
+// other multi-instruction check here, this one needs no liveness query.
+//
+// The relations between these are one-way and are applied when the
+// guarantee is recorded rather than when it is tested: a value known to
+// fit 8 bits also fits 16 and 32, and a value sign-extended from bit 7
+// is sign-extended from bit 31. Zero-extension to 32 does NOT imply
+// sign-extension to 32 -- `lwu` of 0x80000000 is the counter-example,
+// and it is why `sext.w` after `lwu` is a real instruction.
+enum {
+    RISCVLINT_G_SEXT8  = 1u << 0,   // sign-extended from bit 7
+    RISCVLINT_G_SEXT16 = 1u << 1,
+    RISCVLINT_G_SEXT32 = 1u << 2,
+    RISCVLINT_G_ZEXT8  = 1u << 3,   // zero above bit 7
+    RISCVLINT_G_ZEXT16 = 1u << 4,
+    RISCVLINT_G_ZEXT32 = 1u << 5,
+};
+
+// The guarantees `w`'s result carries, with `rd` set to the register it
+// writes. 0 when it guarantees nothing, which is the answer for most of
+// the ISA and the safe one: a missing guarantee costs a finding.
+unsigned rv_result_guarantees(uint32_t w, unsigned size, unsigned *rd);
+
+// True when `w` is one of the extension spellings -- an instruction
+// whose only effect is to impose `*guarantee` on `*rs1`. `sext.w` is
+// `addiw rd,rs,0` and `zext.w` is `add.uw rd,rs,x0`, so these are
+// aliases the raw decode has to recognise rather than mnemonics.
+//
+// Zcb's two-byte spellings are decoded too, and they are not an
+// afterthought: `c.zext.b` and its family are where most of the corpus's
+// extension instructions actually are, because the assembler selects
+// them whenever the register is in x8-x15. Capstone prints them with the
+// wide mnemonic, so an `andi a2,a2,0xff` in a disassembly is as often
+// two bytes as four -- which is also why deleting one usually saves two
+// bytes rather than four.
+bool rv_decode_extension(uint32_t w, unsigned size, unsigned *rd,
+                         unsigned *rs1, unsigned *guarantee);
+
+// True when `w` ends a straight-line region: a call or an unconditional
+// transfer, in any of their spellings.
+bool rv_ends_region(uint32_t w, unsigned size);
+
 // True when `w` is an instruction whose only effect is to write one
 // general register: the ALU opcodes and their compressed spellings.
 // Deleting such an instruction is observationally free once its result
@@ -285,6 +332,21 @@ bool check_slli_srli_to_zext(riscvlint_state *state, const cs_insn *insn,
 // exactly once and riscvlint_state_set_section resets it.
 bool check_redundant_sp_restore(riscvlint_state *state, const cs_insn *insn,
                                 riscvlint_finding *finding);
+
+// An extension applied to a value that already has that form: `sext.w`
+// after `lw`, `andi rd,rd,255` after `lbu`, and the rest of the family.
+// Where it writes back the register it read, deleting it leaves that
+// register bit-identical and nothing downstream has to be proved;
+// where it writes elsewhere it becomes a `mv`.
+//
+// Like check_redundant_sp_restore this carries state across the section
+// -- one guarantee mask per register -- and for the same reason: what
+// makes the extension redundant is upstream, not under the cursor. The
+// table is cleared at a side entry, a call and an unconditional
+// transfer, so a guarantee is only ever read on the straight-line path
+// that established it.
+bool check_redundant_extension(riscvlint_state *state, const cs_insn *insn,
+                               riscvlint_finding *finding);
 
 bool check_dead_def(riscvlint_state *state, const cs_insn *insn,
                     riscvlint_finding *finding);

@@ -627,6 +627,202 @@ static void test_sp_restore_check(csh handle)
     CHECK(run_sp_restore(handle, shared, sizeof shared, 0x1000, NULL) == 0);
 }
 
+// ---- redundant sign or zero extension ----
+
+static int run_redundant_ext(csh handle, const uint8_t *code, size_t len,
+                             uint64_t vaddr, riscvlint_finding *out)
+{
+    static uint8_t buf[256];
+    memcpy(buf, code, len);
+    riscvlint_state *state = riscvlint_state_create();
+    if (!state) return -1;
+    int fired = 0;
+    if (riscvlint_state_set_section(state, handle, buf, len, vaddr)) {
+        cs_insn *insn = cs_malloc(handle);
+        const uint8_t *p = buf;
+        size_t remain = len;
+        uint64_t addr = vaddr;
+        while (insn && remain >= 2 &&
+               cs_disasm_iter(handle, &p, &remain, &addr, insn)) {
+            riscvlint_finding f;
+            memset(&f, 0, sizeof f);
+            if (check_redundant_extension(state, insn, &f)) {
+                if (out && !fired) *out = f;
+                fired++;
+            }
+        }
+        if (insn) cs_free(insn, 1);
+    }
+    riscvlint_state_destroy(state);
+    return fired;
+}
+
+static void test_result_guarantees(void)
+{
+    unsigned rd = 99, g;
+
+    // `lw a0,0(a1)` sign-extends from bit 31 and says nothing narrower.
+    g = rv_result_guarantees(0x0005a503u, 4, &rd);
+    CHECK(rd == 10 && g == RISCVLINT_G_SEXT32);
+
+    // `lbu a0,0(a1)` bounds the value to 0..255, which closes upward
+    // through both families -- including sign-extension to 32, since
+    // bit 31 of such a value is zero.
+    g = rv_result_guarantees(0x0005c503u, 4, &rd);
+    CHECK(rd == 10);
+    CHECK((g & RISCVLINT_G_ZEXT8) && (g & RISCVLINT_G_ZEXT16) &&
+          (g & RISCVLINT_G_ZEXT32) && (g & RISCVLINT_G_SEXT32));
+    CHECK(!(g & RISCVLINT_G_SEXT8));   // 200 is not sign-extended from bit 7
+
+    // `lwu a0,0(a1)` is the counter-example the whole model turns on:
+    // zero-extended to 32 does NOT imply sign-extended to 32, because
+    // 0x80000000 is a legal result.
+    g = rv_result_guarantees(0x0005e503u, 4, &rd);
+    CHECK((g & RISCVLINT_G_ZEXT32) && !(g & RISCVLINT_G_SEXT32));
+
+    // `andi a0,a1,1` bounds the result by its mask, which is how the
+    // check catches sites a producer list keyed on mnemonics misses.
+    g = rv_result_guarantees(0x0015f513u, 4, &rd);
+    CHECK(rd == 10 && (g & RISCVLINT_G_ZEXT8));
+
+    // A mask too wide for 8 bits stops at 16.
+    g = rv_result_guarantees(0x7ff5f513u, 4, &rd);          // andi a0,a1,2047
+    CHECK(!(g & RISCVLINT_G_ZEXT8) && (g & RISCVLINT_G_ZEXT16));
+
+    // Every OP-IMM-32 result is sign-extended from bit 31 by definition.
+    g = rv_result_guarantees(0x0015051bu, 4, &rd);          // addiw a0,a0,1
+    CHECK(g == RISCVLINT_G_SEXT32);
+
+    // c.lbu, two bytes: the same guarantee as its wide spelling.
+    g = rv_result_guarantees(0x8188u, 2, &rd);
+    CHECK(rd == 10 && (g & RISCVLINT_G_ZEXT8));
+
+    // c.zext.b is itself a producer as well as an extension.
+    g = rv_result_guarantees(0x9d61u, 2, &rd);
+    CHECK(rd == 10 && (g & RISCVLINT_G_ZEXT8));
+
+    // `ld` and `add` guarantee nothing about the high half.
+    CHECK(rv_result_guarantees(0x0005b503u, 4, &rd) == 0); // ld a0,0(a1)
+    CHECK(rv_result_guarantees(0x00c58533u, 4, &rd) == 0); // add a0,a1,a2
+}
+
+static void test_decode_extension(void)
+{
+    unsigned rd, rs1, g;
+
+    // sext.w is `addiw rd,rs,0`, not a mnemonic of its own.
+    CHECK(rv_decode_extension(0x0005061bu, 4, &rd, &rs1, &g));
+    CHECK(rd == 12 && rs1 == 10 && g == RISCVLINT_G_SEXT32);
+    // The same opcode with a non-zero immediate is an addition.
+    CHECK(!rv_decode_extension(0x0015061bu, 4, &rd, &rs1, &g));
+
+    // zext.w is `add.uw rd,rs,x0`; with a real rs2 it is an addition.
+    CHECK(rv_decode_extension(0x0805053bu, 4, &rd, &rs1, &g));
+    CHECK(rd == 10 && rs1 == 10 && g == RISCVLINT_G_ZEXT32);
+    CHECK(!rv_decode_extension(0x08c5053bu, 4, &rd, &rs1, &g));
+
+    // zext.h, sext.b and sext.h.
+    CHECK(rv_decode_extension(0x0805453bu, 4, &rd, &rs1, &g));
+    CHECK(g == RISCVLINT_G_ZEXT16);
+    CHECK(rv_decode_extension(0x60451513u, 4, &rd, &rs1, &g));
+    CHECK(g == RISCVLINT_G_SEXT8);
+    CHECK(rv_decode_extension(0x60551513u, 4, &rd, &rs1, &g));
+    CHECK(g == RISCVLINT_G_SEXT16);
+
+    // zext.b is `andi rd,rs,255`; any other mask is a real mask.
+    CHECK(rv_decode_extension(0x0ff57513u, 4, &rd, &rs1, &g));
+    CHECK(rd == 10 && rs1 == 10 && g == RISCVLINT_G_ZEXT8);
+    CHECK(!rv_decode_extension(0x0015f513u, 4, &rd, &rs1, &g));
+
+    // The two-byte spellings, which is where most of the corpus's
+    // extensions are. `c.addiw a0,0` at 0x2501 is `sext.w a0,a0`, and
+    // `c.zext.b a0` at 0x9d61 is the one capstone prints as
+    // `andi a0,a0,0xff` -- reading that as the four-byte form is how
+    // this check first came out a fifth short.
+    CHECK(rv_decode_extension(0x2501u, 2, &rd, &rs1, &g));
+    CHECK(rd == 10 && rs1 == 10 && g == RISCVLINT_G_SEXT32);
+    CHECK(rv_decode_extension(0x9d61u, 2, &rd, &rs1, &g));
+    CHECK(rd == 10 && rs1 == 10 && g == RISCVLINT_G_ZEXT8);
+    // c.addiw with a non-zero immediate, and c.not, are not extensions.
+    CHECK(!rv_decode_extension(0x2505u, 2, &rd, &rs1, &g));
+    CHECK(!rv_decode_extension(0x9d75u, 2, &rd, &rs1, &g));
+}
+
+static void test_redundant_ext_check(csh handle)
+{
+    riscvlint_finding f;
+
+    // The ripgrep site at 0xc55d8, cut down: `andi a0,a1,1` bounds the
+    // value to one bit, and the c.zext.b two instructions later cannot
+    // change it.
+    //
+    // The trailing `ret` is load-bearing. riscvlint_word_at reads four
+    // bytes, so a two-byte instruction in the last two bytes of a
+    // section cannot be read at all and no check fires on it. Real code
+    // never ends a section on one of these, but a fixture will.
+    static const uint8_t masked[] = {
+        0x13, 0xf5, 0x15, 0x00,        // andi a0,a1,1
+        0x13, 0x00, 0x00, 0x00,        // nop
+        0x61, 0x9d,                    // c.zext.b a0
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_redundant_ext(handle, masked, sizeof masked, 0x1000, &f) == 1);
+    CHECK(f.insn_count == 1 && f.address == 0x1008);
+    CHECK(strcmp(f.replacement,
+                 "delete; a0 is already zext.b (2 bytes)") == 0);
+
+    // Writing elsewhere makes it a copy rather than a deletion, and a
+    // four-byte extension becomes a two-byte c.mv.
+    static const uint8_t to_mv[] = {
+        0x03, 0xa5, 0x05, 0x00,        // lw a0,0(a1)
+        0x1b, 0x06, 0x05, 0x00,        // sext.w a2,a0
+    };
+    CHECK(run_redundant_ext(handle, to_mv, sizeof to_mv, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement,
+                 "mv a2, a0; a0 is already sext.w (4 -> 2 bytes)") == 0);
+
+    // The counter-example: lwu zero-extends, and sext.w of 0x80000000 is
+    // not the same value. Not a finding.
+    static const uint8_t lwu_sextw[] = {
+        0x03, 0xe5, 0x05, 0x00,        // lwu a0,0(a1)
+        0x1b, 0x05, 0x05, 0x00,        // sext.w a0,a0
+    };
+    CHECK(run_redundant_ext(handle, lwu_sextw, sizeof lwu_sextw, 0x1000,
+                            NULL) == 0);
+
+    // The producer is overwritten before the extension reads it.
+    static const uint8_t clobbered[] = {
+        0x03, 0xc5, 0x05, 0x00,        // lbu a0,0(a1)
+        0x03, 0xb5, 0x05, 0x00,        // ld a0,0(a1)
+        0x61, 0x9d,                    // c.zext.b a0
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_redundant_ext(handle, clobbered, sizeof clobbered, 0x1000,
+                            NULL) == 0);
+
+    // A call in between: the table is cleared outright rather than
+    // trusting a register model at the place it is known to be thin.
+    static const uint8_t across_call[] = {
+        0x03, 0xc5, 0x05, 0x00,        // lbu a0,0(a1)
+        0xef, 0x00, 0x00, 0x01,        // jal ra, .+16 (out of section)
+        0x61, 0x9d,                    // c.zext.b a0
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_redundant_ext(handle, across_call, sizeof across_call, 0x1000,
+                            NULL) == 0);
+
+    // A side entry onto the extension: the value reaching it was not
+    // necessarily produced by what precedes it in address order.
+    static const uint8_t side[] = {
+        0x03, 0xc5, 0x05, 0x00,        // lbu a0,0(a1)
+        0x63, 0x04, 0x05, 0x00,        // beqz a0, .+8  (targets the zext)
+        0x13, 0x00, 0x00, 0x00,        // nop
+        0x61, 0x9d,                    // c.zext.b a0   <- branch target
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_redundant_ext(handle, side, sizeof side, 0x1000, NULL) == 0);
+}
+
 int main(void)
 {
     csh handle;
@@ -641,11 +837,14 @@ int main(void)
     test_jal_reach();
     test_decode_shift_add();
     test_decode_addi();
+    test_result_guarantees();
+    test_decode_extension();
     test_arch_gate();
     test_check(handle);
     test_shadd_check(handle);
     test_zext_check(handle);
     test_sp_restore_check(handle);
+    test_redundant_ext_check(handle);
 
     cs_close(&handle);
     if (failures) {

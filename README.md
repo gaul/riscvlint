@@ -84,6 +84,37 @@ written next is decided by the corpus rather than by intuition.
   pointer. Ubuntu builds with `-fno-omit-frame-pointer` deliberately, and
   the frame pointer stays.
 
+* **redundant sign or zero extension** -- an extension applied to a value
+  that already has that form: `sext.w` after `lw`, `andi rd,rd,255` after
+  `lbu`, `sext.h` after `lb`. Where it writes back the register it read,
+  deleting it leaves that register bit-identical, so like the `zext.w`
+  check and unlike everything else here it needs no liveness query at
+  all; where it writes elsewhere it becomes a `mv`.
+
+  Population: 4,546 sites in C++ and Rust and 1,593 in Go. The C++ half
+  is 3,433 libQt6Core against 817 libLLVM, which makes it GCC's residue
+  where the stack-restore check is clang's -- the same corpus, the other
+  compiler's habit, and neither would have been visible with one C++
+  compiler in it.
+
+  Report it as instructions rather than space. `sext.w rd,rd` after `lw`
+  assembles to `c.addiw rd,0`, two bytes, and the assembler picks
+  `c.zext.b` over the four-byte `andi rd,rd,255` whenever the register
+  is in x8-x15 -- so most deletions save two bytes, not four. Capstone
+  prints both spellings with the wide mnemonic, and reading a site as
+  the four-byte form is what made this check come out a fifth short the
+  first time it was measured.
+
+  What a producer guarantees is tracked as a mask per register, with the
+  closures applied when the guarantee is recorded rather than when it is
+  tested: a value that fits 8 bits fits 16 and 32, and one sign-extended
+  from bit 7 is sign-extended from bit 31. The one relation that does not
+  hold is zero-extension to 32 implying sign-extension to 32 -- `lwu` of
+  0x80000000 is the counter-example, which is why `sext.w` after `lwu` is
+  a real instruction and not a finding. Bounding the value by an `andi`
+  mask rather than by a load mnemonic is what catches sites like
+  `andi a0,a1,1` followed by a `zext.b`.
+
 * **dead register definition** -- an instruction whose only effect is to
   write a register nothing goes on to read; deleting it is free. Unlike
   the others this cannot be decided from a pair, so it runs a bounded
