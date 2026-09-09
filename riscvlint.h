@@ -71,6 +71,17 @@ bool rv_decode_add(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
 // is known to be dead, which is what makes it a candidate.
 bool rv_pure_def(uint32_t w, unsigned size, unsigned *rd);
 
+// addi, in the two spellings that can express a frame-pointer prologue
+// or its matching stack restore. `c.addi4spn` is not optional here:
+// `addi s0,sp,48` assembles to it, and that is how every frame-pointer
+// prologue in the Rust corpus is spelled, so a decoder that read only
+// the 4-byte encoding would miss most of the population. The other
+// compressed addi forms cannot express either shape -- `c.addi` writes
+// the register it reads and `c.addi16sp` writes sp from sp -- so they
+// are left out rather than decoded and rejected.
+bool rv_decode_addi(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
+                    int64_t *imm);
+
 // srli, in either spelling. The compressed form is CB-format and can
 // only name x8-x15, so `srli a6,a6,32` stays four bytes where
 // `srli s0,s0,32` does not; c.srai and c.andi share its funct3 and are
@@ -259,6 +270,22 @@ bool check_slli_srli_to_zext(riscvlint_state *state, const cs_insn *insn,
 //
 // Needs no extension and is the first check here that fires on C++ code,
 // where the earlier three find almost nothing.
+// `addi s0,sp,K` in the prologue and `addi sp,s0,-K` at the exit. When
+// nothing has written sp in between, the frame did not move, so the
+// restore assigns sp the value it already holds and deleting it is
+// free. No liveness query is involved: the instruction's whole effect is
+// already in force, which is what separates this from a dead definition.
+//
+// This is the one check that cannot be decided from the instruction
+// under the cursor and what follows it. The prologue that makes the
+// restore redundant sits at the top of the function, past every call and
+// branch in it, and the variable-length encoding makes searching
+// backward unreliable. So the prologue is carried forward in the state
+// instead, which is sound because the driver walks each section forward
+// exactly once and riscvlint_state_set_section resets it.
+bool check_redundant_sp_restore(riscvlint_state *state, const cs_insn *insn,
+                                riscvlint_finding *finding);
+
 bool check_dead_def(riscvlint_state *state, const cs_insn *insn,
                     riscvlint_finding *finding);
 

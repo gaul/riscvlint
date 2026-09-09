@@ -113,6 +113,34 @@ bool rv_decode_add(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
     return true;
 }
 
+bool rv_decode_addi(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
+                    int64_t *imm)
+{
+    if (size == 4) {
+        // I-type: opcode OP-IMM, funct3 000.
+        if (RV_OPCODE(w) != 0x13u) return false;
+        if (((w >> 12) & 0x7u) != 0u) return false;
+        *rd = (w >> 7) & 0x1fu;
+        *rs1 = (w >> 15) & 0x1fu;
+        *imm = sign_extend((uint64_t)(w >> 20) & 0xfffu, 12);
+        return true;
+    }
+    if (size != 2) return false;
+    // CIW-format c.addi4spn: op 00, funct3 000. rs1 is sp implicitly and
+    // rd' names x8-x15, so `addi s0,sp,K` fits it and `addi a5,sp,K` does
+    // not. The immediate is a byte offset assembled out of four
+    // non-adjacent fields, and zero is the reserved encoding rather than
+    // an addi of nothing.
+    if ((w & 0xe003u) != 0x0000u) return false;
+    unsigned nz = (((w >> 11) & 0x3u) << 4) | (((w >> 7) & 0xfu) << 6) |
+                  (((w >> 6) & 0x1u) << 2) | (((w >> 5) & 0x1u) << 3);
+    if (nz == 0) return false;
+    *rd = 8u + ((w >> 2) & 0x7u);
+    *rs1 = 2u;
+    *imm = (int64_t)nz;
+    return true;
+}
+
 bool rv_decode_srli(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
                     unsigned *shamt)
 {
@@ -229,6 +257,18 @@ struct riscvlint_state {
     csh handle;         // for the liveness walk, which must disassemble
                         // ahead of the caller's own cursor
     cs_insn *probe;
+
+    // The prologue check_redundant_sp_restore is waiting to match, and
+    // whether anything has moved sp since. Every other check reads only
+    // the instruction under the cursor and what follows it; this one
+    // needs what came before, so it carries it rather than searching
+    // backward through a variable-length encoding.
+    struct {
+        bool armed;      // an `addi s0,sp,K` has been seen
+        int64_t k;       // its K
+        uint64_t setup;  // its address, for the finding text
+        bool sp_moved;   // something has written sp since
+    } fp;
 };
 
 riscvlint_state *riscvlint_state_create(void)
@@ -274,6 +314,7 @@ bool riscvlint_state_set_section(riscvlint_state *state, csh handle,
     state->size = size;
     state->vaddr = vaddr;
     state->handle = handle;
+    memset(&state->fp, 0, sizeof state->fp);
     if (!state->probe) state->probe = cs_malloc(handle);
     if (!state->probe) return false;
 
@@ -646,6 +687,79 @@ int riscvlint_liveness(riscvlint_state *state, uint64_t addr, unsigned rd)
         }
     }
     return RISCVLINT_LIVE_DEAD;
+}
+
+
+// ---- redundant stack-pointer restore ----
+
+#define RV_REG_SP 2u
+#define RV_REG_FP 8u   // s0
+
+// Does this instruction write `rn`? Answering it by raw decode would mean
+// decoding every instruction form in the ISA, which is the argument
+// riscvlint_liveness already makes for consulting capstone's register
+// model rather than the encoding. The model's known RISC-V gap is the
+// ra-implicit link aliases, and ra is neither sp nor the frame pointer,
+// so nothing needs correcting here. A failed query answers "yes", which
+// disarms the check rather than licensing a finding.
+static bool insn_writes(const riscvlint_state *state, const cs_insn *insn,
+                        unsigned rn)
+{
+    cs_regs rr, rw;
+    uint8_t nr = 0, nw = 0;
+    if (cs_regs_access(state->handle, insn, rr, &nr, rw, &nw) != CS_ERR_OK)
+        return true;
+    for (int i = 0; i < nw; i++)
+        if (cs_reg_to_num(rw[i]) == rn) return true;
+    return false;
+}
+
+bool check_redundant_sp_restore(riscvlint_state *state, const cs_insn *insn,
+                                riscvlint_finding *finding)
+{
+    unsigned rd = 0, rs1 = 0;
+    int64_t imm = 0;
+    bool addi = false;
+    if (insn->size == 2 || insn->size == 4) {
+        uint32_t w;
+        if (riscvlint_word_at(state, insn->address, &w))
+            addi = rv_decode_addi(w, insn->size, &rd, &rs1, &imm);
+    }
+
+    bool found = false;
+    if (addi && rd == RV_REG_SP && rs1 == RV_REG_FP && state->fp.armed &&
+        !state->fp.sp_moved && imm == -state->fp.k &&
+        !riscvlint_is_relocated(state, insn->address) &&
+        // A restore something branches to can be entered from code that
+        // has not been walked yet, and that code may move sp. The scan
+        // is linear, so only a fall-through restore is covered by what
+        // it has already seen. This costs the shared epilogue -- 17% of
+        // the population in the corpus -- and is what keeps the rest
+        // provable rather than likely.
+        !riscvlint_is_branch_target(state, insn->address)) {
+        finding->title = "redundant stack-pointer restore";
+        finding->address = insn->address;
+        finding->insn_count = 1;
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "delete; sp already holds %s-%" PRId64
+                 " from 0x%" PRIx64 " (%u bytes)",
+                 rv_reg_name(RV_REG_FP), state->fp.k, state->fp.setup,
+                 insn->size);
+        found = true;
+    }
+
+    // Carry the prologue forward. Order matters: the restore above is
+    // judged against the state as it stood before this instruction, and
+    // only then does this instruction get to change it.
+    if (insn_writes(state, insn, RV_REG_SP)) state->fp.sp_moved = true;
+    if (insn_writes(state, insn, RV_REG_FP)) state->fp.armed = false;
+    if (addi && rd == RV_REG_FP && rs1 == RV_REG_SP && imm > 0) {
+        state->fp.armed = true;
+        state->fp.k = imm;
+        state->fp.setup = insn->address;
+        state->fp.sp_moved = false;
+    }
+    return found;
 }
 
 bool check_dead_def(riscvlint_state *state, const cs_insn *insn,

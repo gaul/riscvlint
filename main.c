@@ -264,6 +264,7 @@ static const riscvlint_check_fn checks[] = {
     check_slli_add_to_shadd,
     check_slli_srli_to_zext,
     check_dead_def,
+    check_redundant_sp_restore,
 };
 
 static void scan_section(csh handle, riscvlint_state *state,

@@ -27,7 +27,7 @@ which also records where the first figure was wrong and why.
 | 5 | dead register definitions | 14,458 | 47,655 | **implemented** |
 | 6 | constant re-materialization | 4,580 | 193,398 | size test applied |
 | 7 | compare-then-branch folding | 1,978 | 21,986 | liveness applied |
-| 8 | frame-pointer teardown over a static frame | 133,670 | - | candscan-sized |
+| 8 | frame-pointer teardown over a static frame | 111,445 | 133,670 | **implemented** |
 | 9 | extension the producer already guarantees | 6,033 | - | candscan-sized |
 | 10 | dead store to a frame slot | 10,131 | - | candscan-sized |
 
@@ -236,19 +236,21 @@ call or fence: heap sz8 5,879, sz1 2,883, sz4 829, sp sz8 437. Distances
 cluster at 4-15 instructions, so this one genuinely needs the window; no
 pair check can see it.
 
-### 8. Frame-pointer teardown over a static frame -- 133,670
+### 8. Frame-pointer teardown over a static frame -- 111,445  [implemented]
 
 `addi s0,sp,K` in the prologue and `addi sp,s0,-K` at each exit. When
 nothing writes sp in between, the teardown assigns sp the value it
 already holds, and deleting it is free.
 
-| corpus | findings | forced (frame moved) |
+Measured by `check_redundant_sp_restore` itself:
+
+| corpus | findings | shapes candscan counted |
 |---|---:|---:|
-| C++ | 119,584 | 5,393 |
-| Rust | 14,086 | 348 |
+| C++ | 100,716 | 119,584 |
+| Rust | 10,729 | 14,086 |
 | Go | 0 | 0 |
 
-The C++ figure is 119,584 from libLLVM and **0 from libQt6Core**, and
+The C++ figure is 100,716 from libLLVM and **0 from libQt6Core**, and
 that split is the finding. GCC emits an sp-relative epilogue and leaves
 two of these shapes in the whole of Qt6Core; clang and rustc emit the
 fp-relative restore unconditionally. It is an LLVM code-generation
@@ -256,31 +258,41 @@ finding the way check 1 is a Rust linker-relaxation one, and it is the
 largest population measured in this corpus outside Go.
 
 Every site is a 4-byte encoding -- `c.addi16sp` can only spell
-`sp,sp`, so this shape never compresses -- which puts it at 133,670
-instructions and about 522 KB, the only figure here where the byte
+`sp,sp`, so this shape never compresses -- which puts it at 111,445
+instructions and about 435 KB, the only figure here where the byte
 count is simply four times the instruction count.
 
-What makes it cheap to write: **it needs no liveness walk, no ABI
+What made it cheap to write: **it needs no liveness walk, no ABI
 assumption and no extension gate.** Deleting an instruction that writes
-a register the value it already has is unconditionally safe; the only
-precondition is that sp was not written between the two, which is a scan
-over the address range rather than a question about paths. For a
-contiguous function that range is a superset of every path between them,
-so a linear answer is the conservative one. Any write to sp at all
-disqualifies the site, including the balanced `addi sp,sp,imm` pair a
-body may use, because a linear scan cannot prove a branch did not skip
-one half of it.
+a register the value it already has is unconditionally safe. Nor is the
+call in the middle of every one of these functions an ABI assumption: a
+callee that returned with sp and s0 no longer a fixed distance apart
+would have invalidated the caller's frame, not merely this rewrite.
 
-Counts are a floor. fd carries 4,247 instructions of the teardown shape;
-`candscan` claims 3,021, rejects 86 as frames that moved, and declines
-the rest because it never saw a matching setup.
+Two things separate the 133,670 shapes from the 111,445 findings.
 
-The finding must not be reported as "drop the frame pointer". Ubuntu
-builds with `-fno-omit-frame-pointer` deliberately, and the frame
-pointer stays; it is the restore that is redundant. Where the fp is not
-also used to address locals, `check_dead_def` then reports the setup on
-its own, so the two checks compose to two instructions per exit without
-either of them having to reason about the other.
+The check gives up a restore that something branches to -- 22,225
+sites, 17% of the population. A shared epilogue can be entered from code
+at a higher address, which a linear scan has not walked yet and which
+may have moved sp. Nothing short of a backward analysis decides those,
+and the check declines rather than assume.
+
+The rest is where `candscan` was looser than the check: it allowed a
+balanced `addi sp,sp,imm` pair in the body, and the check disqualifies
+any write to sp at all, because a linear scan cannot prove a branch did
+not skip one half of such a pair.
+
+Both counts are floors. fd carries 4,247 instructions of the teardown
+shape and the check reports 2,261; the difference is the branch-target
+rule, frames that really did move, and restores whose prologue the scan
+never saw.
+
+The finding is reported as "delete this instruction", never as "drop the
+frame pointer". Ubuntu builds with `-fno-omit-frame-pointer`
+deliberately, and the frame pointer stays. Where the fp is not also used
+to address locals, `check_dead_def` then reports the setup on its own,
+so the two checks compose to two instructions per exit without either
+having to know about the other.
 
 ### 9. An extension whose producer already guarantees it -- 6,033
 
@@ -484,20 +496,19 @@ can be applied without writing the check applied:
 
 | # | candidate | population | machinery needed |
 |---|---|---:|---|
-| 1 | frame-pointer teardown over a static frame | 133,670 | nothing new |
-| 2 | `addi` + memory-op offset folding | see below | liveness walk (exists) |
-| 3 | dead store to a frame slot | 10,131 | windowed memory table (new) |
-| 4 | redundant reloads | 9,030 | the same table |
-| 5 | extension the producer already guarantees | 6,033 | nothing new |
-| 6 | constant re-materialization | 4,580 | the same table + size test |
-| 7 | compare-then-branch | 1,942 | liveness walk (exists) |
-| 8 | missed compression | unsized | RVC encodability pass (new) |
+| 1 | `addi` + memory-op offset folding | see below | liveness walk (exists) |
+| 2 | dead store to a frame slot | 10,131 | windowed memory table (new) |
+| 3 | redundant reloads | 9,030 | the same table |
+| 4 | extension the producer already guarantees | 6,033 | nothing new |
+| 5 | constant re-materialization | 4,580 | the same table + size test |
+| 6 | compare-then-branch | 1,942 | liveness walk (exists) |
+| 7 | missed compression | unsized | RVC encodability pass (new) |
 
-Candidates 1 and 5 sit at the top not because they are the biggest --
-1 is, 5 is not -- but because neither needs machinery that does not
-already exist, and neither needs a liveness query at all. Both delete an
-instruction whose effect is already in force, which is the one rewrite
-that requires nothing to be proved about what comes after it.
+Candidate 4 is out of population order deliberately. It needs no
+machinery that does not exist and no liveness query at all -- it deletes
+an instruction whose effect is already in force, which is the one
+rewrite that requires nothing to be proved about what comes after it.
+The frame-pointer restore had the same shape and is now implemented.
 
 ### 1. `addi` + memory-op offset folding
 
@@ -532,7 +543,7 @@ and `addi ;; ld` at 165,767 sat at the top of the uncovered list from the
 first scan. The families a ranking script knows about decide what gets
 looked at, which makes an unclassified remainder worth reading directly.
 
-### 2-8
+### 2-7
 
 Reloads, dead stores and re-materialization all want the same new machinery: a
 region-local table of what is already in a register, invalidated by
@@ -558,7 +569,7 @@ them compressed, 18,313,847 pairs:
 
 | # | opportunity | actionable | raw pattern |
 |---|---|---:|---:|
-| 1 | frame-pointer teardown over a static frame | 133,670 | - |
+| 1 | frame-pointer teardown over a static frame | 111,445 | 133,670 |
 | 2 | `auipc`+`jalr` within `jal` reach | 89,804 | 121,543 |
 | 3 | dead register definitions | 6,582 | 44,546 |
 | 4 | redundant reloads | 5,781 | - |

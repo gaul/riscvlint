@@ -458,6 +458,175 @@ static void test_zext_check(csh handle)
     CHECK(!run_zext(handle, other, sizeof other, 0, NULL));
 }
 
+// ---- redundant stack-pointer restore ----
+
+// This check carries state across the section, so unlike run_check it
+// has to be driven over every instruction rather than the first one.
+// Sequences here mix 2- and 4-byte encodings, so they are built as bytes.
+static int run_sp_restore(csh handle, const uint8_t *code, size_t len,
+                          uint64_t vaddr, riscvlint_finding *out)
+{
+    static uint8_t buf[256];
+    memcpy(buf, code, len);
+    riscvlint_state *state = riscvlint_state_create();
+    if (!state) return -1;
+    int fired = 0;
+    if (riscvlint_state_set_section(state, handle, buf, len, vaddr)) {
+        cs_insn *insn = cs_malloc(handle);
+        const uint8_t *p = buf;
+        size_t remain = len;
+        uint64_t addr = vaddr;
+        while (insn && remain >= 2 &&
+               cs_disasm_iter(handle, &p, &remain, &addr, insn)) {
+            riscvlint_finding f;
+            memset(&f, 0, sizeof f);
+            if (check_redundant_sp_restore(state, insn, &f)) {
+                if (out && !fired) *out = f;
+                fired++;
+            }
+        }
+        if (insn) cs_free(insn, 1);
+    }
+    riscvlint_state_destroy(state);
+    return fired;
+}
+
+static void test_decode_addi(void)
+{
+    unsigned rd, rs1;
+    int64_t imm;
+
+    // `addi sp,s0,-48` at 0x6e3d0 in ripgrep: 0xfd040113. The teardown
+    // is always this four-byte form -- no compressed spelling writes sp
+    // from another register.
+    CHECK(rv_decode_addi(0xfd040113u, 4, &rd, &rs1, &imm));
+    CHECK(rd == 2 && rs1 == 8 && imm == -48);
+
+    // `addi s0,sp,48` in its four-byte spelling.
+    CHECK(rv_decode_addi(0x03010413u, 4, &rd, &rs1, &imm));
+    CHECK(rd == 8 && rs1 == 2 && imm == 48);
+
+    // The same instruction as ripgrep actually spells it at 0x6e36c:
+    // `c.addi4spn s0,sp,48`, two bytes, 0x1800. Reading only the 4-byte
+    // encoding would miss every prologue in that binary.
+    CHECK(rv_decode_addi(0x1800u, 2, &rd, &rs1, &imm));
+    CHECK(rd == 8 && rs1 == 2 && imm == 48);
+
+    // c.addi4spn's immediate comes out of four non-adjacent fields;
+    // `c.addi4spn a5,sp,16` exercises a different one than 48 does.
+    CHECK(rv_decode_addi(0x081cu, 2, &rd, &rs1, &imm));
+    CHECK(rd == 15 && rs1 == 2 && imm == 16);
+
+    // A zero immediate is the reserved encoding, not an addi of nothing.
+    CHECK(!rv_decode_addi(0x0000u, 2, &rd, &rs1, &imm));
+
+    // The other compressed addi spellings are not decoded here, because
+    // neither can express a frame-pointer prologue or its restore:
+    // `c.addi sp,sp,-16` and `c.addi16sp sp,-16` both write sp from sp.
+    CHECK(!rv_decode_addi(0x1141u, 2, &rd, &rs1, &imm));
+    CHECK(!rv_decode_addi(0x7139u, 2, &rd, &rs1, &imm));
+
+    // Not an addi at all: funct3 001 is slli, and 0x33 is OP.
+    CHECK(!rv_decode_addi(0x00151513u, 4, &rd, &rs1, &imm));
+    CHECK(!rv_decode_addi(0x00a58533u, 4, &rd, &rs1, &imm));
+}
+
+static void test_sp_restore_check(csh handle)
+{
+    riscvlint_finding f;
+
+    // The ripgrep shape, cut down: allocate, establish the frame
+    // pointer, do something, restore sp from it. Nothing moved sp, so
+    // the restore assigns it the value it already holds.
+    static const uint8_t plain[] = {
+        0x79, 0x71,                    // c.addi sp,sp,-48
+        0x00, 0x18,                    // c.addi4spn s0,sp,48
+        0x13, 0x00, 0x00, 0x00,        // nop
+        0x13, 0x01, 0x04, 0xfd,        // addi sp,s0,-48
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_sp_restore(handle, plain, sizeof plain, 0x1000, &f) == 1);
+    CHECK(f.insn_count == 1 && f.address == 0x1008);
+    CHECK(strstr(f.replacement, "delete; sp already holds s0-48") != NULL);
+
+    // A call between the two does not disqualify it, and this is the
+    // whole reason the check carries the prologue rather than working
+    // region-locally: every frame-pointer function in the corpus has
+    // calls between its prologue and its epilogue. What a callee does
+    // to sp is not an assumption being made here -- a callee that
+    // returned with sp and s0 no longer a fixed distance apart would
+    // have invalidated the caller's frame, not just this rewrite.
+    static const uint8_t across_call[] = {
+        0x79, 0x71,                    // c.addi sp,sp,-48
+        0x00, 0x18,                    // c.addi4spn s0,sp,48
+        0xef, 0x00, 0x00, 0x01,        // jal ra, .+16 (out of section)
+        0x13, 0x00, 0x00, 0x00,        // nop
+        0x13, 0x01, 0x04, 0xfd,        // addi sp,s0,-48
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_sp_restore(handle, across_call, sizeof across_call, 0x1000,
+                         NULL) == 1);
+
+    // sp moved in between: the frame is not where the prologue left it,
+    // so the restore is doing real work. This is the alloca/VLA case.
+    static const uint8_t sp_moved[] = {
+        0x79, 0x71,                    // c.addi sp,sp,-48
+        0x00, 0x18,                    // c.addi4spn s0,sp,48
+        0x13, 0x01, 0x01, 0xff,        // addi sp,sp,-16
+        0x13, 0x01, 0x04, 0xfd,        // addi sp,s0,-48
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_sp_restore(handle, sp_moved, sizeof sp_moved, 0x1000,
+                         NULL) == 0);
+
+    // s0 reloaded in between: whatever it holds at the restore is not
+    // what the prologue put there.
+    static const uint8_t fp_clobbered[] = {
+        0x79, 0x71,                    // c.addi sp,sp,-48
+        0x00, 0x18,                    // c.addi4spn s0,sp,48
+        0x03, 0x34, 0x01, 0x00,        // ld s0,0(sp)
+        0x13, 0x01, 0x04, 0xfd,        // addi sp,s0,-48
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_sp_restore(handle, fp_clobbered, sizeof fp_clobbered, 0x1000,
+                         NULL) == 0);
+
+    // The displacements have to be opposites. `addi sp,s0,-32` after
+    // `addi s0,sp,48` computes a different address on purpose.
+    static const uint8_t mismatched[] = {
+        0x79, 0x71,                    // c.addi sp,sp,-48
+        0x00, 0x18,                    // c.addi4spn s0,sp,48
+        0x13, 0x01, 0x04, 0xfe,        // addi sp,s0,-32
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_sp_restore(handle, mismatched, sizeof mismatched, 0x1000,
+                         NULL) == 0);
+
+    // No prologue at all: a restore with nothing to match it is not a
+    // finding, which is also what keeps a prologue from one function
+    // being matched against a restore in the next.
+    static const uint8_t orphan[] = {
+        0x13, 0x00, 0x00, 0x00,        // nop
+        0x13, 0x01, 0x04, 0xfd,        // addi sp,s0,-48
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_sp_restore(handle, orphan, sizeof orphan, 0x1000, NULL) == 0);
+
+    // A shared epilogue: something branches to the restore, so it can be
+    // reached from code the linear scan has not walked, and that code
+    // may have moved sp. 17% of the corpus population has this shape and
+    // the check gives all of it up rather than assume.
+    static const uint8_t shared[] = {
+        0x79, 0x71,                    // c.addi sp,sp,-48
+        0x00, 0x18,                    // c.addi4spn s0,sp,48
+        0x63, 0x04, 0x05, 0x00,        // beqz a0, .+8   (targets the addi)
+        0x13, 0x00, 0x00, 0x00,        // nop
+        0x13, 0x01, 0x04, 0xfd,        // addi sp,s0,-48  <- branch target
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_sp_restore(handle, shared, sizeof shared, 0x1000, NULL) == 0);
+}
+
 int main(void)
 {
     csh handle;
@@ -471,10 +640,12 @@ int main(void)
     test_decode_jalr();
     test_jal_reach();
     test_decode_shift_add();
+    test_decode_addi();
     test_arch_gate();
     test_check(handle);
     test_shadd_check(handle);
     test_zext_check(handle);
+    test_sp_restore_check(handle);
 
     cs_close(&handle);
     if (failures) {

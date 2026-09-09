@@ -56,6 +56,34 @@ written next is decided by the corpus rather than by intuition.
   only x8-x15. `sext.w` is the same shape with `srai` and a different
   rewrite, which the check rejects rather than folds.
 
+* **redundant stack-pointer restore** -- `addi s0,sp,K` in the prologue
+  and `addi sp,s0,-K` at the exit. When nothing has written sp in
+  between, the frame did not move, so the restore assigns sp the value it
+  already holds and deleting it is free. No liveness query is involved:
+  the instruction's whole effect is already in force, which is what
+  separates it from a dead definition.
+
+  Population: 111,445 sites -- 100,716 in libLLVM, 10,729 in Rust, and
+  **0 in libQt6Core**, which is the finding. GCC emits an sp-relative
+  epilogue; clang and rustc restore sp from the frame pointer whether or
+  not the frame moved. Go has none of this shape at all. Every site is a
+  four-byte encoding -- `c.addi16sp` can only spell `sp,sp` -- so it is
+  111,445 instructions and about 435 KB, the one check here whose byte
+  count is simply four times its finding count.
+
+  This is the only check that cannot be decided from the instruction
+  under the cursor and what follows it: the prologue that makes the
+  restore redundant sits past every call and branch in the function, and
+  the variable-length encoding makes searching backward unreliable. So it
+  carries the prologue forward in the section state instead. A restore
+  something branches to is skipped, because it can be entered from code
+  the linear scan has not walked and that code may have moved sp -- 17%
+  of the measured population, given up to keep the rest provable.
+
+  It reads as advice to delete one instruction, not to drop the frame
+  pointer. Ubuntu builds with `-fno-omit-frame-pointer` deliberately, and
+  the frame pointer stays.
+
 * **dead register definition** -- an instruction whose only effect is to
   write a register nothing goes on to read; deleting it is free. Unlike
   the others this cannot be decided from a pair, so it runs a bounded

@@ -1,0 +1,22 @@
+redundant stack-pointer restore at offset: 0x8: -> delete; sp already holds s0-48 from 0x4 (4 bytes) (1 instructions)
+  addi sp, s0, -0x30
+
+call pair foldable to jal at offset: 0x16: -> jal ra, 0x66 (2 instructions)
+  auipc ra, 0
+  jalr 0x50(ra)
+
+redundant stack-pointer restore at offset: 0x1e: -> delete; sp already holds s0-32 from 0x14 (4 bytes) (1 instructions)
+  addi sp, s0, -0x20
+
+dead register definition at offset: 0x34: -> delete; nothing reads s0 (2 bytes) (1 instructions)
+  addi s0, sp, 0x20
+
+redundant stack-pointer restore at offset: 0x60: -> delete; sp already holds s0-2044 from 0x5a (4 bytes) (1 instructions)
+  addi sp, s0, -0x7fc
+
+Optimization opportunities by type:
+       3  redundant stack-pointer restore
+       1  call pair foldable to jal
+       1  dead register definition
+
+5 optimization opportunities in 41 instructions
