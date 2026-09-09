@@ -1,0 +1,16 @@
+slli + srli foldable to zext.w at offset: 0x0: -> zext.w a4, a2 (6 -> 4 bytes) (2 instructions)
+  slli a4, a2, 0x20
+  srli a4, a4, 0x20
+
+slli + srli foldable to zext.w at offset: 0x6: -> zext.w s0, s0 (4 -> 4 bytes) (2 instructions)
+  slli s0, s0, 0x20
+  srli s0, s0, 0x20
+
+slli + srli foldable to zext.w at offset: 0xa: -> zext.w a6, a6 (6 -> 4 bytes) (2 instructions)
+  slli a6, a6, 0x20
+  srli a6, a6, 0x20
+
+Optimization opportunities by type:
+       3  slli + srli foldable to zext.w
+
+3 optimization opportunities in 21 instructions

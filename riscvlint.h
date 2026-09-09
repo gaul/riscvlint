@@ -62,6 +62,13 @@ bool rv_decode_slli(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
 bool rv_decode_add(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
                    unsigned *rs2);
 
+// srli, in either spelling. The compressed form is CB-format and can
+// only name x8-x15, so `srli a6,a6,32` stays four bytes where
+// `srli s0,s0,32` does not; c.srai and c.andi share its funct3 and are
+// separated by two bits the decoder must check.
+bool rv_decode_srli(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
+                    unsigned *shamt);
+
 // ---- analysis state ----
 //
 // One section at a time. The state owns the side-entry map, which is
@@ -188,6 +195,28 @@ bool check_call_pair_to_jal(riscvlint_state *state, const cs_insn *insn,
 // Measured population: 19,933 across the corpus, 19,671 of them in Go
 // binaries -- GCC and LLVM already use the extension. See TODO.md.
 bool check_slli_add_to_shadd(riscvlint_state *state, const cs_insn *insn,
+                             riscvlint_finding *finding);
+
+// `slli rd,rs,32` + `srli rd,rd,32` clears the upper word in two
+// dependent instructions; Zba's `zext.w` (an alias of `add.uw rd,rs,x0`)
+// does it in one. Reported only when the srli both reads and overwrites
+// the register the slli wrote, so the intermediate is dead by
+// construction.
+//
+// Unlike the shift-add family this shape is essentially always written
+// that way: of the sites in the corpus, none use a third register, so
+// the population does not shrink when the precondition is applied.
+//
+// The rewrite is costed at `zext.w`'s four bytes. Zcb has a two-byte
+// `c.zext.w` for a destination in x8-x15, which would save two more, but
+// claiming it would mean gating on Zcb as well; the figure here is a
+// floor on the saving rather than the best case.
+//
+// Gated on Zba, on the same three-valued rule as the shift-add check.
+//
+// Measured population: 18,073 across the corpus, all but two of them in
+// Go binaries. See TODO.md.
+bool check_slli_srli_to_zext(riscvlint_state *state, const cs_insn *insn,
                              riscvlint_finding *finding);
 
 #endif  // RISCVLINT_H

@@ -16,7 +16,7 @@ which also records where the first figure was wrong and why.
 |---|---|---:|---:|---|
 | 1 | `auipc`+`jalr` within `jal` reach | 89,860 | 801,519 | **implemented** |
 | 2 | Zba shift-add | 13,249 | 48,270 | **implemented** |
-| 3 | Zba `zext.w` | 18,073 | 25,672 | immediate applied |
+| 3 | Zba `zext.w` | 18,073 | 25,672 | **implemented** |
 | 4 | redundant reloads | 10,079 | - | region-sound |
 | 5 | dead register definitions | 4,808 | 47,659 | verified on sites |
 | 6 | constant re-materialization | 4,580 | 193,398 | size test applied |
@@ -186,15 +186,38 @@ makes "what would rebuilding for RVA23 buy me?" answerable at all: the
 have already taken the extension; running C++ with `-m rva23` does not
 change them, because those objects already declare Zba.
 
-### 6. Zba `zext.w` -- 18,073
+### 6. Zba `zext.w` -- 18,073  [implemented]
 
-`slli rd,rs,32` + `srli rd,rd,32`. Go 18,071, C++ 2, Rust 0.
+`slli rd,rs,32` + `srli rd,rd,32` clears the upper word in two dependent
+instructions; `zext.w` (an alias of `add.uw rd,rs,x0`) does it in one.
+Go 18,071, C++ 2, Rust 0.
 
-Checks 5 and 6 are almost entirely a Go story. Ubuntu 26.04 riscv64
-targets RVA23 (`Tag_RISCV_arch` carries `zba1p0_zbb1p0_zbs1p0`), and
-GCC/LLVM use it -- the corpus contains 153,727 `sh3add`, 105,620
-`zext.w`, 24,315 `maxu`. Go's backend does not, which is why both
-populations sit in one language.
+Unlike the shift-add family, applying the precondition costs nothing
+here: the check requires the srli to both read and overwrite the
+register the slli wrote, and every site in the corpus is written that
+way. 18,073 shapes, 18,073 findings -- no third-register variants exist
+to need liveness.
+
+| spelling | count | saving |
+|---|---:|---|
+| both 4-byte | 8,502 | one instruction, 4 bytes |
+| mixed | 8,062 | one instruction, 2 bytes |
+| `c.slli` + `c.srli` | 1,509 | one instruction, no bytes |
+
+So about 49 KB and 18,073 instructions. The compressed-pair share is far
+smaller here than in the shift-add family (8% against 41%), because
+`c.srli` is CB-format and can only name x8-x15, so half the register
+file forces the four-byte spelling.
+
+The rewrite is costed at `zext.w`'s four bytes. Zcb has a two-byte
+`c.zext.w` for a destination in x8-x15 that would save two more, but
+claiming it means gating on Zcb as well, so the figure is a floor.
+
+`sext.w` -- the same shape with `srai` -- is a separate rewrite the base
+ISA already spells `addiw rd,rs,0`, needing no extension at all. It does
+not appear in the Go corpus and totals 341 sites overall, so it is not
+worth a check; the zext check rejects it explicitly rather than
+mis-folding it.
 
 ### 7. Redundant reloads -- 10,079
 

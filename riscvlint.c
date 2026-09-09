@@ -113,6 +113,34 @@ bool rv_decode_add(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
     return true;
 }
 
+bool rv_decode_srli(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
+                    unsigned *shamt)
+{
+    if (size == 4) {
+        // I-type shift right logical: funct3 101, funct6 000000. funct6
+        // 010000 is srai, which shifts in the sign and is a different
+        // rewrite.
+        if (RV_OPCODE(w) != 0x13u) return false;
+        if (((w >> 12) & 0x7u) != 5u) return false;
+        if (((w >> 26) & 0x3fu) != 0u) return false;
+        *rd = (w >> 7) & 0x1fu;
+        *rs1 = (w >> 15) & 0x1fu;
+        *shamt = (w >> 20) & 0x3fu;
+        return true;
+    }
+    if (size != 2) return false;
+    // CB-format c.srli: funct3 100, op 01, bits [11:10] zero. c.srai sets
+    // bit 10 and c.andi bit 11. The register field is three bits wide, so
+    // only x8-x15 can be named.
+    if ((w & 0xec03u) != 0x8001u) return false;
+    unsigned r = 8u + ((w >> 7) & 0x7u);
+    unsigned sh = (((w >> 12) & 1u) << 5) | ((w >> 2) & 0x1fu);
+    if (sh == 0) return false;
+    *rd = *rs1 = r;
+    *shamt = sh;
+    return true;
+}
+
 unsigned riscvlint_parse_arch(const char *arch)
 {
     if (!arch) return 0;
@@ -392,5 +420,44 @@ bool check_slli_add_to_shadd(riscvlint_state *state, const cs_insn *insn,
     snprintf(finding->replacement, sizeof finding->replacement,
              "sh%uadd %s, %s, %s (%u -> 4 bytes)", shamt, rv_reg_name(rd2),
              rv_reg_name(rs1), rv_reg_name(addend), before);
+    return true;
+}
+
+bool check_slli_srli_to_zext(riscvlint_state *state, const cs_insn *insn,
+                             riscvlint_finding *finding)
+{
+    if (!riscvlint_may_use(state, RISCVLINT_EXT_ZBA)) return false;
+    if (insn->size != 2 && insn->size != 4) return false;
+
+    uint32_t w1;
+    if (!riscvlint_word_at(state, insn->address, &w1)) return false;
+    unsigned rd1, rs1, sh1;
+    if (!rv_decode_slli(w1, insn->size, &rd1, &rs1, &sh1)) return false;
+    if (sh1 != 32 || rd1 == 0) return false;
+
+    uint64_t second = insn->address + insn->size;
+    uint32_t w2;
+    if (!riscvlint_word_at(state, second, &w2)) return false;
+    unsigned len2 = rv_insn_len(w2);
+    unsigned rd2, srs1, sh2;
+    if (!rv_decode_srli(w2, len2, &rd2, &srs1, &sh2)) return false;
+    if (sh2 != 32) return false;
+
+    // The srli must consume the shifted value and overwrite it, which is
+    // what leaves nothing of the intermediate to keep alive.
+    if (rd2 != rd1 || srs1 != rd1) return false;
+
+    if (riscvlint_is_branch_target(state, second)) return false;
+    if (riscvlint_is_relocated(state, insn->address) ||
+        riscvlint_is_relocated(state, second))
+        return false;
+
+    unsigned before = insn->size + len2;
+    finding->title = "slli + srli foldable to zext.w";
+    finding->address = insn->address;
+    finding->insn_count = 2;
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "zext.w %s, %s (%u -> 4 bytes)", rv_reg_name(rd1),
+             rv_reg_name(rs1), before);
     return true;
 }

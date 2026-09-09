@@ -42,6 +42,20 @@ written next is decided by the corpus rather than by intuition.
   string that is present and does not name the extension. When the set
   had to be assumed rather than read, the run says so.
 
+* **slli + srli foldable to zext.w** -- `slli rd,rs,32` +
+  `srli rd,rd,32` clears the upper word in two dependent instructions
+  where Zba's `zext.w` does it in one. Reported only when the srli both
+  reads and overwrites the register the slli wrote, which makes the
+  intermediate dead by construction -- and unlike the shift-add family
+  every site in the corpus is written that way, so the precondition costs
+  nothing.
+
+  Population: 18,073 sites, 18,071 of them in Go, worth about 49 KB and
+  18,073 instructions. Only 8% are `c.slli` + `c.srli` -- far fewer than
+  the shift-add family's 41%, because `c.srli` is CB-format and can name
+  only x8-x15. `sext.w` is the same shape with `srai` and a different
+  rewrite, which the check rejects rather than folds.
+
 ## Selecting the target
 
 `-m <name>` pins the extensions the checks may assume, and may be

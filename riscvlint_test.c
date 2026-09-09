@@ -97,6 +97,24 @@ static void test_decode_shift_add(void)
     CHECK(rv_decode_add(0x97bau, 2, &rd, &rs1, &rs2));
     CHECK(rd == 15 && rs2 == 14);                   // a5, a4
 
+    // srli, both spellings. `slli a4,a2,0x20` is 0x02061713 and the
+    // c.srli that follows it is 0x9301; `srli a6,a6,0x20` stays four
+    // bytes at 0x02085813 because a6 is x16 and CB-format names only
+    // x8-x15.
+    CHECK(rv_decode_srli(0x9301u, 2, &rd, &rs1, &sh));
+    CHECK(rd == 14 && rs1 == 14 && sh == 32);        // a4
+    CHECK(rv_decode_srli(0x9001u, 2, &rd, &rs1, &sh));
+    CHECK(rd == 8 && sh == 32);                      // s0
+    CHECK(rv_decode_srli(0x02085813u, 4, &rd, &rs1, &sh));
+    CHECK(rd == 16 && rs1 == 16 && sh == 32);        // a6
+    // c.srai shares c.srli's funct3 and differs in bit 10; it shifts in
+    // the sign, which is sext.w rather than zext.w.
+    CHECK(!rv_decode_srli(0x9401u, 2, &rd, &rs1, &sh));
+    // The 4-byte srai differs in funct6.
+    CHECK(!rv_decode_srli(0x02085813u | (0x10u << 26), 4, &rd, &rs1, &sh));
+    // slli shares the opcode, differing in funct3.
+    CHECK(!rv_decode_srli(0x02061713u, 4, &rd, &rs1, &sh));
+
     CHECK(rv_insn_len(0x00239413u) == 4);
     CHECK(rv_insn_len(0x040au) == 2);
 
@@ -377,6 +395,69 @@ static void test_shadd_check(csh handle)
     CHECK(!run_shadd(handle, sub, sizeof sub, 0, NULL));
 }
 
+static bool run_zext(csh handle, const uint8_t *bytes, size_t len,
+                     unsigned exts, riscvlint_finding *out)
+{
+    static uint8_t buf[256];
+    memcpy(buf, bytes, len);
+    riscvlint_state *state = riscvlint_state_create();
+    if (!state) return false;
+    bool fired = false;
+    riscvlint_state_set_extensions(state, exts);
+    if (riscvlint_state_set_section(state, handle, buf, len, 0x1000)) {
+        cs_insn *insn = cs_malloc(handle);
+        const uint8_t *p = buf;
+        size_t remain = len;
+        uint64_t addr = 0x1000;
+        if (insn && cs_disasm_iter(handle, &p, &remain, &addr, insn)) {
+            riscvlint_finding f;
+            memset(&f, 0, sizeof f);
+            fired = check_slli_srli_to_zext(state, insn, &f);
+            if (fired && out) *out = f;
+        }
+        if (insn) cs_free(insn, 1);
+    }
+    riscvlint_state_destroy(state);
+    return fired;
+}
+
+static void test_zext_check(csh handle)
+{
+    riscvlint_finding f;
+    // slli a4,a2,32 ; c.srli a4,32 -- the shape as gh writes it.
+    const uint8_t mixed[] = { 0x13, 0x17, 0x06, 0x02, 0x01, 0x93, 0x82, 0x80 };
+    CHECK(run_zext(handle, mixed, sizeof mixed, 0, &f));
+    CHECK(strcmp(f.replacement, "zext.w a4, a2 (6 -> 4 bytes)") == 0);
+
+    // c.slli s0,32 ; c.srli s0,32 -- four bytes either way.
+    const uint8_t cc[] = { 0x02, 0x14, 0x01, 0x90, 0x82, 0x80 };
+    CHECK(run_zext(handle, cc, sizeof cc, 0, &f));
+    CHECK(strcmp(f.replacement, "zext.w s0, s0 (4 -> 4 bytes)") == 0);
+
+    // c.slli s0,32 ; c.srai s0,32 shifts in the sign: sext.w, not this.
+    const uint8_t sra[] = { 0x02, 0x14, 0x01, 0x94, 0x82, 0x80 };
+    CHECK(!run_zext(handle, sra, sizeof sra, 0, NULL));
+
+    // Declared without Zba: silent. Declared with it, or not at all: not.
+    CHECK(!run_zext(handle, cc, sizeof cc,
+                    RISCVLINT_EXT_DECLARED | RISCVLINT_EXT_ZBB, NULL));
+    CHECK(run_zext(handle, cc, sizeof cc,
+                   RISCVLINT_EXT_DECLARED | RISCVLINT_EXT_ZBA, NULL));
+
+    // A shift of 31 leaves a bit of the upper word, so it is not a
+    // zero-extension of the low 32. Bytes taken from the assembler:
+    // `slli s0,s0,31` is 0x047e and `srli s0,s0,31` is 0x807d.
+    const uint8_t sh31[] = { 0x7e, 0x04, 0x7d, 0x80, 0x82, 0x80 };
+    CHECK(!run_zext(handle, sh31, sizeof sh31, 0, NULL));
+
+    // The srli writes elsewhere, leaving the shifted value alive:
+    // slli a4,a2,32 ; srli a5,a4,32 (0x020757b3 is srl, so spell the
+    // immediate form 0x02075793).
+    const uint8_t other[] = { 0x13, 0x17, 0x06, 0x02,
+                              0x93, 0x57, 0x07, 0x02, 0x82, 0x80 };
+    CHECK(!run_zext(handle, other, sizeof other, 0, NULL));
+}
+
 int main(void)
 {
     csh handle;
@@ -393,6 +474,7 @@ int main(void)
     test_arch_gate();
     test_check(handle);
     test_shadd_check(handle);
+    test_zext_check(handle);
 
     cs_close(&handle);
     if (failures) {
