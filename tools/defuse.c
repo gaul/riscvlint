@@ -346,9 +346,12 @@ static uint8_t *mark_branch_targets(csh handle, const uint8_t *code,
             p += 2; remain -= 2; addr += 2;
             continue;
         }
-        if (!has_group(insn, RISCV_GRP_BRANCH_RELATIVE) &&
-            !has_group(insn, RISCV_GRP_JUMP) &&
-            !has_group(insn, RISCV_GRP_CALL))
+        // BRANCH_RELATIVE only. An indirect `jalr rd,<off>(rs)` is in
+        // the JUMP group and carries an immediate too, but that
+        // immediate is an offset from a register, not an address --
+        // recording it marks an unrelated instruction as a side entry
+        // and suppresses findings there.
+        if (!has_group(insn, RISCV_GRP_BRANCH_RELATIVE))
             continue;
         const cs_riscv *a = &insn->detail->riscv;
         for (int i = 0; i < a->op_count; i++) {

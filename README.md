@@ -3,9 +3,25 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-At present the repository holds only the corpus-mining tools that decide
-what the checker should check. See [TODO.md](TODO.md) for the candidate
-list and the populations behind it.
+One check is implemented so far. [TODO.md](TODO.md) holds the rest of the
+backlog with the measured population behind each entry, so what gets
+written next is decided by the corpus rather than by intuition.
+
+## Checks
+
+* **call pair foldable to jal** -- `auipc rd,X` + `jalr rd,Y(rd)` builds a
+  call with +/-2GB of reach out of eight bytes and a register dependency.
+  Where the target is inside `jal`'s +/-1MB, one four-byte `jal rd,target`
+  does the same job. The check reports only the shape whose `jalr` writes
+  back the register the `auipc` wrote, which folds exactly; the tail-call
+  spelling `jalr x0,Y(rd)` would stop writing that register and needs a
+  liveness proof this check does not have.
+
+  Population: 89,860 sites across the corpus -- 89,804 of them in Rust
+  binaries, roughly 4.9% of that text, and **0** in C++, because
+  libLLVM's text segment is far past `jal`'s reach so every one of its
+  679,812 call pairs is forced. It is a linker-relaxation finding rather
+  than a compiler one.
 
 ## Building
 
@@ -26,6 +42,12 @@ ninja -C build && ninja -C build install
 Then `make`, or `make CAPSTONE_PREFIX=/path/to/install`. The link is
 static on purpose: with a shared link the system's Capstone 5 wins at run
 time and reports subtly wrong output rather than failing.
+
+`make test` runs the unit suite, `make integration-test` the snapshot
+fixtures under `fixtures/`, and `make tools` the mining utilities. The
+fixture harness exits 2 rather than 0 when it cannot find an assembler
+that targets riscv64, so a missing toolchain cannot pass by testing
+nothing.
 
 ## Mining tools
 
@@ -75,8 +97,13 @@ the categories built around them have flagless replacements.
   plain file, `rank.py` says so rather than reporting the upper bound as
   a number.
 
-Both tools correct Capstone's register-access model where it is
-incomplete for RISC-V: `jal <imm>` and `jalr <rs>` are the aliases of
+The checks in `riscvlint.c` decode raw encodings rather than reading
+Capstone's operand model, and the reason is not stylistic. Capstone
+reports `auipc`'s operand as the raw imm20 field rather than the
+sign-extended addend, so a range test written against it silently drops
+every backward call -- which is how the call family was first sized at
+30,175 instead of 89,860. The mining tools do lean on that model, and
+correct it where they must: `jal <imm>` and `jalr <rs>` are the aliases of
 `jal ra, <imm>` and `jalr ra, 0(<rs>)` and report no write, and `ret`
 reports no read of `ra`. Left alone, a reloaded `ra` looks like a dead
 definition. This mirrors armlint's correction for the AArch64 compare

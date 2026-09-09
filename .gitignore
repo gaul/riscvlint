@@ -1,3 +1,6 @@
+riscvlint
+riscvlint_test
+libriscvlint.a
 tools/pairscan
 tools/defuse
 corpus/

@@ -1,0 +1,20 @@
+call pair foldable to jal at offset: 0x0: -> jal ra, 0x10 (2 instructions)
+  auipc ra, 0
+  jalr 0x10(ra)
+
+call pair foldable to jal at offset: 0x8: -> jal ra, 0x808 (2 instructions)
+  auipc ra, 1
+  jalr -0x800(ra)
+
+call pair foldable to jal at offset: 0x10: -> jal ra, 0xff80e (2 instructions)
+  auipc ra, 0xff
+  jalr 0x7fe(ra)
+
+call pair foldable to jal at offset: 0x18: -> jal t0, 0x38 (2 instructions)
+  auipc t0, 0
+  jalr t0, 0x20(t0)
+
+Optimization opportunities by type:
+       4  call pair foldable to jal
+
+4 optimization opportunities in 27 instructions

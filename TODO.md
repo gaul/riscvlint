@@ -14,7 +14,7 @@ which also records where the first figure was wrong and why.
 
 | # | opportunity | actionable | raw pattern | status |
 |---|---|---:|---:|---|
-| 1 | `auipc`+`jalr` within `jal` reach | 30,175 | 801,519 | verified on sites |
+| 1 | `auipc`+`jalr` within `jal` reach | 89,860 | 801,519 | **implemented** |
 | 2 | Zba shift-add | 19,933 | 48,270 | immediate applied |
 | 3 | Zba `zext.w` | 18,073 | 25,672 | immediate applied |
 | 4 | redundant reloads | 10,079 | - | region-sound |
@@ -75,20 +75,24 @@ The known remaining false-positive source is `ecall`, whose implicit
 reads of a0-a7 capstone does not report; there are 870 `ecall` sites in
 the whole corpus.
 
-### 3. Call pairs that fit in `jal` -- 30,175
+### 3. Call pairs that fit in `jal` -- 89,860  [implemented]
 
 `auipc ra,X` + `jalr ra,Y(ra)` reaches +/-2GB in 8 bytes; a single `jal`
-reaches +/-1MB in 4. Split by whether the target is actually in reach:
+reaches +/-1MB in 4. Measured by `check_call_pair_to_jal` itself:
 
-| corpus | in `jal` range | beyond | collapsible |
+| corpus | foldable | instructions | bytes saved |
 |---|---:|---:|---:|
-| C++ | 0 | 679,812 | 0.0% |
-| Rust | 30,119 | 91,424 | 24.8% |
-| Go | 56 | 108 | 34.1% |
+| C++ | 0 | 17,848,524 | 0 |
+| Rust | 89,804 | 2,285,426 | ~359 KB |
+| Go | 56 | 14,310,206 | 224 |
 
 The C++ zero is the whole point: libLLVM's text segment is far larger
-than `jal`'s reach, so every one of its 679,812 call pairs is forced.
-The Rust population is a linker-relaxation finding, not a compiler one.
+than `jal`'s reach, so every one of its 679,812 call pairs is forced. The
+Rust population is a linker-relaxation finding, not a compiler one, and
+it is large -- roughly 4.9% of the Rust corpus's text.
+
+This supersedes the 30,175 first reported here, which was three times too
+low; see "Raw fields versus decoded values" below.
 
 ### 7. Compare-then-branch folding -- 1,978 of 21,986
 
@@ -214,7 +218,7 @@ them compressed, 18,313,847 pairs:
 
 | # | opportunity | actionable | raw pattern |
 |---|---|---:|---:|
-| 1 | `auipc`+`jalr` within `jal` reach | 30,119 | 121,543 |
+| 1 | `auipc`+`jalr` within `jal` reach | 89,804 | 121,543 |
 | 2 | redundant reloads | 5,781 | - |
 | 3 | dead register definitions | 4,528 | 44,550 |
 | 4 | constant re-materialization | 2,969 | 94,445 |
@@ -256,6 +260,30 @@ The shift pairs that are *not* foldable -- shift amounts other than 32,
 which are bitfield extracts -- number 42,592 on their own, more than the
 real `zext.w` and `sh#add` populations combined. Any check in this area
 has to read the shift amount, and any sizing that does not is fiction.
+
+## Raw fields versus decoded values
+
+The first sizing of the call family came from `pairscan -x`, testing the
+auipc immediate against `|imm| <= 254` to mean "within a megabyte". That
+counted forward calls and missed every backward one.
+
+Capstone reports auipc's operand as the **raw imm20 field**, not the
+sign-extended addend: `auipc ra,0xfffff` is a displacement of -4096 and
+capstone hands back 1048575. Anything with a negative displacement fell
+outside the exact-immediate window, printed as `#i`, and was counted as
+out of range -- and a call to a PLT stub near the start of `.text` is
+exactly that shape.
+
+| | pooled | Rust |
+|---|---:|---:|
+| via capstone's operand | 30,175 | 30,119 |
+| via raw decode | 89,860 | 89,804 |
+
+The check decodes the field and sign-extends it itself, which is what
+riscvlint.h means by not reading capstone's operand model. Both counts
+were cross-checked against an independent objdump-driven pass over
+ripgrep: 31,420 sites, the same set address for address -- but only after
+that pass was fixed, because it had made the identical mistake.
 
 ## Region discipline
 
