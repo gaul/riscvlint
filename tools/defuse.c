@@ -264,10 +264,19 @@ static bool is_cond_branch(const cs_insn *insn)
            has_group(insn, RISCV_GRP_BRANCH_RELATIVE);
 }
 
+// Any jal/jalr links into a register and ends the region. The group is
+// not enough: capstone marks `jalr ra, 86(ra)` -- the ordinary PLT call
+// sequence, and by far the most common call in the corpus -- as JUMP
+// rather than CALL, and marks `jal <imm>` as neither. Missing those
+// leaves argument setup tracked across the call, where the callee's
+// clobbers make it look like a dead definition and its memory writes
+// make a reload look redundant. The rd == x0 spellings print as `j` and
+// `jr`, so any surviving jal/jalr mnemonic links.
 static bool is_call(const cs_insn *insn)
 {
     return has_group(insn, RISCV_GRP_CALL) ||
-           strcmp(insn->mnemonic, "jal") == 0;
+           strcmp(insn->mnemonic, "jal") == 0 ||
+           strcmp(insn->mnemonic, "jalr") == 0;
 }
 
 static bool uncond_transfer(const cs_insn *insn)
