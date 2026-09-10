@@ -353,6 +353,55 @@ static int load_size(const char *m)
     if (!strcmp(m, "ld")) return 8;
     return 0;
 }
+
+// The width an ordinary load or store moves, and which register file it
+// moves it through. Zero for everything else -- the vector and atomic
+// accesses included, which the window below has to treat as opaque
+// rather than as a slot it can reason about.
+static int mem_width(const char *m, bool *store, bool *fp)
+{
+    static const struct { const char *m; int w; bool st, fp; } t[] = {
+        {"lb", 1, false, false},  {"lbu", 1, false, false},
+        {"lh", 2, false, false},  {"lhu", 2, false, false},
+        {"lw", 4, false, false},  {"lwu", 4, false, false},
+        {"ld", 8, false, false},
+        {"flw", 4, false, true},  {"fld", 8, false, true},
+        {"sb", 1, true, false},   {"sh", 2, true, false},
+        {"sw", 4, true, false},   {"sd", 8, true, false},
+        {"fsw", 4, true, true},   {"fsd", 8, true, true},
+    };
+    for (size_t i = 0; i < sizeof t / sizeof *t; i++)
+        if (!strcmp(m, t[i].m)) {
+            *store = t[i].st;
+            *fp = t[i].fp;
+            return t[i].w;
+        }
+    return 0;
+}
+
+// The one instruction a load becomes when the bytes it reads are still
+// in a register: a move where the two widths match exactly, and the
+// extension the load's own signedness implies where they do not. The
+// bracketed forms need an extension the target may not declare, which
+// is why the probe keys on the form rather than reporting one total.
+//
+// `zext.b` is bracketless because `andi rd,rs,255` needs no extension;
+// `zext.h` and `zext.w` have no such spelling and cost two shifts
+// without Zbb and Zba, which is no longer a rewrite worth making.
+static const char *fwd_form(const char *st, const char *ld)
+{
+    if (!strcmp(st, "sd") && !strcmp(ld, "ld")) return "mv";
+    if (!strcmp(st, "fsd") && !strcmp(ld, "fld")) return "fmv.d";
+    if (!strcmp(st, "fsw") && !strcmp(ld, "flw")) return "fmv.s";
+    if (!strcmp(st, "sw") && !strcmp(ld, "lw")) return "sext.w";
+    if (!strcmp(st, "sw") && !strcmp(ld, "lwu")) return "zext.w [Zba]";
+    if (!strcmp(st, "sh") && !strcmp(ld, "lh")) return "sext.h [Zbb]";
+    if (!strcmp(st, "sh") && !strcmp(ld, "lhu")) return "zext.h [Zbb]";
+    if (!strcmp(st, "sb") && !strcmp(ld, "lb")) return "sext.b [Zbb]";
+    if (!strcmp(st, "sb") && !strcmp(ld, "lbu")) return "zext.b";
+    return NULL;
+}
+
 // ---- per-region tracking ----
 //
 // One record per register: what wrote it, from which sources, how many
@@ -397,11 +446,31 @@ typedef struct { bool live; int base; int64_t disp; int sz; long idx;
 static strec stores[48];
 static int nstores;
 
+// ---- a slot stored and then loaded straight back ----
+//
+// The same window looked at from the other side: `sd rD,K(rB)` followed
+// by `ld rT,K(rB)` reads back the bytes the store just wrote, so the
+// load is a move from rD. TODO.md records this as a redundancy the
+// windowed table could see and does not claim; this is the count behind
+// that sentence.
+//
+// Unlike its neighbours it needs no liveness walk and no ABI split,
+// because nothing is deleted -- the store stays and the load becomes a
+// register move. Both of its questions are backward ones the window can
+// answer: are the bytes still what the store left, and does rD still
+// hold the value it stored.
+typedef struct { bool live; int base; unsigned bgen; int64_t disp; int sz;
+                 int data; unsigned dgen; bool fp; bool xbr; long idx;
+                 uint64_t adr; char mn[32]; } fwdrec;
+static fwdrec fwds[48];
+static int nfwds;
+
 static void creset(void)
 {
     memset(cd, 0, sizeof cd);
     namats = 0;
     nstores = 0;
+    nfwds = 0;
 }
 
 static int op_reg(const cs_insn *in, int i)
@@ -579,7 +648,7 @@ static void scan_section(csh handle, const char *path, const uint8_t *code,
                          size_t size, uint64_t vaddr)
 {
     ex_code = code; ex_size = size; ex_vaddr = vaddr; ex_path = path;
-    fp_k = FP_IDLE; fp_dirty = true; nstores = 0;
+    fp_k = FP_IDLE; fp_dirty = true; nstores = 0; nfwds = 0;
     uint8_t *bits = mark_branch_targets(handle, code, size, vaddr);
     if (!bits) return;
     cs_insn *insn = cs_malloc(handle);
@@ -1031,6 +1100,124 @@ static void scan_section(csh handle, const char *path, const uint8_t *code,
             if (is_call(insn)) nstores = 0;
         }
 
+        // ---- a slot stored and then loaded straight back ----
+        //
+        // The width has to match exactly. A narrower load of a wider
+        // store is a field extraction rather than a move, and a wider
+        // load reads bytes the store never wrote.
+        {
+            const cs_riscv *ra = &insn->detail->riscv;
+            int mbase = -1; int64_t mdisp = 0; bool hasmem = false;
+            for (int i = 0; i < ra->op_count; i++)
+                if (ra->operands[i].type == RISCV_OP_MEM) {
+                    hasmem = true;
+                    mbase = reg_slot(ra->operands[i].mem.base);
+                    mdisp = ra->operands[i].mem.disp;
+                }
+            bool st = false, isfp = false;
+            int w = mem_width(m, &st, &isfp);
+            if (!w && (hasmem || m[0] == 'v' || !strncmp(m, "fence", 5) ||
+                       !strncmp(m, "amo", 3) || !strncmp(m, "lr.", 3) ||
+                       !strncmp(m, "sc.", 3))) {
+                // An access the window cannot model -- vector, atomic,
+                // or an ordering barrier. Nothing held survives it. The
+                // mnemonics are listed rather than left to `hasmem`
+                // because whether capstone gives one of these a memory
+                // operand is exactly the kind of thing its RISC-V model
+                // has been wrong about before.
+                nfwds = 0;
+            } else if (w && st && mbase >= 0) {
+                // A store through another base may alias what is held;
+                // through this one, overlapping bytes replace it and
+                // disjoint bytes provably miss it. That is the only
+                // aliasing question this window answers positively.
+                for (int i = 0; i < nfwds; i++)
+                    if (fwds[i].live &&
+                        !(fwds[i].base == mbase &&
+                          (mdisp + w <= fwds[i].disp ||
+                           fwds[i].disp + fwds[i].sz <= mdisp)))
+                        fwds[i].live = false;
+                if (nfwds < 48 && d0 >= -1) {
+                    fwdrec *r = &fwds[nfwds++];
+                    *r = (fwdrec){true, mbase, cgen[mbase], mdisp, w, d0,
+                                  d0 >= 0 ? cgen[d0] : 0, isfp, false, idx,
+                                  here, {0}};
+                    snprintf(r->mn, sizeof r->mn, "%s", m);
+                }
+            } else if (w && !st && mbase >= 0) {
+                for (int i = 0; i < nfwds; i++) {
+                    fwdrec *r = &fwds[i];
+                    if (!r->live || r->base != mbase || r->disp != mdisp ||
+                        r->sz != w)
+                        continue;
+                    long d = idx - r->idx;
+                    char key[80];
+                    const char *why = NULL;
+                    // Every shape that reaches a matching load and is not
+                    // an opportunity is counted under the reason it is
+                    // not one. Those reasons are the part of this that
+                    // intuition gets wrong, and each row is a key `-e`
+                    // can be pointed at.
+                    if (cgen[mbase] != r->bgen) {
+                        // Mostly one idiom: `addi sp,s0,-K` restores sp
+                        // to the value it already had, so the address is
+                        // in fact unchanged. Recognising that means
+                        // modelling the teardown candidate 8 measures,
+                        // and a probe that cannot prove the address is
+                        // the same declines rather than guesses.
+                        snprintf(key, sizeof key,
+                                 "fwd|base moved since the store|%s",
+                                 mbase == 2 ? "sp" : "other");
+                        why = key;
+                    } else if (r->fp != isfp) {
+                        // A bit-cast through memory. `fmv.w.x` and
+                        // `fmv.x.w`, or their 64-bit counterparts, do it
+                        // in one instruction and no memory at all --
+                        // a different rewrite from this one, so it is
+                        // counted rather than claimed.
+                        why = "fwd|across the register files";
+                    } else if (r->data < 0) {
+                        why = "fwd|stored zero -> li rd,0";
+                    } else if (cgen[r->data] != r->dgen) {
+                        why = "fwd|source overwritten";
+                    } else if (r->data == d0) {
+                        // The value is already where the load puts it, so
+                        // the load is redundant on its own and the store
+                        // with it -- a different finding from this one.
+                        why = "fwd|already in that register";
+                    }
+                    if (why) {
+                        bump(why, d);
+                        show(why, r->adr, here);
+                    } else {
+                        const char *f = fwd_form(r->mn, m);
+                        if (f) {
+                            snprintf(key, sizeof key, "fwd|%s", f);
+                            bump(key, d);
+                            bump(r->base == 2 || r->base == 8
+                                     ? "fwd|base sp/fp"
+                                     : "fwd|base other", d);
+                            // `c.mv` names any two registers, so the
+                            // move is two bytes whenever it is a move at
+                            // all; every extension form writes a second
+                            // register and so stays four. The rewrite
+                            // therefore saves bytes only where a
+                            // four-byte load becomes `mv`, and the split
+                            // is reported rather than assumed.
+                            bump(insn->size == 2 ? "fwd|load already 2 bytes"
+                                                 : "fwd|load 4 bytes", d);
+                            if (insn->size == 4 && !strcmp(f, "mv"))
+                                bump("fwd|BYTES|2", d);
+                            if (r->xbr) bump("fwd|xbr", d);
+                            bump("fwd|TOTAL", d);
+                            show(key, r->adr, here);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
         // ---- frame pointer set from sp, later used to restore it ----
         {
             bool wr_sp = false, wr_fp = false;
@@ -1146,8 +1333,10 @@ static void scan_section(csh handle, const char *path, const uint8_t *code,
         } else if (new_addr && namats < 64 && d0 >= 0) {
             amats[namats++] = (amat){addr_val, d0, cgen[d0], false};
         }
-        if (is_cond_branch(insn))
+        if (is_cond_branch(insn)) {
             for (int i = 0; i < NSLOT; i++) cd[i].xbr = true;
+            for (int i = 0; i < nfwds; i++) fwds[i].xbr = true;
+        }
         if (isc || uncond_transfer(insn)) creset();
     }
     cs_free(insn, 1);
