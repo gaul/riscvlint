@@ -13,6 +13,9 @@ dead store to a frame slot at offset: 0x16: -> delete; 32(sp) is overwritten at 
 dead register definition at offset: 0x2a: -> delete; nothing reads a0 (2 bytes) (1 instructions)
   li a0, 0
 
+load of a just-stored value at offset: 0x3a: -> mv a7, a0; stored at 0x38 (2 -> 2 bytes) (1 instructions)
+  ld a7, 0x40(sp)
+
 call pair foldable to jal at offset: 0x48: -> jal ra, 0x86 (2 instructions)
   auipc ra, 0
   jalr 0x3e(ra)
@@ -28,6 +31,7 @@ Optimization opportunities by type:
        2  dead store to a frame slot
        1  call pair foldable to jal
        1  constant re-materialization
+       1  load of a just-stored value
        1  redundant reload
 
-8 optimization opportunities in 57 instructions
+9 optimization opportunities in 57 instructions

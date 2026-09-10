@@ -1,0 +1,34 @@
+load of a just-stored value at offset: 0x4: -> mv a1, a0; stored at 0x0 (2 -> 2 bytes) (1 instructions)
+  ld a1, 8(sp)
+
+load of a just-stored value at offset: 0xa: -> sext.w a6, a0; stored at 0x6 (4 -> 4 bytes) (1 instructions)
+  lw a6, 0x10(a3)
+
+load of a just-stored value at offset: 0x12: -> zext.w a6, a0; stored at 0xe (4 -> 4 bytes) (1 instructions)
+  lwu a6, 0x18(a3)
+
+load of a just-stored value at offset: 0x1c: -> sext.h a6, a0; stored at 0x16 (4 -> 4 bytes) (1 instructions)
+  lh a6, 0x20(a3)
+
+load of a just-stored value at offset: 0x26: -> zext.b a6, a0; stored at 0x20 (4 -> 4 bytes) (1 instructions)
+  lbu a6, 0x28(a3)
+
+load of a just-stored value at offset: 0x2e: -> mv a1, a0; stored at 0x2a (2 -> 2 bytes) (1 instructions)
+  ld a1, 0x30(a3)
+
+call pair foldable to jal at offset: 0x56: -> jal ra, 0x7c (2 instructions)
+  auipc ra, 0
+  jalr 0x26(ra)
+
+load of a just-stored value at offset: 0x74: -> mv a1, a0; stored at 0x72 (2 -> 2 bytes) (1 instructions)
+  ld a1, 0x80(sp)
+
+redundant reload at offset: 0x78: -> mv a5, a1; loaded at 0x74 (2 -> 2 bytes) (1 instructions)
+  ld a5, 0x80(sp)
+
+Optimization opportunities by type:
+       7  load of a just-stored value
+       1  call pair foldable to jal
+       1  redundant reload
+
+9 optimization opportunities in 55 instructions

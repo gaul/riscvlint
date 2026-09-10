@@ -3,8 +3,8 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Thirteen checks are implemented, and one measured candidate is waiting:
-a slot stored and then loaded back, 9,737 sites.
+Fourteen checks are implemented. Two measured candidates are waiting,
+both of them shapes the fourteenth turned up while being sized.
 [TODO.md](TODO.md) is the ledger behind them: every candidate that was
 measured, the population it came back with, and the ones rejected on
 that evidence. What got written was decided by the corpus rather than by
@@ -12,7 +12,7 @@ intuition, and what did not get written was rejected the same way.
 
 ## Checks
 
-Thirteen of them. Every figure below is what the check itself reports
+Fourteen of them. Every figure below is what the check itself reports
 over the [corpus](#corpus) -- 73,139,165 instructions of three
 toolchains -- rather than what a mining tool estimated for it. The two
 have differed by an order of magnitude every time both were measured.
@@ -25,6 +25,7 @@ have differed by an order of magnitude every time both were measured.
 | redundant stack-pointer restore | 100,718 | 11,683 | 0 | 112,401 | 449,604 |
 | comparison a branch could have made | 2,895 | 42 | 0 | 2,937 | 7,578 |
 | redundant reload | 1,972 | 219 | 2,837 | 5,028 | 7,068 |
+| load of a just-stored value | 1,457 | 142 | 843 | 2,442 | 1,766 |
 | dead store to a frame slot | 203 | 1 | 4,172 | 4,376 | 16,714 |
 | constant re-materialization | 8,970 | 571 | 1,457 | 10,998 | 21,996 |
 | base add foldable into memory offset | 2,922 | 429 | 2,993 | 6,344 | 19,574 |
@@ -32,11 +33,11 @@ have differed by an order of magnitude every time both were measured.
 | instruction compressible to a Zcb form | 705 | 181 | 29,762 | 30,648 | 61,296 |
 | redundant sign or zero extension | 6,589 | 333 | 1,593 | 8,515 | 20,864 |
 | dead register definition | 11,741 | 248 | 7,876 | 19,865 | 54,570 |
-| **total** | **278,723** | **186,824** | **3,043,590** | **3,509,137** | **7,870,856** |
+| **total** | **280,180** | **186,966** | **3,044,433** | **3,511,579** | **7,872,622** |
 
 Do not read the total row as a result. One row is 85% of it, and that
 row is Go's assembler declining to select RVC at all, which is a
-different kind of finding from the twelve around it. The byte column for
+different kind of finding from the thirteen around it. The byte column for
 the call-pair row is arithmetic rather than measurement: that check does
 not print a size, and every site is eight bytes in and four out except a
 handful of `jalr ra,0(ra)` that were already two.
@@ -164,6 +165,26 @@ handful of `jalr ra,0(ra)` that were already two.
   which loads those are. The window is otherwise strict -- any store,
   call, fence, atomic or system instruction ends it, as does a write to
   either the base or the register holding the value.
+
+* **load of a just-stored value** -- the bytes a store just wrote, read
+  straight back. `sd a0,8(sp)` then `ld a1,8(sp)` puts in a1 what a0
+  already holds, so the load is `mv a1,a0`; where the two are narrower
+  than a doubleword it is the extension the load's own signedness
+  implies, and `zext.w` and the halfword forms need Zba or Zbb.
+
+  The cheapest of the four to decide, because nothing is deleted -- the
+  store stays and the load becomes a register operation, so there is no
+  liveness query at all. It reports one rewrite per site: where a
+  redundant reload of the same address is also available, that check has
+  the nearer source and this one stands down.
+
+  The same window serves it, so the same strictness applies, and here it
+  costs more than it does the reload check: a spill sequence that writes
+  several adjacent slots before reading any of them back loses every
+  claim at the second store. 6,585 sites across the corpus are that and
+  nothing else. Floating point is refused on both sides for a different
+  reason -- the window drops a held value when the register holding it
+  is written, and its write scan cannot see the f registers at all.
 
 * **dead store to a frame slot** -- the same slot stored twice with
   nothing reading it in between. The store analogue of a dead register

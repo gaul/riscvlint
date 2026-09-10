@@ -1079,13 +1079,17 @@ static void test_decode_base_add(void)
 // runner here this one has to call riscvlint_state_observe -- and after
 // the checks, which is the order the driver uses and the order the
 // answers depend on.
-static int run_window(csh handle, riscvlint_check_fn fn, const uint8_t *code,
-                      size_t len, uint64_t vaddr, riscvlint_finding *out)
+// The window checks, run over a buffer with `exts` declared. Zero is
+// the Go case -- no attributes at all -- under which every gate opens.
+static int run_window_exts(csh handle, riscvlint_check_fn fn,
+                           const uint8_t *code, size_t len, uint64_t vaddr,
+                           unsigned exts, riscvlint_finding *out)
 {
     static uint8_t buf[256];
     memcpy(buf, code, len);
     riscvlint_state *state = riscvlint_state_create();
     if (!state) return -1;
+    riscvlint_state_set_extensions(state, exts);
     int fired = 0;
     if (riscvlint_state_set_section(state, handle, buf, len, vaddr)) {
         cs_insn *insn = cs_malloc(handle);
@@ -1106,6 +1110,12 @@ static int run_window(csh handle, riscvlint_check_fn fn, const uint8_t *code,
     }
     riscvlint_state_destroy(state);
     return fired;
+}
+
+static int run_window(csh handle, riscvlint_check_fn fn, const uint8_t *code,
+                      size_t len, uint64_t vaddr, riscvlint_finding *out)
+{
+    return run_window_exts(handle, fn, code, len, vaddr, 0, out);
 }
 
 static void test_window_checks(csh handle)
@@ -1204,6 +1214,109 @@ static void test_window_checks(csh handle)
     };
     CHECK(run_window(handle, check_const_remat, narrow, sizeof narrow,
                      0x1000, NULL) == 0);
+
+    // ---- the bytes a store just wrote, read straight back ----
+
+    // A doubleword read back into another register is a move from the
+    // one the store read.
+    static const uint8_t fwd[] = {
+        0x2a, 0xe8,                    // c.sdsp a0,16(sp)
+        0x05, 0x06,                    // c.addi a2,1
+        0xc2, 0x65,                    // c.ldsp a1,16(sp)
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_store_to_load, fwd, sizeof fwd,
+                     0x1000, &f) == 1);
+    CHECK(f.address == 0x1004 && f.insn_count == 1);
+    CHECK(strstr(f.replacement, "mv a1, a0") != NULL);
+
+    // Read back into the register the store read: the value never left,
+    // so the load is redundant by itself and this is not that finding.
+    static const uint8_t same[] = {
+        0x2a, 0xe8,                    // c.sdsp a0,16(sp)
+        0x05, 0x06,                    // c.addi a2,1
+        0x42, 0x65,                    // c.ldsp a0,16(sp)
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_store_to_load, same, sizeof same,
+                     0x1000, NULL) == 0);
+
+    // Storing x0 makes the rewrite `li a1,0` rather than a move.
+    static const uint8_t zeroed[] = {
+        0x02, 0xe8,                    // c.sdsp zero,16(sp)
+        0x05, 0x06,                    // c.addi a2,1
+        0xc2, 0x65,                    // c.ldsp a1,16(sp)
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_store_to_load, zeroed, sizeof zeroed,
+                     0x1000, NULL) == 0);
+
+    // A narrower load of a wider store is a field extraction, not a
+    // move, whatever the byte order happens to be.
+    static const uint8_t partial[] = {
+        0x2a, 0xe8,                    // c.sdsp a0,16(sp)
+        0x05, 0x06,                    // c.addi a2,1
+        0xc2, 0x45,                    // c.lwsp a1,16(sp)
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_store_to_load, partial, sizeof partial,
+                     0x1000, NULL) == 0);
+
+    // A word read back with lw is the sign-extension of what was
+    // stored, and `sext.w` is `addiw rd,rs,0` -- no extension needed.
+    static const uint8_t sextw[] = {
+        0x88, 0xca,                    // c.sw a0,16(a3)
+        0x05, 0x06,                    // c.addi a2,1
+        0x03, 0xa8, 0x06, 0x01,        // lw a6,16(a3)
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_store_to_load, sextw, sizeof sextw,
+                     0x1000, &f) == 1);
+    CHECK(strstr(f.replacement, "sext.w a6, a0") != NULL);
+
+    // The same shape spelled in two bytes. Every extension form is four,
+    // so the rewrite would cost two bytes to save an access -- the trade
+    // check_const_remat refuses, and this refuses it too.
+    static const uint8_t sextw_c[] = {
+        0x2a, 0xc8,                    // c.swsp a0,16(sp)
+        0x05, 0x06,                    // c.addi a2,1
+        0xc2, 0x45,                    // c.lwsp a1,16(sp)
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_store_to_load, sextw_c, sizeof sextw_c,
+                     0x1000, NULL) == 0);
+
+    // A halfword read back with lh is Zbb's `sext.h`, so it is reported
+    // where the extension may be used and suppressed where the object
+    // declares an arch without it.
+    static const uint8_t sexth[] = {
+        0x23, 0x98, 0xa6, 0x00,        // sh a0,16(a3)
+        0x03, 0x98, 0x06, 0x01,        // lh a6,16(a3)
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window_exts(handle, check_store_to_load, sexth, sizeof sexth,
+                          0x1000, RISCVLINT_EXT_ZBB |
+                          RISCVLINT_EXT_DECLARED, &f) == 1);
+    CHECK(strstr(f.replacement, "sext.h a6, a0") != NULL);
+    CHECK(run_window_exts(handle, check_store_to_load, sexth, sizeof sexth,
+                          0x1000, RISCVLINT_EXT_DECLARED, NULL) == 0);
+
+    // Two loads after one store. The first is this check's; the second
+    // is check_redundant_reload's, whose source is the nearer of the
+    // two, so this one reports the site once rather than twice.
+    static const uint8_t twice[] = {
+        0x2a, 0xe8,                    // c.sdsp a0,16(sp)
+        0xc2, 0x65,                    // c.ldsp a1,16(sp)
+        0x05, 0x06,                    // c.addi a2,1
+        0xc2, 0x67,                    // c.ldsp a5,16(sp)
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_store_to_load, twice, sizeof twice,
+                     0x1000, &f) == 1);
+    CHECK(f.address == 0x1002);
+    CHECK(run_window(handle, check_redundant_reload, twice, sizeof twice,
+                     0x1000, &f) == 1);
+    CHECK(f.address == 0x1006);
 }
 
 // ---- conditions and branches ----

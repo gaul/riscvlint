@@ -344,22 +344,23 @@ unsigned rv_branch_encoded_size(unsigned funct3, unsigned rs1, unsigned rs2,
 
 // ---- the windowed memory and constant table ----
 //
-// Three checks -- redundant reload, dead store, constant
-// re-materialization -- need the same thing: a region-local record of
-// what is already in a register and what is already in a frame slot.
-// None of them can be decided from a pair, which is why the distances
-// cluster at 4-15 instructions and why no pair scan ever saw them.
+// Four checks -- redundant reload, dead store, constant
+// re-materialization, and the load of a just-stored value -- need the
+// same thing: a region-local record of what is already in a register
+// and what is already in a frame slot. None of them can be decided from
+// a pair, which is why the distances cluster at 4-15 instructions and
+// why no pair scan ever saw them.
 //
 // The driver calls this once per instruction, **after** the checks have
-// run, because each of the three judges the instruction under the cursor
+// run, because each of the four judges the instruction under the cursor
 // against the table as it stood before it. Recording an instruction also
 // clears the table when the *next* address is a side entry, which is
 // what keeps a check from reading a value across a branch into the
 // middle of a region.
 //
 // The two other stateful checks carry a scalar or two and update it
-// inline. This one is a table three checks read, so it gets a single
-// owner rather than three writers racing to keep it consistent.
+// inline. This one is a table four checks read, so it gets a single
+// owner rather than four writers racing to keep it consistent.
 void riscvlint_state_observe(riscvlint_state *state, const cs_insn *insn);
 
 // Drops the whole window. The driver calls it where it cannot keep the
@@ -518,6 +519,27 @@ bool check_base_add_to_offset(riscvlint_state *state, const cs_insn *insn,
 // a write to either the base or the register holding the value.
 bool check_redundant_reload(riscvlint_state *state, const cs_insn *insn,
                             riscvlint_finding *finding);
+
+// The bytes a store just wrote, read straight back: `sd a0,8(sp)` then
+// `ld a1,8(sp)` puts in a1 what a0 already holds, so the load is
+// `mv a1,a0`. Where the two are narrower than a doubleword the rewrite
+// is the extension the load's own signedness implies, and two of those
+// spellings need Zba or Zbb.
+//
+// This is the cheapest of the four to decide. Nothing is deleted -- the
+// store stays and the load becomes a register operation -- so there is
+// no liveness query, and both of the questions there are look backward
+// into the window that is already there: the record goes when the base
+// or the stored register is written, and when any store lands that the
+// decoder cannot place.
+//
+// Floating-point accesses are refused on both sides. The window drops a
+// held value when the register holding it is written, and its write
+// scan cannot see the f registers, so an f-register claim would never
+// be taken away. That costs the `fmv.s` and `fmv.d` forms, 409 sites
+// across the corpus.
+bool check_store_to_load(riscvlint_state *state, const cs_insn *insn,
+                         riscvlint_finding *finding);
 
 // A frame slot stored twice with nothing reading it in between. The
 // store analogue of a dead register definition, and it is limited to sp-

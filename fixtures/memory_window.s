@@ -68,6 +68,9 @@ _start:
     lbu     a3, 3(a1)
 
     // N5) A load from the slot is the read that keeps the store alive.
+    //     That load is check_store_to_load's finding, since the value it
+    //     reads is still in a0 -- a different claim from the one this
+    //     case is a negative for.
     sd      a0, 64(sp)
     ld      a7, 64(sp)
     sd      a4, 64(sp)

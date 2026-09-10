@@ -1856,11 +1856,15 @@ void riscvlint_state_observe(riscvlint_state *state, const cs_insn *insn)
             sl->base = base; sl->disp = off; sl->kind = kind;
             sl->width = width; sl->data = data; sl->addr = insn->address;
             sl->size = insn->size;
-            // A store leaves the value in a register too, but forwarding
-            // it to a later load is a different rewrite than collapsing
-            // two loads, and one this corpus has never measured. Only
-            // loads arm `held`.
-            sl->held = !store && !fp;
+            // A store leaves the value in a register just as a load
+            // does, and a later load of the same bytes is a move from
+            // it: check_store_to_load. Floating-point accesses arm
+            // nothing either way. The window drops a held value when
+            // the register holding it is written, and the write scan
+            // above reads cs_reg_to_num, which cannot see the f
+            // registers at all -- so an f-register claim would never be
+            // taken away.
+            sl->held = !fp;
             sl->unread = store && (base == 2 || base == 8);
         }
     }
@@ -1989,7 +1993,7 @@ bool check_base_add_to_offset(riscvlint_state *state, const cs_insn *insn,
     return true;
 }
 
-// ---- the three checks the window serves ----
+// ---- the four checks the window serves ----
 
 // `mv rd, rs` is two bytes whenever neither register is x0, which both
 // of these rewrites can rely on.
@@ -2021,6 +2025,101 @@ bool check_redundant_reload(riscvlint_state *state, const cs_insn *insn,
                  "mv %s, %s; loaded at 0x%" PRIx64 " (%u -> %u bytes)",
                  rv_reg_name(data), rv_reg_name(sl->data), sl->addr,
                  insn->size, mv_bytes());
+        return true;
+    }
+    return false;
+}
+
+// The one instruction a load becomes when the bytes it reads are still
+// in a register: a move where the store and the load are the same width
+// and the same file, and otherwise the extension the load's own
+// signedness implies. `sext.w` is `addiw rd,rs,0` and `zext.b` is
+// `andi rd,rs,255`, so neither needs an extension; `zext.h` and
+// `zext.w` have no such spelling and cost two shifts without theirs,
+// which is no longer a rewrite worth making.
+static bool forward_form(rv_mem_kind st, rv_mem_kind ld, const char **name,
+                         unsigned *ext)
+{
+    static const struct {
+        rv_mem_kind st, ld;
+        const char *name;
+        unsigned ext;
+    } t[] = {
+        { RV_MEM_SD, RV_MEM_LD,  "mv",     0 },
+        { RV_MEM_SW, RV_MEM_LW,  "sext.w", 0 },
+        { RV_MEM_SW, RV_MEM_LWU, "zext.w", RISCVLINT_EXT_ZBA },
+        { RV_MEM_SH, RV_MEM_LH,  "sext.h", RISCVLINT_EXT_ZBB },
+        { RV_MEM_SH, RV_MEM_LHU, "zext.h", RISCVLINT_EXT_ZBB },
+        { RV_MEM_SB, RV_MEM_LB,  "sext.b", RISCVLINT_EXT_ZBB },
+        { RV_MEM_SB, RV_MEM_LBU, "zext.b", 0 },
+    };
+    for (size_t i = 0; i < sizeof t / sizeof *t; i++)
+        if (t[i].st == st && t[i].ld == ld) {
+            *name = t[i].name;
+            *ext = t[i].ext;
+            return true;
+        }
+    return false;
+}
+
+bool check_store_to_load(riscvlint_state *state, const cs_insn *insn,
+                         riscvlint_finding *finding)
+{
+    if (insn->size != 2 && insn->size != 4) return false;
+    uint32_t w;
+    if (!riscvlint_word_at(state, insn->address, &w)) return false;
+    rv_mem_kind kind;
+    unsigned data, base;
+    int64_t off;
+    if (!rv_decode_mem(w, insn->size, &kind, &data, &base, &off)) return false;
+    if (rv_mem_is_store(kind) || rv_mem_is_fp(kind)) return false;
+    if (data == 0) return false;
+    if (riscvlint_is_relocated(state, insn->address)) return false;
+
+    // A held load of the same kind at the same address is
+    // check_redundant_reload's finding, and its source is the nearer of
+    // the two. One rewrite per site, so this one stands down.
+    for (int i = 0; i < state->win.nslots; i++) {
+        const rvl_slot *sl = &state->win.slots[i];
+        if (sl->held && sl->kind == kind && sl->base == base &&
+            sl->disp == off)
+            return false;
+    }
+
+    for (int i = 0; i < state->win.nslots; i++) {
+        const rvl_slot *sl = &state->win.slots[i];
+        if (!sl->held || !rv_mem_is_store(sl->kind)) continue;
+        if (sl->base != base || sl->disp != off) continue;
+        // The width has to match exactly. A narrower load of a wider
+        // store is a field extraction rather than a move, and a wider
+        // load reads bytes the store never wrote.
+        const char *name;
+        unsigned ext;
+        if (!forward_form(sl->kind, kind, &name, &ext)) return false;
+        if (ext && !riscvlint_may_use(state, ext)) return false;
+        // Storing x0 makes the rewrite `li rd,0` rather than a move, and
+        // a load into the register that already holds the value makes
+        // the load redundant by itself. Both are real and neither is
+        // this; see candidates in TODO.md.
+        if (sl->data == 0 || sl->data == data) return false;
+
+        // `c.mv` names any two registers, so a move is two bytes
+        // whenever it is a move at all. Every extension form writes a
+        // register it does not read, which no compressed spelling can
+        // express, so all of them are four -- and against a load the
+        // assembler already compressed that is two bytes spent to save
+        // an access. check_const_remat refuses the same trade, and so
+        // does this.
+        unsigned after = strcmp(name, "mv") ? 4u : mv_bytes();
+        if (after > insn->size) return false;
+
+        finding->title = "load of a just-stored value";
+        finding->address = insn->address;
+        finding->insn_count = 1;
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "%s %s, %s; stored at 0x%" PRIx64 " (%u -> %u bytes)",
+                 name, rv_reg_name(data), rv_reg_name(sl->data), sl->addr,
+                 insn->size, after);
         return true;
     }
     return false;
