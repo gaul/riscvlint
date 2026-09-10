@@ -1,44 +1,57 @@
-# Candidate checks, ranked by measured population
+# The measurements behind the checks
 
-Every figure below comes from `tools/pairscan`, `tools/defuse` and
-`tools/candscan` over the corpus described in README.md: 73,139,165
-instructions of riscv64 code (C++, Rust and Go), 0 of them undecodable.
+The corpus is the one described in README.md: 73,139,165 instructions of
+riscv64 code (C++, Rust and Go), 0 of them undecodable. `firefox-esr`
+(libxul.so) and `rust-coreutils` (uutils) joined it after most of this
+was first written, more than doubling it and overturning three results
+outright -- see "What the second corpus changed" at the bottom.
 
-Figures below were re-measured after `firefox-esr` (libxul.so) and
-`rust-coreutils` (uutils) joined the corpus, which more than doubled it
-and overturned three results outright -- see "What the second corpus
-changed" at the bottom.
+Two kinds of number appear below, and they are not the same kind. The
+`actionable` column, and every figure a section attributes to a
+`check_*` function, is what that check reports over the whole current
+corpus. The `raw pattern` column, and the `pairscan` and `defuse` tables
+in the appendices, are shape scans from before the second corpus, kept
+as recorded: they exist to show the gap a check's own preconditions
+close, and re-running them would move both halves of that ratio at once.
+So read across such a row for the ratio and not for the difference --
+`pairscan` counts 2,378,898 call pairs on today's corpus against the
+801,519 the table carries.
 
 `candscan` is the one that reports populations rather than shapes: it
 applies each candidate's own operand, immediate and encodability
 conditions and runs the liveness walk where a fold needs one, so its
 figures need no "upper bound" caveat. Rows sized by it say so.
 
-Read the population column as an upper bound on what a check could fire
-on, not as a defect count. A shape is only a check once its operand and
-encodability conditions are applied, and applying them is what moved most
-of these numbers -- see "What the measurements changed" at the bottom,
-which also records where the first figure was wrong and why.
+Every row is implemented, so `actionable` is no longer an estimate of
+what a check could fire on -- it is what one does. Applying the operand
+and encodability conditions is what moved most of these numbers between
+the columns; see "What the measurements changed" at the bottom, which
+records where a first figure was wrong and why.
 
 ## Pooled corpus
 
 | # | opportunity | actionable | raw pattern | status |
 |---|---|---:|---:|---|
-| 1 | `auipc`+`jalr` within `jal` reach | 292,299 | 801,519 | **implemented** |
-| 2 | Zba shift-add | 13,249 | 48,270 | **implemented** |
-| 3 | Zba `zext.w` | 18,073 | 25,672 | **implemented** |
-| 4 | redundant reloads | 5,028 | 10,079 | **implemented** |
-| 5 | dead register definitions | 14,458 | 47,655 | **implemented** |
-| 6 | constant re-materialization | 10,998 | 193,398 | **implemented** |
-| 7 | compare-then-branch folding | 2,937 | 21,986 | **implemented** |
-| 8 | frame-pointer teardown over a static frame | 112,401 | 133,670 | **implemented** |
-| 9 | extension the producer already guarantees | 8,515 | - | **implemented** |
-| 10 | dead store to a frame slot | 4,376 | 15,199 | **implemented** |
-| 11 | Zcb-compressible 4-byte encodings | 30,648 | 351,198 | **implemented** |
 | 13 | base-C-compressible 4-byte encodings | 2,984,189 | - | **implemented** |
+| 1 | `auipc`+`jalr` within `jal` reach | 292,299 | 801,519 | **implemented** |
+| 8 | frame-pointer teardown over a static frame | 112,401 | 133,670 | **implemented** |
+| 11 | Zcb-compressible 4-byte encodings | 30,648 | 351,198 | **implemented** |
+| 5 | dead register definitions | 19,865 | 47,655 | **implemented** |
+| 3 | Zba `zext.w` | 18,125 | 25,672 | **implemented** |
+| 2 | Zba shift-add | 13,412 | 48,270 | **implemented** |
+| 6 | constant re-materialization | 10,998 | 193,398 | **implemented** |
+| 9 | extension the producer already guarantees | 8,515 | - | **implemented** |
 | 12 | `addi` folded into a memory offset | 6,344 | ~54,000 shapes | **implemented** |
+| 4 | redundant reloads | 5,028 | 10,079 | **implemented** |
+| 10 | dead store to a frame slot | 4,376 | 15,199 | **implemented** |
+| 7 | compare-then-branch folding | 2,937 | 21,986 | **implemented** |
 
-### 6. Constant re-materialization -- 4,580 of 193,398
+Sections below carry the `#` from that table and appear in the order they
+were first written, which is not the order of the column; 11 and 13 have
+top-level sections of their own. Every "candidate N" in the prose means
+that number.
+
+### 6. Constant re-materialization -- 10,998 of 193,398  [implemented]
 
 A constant loaded into a register while the same value is still live in
 another. Rewriting the duplicate as `mv` only saves bytes when the
@@ -57,20 +70,26 @@ the population on that test rather than assuming it:
 The reason the split is so lopsided: 73.8% of re-materialized constants
 are 0 and another 16% are 1. Compilers re-load small constants freely
 because it costs them nothing, which is exactly why the raw count is a
-bad guide. Actionable population is 4,580, not 198,221.
+bad guide. `defuse` put the actionable population at 4,580 rather than
+198,221 -- and `check_const_remat` reports 10,998, for reasons in "The
+windowed memory table" below: the corpus grew, and the check tests the
+constant's magnitude where `defuse` tested the encoding's width.
 
-### 2. Dead register definitions -- 14,458  [implemented]
+### 5. Dead register definitions -- 19,865  [implemented]
 
 An instruction whose only effect is to write a register nothing goes on
 to read. Deleting it is free.
 
 | corpus | findings |
 |---|---:|
+| C++ | 11,741 |
 | Go | 7,876 |
-| C++ | 6,459 |
-| Rust | 123 |
+| Rust | 248 |
 
-`check_dead_def` finds three times what `defuse` called clean (4,806),
+C++ overtook Go with the second corpus: libxul contributes 5,239 and
+libQt6Core 5,203, which nearly tie, and libLLVM adds 1,256.
+
+`check_dead_def` finds four times what `defuse` called clean (4,806),
 because the bounded liveness walk proves deadness across branches and
 jumps that a region-local redefinition test cannot follow. The commonest
 shape is a frame pointer established and never used.
@@ -92,7 +111,7 @@ over the disassembly of one C++ and one Go binary: 0 false positives,
 with 75% of the C++ findings and 14% of the Go ones confirmable without
 following a branch at all.
 
-### 3. Call pairs that fit in `jal` -- 89,860  [implemented]
+### 1. Call pairs that fit in `jal` -- 292,299  [implemented]
 
 `auipc ra,X` + `jalr ra,Y(ra)` reaches +/-2GB in 8 bytes; a single `jal`
 reaches +/-1MB in 4. Measured by `check_call_pair_to_jal` itself:
@@ -170,7 +189,7 @@ the compressed field's range -- and agree on every one, as does the size
 model that decides whether the folded branch keeps two bytes or takes
 four.
 
-### 5. Zba shift-add (`sh1add`/`sh2add`/`sh3add`) -- 13,249  [implemented]
+### 2. Zba shift-add (`sh1add`/`sh2add`/`sh3add`) -- 13,412  [implemented]
 
 `slli rd,rs,{1,2,3}` + `add rd,rd,rs2` in two dependent instructions,
 where `sh1add`/`sh2add`/`sh3add` does it in one.
@@ -178,26 +197,26 @@ where `sh1add`/`sh2add`/`sh3add` does it in one.
 `check_slli_add_to_shadd` reports only the pairs whose add writes back
 the register the slli wrote and reads it exactly once. That makes the
 shifted value dead by construction, so no liveness query is needed --
-and it is what separates 13,249 from the 19,933 the pair shapes counted,
+and it is what separates 13,412 from the 19,933 the pair shapes counted,
 the difference being adds that write elsewhere and leave the shifted
 value alive.
 
 | corpus | foldable |
 |---|---:|
 | Go | 13,180 |
+| Rust | 165 |
 | C++ | 67 |
-| Rust | 2 |
 
 Both halves have compressed spellings, and c.slli + c.add is the
 commonest form, which matters for what the fix is worth:
 
 | spelling | count | saving |
 |---|---:|---|
-| `c.slli` + `c.add` | 5,419 | one instruction, no bytes |
-| mixed | 3,796 | one instruction, 2 bytes |
+| `c.slli` + `c.add` | 5,526 | one instruction, no bytes |
+| mixed | 3,852 | one instruction, 2 bytes |
 | both 4-byte | 4,034 | one instruction, 4 bytes |
 
-So the win is 13,249 instructions and about 23 KB, not 13,249 x 4 bytes.
+So the win is 13,412 instructions and 23,840 bytes, not 13,412 x 4.
 Reporting it as space alone would overstate it by more than twice.
 
 Gating: suggesting a Zba instruction to an object built without Zba is
@@ -211,31 +230,38 @@ Zba, and it says so when the set was assumed rather than read.
 
 `-m zba` / `-m rva23` overrides the object either way, which is what
 makes "what would rebuilding for RVA23 buy me?" answerable at all: the
-13,249 figure above is what today's binaries leave on the table, whereas
+13,412 figure above is what today's binaries leave on the table, whereas
 `riscvlint -m rva23` over an rv64gc build sizes the gain from switching
-`-march`. The 67 C++ and 2 Rust sites are the residue after GCC and LLVM
-have already taken the extension; running C++ with `-m rva23` does not
-change them, because those objects already declare Zba.
+`-march`. The 232 sites that are not Go are the residue after GCC and
+LLVM have already taken the extension; running C++ with `-m rva23` does
+not change them, because those objects already declare Zba.
 
-### 6. Zba `zext.w` -- 18,073  [implemented]
+163 of those 232 are uutils, which was 2 sites' worth of Rust before the
+second corpus. It declares `zba1p0` and rustc still left them, so "the
+compilers already take it" is a claim about how much they leave, not
+about whether they leave any. All 163 have at least one compressed half:
+the both-4-byte row above did not move at all.
+
+### 3. Zba `zext.w` -- 18,125  [implemented]
 
 `slli rd,rs,32` + `srli rd,rd,32` clears the upper word in two dependent
 instructions; `zext.w` (an alias of `add.uw rd,rs,x0`) does it in one.
-Go 18,071, C++ 2, Rust 0.
+Go 18,071, Rust 52, C++ 2 -- the Rust column was 0 before uutils, and
+all 52 of them are uutils.
 
 Unlike the shift-add family, applying the precondition costs nothing
 here: the check requires the srli to both read and overwrite the
 register the slli wrote, and every site in the corpus is written that
-way. 18,073 shapes, 18,073 findings -- no third-register variants exist
-to need liveness.
+way: shapes and findings are the same number, now 18,125 of each -- no
+third-register variants exist to need liveness.
 
 | spelling | count | saving |
 |---|---:|---|
-| both 4-byte | 8,502 | one instruction, 4 bytes |
-| mixed | 8,062 | one instruction, 2 bytes |
-| `c.slli` + `c.srli` | 1,509 | one instruction, no bytes |
+| both 4-byte | 8,505 | one instruction, 4 bytes |
+| mixed | 8,079 | one instruction, 2 bytes |
+| `c.slli` + `c.srli` | 1,541 | one instruction, no bytes |
 
-So about 49 KB and 18,073 instructions. The compressed-pair share is far
+So 50,178 bytes and 18,125 instructions. The compressed-pair share is far
 smaller here than in the shift-add family (8% against 41%), because
 `c.srli` is CB-format and can only name x8-x15, so half the register
 file forces the four-byte spelling.
@@ -250,14 +276,18 @@ not appear in the Go corpus and totals 341 sites overall, so it is not
 worth a check; the zext check rejects it explicitly rather than
 mis-folding it.
 
-### 7. Redundant reloads -- 10,079
+### 4. Redundant reloads -- 5,028 of 10,079  [implemented]
 
 Same (base, displacement, size) loaded twice with no intervening store,
-call or fence: heap sz8 5,879, sz1 2,883, sz4 829, sp sz8 437. Distances
-cluster at 4-15 instructions, so this one genuinely needs the window; no
-pair check can see it.
+call or fence: heap sz8 5,879, sz1 2,883, sz4 829, sp sz8 437 by
+`defuse`'s count. Distances cluster at 4-15 instructions, so this one
+genuinely needs the window; no pair check can see it.
 
-### 8. Frame-pointer teardown over a static frame -- 111,445  [implemented]
+`check_redundant_reload` reports 5,028 of those, split in "The windowed
+memory table" below, which also records the three rules the mining tools
+did not have.
+
+### 8. Frame-pointer teardown over a static frame -- 112,401  [implemented]
 
 `addi s0,sp,K` in the prologue and `addi sp,s0,-K` at each exit. When
 nothing writes sp in between, the teardown assigns sp the value it
@@ -271,17 +301,20 @@ Measured by `check_redundant_sp_restore` itself:
 | Rust | 11,683 | 14,086 |
 | Go | 0 | 0 |
 
-The C++ figure is 100,716 from libLLVM and **0 from libQt6Core**, and
-that split is the finding. GCC emits an sp-relative epilogue and leaves
-two of these shapes in the whole of Qt6Core; clang and rustc emit the
-fp-relative restore unconditionally. It is an LLVM code-generation
-finding the way check 1 is a Rust linker-relaxation one, and it is the
-largest population measured in this corpus outside Go.
+The C++ figure is 100,716 from libLLVM, 2 from libgkcodecs.so and **0
+from libQt6Core**, and that split is the finding. GCC emits an
+sp-relative epilogue and leaves two of these shapes in the whole of
+Qt6Core; clang and rustc emit the fp-relative restore unconditionally.
+It is an LLVM code-generation finding the way check 1 is a Rust
+linker-relaxation one, and it is the largest population measured in this
+corpus outside Go.
 
 Every site is a 4-byte encoding -- `c.addi16sp` can only spell
-`sp,sp`, so this shape never compresses -- which puts it at 111,445
-instructions and about 435 KB, the only figure here where the byte
-count is simply four times the instruction count.
+`sp,sp`, so this shape never compresses -- which puts it at 112,401
+instructions and 439 KB, the only figure here where the byte count is
+simply four times the instruction count. It was recorded as 111,445 and
+435 KB, which was four times `candscan`'s count rather than four times
+its own.
 
 What made it cheap to write: **it needs no liveness walk, no ABI
 assumption and no extension gate.** Deleting an instruction that writes
@@ -290,7 +323,7 @@ call in the middle of every one of these functions an ABI assumption: a
 callee that returned with sp and s0 no longer a fixed distance apart
 would have invalidated the caller's frame, not merely this rewrite.
 
-Two things separate the 133,670 shapes from the 111,445 findings.
+Two things separate the 133,670 shapes from the 112,401 findings.
 
 The check gives up a restore that something branches to -- 22,225
 sites, 17% of the population. A shared epilogue can be entered from code
@@ -315,28 +348,39 @@ to address locals, `check_dead_def` then reports the setup on its own,
 so the two checks compose to two instructions per exit without either
 having to know about the other.
 
-### 9. An extension whose producer already guarantees it -- 6,139  [implemented]
+### 9. An extension whose producer already guarantees it -- 8,515  [implemented]
 
 `sext.w`/`zext.w`/`sext.b`/`sext.h`/`zext.h`, or `andi rd,rd,255`, on a
 register whose producer already left it in exactly that form.
 
-| producer -> extension | findings |
+`candscan`'s census of which producer leaves the guarantee, re-run over
+the second corpus (8,204 shapes, delete and `->mv` together):
+
+| producer -> extension | shapes |
 |---|---:|
-| `lw` -> `sext.w` | 3,311 |
-| `lbu` -> `sext.w` | 1,095 |
-| `lbu` -> `andi rd,rd,255` | 680 |
-| `sraiw` -> `sext.w` | 417 |
-| `lhu` -> `sext.w` / `zext.h` / `zext.w` | 260 |
+| `lw` -> `sext.w` | 3,418 |
+| `lbu` -> `andi rd,rd,255` | 2,655 |
+| `lbu` -> `sext.w` | 1,104 |
+| `sraiw` -> `sext.w` | 418 |
+| `lhu` -> `sext.w` / `zext.h` / `zext.w` | 262 |
 | `lb` -> `sext.b` | 133 |
-| `lh`, `sraw`, `lui`, `li`, `addiw`, `srliw` ... | 137 |
+| `li`, `lh`, `sraw`, `lui`, `addiw` ... | 214 |
+
+The `lbu` + `andi` row went from 680 to 2,655, and 1,870 of it is
+libxul: that one producer/extension pair is 91% of everything the check
+finds there.
 
 Measured by `check_redundant_extension` itself:
 
 | corpus | findings | shapes candscan counted |
 |---|---:|---:|
-| C++ | 6,589 | 4,232 |
-| Rust | 333 | 208 |
+| C++ | 6,589 | 6,366 |
+| Rust | 333 | 245 |
 | Go | 1,593 | 1,593 |
+
+By what is left behind: `sext.w` 5,317, `zext.b` 2,939, `sext.b` 137,
+`zext.h` 53, `sext.h` 41, `zext.w` 28. 6,416 delete and 2,099 become
+`mv`.
 
 libxul contributes 2,253 of the C++ figure, measured after the fact --
 the check was written against the first corpus and neither its rules nor
@@ -361,17 +405,24 @@ Report it as instructions rather than space. `sext.w rd,rd` after `lw`
 assembles to `c.addiw rd,0`, two bytes, and the assembler picks
 `c.zext.b` over the four-byte `andi rd,rd,255` whenever the register is
 in x8-x15, so most deletions save two bytes rather than four. The family
-is about 12 KB -- costing it at four bytes a site would overstate it by
-more than twice.
+is 20,864 bytes -- costing it at four bytes a site would overstate it by
+more than half.
+
+Which of the two it is turns out to be a statement about the target
+rather than about the site. 4,499 deletions save two bytes and 1,917
+save four -- and 1,733 of those 1,917 are libxul, the one baseline
+rv64gc member, where `andi rd,rd,255` stays four bytes because there is
+no `c.zext.b` to pick. Everywhere else the assembler had already taken
+half the saving before the check got there.
 
 This supersedes "redundant mask after a zero-extending load -- 148"
 below, which was measured on adjacent pairs only. With the region window
-the `lbu`/`andi` half alone is 680, and the family it belongs to is
-6,139. The lesson is the reverse of the usual one here: applying a
+the `lbu`/`andi` half alone is 2,655, and the family it belongs to is
+8,515. The lesson is the reverse of the usual one here: applying a
 precondition cut every other candidate, but widening the window from a
-pair to a region grew this one 40-fold.
+pair to a region grew this one 18-fold.
 
-### 10. Dead store to a frame slot -- 15,199
+### 10. Dead store to a frame slot -- 4,376 of 15,199  [implemented]
 
 The store analogue of the dead-definition check: the same
 (base, displacement, width) written twice with no load from it, call,
@@ -379,17 +430,22 @@ fence or write to the base in between. Only sp- and fp-relative slots
 are counted; a heap address may alias anything and nothing in the
 encoding says it does not.
 
-| corpus | findings |
-|---|---:|
-| Go | 8,279 |
-| C++ | 6,618 |
-| Rust | 302 |
+| corpus | shapes | findings |
+|---|---:|---:|
+| Go | 8,279 | 4,172 |
+| C++ | 6,618 | 203 |
+| Rust | 302 | 1 |
 
 For C++ and Rust this sits below compare-then-branch and is not worth
 writing on its own. What makes it worth recording is that it wants
 exactly the windowed memory table candidate 4 (redundant reloads) wants,
-so the machinery pays for two checks, and Go's 8,279 is where the second
-one lands.
+so the machinery pays for two checks, and Go is where the second one
+lands.
+
+The C++ column is the one the shape count misled about worst -- 6,618
+shapes and 203 findings -- and the rule that closed the gap was the
+conditional branch between the two stores, which makes the overwrite
+uncertain. See "The windowed memory table" below.
 
 ## Missed compression -- base C is Go's alone, Zcb is not
 
@@ -758,9 +814,9 @@ two are separate implementations of the same rule rather than shared
 code. The probe now carries the corrected rule and the two agree form by
 form on every binary in the corpus.
 
-### The 179 in uutils are one binary with two targets
+### The 181 in uutils are one binary with two targets
 
-uutils declares `zcb1p0` and still has 179 shrinkable sites, mostly
+uutils declares `zcb1p0` and still has 181 shrinkable sites, mostly
 `c.lbu` and `c.sb`, where the other four Rust binaries have none. GNU ld
 merges `Tag_RISCV_arch` by taking the union of extensions, so a declared
 extension means *some* object used it, not all of them. The shape of the
@@ -945,12 +1001,12 @@ scan saw, where one was taken -- and no row's figure is a mining tool's
 any more.
 
 The `redundant mask after lbu` row is gone from this table: it was 142
-here and is now part of candidate 5, which subsumes it at 659 in this
+here and is now part of candidate 6, which subsumes it at 2,634 in this
 cohort once the window is a region rather than a pair.
 
-Items 2 and 5 are the two toolchains taking turns. Candidate 2 is
+Items 2 and 6 are the two toolchains taking turns. Candidate 2 is
 100,716 libLLVM and 0 libQt6Core -- clang and rustc restore sp from the
-frame pointer unconditionally, GCC does not. Candidate 5 is 4,336
+frame pointer unconditionally, GCC does not. Candidate 6 is 3,433
 Qt6Core against 817 libLLVM -- GCC re-extends a value its own load
 already extended, clang mostly does not. Neither would have been visible
 in a corpus with one C++ compiler in it.
@@ -1066,7 +1122,7 @@ first half is right and the second is not. libLLVM's pairs are all
 `auipc ra,0x31ad` + `jalr`, which lands in the PLT about 52 MB away: the
 distance that matters is to the PLT, not to the end of `.text`.
 
-libxul's `.text` is 105 MB, twice libLLVM's, and 120,568 of its call
+libxul's `.text` is 105 MB, twice libLLVM's, and 120,578 of its call
 pairs are inside `jal`'s reach and unrelaxed -- local intra-module calls
 rather than PLT stubs. C++ now contributes 120,578 to a family it was
 recorded as contributing nothing to, and the corrected figure for the
@@ -1101,7 +1157,7 @@ it are:
 
 | idiom | libxul | RVA23 C++/Rust |
 |---|---:|---:|
-| 4-byte encodings a Zcb form would spell in 2 | 301,607 | 402 |
+| 4-byte encodings a Zcb form would spell in 2 | 320,550 | 886 |
 | `not`+logic -> `andn`/`orn`/`xnor` | 14,874 | 34 |
 | `slli`+`srli` -> `zext.h`, `slli`+`srai` -> `sext.h`/`sext.b` | 12,084 | 0 |
 | `slli`+`srli`+`or` -> `rori` | 1,068 | 0 |
