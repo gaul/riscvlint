@@ -695,6 +695,55 @@ static void scan_section(csh handle, const char *path, const uint8_t *code,
             }
         }
 
+        // ---- addi folded into the memory offset that follows it ----
+        //
+        // The shape `check_base_add_to_offset` fires on, counted before
+        // the liveness condition rather than after, so the raw column in
+        // TODO.md has a number of the same kind as its neighbours. The
+        // check requires the two to be adjacent, so this asks for the
+        // base's def to be the immediately preceding instruction.
+        {
+            const cs_riscv *ra = &insn->detail->riscv;
+            int mbase = -1; int64_t mdisp = 0;
+            for (int i = 0; i < ra->op_count; i++)
+                if (ra->operands[i].type == RISCV_OP_MEM) {
+                    mbase = reg_slot(ra->operands[i].mem.base);
+                    mdisp = ra->operands[i].mem.disp;
+                }
+            int sz = load_size(m);
+            bool store = !strcmp(m, "sd") || !strcmp(m, "sw") ||
+                         !strcmp(m, "sh") || !strcmp(m, "sb");
+            // The float forms fold the same way; their data register is
+            // in the other file, so neither the self-killing case nor the
+            // store-data exclusion can apply to them.
+            bool fp = !strcmp(m, "flw") || !strcmp(m, "fld") ||
+                      !strcmp(m, "fsw") || !strcmp(m, "fsd");
+            if (mbase > 0 && (sz || store || fp) && cd[mbase].live &&
+                cd[mbase].idx == idx - 1 && cd[mbase].rs1 > 0 &&
+                mbase != 2 && mbase != 3 && mbase != 4 &&
+                (!strcmp(cd[mbase].mn, "addi") || !strcmp(cd[mbase].mn, "mv")) &&
+                cd[mbase].g1 == cgen[cd[mbase].rs1]) {
+                int64_t sum = (cd[mbase].has_imm ? cd[mbase].imm : 0) + mdisp;
+                if (fits12(sum) && !(store && !fp && d0 == mbase)) {
+                    const char *br = cd[mbase].xbr ? "xbr" : "clean";
+                    char key[96];
+                    bump("baseadd|TOTAL", -1);
+                    // A load into its own base kills the address by
+                    // construction; everything else has to ask the walk.
+                    if (sz && !fp && d0 == mbase) {
+                        snprintf(key, sizeof key, "baseadd|self-killing|%s", br);
+                        bump(key, -1);
+                    } else {
+                        int v = liveness(probe_handle, probe, code, size,
+                                         vaddr, &next, 1, mbase);
+                        snprintf(key, sizeof key, "baseadd|walk %s|%s",
+                                 verdict(v), br);
+                        bump(key, -1);
+                    }
+                }
+            }
+        }
+
         // ---- slli + srli/srai with equal shifts ----
         if ((!strcmp(m, "srli") || !strcmp(m, "srai")) && s1 >= 0 && hasi2 &&
             cd[s1].live && cd[s1].uses == 0 && !strcmp(cd[s1].mn, "slli") &&

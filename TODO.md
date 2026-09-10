@@ -6,16 +6,21 @@ riscv64 code (C++, Rust and Go), 0 of them undecodable. `firefox-esr`
 was first written, more than doubling it and overturning three results
 outright -- see "What the second corpus changed" at the bottom.
 
-Two kinds of number appear below, and they are not the same kind. The
-`actionable` column, and every figure a section attributes to a
-`check_*` function, is what that check reports over the whole current
-corpus. The `raw pattern` column, and the `pairscan` and `defuse` tables
-in the appendices, are shape scans from before the second corpus, kept
-as recorded: they exist to show the gap a check's own preconditions
-close, and re-running them would move both halves of that ratio at once.
-So read across such a row for the ratio and not for the difference --
-`pairscan` counts 2,378,898 call pairs on today's corpus against the
-801,519 the table carries.
+Two kinds of number appear below. The `actionable` column, and every
+figure a section attributes to a `check_*` function, is what that check
+reports. The `raw pattern` column is what a shape scan saw before that
+check's own operand, immediate and encodability conditions were applied.
+Both are now measured over the whole current corpus with the current
+tools, and the gap between them across a row is the point of the file.
+
+The raw column used to be first-corpus throughout, which was checked
+rather than assumed: re-run over the corpus with `firefox-esr` and
+`rust-coreutils` removed, `defuse` returns 47,655 dead definitions,
+193,398 re-materializations and 21,986 compare-then-branch shapes, and
+`candscan` returns 133,670 teardowns -- each the figure this file used to
+carry, to the digit. Two rows were stale for a different reason: the Zcb
+shape count predated the `c.mul` commuted-form fix, and the reload count
+predated keying `defuse`'s records on the exact mnemonic.
 
 `candscan` is the one that reports populations rather than shapes: it
 applies each candidate's own operand, immediate and encodability
@@ -33,25 +38,33 @@ records where a first figure was wrong and why.
 | # | opportunity | actionable | raw pattern | status |
 |---|---|---:|---:|---|
 | 13 | base-C-compressible 4-byte encodings | 2,984,189 | - | **implemented** |
-| 1 | `auipc`+`jalr` within `jal` reach | 292,299 | 801,519 | **implemented** |
-| 8 | frame-pointer teardown over a static frame | 112,401 | 133,670 | **implemented** |
-| 11 | Zcb-compressible 4-byte encodings | 30,648 | 351,198 | **implemented** |
-| 5 | dead register definitions | 19,865 | 47,655 | **implemented** |
-| 3 | Zba `zext.w` | 18,125 | 25,672 | **implemented** |
-| 2 | Zba shift-add | 13,412 | 48,270 | **implemented** |
-| 6 | constant re-materialization | 10,998 | 193,398 | **implemented** |
+| 1 | `auipc`+`jalr` within `jal` reach | 292,299 | 2,378,898 | **implemented** |
+| 8 | frame-pointer teardown over a static frame | 112,401 | 135,045 | **implemented** |
+| 11 | Zcb-compressible 4-byte encodings | 30,648 | 386,257 | **implemented** |
+| 5 | dead register definitions | 19,865 | 120,647 | **implemented** |
+| 3 | Zba `zext.w` | 18,125 | 203,831 | **implemented** |
+| 2 | Zba shift-add | 13,412 | 180,591 | **implemented** |
+| 6 | constant re-materialization | 10,998 | 329,926 | **implemented** |
 | 9 | extension the producer already guarantees | 8,515 | - | **implemented** |
-| 12 | `addi` folded into a memory offset | 6,344 | ~54,000 shapes | **implemented** |
-| 4 | redundant reloads | 5,028 | 10,079 | **implemented** |
+| 12 | `addi` folded into a memory offset | 6,344 | 86,564 | **implemented** |
+| 4 | redundant reloads | 5,028 | 33,110 | **implemented** |
 | 10 | dead store to a frame slot | 4,376 | 15,199 | **implemented** |
-| 7 | compare-then-branch folding | 2,937 | 21,986 | **implemented** |
+| 7 | compare-then-branch folding | 2,937 | 26,513 | **implemented** |
+
+Where the raw figure comes from: `pairscan` for rows 1, 2 and 3 (the two
+Zba rows read shift-blind, which is exactly what a collapsed file
+forces); `defuse` for 4, 5, 6 and 7; `candscan` for 8, 10, 11 and 12.
+Row 9 has no dash-free entry because no shape scan sizes it -- the
+producer has to be tracked, which is `candscan`'s job and not
+`pairscan`'s. Row 13's raw entry is in its own section: a shape token
+can only ask about `mv` and `li`, and that census found 384.
 
 Sections below carry the `#` from that table and appear in the order they
 were first written, which is not the order of the column; 11 and 13 have
 top-level sections of their own. Every "candidate N" in the prose means
 that number.
 
-### 6. Constant re-materialization -- 10,998 of 193,398  [implemented]
+### 6. Constant re-materialization -- 10,998 of 329,926  [implemented]
 
 A constant loaded into a register while the same value is still live in
 another. Rewriting the duplicate as `mv` only saves bytes when the
@@ -62,18 +75,19 @@ the population on that test rather than assuming it:
 
 | | count | d=1 |
 |---|---:|---:|
-| `remat\|li\|fits-c.li` (no saving) | 188,807 | 123,163 |
-| `remat\|li\|wide` | 3,469 | 1,662 |
-| `remat\|lui\|wide` | 1,111 | 292 |
+| `remat\|li\|fits-c.li` (no saving) | 317,443 | 205,902 |
+| `remat\|li\|wide` | 9,697 | 3,516 |
+| `remat\|lui\|wide` | 2,775 | 450 |
 | `remat\|lui\|fits-c.li` | 11 | 1 |
 
 The reason the split is so lopsided: 73.8% of re-materialized constants
 are 0 and another 16% are 1. Compilers re-load small constants freely
 because it costs them nothing, which is exactly why the raw count is a
-bad guide. `defuse` put the actionable population at 4,580 rather than
-198,221 -- and `check_const_remat` reports 10,998, for reasons in "The
-windowed memory table" below: the corpus grew, and the check tests the
-constant's magnitude where `defuse` tested the encoding's width.
+bad guide: 96% of the shapes sit in the row that saves nothing. `defuse`
+puts the actionable population at 12,472 rather than 329,926, and
+`check_const_remat` reports 10,998 -- see "The windowed memory table"
+below, where the two rules part company over whether the test is the
+constant's magnitude or the encoding's width.
 
 ### 5. Dead register definitions -- 19,865  [implemented]
 
@@ -163,7 +177,7 @@ wrote.
 The fold only removes an instruction if the condition register is dead
 on **both** successors, which is why this needs the walk and not a scan:
 the taken path is elsewhere in the section. `defuse` sized that filter
-at `live` 51.8%, `unk` 38.1%, `fold` 10.1%, and the shapes explain it --
+at `live` 47.3%, `unk` 38.8%, `fold` 13.8%, and the shapes explain it --
 `sub rd,a,b; beqz rd` is usually a subtraction whose difference is
 wanted, and `xor rd,a,b; bnez rd` is usually the stack-canary idiom,
 whose walk correctly refuses to decide because the canary sits in an
@@ -197,7 +211,7 @@ where `sh1add`/`sh2add`/`sh3add` does it in one.
 `check_slli_add_to_shadd` reports only the pairs whose add writes back
 the register the slli wrote and reads it exactly once. That makes the
 shifted value dead by construction, so no liveness query is needed --
-and it is what separates 13,412 from the 19,933 the pair shapes counted,
+and it is what separates 13,412 from the 69,552 the pair shapes counted,
 the difference being adds that write elsewhere and leave the shifted
 value alive.
 
@@ -276,12 +290,13 @@ not appear in the Go corpus and totals 341 sites overall, so it is not
 worth a check; the zext check rejects it explicitly rather than
 mis-folding it.
 
-### 4. Redundant reloads -- 5,028 of 10,079  [implemented]
+### 4. Redundant reloads -- 5,028 of 33,110  [implemented]
 
 Same (base, displacement, size) loaded twice with no intervening store,
-call or fence: heap sz8 5,879, sz1 2,883, sz4 829, sp sz8 437 by
-`defuse`'s count. Distances cluster at 4-15 instructions, so this one
-genuinely needs the window; no pair check can see it.
+call or fence: 33,110 by `defuse`'s count -- heap sz8 21,368, sp sz8
+4,234, heap sz1 3,749, heap sz4 3,559, and 200 in the smaller widths.
+Distances cluster at 4-15 instructions, so this one genuinely needs the
+window; no pair check can see it.
 
 `check_redundant_reload` reports 5,028 of those, split in "The windowed
 memory table" below, which also records the three rules the mining tools
@@ -323,23 +338,25 @@ call in the middle of every one of these functions an ABI assumption: a
 callee that returned with sp and s0 no longer a fixed distance apart
 would have invalidated the caller's frame, not merely this rewrite.
 
-Two things separate the 133,670 shapes from the 112,401 findings.
+Two things separate the 135,045 shapes from the 112,401 findings, a gap
+of 22,644 or 17% of the shapes.
 
-The check gives up a restore that something branches to -- 22,225
-sites, 17% of the population. A shared epilogue can be entered from code
-at a higher address, which a linear scan has not walked yet and which
-may have moved sp. Nothing short of a backward analysis decides those,
-and the check declines rather than assume.
+The check gives up a restore that something branches to. A shared
+epilogue can be entered from code at a higher address, which a linear
+scan has not walked yet and which may have moved sp. Nothing short of a
+backward analysis decides those, and the check declines rather than
+assume. This is the larger half of the gap; it is a count the check
+would have to be instrumented to report exactly, and it is not.
 
 The rest is where `candscan` was looser than the check: it allowed a
 balanced `addi sp,sp,imm` pair in the body, and the check disqualifies
 any write to sp at all, because a linear scan cannot prove a branch did
 not skip one half of such a pair.
 
-Both counts are floors. fd carries 4,247 instructions of the teardown
-shape and the check reports 2,261; the difference is the branch-target
-rule, frames that really did move, and restores whose prologue the scan
-never saw.
+Both counts are floors. fd carries 3,021 shapes of the teardown and the
+check reports 2,261; the difference is the branch-target rule, frames
+that really did move -- `candscan` counts 86 of those in fd on its
+own -- and restores whose prologue the scan never saw.
 
 The finding is reported as "delete this instruction", never as "drop the
 frame pointer". Ubuntu builds with `-fno-omit-frame-pointer`
@@ -468,8 +485,8 @@ constraints, which needs an instruction census rather than a pair table
 -- `pairscan -1`. Done for the two rules a shape token can decide on its
 own (`c.mv` needs only both registers non-zero, `c.li` only a non-zero
 destination and an immediate in [-32,31]; both checked against the
-assembler first), the GCC/LLVM cohort leaves 93 of 1,815,725 `mv` and 0
-of 1,084,536 in-range `li` uncompressed.
+assembler first), the GCC/LLVM cohort leaves 384 of 4,629,930 `mv` and 0
+of 3,065,349 in-range `li` uncompressed.
 
 So the base C extension is not a general opportunity. RVC selection is
 an assembler pass and GNU as / LLVM MC take it whenever it is legal; the
@@ -502,9 +519,10 @@ select RVC.
 
 This entry was recorded at 93 sites, from the two RVC rules a shape
 token could decide on its own (`c.mv` needs both registers non-zero,
-`c.li` a non-zero destination and an immediate in [-32,31]). The full
-pass finds 22,596 in the same cohort, and every class of the difference
-is an immediate the assembler did not yet know:
+`c.li` a non-zero destination and an immediate in [-32,31]). That census
+now reads 384 of 4,629,930 `mv` and 0 of 3,065,349 in-range `li`. The
+full pass finds 22,596 in the same cohort, and every class of the
+difference is an immediate the assembler did not yet know:
 
 * The `addi` or `ld` half of an `auipc` pair. Its immediate was a
   relocation at assembly time and a small number after the linker
@@ -572,10 +590,10 @@ Measured by the checks themselves:
 
 ### What the mining tools had wrong
 
-The entries these replace said 10,079 reloads and 15,199 dead stores.
-The checks find half and a third of that, and the difference is not a
-precondition being applied -- it is three rules `defuse` and `candscan`
-did not have. Each was found by reading the disassembly around a
+The shape counts these replace are 33,110 reloads and 15,199 dead
+stores. The checks find 15% and 29% of that, and most of the difference
+is not a precondition being applied -- it is three rules `defuse` and
+`candscan` did not have. Each was found by reading the disassembly around a
 finding, and none by any test:
 
 * **A load that overwrites its own base.** `ld a1,0(a1)` walks a
@@ -608,8 +626,9 @@ dead-store findings by hand.
 
 ### Re-materialization went up, and the corpus is why
 
-4,580 became 10,998, which is the one figure here that grew. 6,107 of it
-is libxul, which was not in the corpus when the first number was taken;
+`defuse`'s 4,580 became the check's 10,998, which is the one figure here
+that grew when a check replaced an estimate. 6,107 of it is libxul,
+which was not in the corpus when the first number was taken;
 C++ without it is 2,863 against the 2,969 first measured for C++ and
 Rust together.
 
@@ -656,18 +675,26 @@ Measured by `check_base_add_to_offset` itself:
 | Rust | 429 |
 
 This entry used to carry a shape count and a warning that the shape
-count was not a population. The warning was right and it was not
-pessimistic enough:
+count was not a population. The warning was right; the number attached
+to it was measuring something else. `candscan` now carries a `baseadd`
+probe with the check's own encoding conditions -- the access's base is
+the immediately preceding `addi`'s destination, and the two immediates
+sum inside imm12 -- and its self-killing and `fold` rows add up to the
+check's findings exactly, binary for binary:
 
-| binary | shapes whose sum fits | findings |
-|---|---:|---:|
-| C++ Qt6Core | 12,530 | 1,393 |
-| Go gh | 24,705 | 684 |
-| Rust ripgrep | 16,332 | 11 |
+| binary | shapes | self-killing | walk says fold | findings |
+|---|---:|---:|---:|---:|
+| C++ Qt6Core | 2,594 | 1,119 | 274 | 1,393 |
+| Go gh | 1,460 | 174 | 509 | 683 |
+| Rust ripgrep | 418 | 9 | 2 | 11 |
+| **corpus** | **86,564** | **4,311** | **2,033** | **6,344** |
 
-Roughly nine times over across the corpus, and 1,485 times over for
-ripgrep. The precedent this entry cited -- a liveness condition cutting a
-shape count elevenfold -- turned out to be the mild case.
+So the liveness condition cuts the shape count 13.6x across the corpus,
+and 38x for ripgrep. The figures this entry used to carry -- 12,530 for
+Qt6Core and 24,705 for gh, "roughly nine times over" -- counted `addi`
+results consumed by an access anywhere later in the region. The check
+only ever looks at the next instruction, so most of what that counted
+was never a candidate for it.
 
 Where the access is a load that overwrites its own base, the computed
 address is dead by construction and no query is needed:
@@ -838,68 +865,83 @@ expanding alike when this landed.
 
 Worth recording so nobody re-derives them from intuition.
 
-### Redundant mask after a zero-extending load -- 148
+### Redundant mask after a zero-extending load -- 1,354
 
 `lbu` already zero-extends, so `andi rd,rd,255` after it is dead. The
-pair family "load then extend" counts 50,998 -- but with the mask value
-applied, only 148 are actually redundant. The rest are masks after `lb`
-/`lh` (which sign-extend, so the mask does real work: 4,243) or masks
-other than 255. A check written off the 50,998 figure would have been
-wrong 99.7% of the time.
+pair family "load then extend" counts 136,309 across the corpus -- but
+with the mask value applied, only 1,360 are actually redundant, 1,354 of
+them in C++ and Rust. The rest are masks after `lb`/`lh` (which
+sign-extend, so the mask does real work: 6,045) or masks other than 255.
+A check written off the 136,309 figure would have been wrong 99.0% of
+the time.
 
-### Consecutive register moves -- 589,596 in C++/Rust
+### Consecutive register moves -- 1,355,450 in C++/Rust
 
-The second largest pair family, 3.2% of all pairs, and almost all of it
+The second largest pair family, 2.5% of all pairs, and almost all of it
 is argument shuffling that is doing real work. The sound subset is the
 dead `mv` already counted under 2. Ranking off pair frequency would put
 this near the top of the backlog.
 
-### `auipc`+`addi` address materialization -- 246,516 in C++/Rust
+### `auipc`+`addi` address materialization -- 875,853 in C++/Rust
 
 PC-relative addressing genuinely costs 8 bytes. gp-relative relaxation
 only reaches +/-2KB around `__global_pointer$`, nowhere near this
 population.
 
-### Move coalescing -- 79 of 24,346
+### Move coalescing -- 192 of 73,017
 
 `op rd,...` immediately followed by `mv rt,rd` folds to `op rt,...`
-whenever rd is dead after the move. The shape is common -- 24,346 sites
+whenever rd is dead after the move. The shape is common -- 73,017 sites
 in C++ and Rust with the producer's value used exactly once -- and the
-population is essentially zero: 79 fold, 4,343 are provably live, and
-19,924 come back UNKNOWN because the walk stops at the call or the
+population is essentially zero: 192 fold, 15,693 are provably live, and
+57,132 come back UNKNOWN because the walk stops at the call or the
 return that follows.
 
 The UNKNOWNs are what make this worth recording. Run again with the
-LP64D convention asserted, 23,212 of them turn **live**, not dead: the
+LP64D convention asserted, 69,611 of them turn **live**, not dead: the
 moves are argument set-up, and the producer's register is read again or
-is itself an argument. Only 283 become folds. So this is the
+is itself an argument. Only 691 become folds. So this is the
 `mv`-after-`mv` rejection reached from the other direction, and it also
 says something reassuring about the checks that do ship -- where the
 ABI-agnostic walk declines, it is usually hiding a live value rather
 than a finding, so no `--abi` flag is being left on the table.
 
+The verdict held through a corpus that tripled the shape count: 0.32% of
+shapes folded then and 0.26% fold now.
+
 Go behaves the same way: 7,792 folds against 60,085 ABI-live.
 
-### The Zbb, Zbs and Zcb idioms -- 521 in C++ and Rust
+### The Zbb, Zbs and Zcb idioms -- 1,025 on an RVA23 target
 
-Every shape below is a one-instruction rewrite the corpus's declared
+Every shape below is a one-instruction rewrite the target's declared
 extensions permit, and GCC and LLVM have already taken all of them.
-Measured with `candscan` so the operand conditions are applied:
+Measured with `candscan` so the operand conditions are applied. The
+first column is the C++ and Rust members that declare the extensions --
+libLLVM, libQt6Core and the Rust binaries -- and the second is the whole
+C++/Rust cohort, which is that plus the nine Debian Firefox objects that
+declare none of them:
 
-| idiom | C++/Rust | Go |
-|---|---:|---:|
-| `slli`+`srli` (equal shift) -> `zext.h` | 0 | 9,522 |
-| `slli`+`srli`+`or` -> `rori` | 0 | 7,690 |
-| `slli`+`srai` -> `sext.h` / `sext.b` | 0 | 2,562 |
-| `not`+`and`/`or`/`xor` -> `andn`/`orn`/`xnor` | 34 | 2,774 |
-| `srli`+`andi 1` -> `bexti` | 32 | 295 |
-| `zext.w`/`slli.uw` + `add` -> `add.uw`/`sh#add.uw` | 44 | 0 |
-| `li` of a mask + `and` -> `zext.h`/`andi` | 9 | 4 |
-| 4-byte encodings a Zcb form would spell in 2 | 705 | 29,762 |
+| idiom | RVA23 | all C++/Rust | Go |
+|---|---:|---:|---:|
+| `slli`+`srli` (equal shift) -> `zext.h` | 0 | 6,074 | 9,522 |
+| `slli`+`srli`+`or` -> `rori` | 0 | 1,068 | 7,690 |
+| `slli`+`srai` -> `sext.h` / `sext.b` | 0 | 6,607 | 2,562 |
+| `not`+`and`/`or`/`xor` -> `andn`/`orn`/`xnor` | 38 | 15,747 | 2,774 |
+| `srli`+`andi 1` -> `bexti` | 48 | 166 | 295 |
+| `zext.w`/`slli.uw` + `add` -> `add.uw`/`sh#add.uw` | 44 | 44 | 0 |
+| `li` of a mask + `and` -> `zext.h`/`andi` | 9 | 42 | 4 |
+| 4-byte encodings a Zcb form would spell in 2 | 886 | 356,495 | 29,762 |
+
+The middle column is the whole argument for keeping a baseline member in
+the corpus, and it is why the first column is the one this entry is
+about: a rejection reads "the compilers already do this" only where the
+compiler was allowed to. The `zext.w`/`slli.uw` row is the one that does
+not move, because an object with no Zba has no `slli.uw` to begin with.
 
 The Zcb row has its own section above; on a baseline target it is
-320,550 in libxul alone, and the 705 here turned out to be two gaps in
-GNU as rather than anything a compiler chose.
+320,550 in libxul alone, and the 886 here is 705 in libQt6Core and 181
+in uutils, which turned out to be two gaps in GNU as and one binary with
+two targets rather than anything a compiler chose.
 
 The Go column is not the same finding. Go emits no `.riscv.attributes`
 and its assembler does not select Zcb, so those rows are the toolchain's
@@ -913,33 +955,34 @@ that declare the extension. That matches the earlier `c.mv`/`c.li`
 census: RVC selection is an assembler pass and GNU as takes it wherever
 it is legal, with two gaps.
 
-### `slli rd,rs,a` + `srli rd,rd,a` with a >= 53 -> `andi` -- 0
+### `slli rd,rs,a` + `srli rd,rd,a` with a >= 53 -> `andi` -- 2
 
 The obvious sibling of the `zext.w` check: an equal shift pair keeping
 64-a low bits is an `andi` whenever the mask fits a 12-bit immediate,
-needing no extension at all. It does not occur -- in any of the three
-corpora. Compilers emit the `andi` directly. Worth recording because the
-shape looks like it should be there and the `zext.w` result invites the
-generalisation.
+needing no extension at all. It was 0 in all three corpora and is now 2,
+both of them in uutils and both writing a third register. Compilers emit
+the `andi` directly. Worth recording because the shape looks like it
+should be there and the `zext.w` result invites the generalisation --
+and 2 sites in 73 million instructions is the same answer as 0.
 
-### `li` of a small constant feeding an op with an immediate form -- 272
+### `li` of a small constant feeding an op with an immediate form -- 942
 
 `li rd,C` then `add`/`and`/`or`/`xor`/`slt`/`sll` reading it, where the
-immediate form of the op would do both. 272 in C++ and Rust, 0 in Go.
+immediate form of the op would do both. 942 in C++ and Rust, 0 in Go.
 
-### Address re-materialization -- 14
+### Address re-materialization -- 39
 
 The same `auipc`+`addi` symbol address built twice in one region with
-the first copy still in a live register. 14 in C++ and Rust, 441 in Go.
+the first copy still in a live register. 39 in C++ and Rust, 441 in Go.
 Linker relaxation and the compilers' own CSE have this covered.
 
-### `addi` chaining, once the frame-pointer idiom is removed -- 74
+### `addi` chaining, once the frame-pointer idiom is removed -- 212
 
 `addi rd,rs,i1` + `addi rd2,rd,i2` folds to one `addi` when the sum fits
-a 12-bit immediate. 27,470 sites in C++ and Rust look like this and
-25,383 of them are candidate 8 in a region-local disguise; what is left
-once that is subtracted is 74. Copy propagation into an addi source
-(`mv` first) adds 1,329 more, with another 1,508 in Go.
+a 12-bit immediate. 27,903 sites in C++ and Rust look like this and
+27,691 of them are candidate 8 in a region-local disguise; what is left
+once that is subtracted is 212. Copy propagation into an addi source
+(`mv` first) adds 4,244 more, with another 1,416 in Go.
 
 This is the shape that led to candidate 8, and it is the reason the
 `sp restore from fp` split exists in `candscan` at all: read as one
@@ -951,7 +994,7 @@ second instruction writes it is one dominant idiom plus nothing.
 Thirteen checks are implemented, and the backlog is empty.
 
 Everything this file ever sized is written. The last entry, base-C
-compression, was recorded at 93 sites on the strength of the two RVC
+compression, was recorded at 384 sites on the strength of the two RVC
 rules a shape token could decide; the full encodability pass found
 22,596 in the same cohort, and the difference is entirely instructions
 whose immediates were relocations when the assembler saw them. A census
@@ -965,7 +1008,7 @@ came back empty, which is where a new candidate would start.
 
 Missed compression in the base C extension is Go's alone. The two RVC
 rules a shape token can decide showed GCC and LLVM leaving essentially
-nothing on the table (93 of 1,815,725 `mv`, 0 of 1,084,536 in-range
+nothing on the table (384 of 4,629,930 `mv`, 0 of 3,065,349 in-range
 `li`), so a check here is worth writing only for Go-built binaries, and
 sizing it means an encodability pass over the whole C extension rather
 than the handful of forms Zcb needed.
@@ -977,28 +1020,38 @@ them compressed, 53,690,808 pairs:
 
 | # | opportunity | actionable | raw pattern |
 |---|---|---:|---:|
-| 1 | `auipc`+`jalr` within `jal` reach | 292,243 | 121,543+ |
-| 2 | frame-pointer teardown over a static frame | 112,401 | 133,670 |
-| 3 | base-C-compressible, on a toolchain that compresses | 22,596 | 93 |
-| 4 | dead register definitions | 11,989 | 44,546 |
-| 5 | constant re-materialization | 9,541 | 94,445 |
-| 6 | extension the producer already guarantees | 6,922 | - |
-| 7 | `addi` folded into a memory offset | 3,351 | ~29,000 |
-| 8 | a comparison a branch could have made | 2,937 | 21,890 |
-| 9 | redundant reloads | 2,191 | 5,781 |
+| 1 | `auipc`+`jalr` within `jal` reach | 292,243 | 2,378,734 |
+| 2 | frame-pointer teardown over a static frame | 112,401 | 135,045 |
+| 3 | base-C-compressible, on a toolchain that compresses | 22,596 | 384 |
+| 4 | dead register definitions | 11,989 | 117,538 |
+| 5 | constant re-materialization | 9,541 | 230,973 |
+| 6 | extension the producer already guarantees | 6,922 | 6,611 |
+| 7 | `addi` folded into a memory offset | 3,351 | 58,930 |
+| 8 | a comparison a branch could have made | 2,937 | 26,417 |
+| 9 | redundant reloads | 2,191 | 29,193 |
 | 10 | Zcb-compressible, target declares Zcb | 886 | - |
-| 11 | dead store to a frame slot | 204 | 1,852 |
-| - | Zba shift-add | 232 | 26,264 |
-| - | Zbb/Zbs/Zcb idioms on an RVA23 target | 521 | - |
-| - | move coalescing | 79 | 24,346 |
-| - | Zba `zext.w` | 54 | 2 |
-| - | equal shift pair foldable to `andi` | 0 | 0 |
+| 11 | dead store to a frame slot | 204 | 6,920 |
+| - | Zba shift-add | 232 | 49,881 |
+| - | Zbb/Zbs/Zcb idioms on an RVA23 target | 1,025 | - |
+| - | move coalescing | 192 | 73,017 |
+| - | Zba `zext.w` | 54 | 57,829 |
+| - | equal shift pair foldable to `andi` | 2 | 2 |
 
-Every row above the rule is the check's own count over the current
-corpus, so the table moved when libxul and uutils joined it and again
-with each check that landed. The `raw pattern` column is what a shape
-scan saw, where one was taken -- and no row's figure is a mining tool's
-any more.
+Both columns are measured over this cohort of the current corpus, and no
+row's raw figure carries a precondition -- that is what the actionable
+column is for. Row 1 used to read "121,543+", the `pairscan -x` pairs
+whose `auipc` immediate was inside `jal`'s reach, and the plus sign was
+there because that test cannot be done on a collapsed immediate at all;
+it is the mistake "Raw fields versus decoded values" below is about, so
+the row now carries the family total instead.
+
+Two rows have a raw figure *smaller* than the actionable one, which is
+worth knowing rather than hiding. Row 6: `candscan` keys the producer on
+a mnemonic and the check also bounds the value by an `andi` mask, so the
+check sees shapes the scan cannot. Row 3 is the row where a shape scan
+was least use at all -- it can only ask about `mv` and `li`, and the
+answer is 384 wide `mv` out of 4,629,930 and 0 wide in-range `li` out of
+3,065,349, against 22,596 from the full encodability pass.
 
 The `redundant mask after lbu` row is gone from this table: it was 142
 here and is now part of candidate 6, which subsumes it at 2,634 in this
@@ -1032,15 +1085,30 @@ does. Every immediate-sensitive family is an upper bound in that mode.
 
 | family | collapsed | exact | overstatement |
 |---|---:|---:|---:|
-| auipc+jalr collapsible to `jal` | 801,519 | 30,175 | 26.6x |
-| Zba shift-add | 48,270 | 19,933 | 2.4x |
-| Zba `zext.w` | 25,672 | 18,073 | 1.4x |
-| redundant mask after `lbu` | 50,998 | 148 | 345x |
+| auipc+jalr collapsible to `jal` | 2,378,898 | 128,155 | 18.6x |
+| Zba shift-add | 180,591 | 69,552 | 2.6x |
+| Zba `zext.w` | 203,831 | 75,900 | 2.7x |
+| redundant mask after `lbu` | 136,309 | 1,360 | 100.2x |
+
+Read "collapsed" as the same family predicate with its immediate test
+dropped, because a collapsed file gives a reader no way to apply one:
+`slli`+`add` at any shift, `slli`+`srli`/`srai` at any shift,
+`lbu`/`lhu`+`andi` at any mask, `auipc`+`jalr` at any displacement.
+
+The first row's exact column is what `pairscan -x` can answer and is
+itself far too low -- the real figure is 292,299 -- for the reason the
+next section gives. It is in the table because the collapsed-to-exact
+ratio is what the table is about, not because 128,155 is a population.
 
 The shift pairs that are *not* foldable -- shift amounts other than 32,
-which are bitfield extracts -- number 42,592 on their own, more than the
-real `zext.w` and `sh#add` populations combined. Any check in this area
-has to read the shift amount, and any sizing that does not is fiction.
+which are bitfield extracts -- number 113,301 on their own, still larger
+than either foldable family but no longer larger than both together, as
+they were on the first corpus. The two foldable families grew 3.5x and
+4.2x with the second corpus where the bitfield one grew 2.7x, which is
+what a member that cannot use Zba does to the ratio. The lesson survives
+the reversal and is the reason to keep stating it: any check in this
+area has to read the shift amount, and any sizing that does not is
+fiction in whichever direction the corpus happens to point.
 
 ## Extensions that share encoding space
 
@@ -1158,9 +1226,13 @@ it are:
 | idiom | libxul | RVA23 C++/Rust |
 |---|---:|---:|
 | 4-byte encodings a Zcb form would spell in 2 | 320,550 | 886 |
-| `not`+logic -> `andn`/`orn`/`xnor` | 14,874 | 34 |
-| `slli`+`srli` -> `zext.h`, `slli`+`srai` -> `sext.h`/`sext.b` | 12,084 | 0 |
-| `slli`+`srli`+`or` -> `rori` | 1,068 | 0 |
+| `not`+logic -> `andn`/`orn`/`xnor` | 15,506 | 38 |
+| `slli`+`srli` -> `zext.h`, `slli`+`srai` -> `sext.h`/`sext.b` | 11,060 | 0 |
+| `slli`+`srli`+`or` -> `rori` | 1,056 | 0 |
+
+The RVA23 column is 1,025 now rather than 521, and all of the growth is
+uutils: it joined that column at the same time libxul joined the other,
+and it is the binary the Zcb section calls one binary with two targets.
 
 None of it is reportable as things stand: libxul declares none of those
 extensions, and the gate correctly stays shut. What it sizes is the

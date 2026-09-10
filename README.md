@@ -459,8 +459,8 @@ the categories built around them have flagless replacements.
   verdict depends on a call or a return is run twice, once with the
   LP64D convention asserted, so a candidate can be told from one whose
   population only exists because the ABI-agnostic walk said UNKNOWN --
-  move coalescing turned out to be the latter, 22,265 shapes of which
-  21,252 come back *live* once the ABI is named.
+  move coalescing turned out to be the latter, 73,017 shapes of which
+  69,611 come back *live* once the ABI is named.
 
   Probes that measured zero stay in the tool. A candidate rejected on
   evidence is worth as much as one accepted, and leaving the probe there
