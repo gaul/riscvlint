@@ -344,24 +344,24 @@ unsigned rv_branch_encoded_size(unsigned funct3, unsigned rs1, unsigned rs2,
 
 // ---- the windowed memory and constant table ----
 //
-// Five checks -- redundant reload, dead store, constant
-// re-materialization, the load of a just-stored value and the load of a
-// value the register still holds -- need the same thing: a region-local
-// record of what is already in a register and what is already in a
-// frame slot. None of them can be decided from a pair, which is why the
-// distances cluster at 4-15 instructions and why no pair scan ever saw
-// them.
+// Six checks -- redundant reload, dead store, constant
+// re-materialization, the load of a just-stored value, the load of a
+// value the register still holds and the store of a value the slot
+// already holds -- need the same thing: a region-local record of what is
+// already in a register and what is already in a frame slot. None of
+// them can be decided from a pair, which is why the distances cluster at
+// 4-15 instructions and why no pair scan ever saw them.
 //
 // The driver calls this once per instruction, **after** the checks have
-// run, because each of the five judges the instruction under the cursor
+// run, because each of the six judges the instruction under the cursor
 // against the table as it stood before it. Recording an instruction also
 // clears the table when the *next* address is a side entry, which is
 // what keeps a check from reading a value across a branch into the
 // middle of a region.
 //
 // The two other stateful checks carry a scalar or two and update it
-// inline. This one is a table five checks read, so it gets a single
-// owner rather than five writers racing to keep it consistent.
+// inline. This one is a table six checks read, so it gets a single
+// owner rather than six writers racing to keep it consistent.
 void riscvlint_state_observe(riscvlint_state *state, const cs_insn *insn);
 
 // Drops the whole window. The driver calls it where it cannot keep the
@@ -529,7 +529,7 @@ bool check_redundant_reload(riscvlint_state *state, const cs_insn *insn,
 // is the extension the load's own signedness implies, and two of those
 // spellings need Zba or Zbb.
 //
-// This is the cheapest of the five to decide. Nothing is deleted -- the
+// This is the cheapest of the six to decide. Nothing is deleted -- the
 // store stays and the load becomes a register operation -- so there is
 // no liveness query, and both of the questions there are look backward
 // into the window that is already there: the record goes when the base
@@ -546,10 +546,10 @@ bool check_store_to_load(riscvlint_state *state, const cs_insn *insn,
 
 // A load whose destination already holds what it would load. The value
 // never left the register, so the load is not a move to be shortened --
-// it is an instruction to delete. That makes it one of the two window
-// checks whose finding is always worth its own encoding in bytes, the
-// other being the dead store; the three that rewrite a load into a move
-// often save nothing at all.
+// it is an instruction to delete. That makes it one of the three window
+// checks whose finding is always worth its own encoding in bytes, with
+// the dead store and the silent store; the three that rewrite a load
+// into a move often save nothing at all.
 //
 // Two shapes reach it, and each has to be exact. The same load again
 // recomputes the same value from the same bytes at any width. A store
@@ -571,6 +571,30 @@ bool check_redundant_load(riscvlint_state *state, const cs_insn *insn,
 // not.
 bool check_dead_store(riscvlint_state *state, const cs_insn *insn,
                       riscvlint_finding *finding);
+
+// A store of bytes the slot already holds, which is the dead store read
+// from the other end: that check deletes the first of two stores, this
+// deletes the second. Same frame-only restriction, for the same reason.
+//
+// The two differ in which of the window's flags they read, and the
+// flags do not have the same lifetime. Two things take `unread` away
+// and leave `held` alone: a conditional branch, because "dead" means
+// the overwrite is certain and on the taken path it does not happen,
+// and a load through a base that cannot be shown to miss the slot,
+// which may be the read that keeps the earlier store alive. Neither
+// disturbs the register, so both belong here. What is left -- two
+// stores of the same register with neither between them -- is 274 of
+// the 6,765 sites, and this stands down on those.
+//
+// Unlike its neighbours it does not compare the record's kind, only its
+// width: those claim something about the register a load produced, and
+// this claims something about the bytes, which do not record how they
+// were read. Floating point is refused on both sides for the reason
+// check_store_to_load gives, and x0 is not -- storing zero over a slot
+// that already holds zero is this finding like any other, where for the
+// checks that rewrite a load it would be `li rd,0` rather than a move.
+bool check_silent_store(riscvlint_state *state, const cs_insn *insn,
+                        riscvlint_finding *finding);
 
 // A constant materialized into a register while the same value is still
 // live in another, where the duplicate takes four bytes and the `mv`

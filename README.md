@@ -3,7 +3,7 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Fifteen checks are implemented and seven measured candidates are
+Sixteen checks are implemented and six measured candidates are
 waiting, the largest of them a frame address computed twice, 34,687
 sites and 52,960 bytes.
 [TODO.md](TODO.md) is the ledger behind them: every candidate that was
@@ -13,7 +13,7 @@ intuition, and what did not get written was rejected the same way.
 
 ## Checks
 
-Fifteen of them. Every figure below is what the check itself reports
+Sixteen of them. Every figure below is what the check itself reports
 over the [corpus](#corpus) -- 73,139,165 instructions of three
 toolchains -- rather than what a mining tool estimated for it. The two
 have differed by an order of magnitude every time both were measured.
@@ -29,17 +29,18 @@ have differed by an order of magnitude every time both were measured.
 | load of a just-stored value | 3,676 | 267 | 4,041 | 7,984 | 6,866 |
 | load of a value the register still holds | 10,445 | 519 | 5,592 | 16,556 | 41,232 |
 | dead store to a frame slot | 203 | 1 | 4,172 | 4,376 | 16,714 |
+| store of a value the slot already holds | 1,199 | 225 | 5,341 | 6,765 | 20,194 |
 | constant re-materialization | 8,970 | 571 | 1,457 | 10,998 | 21,996 |
 | base add foldable into memory offset | 2,922 | 429 | 2,993 | 6,344 | 19,574 |
 | instruction compressible to a base C form | 21,361 | 1,235 | 2,961,593 | 2,984,189 | 5,968,378 |
 | instruction compressible to a Zcb form | 705 | 181 | 29,762 | 30,648 | 61,296 |
 | redundant sign or zero extension | 6,589 | 333 | 1,593 | 8,515 | 20,864 |
 | dead register definition | 11,741 | 248 | 7,876 | 19,865 | 54,570 |
-| **total** | **292,958** | **187,622** | **3,054,794** | **3,535,374** | **7,921,804** |
+| **total** | **294,157** | **187,847** | **3,060,135** | **3,542,139** | **7,941,998** |
 
 Do not read the total row as a result. One row is 84% of it, and that
 row is Go's assembler declining to select RVC at all, which is a
-different kind of finding from the fourteen around it. The byte column for
+different kind of finding from the fifteen around it. The byte column for
 the call-pair row is arithmetic rather than measurement: that check does
 not print a size, and every site is eight bytes in and four out except a
 handful of `jalr ra,0(ra)` that were already two.
@@ -176,7 +177,7 @@ handful of `jalr ra,0(ra)` that were already two.
   than a doubleword it is the extension the load's own signedness
   implies, and `zext.w` and the halfword forms need Zba or Zbb.
 
-  The cheapest of the five to decide, because nothing is deleted -- the
+  The cheapest of the six to decide, because nothing is deleted -- the
   store stays and the load becomes a register operation, so there is no
   liveness query at all. It reports one rewrite per site: where a
   redundant reload of the same address is also available, that check has
@@ -200,7 +201,7 @@ handful of `jalr ra,0(ra)` that were already two.
   The two checks above both refuse this shape, because both rewrite a
   load into a move and there is no move to make. That leaves it here,
   and it deletes an instruction rather than shortening one -- 41,232
-  bytes, the largest of the five figures the window's checks produce and
+  bytes, the largest of the six figures the window's checks produce and
   nearly twice the next.
 
   Each of its two shapes has to be exact. The same load again recomputes
@@ -214,6 +215,34 @@ handful of `jalr ra,0(ra)` that were already two.
   nothing reading it in between. The store analogue of a dead register
   definition, limited to sp- and fp-relative slots for the mirror of the
   reload caveat: a heap address may alias anything.
+
+* **store of a value the slot already holds** -- the dead store read
+  from the other end. That check deletes the first of two stores and
+  needs the overwrite to be certain; this deletes the second, and does
+  not, because putting back what is already there is a no-op on every
+  path that reaches it. Same frame-only restriction, for the same
+  reason.
+
+  The two read different flags of the same record, and the flags do not
+  have the same lifetime. Two things take `unread` away and leave `held`
+  alone: a conditional branch, since "dead" means the overwrite is
+  certain and on the taken path it does not happen, and a load through a
+  base that cannot be shown to miss the slot, which may be the read that
+  keeps the earlier store alive. Neither disturbs the value in the
+  register, so both are this check's and not the dead store's. What is
+  left over -- two stores of the same register with neither a branch nor
+  a load between them -- is 274 sites, and this check stands down on
+  them.
+
+  5,635 of the 6,765 sites are a slot stored and stored again, and 1,130
+  are a slot loaded and written back unchanged. The two cohorts sit at
+  opposite ends of that: Go is 5,332 of the first and 9 of the second,
+  C++ and Rust together are 303 and 1,121.
+
+  Unlike its neighbours it compares the record's width and not its kind:
+  they claim something about the register a load produced, where `lb`
+  and `lbu` are the same bytes and not the same value, and this claims
+  something about the bytes, which do not record how they were read.
 
 * **constant re-materialization** -- a constant built into a register
   while the same value is still live in another, where the constant is

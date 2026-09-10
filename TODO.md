@@ -48,6 +48,7 @@ records where a first figure was wrong and why.
 | 6 | constant re-materialization | 10,998 | 329,926 | **implemented** |
 | 9 | extension the producer already guarantees | 8,515 | - | **implemented** |
 | 14 | a slot stored and then loaded back | 7,984 | 162,811 | **implemented** |
+| 18 | a store of bytes the slot already holds | 6,765 | 7,330 | **implemented** |
 | 4 | redundant reloads | 6,725 | 33,110 | **implemented** |
 | 12 | `addi` folded into a memory offset | 6,344 | 86,564 | **implemented** |
 | 10 | dead store to a frame slot | 4,376 | 15,199 | **implemented** |
@@ -55,7 +56,7 @@ records where a first figure was wrong and why.
 
 Where the raw figure comes from: `pairscan` for rows 1, 2 and 3 (the two
 Zba rows read shift-blind, which is exactly what a collapsed file
-forces); `defuse` for 4, 5, 6 and 7; `candscan` for 8, 10, 11, 12 and 14.
+forces); `defuse` for 4, 5, 6 and 7; `candscan` for 8, 10, 11, 12, 14 and 18.
 Rows 9 and 15 have no dash-free entry because no shape scan sizes
 them whole -- row 9's producer has to be tracked, which is `candscan`'s
 job and not `pairscan`'s, and row 15 is half a shape `candscan` counts
@@ -574,22 +575,22 @@ one earned its place -- `addw a5,a1,a5` compresses because the assembler
 swaps the operands, and a first version of this decoder missed 25 sites
 by requiring the destination to be the first source.
 
-## The windowed memory table, and the five checks it serves  [implemented]
+## The windowed memory table, and the six checks it serves  [implemented]
 
-Five checks need the same thing: a region-local record of what is
+Six checks need the same thing: a region-local record of what is
 already in a register and what is already in a frame slot.
 `riscvlint_state_observe` owns it and the driver calls it once per
-instruction **after** the checks, so each of the five judges the
+instruction **after** the checks, so each of the six judges the
 instruction under the cursor against the table as it stood before it.
 
 Measured by the checks themselves:
 
-| corpus | reload | dead store | remat | just-stored | still holds |
-|---|---:|---:|---:|---:|---:|
-| C++ | 2,086 | 203 | 8,970 | 3,676 | 10,445 |
-| Go | 4,408 | 4,172 | 1,457 | 4,041 | 5,592 |
-| Rust | 231 | 1 | 571 | 267 | 519 |
-| **total** | **6,725** | **4,376** | **10,998** | **7,984** | **16,556** |
+| corpus | reload | dead store | remat | just-stored | still holds | silent store |
+|---|---:|---:|---:|---:|---:|---:|
+| C++ | 2,086 | 203 | 8,970 | 3,676 | 10,445 | 1,199 |
+| Go | 4,408 | 4,172 | 1,457 | 4,041 | 5,592 | 5,341 |
+| Rust | 231 | 1 | 571 | 267 | 519 | 225 |
+| **total** | **6,725** | **4,376** | **10,998** | **7,984** | **16,556** | **6,765** |
 
 ### What the mining tools had wrong
 
@@ -1225,7 +1226,7 @@ second instruction writes it is one dominant idiom plus nothing.
 
 # Remaining candidates, ranked
 
-Fifteen checks are implemented and seven candidates are measured and
+Sixteen checks are implemented and six candidates are measured and
 unwritten. Every figure below is from a `candscan` probe carrying the
 check's own preconditions -- the window's aliasing rule, the generation
 tests, the byte rule -- rather than from a shape count, and every one
@@ -1235,26 +1236,29 @@ was read out of a disassembler before it was believed:
 |---|---|---:|---:|---:|---:|---:|
 | 16 | the same frame address computed twice | 25,251 | 5,660 | 3,776 | 34,687 | 52,960 |
 | 17 | a run of zero stores one wider store would do | 4,913 | 143 | 1,292 | 6,348 | 31,809 |
-| 18 | a store of bytes the slot already holds | 1,553 | 238 | 5,539 | 7,330 | 22,186 |
 | 19 | a conditional branch over an unconditional jump | 4,691 | 340 | 331 | 5,362 | 15,514 |
 | 20 | the same arithmetic computed twice | 2,657 | 126 | 1,804 | 4,587 | 9,314 |
 | 21 | a transfer to the instruction that follows it | 2,867 | 831 | 20 | 3,718 | 7,522 |
 | 22 | a bit-cast routed through a frame slot | 3,238 | 0 | 20 | 3,258 | - |
 
-The byte column is the whole ordering argument. By site count 16 is five
-times 18; by bytes it is twice, because 16 shortens an instruction by
-two and 18 deletes one. 22 has no byte figure because it has never had
-a probe of its own -- it is still counted only as a reason some other
-fold is unavailable, which is the weakest measurement on this page.
+The byte column is the whole ordering argument. By site count 16 is six
+times 19; by bytes it is three, because 16 shortens an instruction by
+two and 19 removes a jump. 22 has no byte figure because it has never
+had a probe of its own -- it is still counted only as a reason some
+other fold is unavailable, which is the weakest measurement on this
+page.
 
 Written against what is already in `riscvlint.c`, the order is not the
-same. 18 needs nothing new: the window holds base, displacement, width
-and the register, and the check is the existing one read backwards. 19
-and 21 need no state at all, two adjacent instructions and a range test.
-16 and 20 want a table the checker does not have -- a region-local
-record of computations, which is `check_const_remat`'s constant table
-generalised from `li` to everything that writes one GPR. 17 needs a run
-tracker and a cover cost, and nothing else.
+same. 19 and 21 need no state at all, two adjacent instructions and a
+range test. 16 and 20 want a table the checker does not have -- a
+region-local record of computations, which is `check_const_remat`'s
+constant table generalised from `li` to everything that writes one GPR.
+17 needs a run tracker and a cover cost, and nothing else.
+
+18 was the one that needed nothing new, and it is written: the window
+already held base, displacement, width and register, and the check is
+the dead store read backwards. Its section below records what the probe
+had right and what it did not.
 
 Everything else this file ever sized is written. The last entry, base-C
 compression, was recorded at 384 sites on the strength of the two RVC
@@ -1334,38 +1338,92 @@ byte-at-a-time store may be the deliberate choice rather than the missed
 one. The frame sites are the ones where the compiler knew the alignment
 and emitted the run anyway.
 
-### 18. A store of bytes the slot already holds -- 7,330
+### 18. A store of bytes the slot already holds -- 6,765 of 7,330  [implemented]
 
-The dual of candidate 15: that one deletes a load whose destination
-already holds the value, this deletes a store whose slot already does.
-ripgrep, adjacent:
+The dead store read from the other end: `check_dead_store` deletes the
+first of two stores, this deletes the second. ripgrep, adjacent:
 
 ```
   14cd22: ld s2, -0x178(s0)
   14cd26: sd s2, -0x178(s0)      -> delete
 ```
 
-7,011 of the 7,330 are sp- or fp-relative. The record is established by
-a load (1,372 sites) or by an earlier store (5,958), because both leave
-the slot equal to a named register, and the store's width has to match
-the record's exactly: a narrower store leaves the high bytes alone and a
-wider one writes bytes the record never covered.
+The check reports 6,765 sites and 20,194 bytes -- 5,341 Go, 1,199 C++,
+225 Rust. 5,635 of them are a slot stored and stored again and 1,130 are
+a slot loaded and written back unchanged, and the two cohorts sit at
+opposite ends of that split: Go is 5,332 of the first and 9 of the
+second, C++ and Rust together are 303 and 1,121.
 
-The overlap with `check_dead_store` is 336 sites, not 5,958. A store
-that repeats an earlier store to the same slot is a dead store seen from
-the other end -- but only when the overwrite is certain, and 5,622 of
-these have a conditional branch between the two, which is exactly the
-case `check_dead_store` must decline (the N12 rule above). Deleting the
-*second* store is sound whether or not the branch is taken; deleting the
-first is not. Go is 5,539 of the population and 5,370 of the branch
-cases, and it is one shape: a slot spilled before a test and spilled
-again from the path that falls through it.
+Its whole content is that `held` and `unread` do not have the same
+lifetime. Two things take `unread` away and leave `held` alone -- a
+conditional branch, because "dead" means the overwrite is certain and on
+the taken path it does not happen, and a load through a base that cannot
+be shown to miss the slot, which may be the read that keeps the earlier
+store alive. Neither disturbs the register, so both are this check's
+findings and not the dead store's. What is left over, two stores of the
+same register with neither between them, is 274 sites, and this check
+stands down on them.
+
+It compares the record's width and not its kind, which is the one place
+it differs from the three window checks around it. They claim something
+about the register a load produced, where `lb` and `lbu` are the same
+bytes and not the same value; this claims something about the bytes,
+which do not record how they were read. A slot armed by `lwu a0,K(sp)`
+is written back unchanged by `sw a0,K(sp)` exactly as one armed by `lw`.
+x0 is a finding rather than a refusal for the same reason the width
+rule is the way it is: the checks that rewrite a load refuse a stored
+zero because their rewrite becomes `li rd,0` rather than a move, and
+this one deletes. It has to split the case its neighbours refuse whole,
+though. A record armed by a *store* of x0 says the bytes are zero and x0
+cannot change, so storing zero again is a finding. A record armed by a
+*load* into x0 -- `ld x0,K(sp)`, a legal no-op -- says only that x0
+holds what is at the address, which is not true of any address. The
+corpus has no site either way and the guard costs nothing; it is here
+because the two look identical in the record, and N11 of the fixture
+fails without it.
+
+Frame slots only, which is `check_dead_store`'s restriction for
+`check_dead_store`'s reason: a heap address may alias anything and may
+be a device register that has to be written whatever it holds. It costs
+319 of the probe's 7,330 sites.
+
+#### Where the probe and the check part
+
+The two reconcile to 28 sites in 6,765, and it took two corrections to
+get there rather than one.
+
+The first was arithmetic. The probe reports the base split and the
+dead-store overlap as separate keys, and subtracting both from the total
+double counts the sites that are in each -- 232 - 107 - 13 = 112 for
+libLLVM against the check's 123. A joint key was added, and nine of the
+eleven C++ binaries then reconcile exactly.
+
+What is left is 28 sites the check finds and the probe does not, and it
+is the second of the two flag lifetimes above: the probe modelled the
+conditional branch and not the load. A store, then `ld a1,0(a3)`, then
+the same store again is a site the probe files under "the dead store
+owns it" and the check reports, because that load took `unread` away.
+Positive 6 of the fixture is that shape.
+
+Two sites go the other way, and they are the same function statically
+linked into `firefox-esr` and into `pingsender`:
 
 ```
-   17be4: sd a0, 0x70(sp)
-   17bf4: bnez t0, 0x17ed0
-   17bfc: sd a0, 0x70(sp)        -> delete
+   38654: sb a1, 33(sp)
+   38658: sb a2, 34(sp)
+   3865c: sb a3, 35(sp)
+   38660: ld a2, 32(sp)
+   38662: ld a0, 0(s8)
+   38666: srli a1, a1, 0x38
+   38668: sd a2, 32(sp)          <- the probe reports this, the check does not
 ```
+
+Assembled into a file of its own the check finds it, so the rule is not
+the problem: the 24-slot window has filled before the `ld` gets to arm a
+record. Rebuilt with 64 slots both binaries report 17 instead of 16,
+which is the whole of that difference and the only place in the corpus
+the bound costs anything. It stays at 24: raising it re-measures five
+other checks to buy two sites.
 
 ### 19. A conditional branch over an unconditional jump -- 5,362
 
@@ -1472,8 +1530,9 @@ them compressed, 53,690,808 pairs:
 | 9 | `addi` folded into a memory offset | 3,351 | 58,930 |
 | 10 | a comparison a branch could have made | 2,937 | 26,417 |
 | 11 | redundant reloads | 2,317 | 29,193 |
-| 12 | Zcb-compressible, target declares Zcb | 886 | - |
-| 13 | dead store to a frame slot | 204 | 6,920 |
+| 12 | a store of bytes the slot already holds | 1,424 | 1,791 |
+| 13 | Zcb-compressible, target declares Zcb | 886 | - |
+| 14 | dead store to a frame slot | 204 | 6,920 |
 | - | Zba shift-add | 232 | 49,881 |
 | - | Zbb/Zbs/Zcb idioms on an RVA23 target | 1,025 | - |
 | - | move coalescing | 192 | 73,017 |

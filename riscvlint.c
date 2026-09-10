@@ -2218,6 +2218,69 @@ bool check_dead_store(riscvlint_state *state, const cs_insn *insn,
     return false;
 }
 
+bool check_silent_store(riscvlint_state *state, const cs_insn *insn,
+                        riscvlint_finding *finding)
+{
+    if (insn->size != 2 && insn->size != 4) return false;
+    uint32_t w;
+    if (!riscvlint_word_at(state, insn->address, &w)) return false;
+    rv_mem_kind kind;
+    unsigned data, base;
+    int64_t off;
+    if (!rv_decode_mem(w, insn->size, &kind, &data, &base, &off)) return false;
+    if (!rv_mem_is_store(kind) || rv_mem_is_fp(kind)) return false;
+    if (base != 2 && base != 8) return false;
+    if (riscvlint_is_relocated(state, insn->address)) return false;
+
+    unsigned width = mem_width(kind);
+    // The same instruction is check_dead_store's finding wherever an
+    // unread store to the same bytes is still on the record: that check
+    // deletes the first store of the pair and this one would delete the
+    // second, for the same saving. One rewrite per site, and the older
+    // check keeps it. The condition is that check's own, branch-target
+    // test included, so this stands down exactly where it fires.
+    if (!riscvlint_is_branch_target(state, insn->address))
+        for (int i = 0; i < state->win.nslots; i++) {
+            const rvl_slot *sl = &state->win.slots[i];
+            if (sl->unread && sl->base == base && sl->disp == off &&
+                sl->width == width)
+                return false;
+        }
+
+    for (int i = 0; i < state->win.nslots; i++) {
+        const rvl_slot *sl = &state->win.slots[i];
+        if (!sl->held || sl->data != data) continue;
+        if (sl->base != base || sl->disp != off || sl->width != width)
+            continue;
+        // A store of x0 over a slot a *store* of x0 armed is a finding:
+        // x0 cannot change, so the bytes are still zero. Over a slot a
+        // load armed it is not -- `ld x0,K(sp)` is a legal no-op that
+        // puts nothing anywhere, and the record would be claiming that
+        // x0 holds what is at K(sp). The neighbouring checks refuse
+        // every x0 record for a different reason; this one has to
+        // distinguish them.
+        if (data == 0 && !rv_mem_is_store(sl->kind)) continue;
+        // The record's kind is not consulted, and this is the one window
+        // check where it must not be. Its neighbours claim something
+        // about the register a load produced, where `lb` and `lbu` are
+        // the same bytes and not the same value; this claims something
+        // about the bytes, which do not record how they were read. A
+        // slot armed by `lwu a0,K(sp)` is written back unchanged by
+        // `sw a0,K(sp)` exactly as one armed by `lw`.
+        finding->title = "store of a value the slot already holds";
+        finding->address = insn->address;
+        finding->insn_count = 1;
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "delete; %" PRId64 "(%s) already holds %s from the %s at "
+                 "0x%" PRIx64 " (%u bytes)", off, rv_reg_name(base),
+                 rv_reg_name(data), rv_mem_is_store(sl->kind) ? "store"
+                                                              : "load",
+                 sl->addr, insn->size);
+        return true;
+    }
+    return false;
+}
+
 bool check_const_remat(riscvlint_state *state, const cs_insn *insn,
                        riscvlint_finding *finding)
 {

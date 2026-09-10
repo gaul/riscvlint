@@ -273,6 +273,7 @@ static const riscvlint_check_fn checks[] = {
     check_store_to_load,
     check_redundant_load,
     check_dead_store,
+    check_silent_store,
     check_const_remat,
     check_cond_to_branch,
 };

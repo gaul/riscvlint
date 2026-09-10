@@ -1190,6 +1190,105 @@ static void test_window_checks(csh handle)
     CHECK(run_window(handle, check_dead_store, readback, sizeof readback,
                      0x1000, NULL) == 0);
 
+    // A slot loaded and then written straight back: the store puts back
+    // what it read, so it is the store that goes.
+    static const uint8_t silent[] = {
+        0x42, 0x65,                    // c.ldsp a0,16(sp)
+        0x05, 0x06,                    // c.addi a2,1
+        0x2a, 0xe8,                    // c.sdsp a0,16(sp)
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_silent_store, silent, sizeof silent,
+                     0x1000, &f) == 1);
+    CHECK(f.address == 0x1004 && f.insn_count == 1);
+    CHECK(strstr(f.replacement, "16(sp) already holds a0") != NULL);
+    CHECK(strstr(f.replacement, "from the load at 0x1000") != NULL);
+
+    // The record's kind is not the store's and must not have to be:
+    // `lwu` says what went into the register, not what is in memory.
+    static const uint8_t silentw[] = {
+        0x03, 0x65, 0x01, 0x01,        // lwu a0,16(sp)
+        0x05, 0x06,                    // c.addi a2,1
+        0x2a, 0xc8,                    // c.swsp a0,16(sp)
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_silent_store, silentw, sizeof silentw,
+                     0x1000, NULL) == 1);
+
+    // The width does have to match. A four-byte store over an
+    // eight-byte record writes bytes the record covers, but proving that
+    // is a rule the corpus never needed.
+    static const uint8_t silentnarrow[] = {
+        0x42, 0x65,                    // c.ldsp a0,16(sp)
+        0x2a, 0xc8,                    // c.swsp a0,16(sp)
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_silent_store, silentnarrow,
+                     sizeof silentnarrow, 0x1000, NULL) == 0);
+
+    // A different register is a different value.
+    static const uint8_t silentother[] = {
+        0x42, 0x65,                    // c.ldsp a0,16(sp)
+        0x3a, 0xe8,                    // c.sdsp a4,16(sp)
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_silent_store, silentother,
+                     sizeof silentother, 0x1000, NULL) == 0);
+
+    // An overlapping store between takes the held value away.
+    static const uint8_t silentover[] = {
+        0x42, 0x65,                    // c.ldsp a0,16(sp)
+        0x3a, 0xca,                    // c.swsp a4,20(sp)
+        0x2a, 0xe8,                    // c.sdsp a0,16(sp)
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_silent_store, silentover,
+                     sizeof silentover, 0x1000, NULL) == 0);
+
+    // Two stores of the same register with nothing between: this is
+    // check_dead_store's finding, which deletes the other one, so this
+    // check stands down.
+    static const uint8_t silentdead[] = {
+        0x2a, 0xe8,                    // c.sdsp a0,16(sp)
+        0x05, 0x06,                    // c.addi a2,1
+        0x2a, 0xe8,                    // c.sdsp a0,16(sp)
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_silent_store, silentdead,
+                     sizeof silentdead, 0x1000, NULL) == 0);
+    CHECK(run_window(handle, check_dead_store, silentdead, sizeof silentdead,
+                     0x1000, NULL) == 1);
+
+    // The same two stores with a conditional branch between them, which
+    // is where the two checks part. `unread` is gone -- the overwrite is
+    // not certain -- and `held` is not, because the second store is
+    // reached by falling through. 5,622 of the corpus population is this
+    // shape.
+    static const uint8_t silentbr[] = {
+        0x2a, 0xe8,                    // c.sdsp a0,16(sp)
+        0x11, 0xc2,                    // c.beqz a2,0x1006
+        0x2a, 0xe8,                    // c.sdsp a0,16(sp)
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_dead_store, silentbr, sizeof silentbr,
+                     0x1000, NULL) == 0);
+    CHECK(run_window(handle, check_silent_store, silentbr, sizeof silentbr,
+                     0x1000, &f) == 1);
+    CHECK(f.address == 0x1004);
+    CHECK(strstr(f.replacement, "from the store at 0x1000") != NULL);
+
+    // A heap address may alias anything and may be a device register, so
+    // only frame slots are claimed -- the dead store's restriction, for
+    // the dead store's reason.
+    static const uint8_t silentheap[] = {
+        0x88, 0x65,                    // c.ld a0,8(a1)
+        0x05, 0x06,                    // c.addi a2,1
+        0x88, 0xe5,                    // c.sd a0,8(a1)
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_silent_store, silentheap,
+                     sizeof silentheap, 0x1000, NULL) == 0);
+
     // A constant materialized twice, both four bytes wide.
     static const uint8_t remat[] = {
         0x93, 0x07, 0x20, 0x4d,        // li a5,1234

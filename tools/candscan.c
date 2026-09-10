@@ -1374,6 +1374,17 @@ static void scan_section(csh handle, const char *path, const uint8_t *code,
                                      r->xbr ? "branch between"
                                             : "straight line");
                             bump(key, dd);
+                            // The two splits above are independent, so
+                            // subtracting both from the total double
+                            // counts what is in each. The joint key is
+                            // what reconciles with the check: it reports
+                            // a frame slot that check_dead_store does
+                            // not already own.
+                            if (r->fromst && !r->xbr)
+                                bump(mbase == 2 || mbase == 8
+                                         ? "silent|dead store owns it|sp/fp"
+                                         : "silent|dead store owns it|other",
+                                     dd);
                             bump(r->base == 2 || r->base == 8
                                      ? "silent|base sp/fp"
                                      : "silent|base other", dd);

@@ -1,0 +1,31 @@
+store of a value the slot already holds at offset: 0x4: -> delete; 8(sp) already holds a0 from the load at 0x0 (2 bytes) (1 instructions)
+  sd a0, 8(sp)
+
+store of a value the slot already holds at offset: 0xa: -> delete; 16(sp) already holds a0 from the store at 0x6 (2 bytes) (1 instructions)
+  sd a0, 0x10(sp)
+
+store of a value the slot already holds at offset: 0x12: -> delete; 24(sp) already holds a0 from the load at 0xc (2 bytes) (1 instructions)
+  sw a0, 0x18(sp)
+
+store of a value the slot already holds at offset: 0x18: -> delete; 32(sp) already holds a0 from the load at 0x14 (2 bytes) (1 instructions)
+  sd a0, 0x20(sp)
+
+store of a value the slot already holds at offset: 0x1e: -> delete; 56(sp) already holds zero from the store at 0x1a (2 bytes) (1 instructions)
+  sd zero, 0x38(sp)
+
+store of a value the slot already holds at offset: 0x26: -> delete; 60(sp) already holds a0 from the store at 0x20 (4 bytes) (1 instructions)
+  sd a0, 0x3c(sp)
+
+dead store to a frame slot at offset: 0x2a: -> delete; 64(sp) is overwritten at 0x2e (2 bytes) (1 instructions)
+  sd a0, 0x40(sp)
+
+call pair foldable to jal at offset: 0x50: -> jal ra, 0x76 (2 instructions)
+  auipc ra, 0
+  jalr 0x26(ra)
+
+Optimization opportunities by type:
+       6  store of a value the slot already holds
+       1  call pair foldable to jal
+       1  dead store to a frame slot
+
+8 optimization opportunities in 54 instructions
