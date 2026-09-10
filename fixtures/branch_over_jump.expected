@@ -1,0 +1,49 @@
+conditional branch over an unconditional jump at offset: 0x0: -> bgeu a0, a1, 0xa92 (8 -> 4 bytes) (2 instructions)
+  bltu a0, a1, 8
+  j 0xa92
+
+conditional branch over an unconditional jump at offset: 0xa: -> bgeu a0, a1, 0x130 (6 -> 4 bytes) (2 instructions)
+  bltu a0, a1, 0x10
+  j 0x130
+
+conditional branch over an unconditional jump at offset: 0x12: -> bnez a0, 0x66 (4 -> 2 bytes) (2 instructions)
+  beqz a0, 0x16
+  j 0x66
+
+conditional branch over an unconditional jump at offset: 0x18: -> bnez a0, 0x130 (4 -> 4 bytes) (2 instructions)
+  beqz a0, 0x1c
+  j 0x130
+
+transfer to the instruction that follows it at offset: 0x40: -> delete; the jump goes where control already goes (2 bytes) (1 instructions)
+  j 0x42
+
+transfer to the instruction that follows it at offset: 0x44: -> delete; the jump goes where control already goes (2 bytes) (1 instructions)
+  j 0x46
+
+transfer to the instruction that follows it at offset: 0x48: -> delete; the branch goes where control already goes (2 bytes) (1 instructions)
+  beqz a1, 0x4a
+
+instruction compressible to a base C form at offset: 0x4c: -> c.j (4 -> 2 bytes) (1 instructions)
+  j 0x50
+
+transfer to the instruction that follows it at offset: 0x4c: -> delete; the jump goes where control already goes (4 bytes) (1 instructions)
+  j 0x50
+
+instruction compressible to a base C form at offset: 0x50: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+transfer to the instruction that follows it at offset: 0x54: -> delete; the branch goes where control already goes (4 bytes) (1 instructions)
+  beq a2, a3, 0x58
+
+instruction compressible to a base C form at offset: 0x58: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+instruction compressible to a base C form at offset: 0x60: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+Optimization opportunities by type:
+       5  transfer to the instruction that follows it
+       4  conditional branch over an unconditional jump
+       4  instruction compressible to a base C form
+
+13 optimization opportunities in 3392 instructions

@@ -23,9 +23,13 @@ call pair foldable to jal at offset: 0x50: -> jal ra, 0x76 (2 instructions)
   auipc ra, 0
   jalr 0x26(ra)
 
+transfer to the instruction that follows it at offset: 0x5c: -> delete; the branch goes where control already goes (2 bytes) (1 instructions)
+  beqz a2, 0x5e
+
 Optimization opportunities by type:
        6  store of a value the slot already holds
        1  call pair foldable to jal
        1  dead store to a frame slot
+       1  transfer to the instruction that follows it
 
-8 optimization opportunities in 54 instructions
+9 optimization opportunities in 54 instructions

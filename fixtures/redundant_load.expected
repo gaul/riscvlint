@@ -17,9 +17,13 @@ call pair foldable to jal at offset: 0x40: -> jal ra, 0x58 (2 instructions)
   auipc ra, 0
   jalr 0x18(ra)
 
+transfer to the instruction that follows it at offset: 0x4c: -> delete; the branch goes where control already goes (2 bytes) (1 instructions)
+  beqz a2, 0x4e
+
 Optimization opportunities by type:
        4  load of a value the register still holds
        1  call pair foldable to jal
        1  dead register definition
+       1  transfer to the instruction that follows it
 
-6 optimization opportunities in 39 instructions
+7 optimization opportunities in 39 instructions

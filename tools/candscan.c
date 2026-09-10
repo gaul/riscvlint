@@ -1522,7 +1522,7 @@ static void scan_section(csh handle, const char *path, const uint8_t *code,
                          is_cond_branch(insn) ? "branch" : "jump", insn->size);
                 bump(key, -1);
                 bump("jnext|TOTAL", -1);
-                show("jnext", here, next);
+                show(key, here, next);
             }
             // `beqz a0,L` + `j X` + `L:` is `bnez a0,X` with the jump
             // gone. The jump must not be a branch target itself, or the

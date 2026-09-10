@@ -52,13 +52,15 @@ records where a first figure was wrong and why.
 | 18 | a store of bytes the slot already holds | 6,765 | 7,330 | **implemented** |
 | 4 | redundant reloads | 6,725 | 33,110 | **implemented** |
 | 12 | `addi` folded into a memory offset | 6,344 | 86,564 | **implemented** |
+| 19 | a conditional branch over an unconditional jump | 5,362 | 128,361 | **implemented** |
 | 10 | dead store to a frame slot | 4,376 | 15,199 | **implemented** |
+| 21 | a transfer to the instruction that follows it | 3,702 | 3,718 | **implemented** |
 | 7 | compare-then-branch folding | 2,937 | 26,513 | **implemented** |
 
 Where the raw figure comes from: `pairscan` for rows 1, 2 and 3 (the two
 Zba rows read shift-blind, which is exactly what a collapsed file
 forces); `defuse` for 4, 5, 6 and 7; `candscan` for 8, 10, 11, 12, 14,
-16+20 and 18. Rows 9 and 15 have no dash-free entry because no shape scan sizes
+16+20, 18, 19 and 21. Rows 9 and 15 have no dash-free entry because no shape scan sizes
 them whole -- row 9's producer has to be tracked, which is `candscan`'s
 job and not `pairscan`'s, and row 15 is half a shape `candscan` counts
 only as a reason some other fold is unavailable. Row 13's raw entry is in its own section: a shape token
@@ -1260,7 +1262,7 @@ second instruction writes it is one dominant idiom plus nothing.
 
 # Remaining candidates, ranked
 
-Seventeen checks are implemented and four candidates are measured and
+Nineteen checks are implemented and two candidates are measured and
 unwritten. Every figure below is from a `candscan` probe carrying the
 check's own preconditions -- the window's aliasing rule, the generation
 tests, the byte rule -- rather than from a shape count, and every one
@@ -1269,28 +1271,23 @@ was read out of a disassembler before it was believed:
 | # | candidate | C++ | Rust | Go | sites | bytes |
 |---|---|---:|---:|---:|---:|---:|
 | 17 | a run of zero stores one wider store would do | 4,913 | 143 | 1,292 | 6,348 | 31,809 |
-| 19 | a conditional branch over an unconditional jump | 4,691 | 340 | 331 | 5,362 | 15,514 |
-| 21 | a transfer to the instruction that follows it | 2,867 | 831 | 20 | 3,718 | 7,522 |
 | 22 | a bit-cast routed through a frame slot | 3,238 | 0 | 20 | 3,258 | - |
 
-The byte column is the whole ordering argument: 17 is larger than 19 by
-sites and twice as large by bytes, because 17 removes several stores and
-19 removes a jump. 22 has no byte figure because it has never had a
-probe of its own -- it is still counted only as a reason some other fold
-is unavailable, which is the weakest measurement on this page.
+17 needs a run tracker and a cover cost, and a finding that spans up to
+eight instructions where every finding the tool emits today spans one or
+two. 22 has no byte figure because it has never had a probe of its own
+-- it is still counted only as a reason some other fold is unavailable,
+which is the weakest measurement on this page, and buying it means
+extending the window to the second register file for those 3,258 sites
+and 409 more where both halves are floating point.
 
-Written against what is already in `riscvlint.c`, the order is not the
-same. 19 and 21 need no state at all, two adjacent instructions and a
-range test; 19's one precondition is a bit lookup in the table
-`mark_branch_targets` already builds. 17 needs a run tracker and a cover
-cost, and a finding that spans up to eight instructions where every
-finding the tool emits today spans one or two.
-
-Two candidates left this table by being written. 18 needed nothing new
+Four candidates left this table by being written. 18 needed nothing new
 -- the window already held base, displacement, width and register, and
 the check is the dead store read backwards. 16 and 20 turned out to be
 one check rather than two; their joint section below says why, and what
-it cost to find out.
+it cost to find out. 19 and 21 needed no state at all: two adjacent
+instructions, a range test and a bit lookup in the table
+`mark_branch_targets` already builds.
 
 Everything else this file ever sized is written. The last entry, base-C
 compression, was recorded at 384 sites on the strength of the two RVC
@@ -1532,7 +1529,7 @@ which is the whole of that difference and the only place in the corpus
 the bound costs anything. It stays at 24: raising it re-measures five
 other checks to buy two sites.
 
-### 19. A conditional branch over an unconditional jump -- 5,362
+### 19. A conditional branch over an unconditional jump -- 5,362  [implemented]
 
 `beqz a0,L` + `j X` + `L:` is `bnez a0,X` with the jump gone, whenever X
 is inside the branch's +/-4KB. libQt6Core:
@@ -1551,8 +1548,58 @@ to four, giving back what the jump gave -- and the byte figure excludes
 them.
 
 The jump must not itself be a branch target, or the paths that reach it
-lose their transfer. That is the only precondition, and it is a bit
-lookup in the table `mark_branch_targets` already builds.
+lose their transfer. That is a bit lookup in the table
+`mark_branch_targets` already builds.
+
+#### What the check reports -- 5,362 and 15,514 bytes
+
+| corpus | sites | bytes |
+|---|---:|---:|
+| C++ | 4,691 | 13,136 |
+| Rust | 340 | 1,054 |
+| Go | 331 | 1,324 |
+| **total** | **5,362** | **15,514** |
+
+Exactly the probe, in all three cohorts and on both columns. Two rules
+the check has and the probe did not turned out to cost nothing: the jump
+must be `j` rather than `jal` -- the second writes a link register that
+would stop being written, and no site in the corpus is that shape -- and
+neither half may be relocated, which no site is either.
+
+A third rule is new and is the one worth recording. Where the jump goes
+exactly where the branch goes, both paths already meet: the pair is dead
+rather than foldable, and inverting the branch would leave a branch to
+the next instruction rather than removing anything. Those sites are
+candidate 21's, and the check hands them over rather than reporting a
+worse rewrite. None occur in the corpus; the fixture has one.
+
+The inverted branch is priced at the original's own encoding class. A
+four-byte branch stays four even where the new displacement would fit
+`c.beqz`, because Go leaves compressible branches wide and that saving
+is `check_c_compressible`'s. Pricing it the other way is the mistake
+candidate 17's first cost model made, one candidate above.
+
+Four shapes come out of that, and they account for the byte figure
+exactly:
+
+| branch | jump | inverted | sites | each |
+|---|---|---|---:|---:|
+| 4 | 4 | 4 | 2,468 | 4 |
+| 4 | 2 | 4 | 360 | 2 |
+| 2 | 4 | 4 | 2,272 | 2 |
+| 2 | 2 | 2 | 189 | 2 |
+| 2 | 2 | 4 | 73 | 0 |
+
+The last row is reported anyway: an instruction and a taken branch go,
+and the finding says the size did not change. That is the same call
+`check_slli_add_to_shadd` makes for the pair that is four bytes either
+way.
+
+98 of the 5,362 are also reported by `check_c_compressible`, which has
+the branch as a four-byte encoding with a two-byte spelling. The fold is
+the better of the two -- it saves four bytes where the compression saves
+two, and removes an instruction as well -- but no stand-down is written,
+for the reason candidate 16's section gives.
 
 ### 20. The same arithmetic computed twice -- 4,587  [implemented]
 
@@ -1588,17 +1635,41 @@ def wrote one of its own sources (`add a0,a0,a1`) does not leave that
 source in the register the record names, so the generation test would be
 asking the wrong question and every later `add rd,a0,a1` would match.
 
-### 21. A transfer to the instruction that follows it -- 3,718
+### 21. A transfer to the instruction that follows it -- 3,702 of 3,718  [implemented]
 
 ```
    70c9c: j 0x70c9e
    70c9e: ld a1, -0x50(s0)        -> delete the j
 ```
 
-3,674 of the 3,718 are a two-byte `c.j` to the next instruction. By
-cohort it is 2,867 C++, 831 Rust and 20 Go -- a block-placement leftover
-in LLVM's output. The smallest candidate here and the smallest check:
-no state, no window, one comparison against the address that follows.
+3,674 of the 3,718 are a two-byte `c.j` to the next instruction -- a
+block-placement leftover in LLVM's output. The smallest candidate here
+and the smallest check: no state, no window, one comparison against the
+address that follows.
+
+The check reports 3,702 of them and 7,458 bytes: 2,851 C++, 831 Rust and
+20 Go. The 16 it declines are the whole content of the measurement, and
+they were found by reading the probe's own examples rather than its
+counts. `jnext|jump|4 bytes` is 19 sites, and capstone prints two
+different instructions the same way in that key:
+
+```
+   2d670: jal 0x2d674          firefox-esr -- writes ra
+  418ba4: j 0x418ba8           restic -- writes nothing
+```
+
+`jal rd,X` with rd other than x0 leaves the address of the following
+instruction in a register, which makes it a PC materialization rather
+than a no-op. All 16 are in Firefox; restic's three four-byte jumps are
+the x0 link and are reported. A check that keyed on "an unconditional
+transfer to the next address" and not on rd would delete a write.
+
+The other 25 are conditional branches to the next instruction -- 24
+four-byte and one two-byte. They are the same no-op and are reported.
+
+4 of the 3,702 are also reported by `check_c_compressible` -- a
+four-byte jump that has a `c.j` spelling. Deleting beats compressing,
+and no stand-down is written.
 
 ### 22. A bit-cast routed through a frame slot -- 3,258
 
@@ -1637,13 +1708,15 @@ them compressed, 53,690,808 pairs:
 | 6 | a load into the register that still holds it | 10,964 | - |
 | 7 | constant re-materialization | 9,541 | 230,973 |
 | 8 | extension the producer already guarantees | 6,922 | 6,611 |
-| 9 | a slot stored and then loaded back | 3,943 | 142,471 |
-| 10 | `addi` folded into a memory offset | 3,351 | 58,930 |
-| 11 | a comparison a branch could have made | 2,937 | 26,417 |
-| 12 | redundant reloads | 2,317 | 29,193 |
-| 13 | a store of bytes the slot already holds | 1,424 | 1,791 |
-| 14 | Zcb-compressible, target declares Zcb | 886 | - |
-| 15 | dead store to a frame slot | 204 | 6,920 |
+| 9 | a conditional branch over an unconditional jump | 5,031 | 117,619 |
+| 10 | a slot stored and then loaded back | 3,943 | 142,471 |
+| 11 | a transfer to the instruction that follows it | 3,682 | 3,698 |
+| 12 | `addi` folded into a memory offset | 3,351 | 58,930 |
+| 13 | a comparison a branch could have made | 2,937 | 26,417 |
+| 14 | redundant reloads | 2,317 | 29,193 |
+| 15 | a store of bytes the slot already holds | 1,424 | 1,791 |
+| 16 | Zcb-compressible, target declares Zcb | 886 | - |
+| 17 | dead store to a frame slot | 204 | 6,920 |
 | - | Zba shift-add | 232 | 49,881 |
 | - | Zbb/Zbs/Zcb idioms on an RVA23 target | 1,025 | - |
 | - | move coalescing | 192 | 73,017 |
@@ -1652,17 +1725,24 @@ them compressed, 53,690,808 pairs:
 
 Both columns are measured over this cohort of the current corpus, and no
 row's raw figure carries a precondition -- that is what the actionable
-column is for, and row 9's two columns are the widest apart of any here
+column is for, and row 10's two columns are the widest apart of any here
 for a reason candidate 14 sets out. Row 6 has no raw figure at all: its
 shape is one `candscan` counts only as a reason some other fold is
 unavailable, which candidate 15 explains.
 
-Row 3 is the newest and the one that changes this table's shape: it is
-the first check to place above base-C compression in the cohort where
-GCC and LLVM leave almost no compression on the table at all. Its two
-columns are close because the probe carries nearly every precondition
-the check does: of the 9,014 between them, 8,959 are matches already
-spelled in two bytes, where a `c.mv` saves nothing, and 55 write sp.
+Row 3 changes this table's shape: it is the first check to place above
+base-C compression in the cohort where GCC and LLVM leave almost no
+compression on the table at all. Its two columns are close because the
+probe carries nearly every precondition the check does: of the 9,014
+between them, 8,959 are matches already spelled in two bytes, where a
+`c.mv` saves nothing, and 55 write sp.
+
+Rows 9 and 11 are the two ends of how far a raw figure can be from a
+population. 9's shape is 117,619 sites here and 5,031 of them are
+findings, because the shape *is* the standard way to spell a branch out
+of range and the question is only whether this one was. 11's two columns
+differ by 16, and every one of those 16 is a `jal` that capstone prints
+like a `j`.
 
 Row 1 used to read "121,543+", the `pairscan -x` pairs
 whose `auipc` immediate was inside `jal`'s reach, and the plus sign was

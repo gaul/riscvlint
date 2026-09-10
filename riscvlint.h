@@ -336,6 +336,14 @@ bool rv_decode_condition(uint32_t w, unsigned size, unsigned *rd,
 bool rv_decode_cond_branch(uint32_t w, unsigned size, unsigned *rs1,
                            unsigned *rs2, unsigned *funct3, int64_t *off);
 
+// An unconditional jump and where it goes. `jal rd,off` is spelled `j`
+// when rd is x0 and `jal` when it is ra -- the difference is the whole
+// question for a check that wants to delete one, since the second form
+// writes a link register. `off` is the signed byte displacement from
+// the instruction. c.jal is RV32-only, so the two-byte form is always
+// the x0 link.
+bool rv_decode_jump(uint32_t w, unsigned size, unsigned *rd, int64_t *off);
+
 // Bytes the branch would assemble to. Only `beqz` and `bnez` have a
 // compressed spelling, and only for a register in x8-x15 with a
 // displacement inside the nine-bit field.
@@ -662,6 +670,54 @@ bool check_comp_remat(riscvlint_state *state, const cs_insn *insn,
 // population is a difference the code goes on to use.
 bool check_cond_to_branch(riscvlint_state *state, const cs_insn *insn,
                           riscvlint_finding *finding);
+
+// `beqz a0,L` + `j X` + `L:` is `bnez a0,X` with the jump gone: the
+// branch inverts, takes the jump's target, and the jump goes. Every
+// conditional branch inverts -- beq/bne, blt/bge and bltu/bgeu are each
+// other with the low bit of funct3 flipped.
+//
+// The shape is 128,361 sites in the corpus and almost all of it is the
+// standard way to spell a conditional branch out of range: the branch
+// reaches +/-4KB and the jump reaches +/-1MB, so an assembler that
+// cannot encode the branch writes this pair instead. 5,362 have a
+// target the branch could reach on its own, and those are the findings.
+//
+// The jump must not itself be a branch target, or the paths that reach
+// it lose their transfer, and it must be `j` rather than `jal` -- the
+// second writes a link register that would stop being written.
+//
+// The inverted branch is priced at the original's own encoding class: a
+// four-byte branch stays four even where the new displacement would fit
+// c.beqz, because Go leaves compressible branches wide and that saving
+// belongs to check_c_compressible. Where the pair is a two-byte branch
+// and a two-byte jump and the new target is outside c.beqz's +/-256,
+// the rewrite is four bytes for four -- it still removes an instruction
+// and a taken branch, so it is reported, and the finding says so.
+// Where the jump goes exactly where the branch goes, both paths already
+// meet: the pair is dead rather than foldable, and inverting the branch
+// would leave a branch to the next instruction rather than removing
+// anything. Those are check_transfer_to_next's, and this stands down.
+//
+// Measured population: 5,362 sites and 15,514 bytes -- C++ 4,691, Rust
+// 340, Go 331 -- which is exactly what the probe reports. See TODO.md.
+bool check_branch_over_jump(riscvlint_state *state, const cs_insn *insn,
+                            riscvlint_finding *finding);
+
+// A relative transfer whose target is the instruction after it. Control
+// arrives there either way, so it does nothing and deleting it is free.
+// Mostly `c.j` to the next instruction -- a block-placement leftover in
+// LLVM's output -- and a few conditional branches that do the same.
+//
+// `jal rd,next` with rd other than x0 is not reported: it writes a link
+// register, which makes it a PC materialization rather than a no-op.
+// That is 16 sites the probe counted and this does not, all of them in
+// Firefox; the three four-byte jumps in Go's binaries are the x0 link
+// and are reported.
+//
+// Measured population: 3,702 sites and 7,458 bytes -- C++ 2,851, Rust
+// 831, Go 20. See TODO.md.
+bool check_transfer_to_next(riscvlint_state *state, const cs_insn *insn,
+                            riscvlint_finding *finding);
 
 // A four-byte encoding the base C extension spells in two. Like the Zcb
 // check this reports an assembler's choice rather than a compiler's, and

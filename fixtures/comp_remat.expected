@@ -80,6 +80,9 @@ dead register definition at offset: 0x8c: -> delete; nothing reads a3 (4 bytes) 
 dead register definition at offset: 0x90: -> delete; nothing reads a0 (4 bytes) (1 instructions)
   addi a0, s0, -8
 
+transfer to the instruction that follows it at offset: 0x94: -> delete; the branch goes where control already goes (2 bytes) (1 instructions)
+  beqz a2, 0x96
+
 dead register definition at offset: 0x96: -> delete; nothing reads a3 (4 bytes) (1 instructions)
   addi a3, s0, -8
 
@@ -116,5 +119,6 @@ Optimization opportunities by type:
        4  instruction compressible to a base C form
        1  call pair foldable to jal
        1  constant re-materialization
+       1  transfer to the instruction that follows it
 
-37 optimization opportunities in 56 instructions
+38 optimization opportunities in 56 instructions

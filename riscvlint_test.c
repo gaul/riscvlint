@@ -1698,6 +1698,242 @@ static void test_window_checks(csh handle)
                      0x1000, NULL) == 0);
 }
 
+// ---- rv_decode_jump ----
+//
+// The CJ and J immediates are scattered fields, and the CB format two
+// decoders over got read wrong once in a way that produced plausible
+// wrong addresses rather than nothing. So every bit of both is pinned
+// against what the assembler emits for a known displacement, rather
+// than against a second reading of the manual: each pair below is
+// `c.j .+K` or `j .+K` assembled at the address given.
+static void test_decode_jump(void)
+{
+    static const struct { uint32_t w; unsigned size; int64_t off; } t[] = {
+        // c.j, one bit of the CJ field at a time.
+        { 0xa011u, 2,      4 },   { 0xa021u, 2,      8 },
+        { 0xa801u, 2,     16 },   { 0xa005u, 2,     32 },
+        { 0xa081u, 2,     64 },   { 0xa041u, 2,    128 },
+        { 0xa201u, 2,    256 },   { 0xa401u, 2,    512 },
+        { 0xa101u, 2,   1024 },   { 0xaffdu, 2,   2046 },
+        { 0xbff5u, 2,     -4 },   { 0xbfe5u, 2,     -8 },
+        { 0xbfc5u, 2,    -16 },   { 0xb7c5u, 2,    -32 },
+        { 0xb7c1u, 2,    -64 },   { 0xb741u, 2,   -128 },
+        { 0xb701u, 2,   -256 },   { 0xb501u, 2,   -512 },
+        { 0xb101u, 2,  -1024 },   { 0xb001u, 2,  -2048 },
+        // jal, likewise, up to the ends of its range.
+        { 0x0040006fu, 4,       4 }, { 0x0080006fu, 4,       8 },
+        { 0x0100006fu, 4,      16 }, { 0x0200006fu, 4,      32 },
+        { 0x0400006fu, 4,      64 }, { 0x0800006fu, 4,     128 },
+        { 0x1000006fu, 4,     256 }, { 0x2000006fu, 4,     512 },
+        { 0x4000006fu, 4,    1024 }, { 0x0010006fu, 4,    2048 },
+        { 0x0000106fu, 4,    4096 }, { 0x0000206fu, 4,    8192 },
+        { 0x0000406fu, 4,   16384 }, { 0x0000806fu, 4,   32768 },
+        { 0x0001006fu, 4,   65536 }, { 0x0002006fu, 4,  131072 },
+        { 0x0004006fu, 4,  262144 }, { 0x0008006fu, 4,  524288 },
+        { 0x7ffff06fu, 4, 1048574 }, { 0x8000006fu, 4, -1048576 },
+    };
+    for (size_t i = 0; i < sizeof t / sizeof t[0]; i++) {
+        unsigned rd = 99;
+        int64_t off = 0;
+        CHECK(rv_decode_jump(t[i].w, t[i].size, &rd, &off));
+        CHECK(rd == 0);
+        CHECK(off == t[i].off);
+    }
+
+    // `jal ra,.+4`: the same encoding with a link register, which is
+    // what separates a jump a check may delete from a call it may not.
+    unsigned rd = 99;
+    int64_t off = 0;
+    CHECK(rv_decode_jump(0x004000efu, 4, &rd, &off));
+    CHECK(rd == 1 && off == 4);
+
+    // Not a jump: c.jr, a conditional branch, an addi.
+    CHECK(!rv_decode_jump(0x8082u, 2, &rd, &off));          // ret
+    CHECK(!rv_decode_jump(0xc111u, 2, &rd, &off));          // c.beqz
+    CHECK(!rv_decode_jump(0x00d60263u, 4, &rd, &off));      // beq
+    CHECK(!rv_decode_jump(0x00160613u, 4, &rd, &off));      // addi
+}
+
+// ---- a conditional branch over an unconditional jump, and a
+//      transfer to the instruction that follows it ----
+//
+// Every encoding below is lifted from the corpus at the address named,
+// which is also how each was checked against a disassembler.
+
+static void test_branch_over_jump(csh handle)
+{
+    riscvlint_finding f;
+
+    // firefox-esr 0x271f4: a four-byte branch over a two-byte jump.
+    // The inverted branch stays four bytes, so the jump's two are the
+    // whole saving.
+    static const uint8_t j2[] = {
+        0x63, 0x63, 0xc7, 0x00,        // bltu a4,a2,0x271fa
+        0x8d, 0xbd,                    // c.j 0x2706a
+        0x09, 0xa0,                    // c.j 0x271fc
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_branch_over_jump, j2, sizeof j2,
+                     0x271f4, &f) == 1);
+    CHECK(f.address == 0x271f4 && f.insn_count == 2);
+    CHECK(strstr(f.replacement, "bgeu a4, a2, 0x2706a") != NULL);
+    CHECK(strstr(f.replacement, "(6 -> 4 bytes)") != NULL);
+
+    // firefox-esr 0x3f790: four and four, the largest of the four
+    // shapes and 2,468 of the 5,362 sites.
+    static const uint8_t j4[] = {
+        0x63, 0x64, 0xb5, 0x00,        // bltu a0,a1,0x3f798
+        0x6f, 0x00, 0x70, 0x60,        // j 0x4059a
+        0x83, 0xb5, 0x8c, 0x03,        // ld a1,56(s9)
+    };
+    CHECK(run_window(handle, check_branch_over_jump, j4, sizeof j4,
+                     0x3f790, &f) == 1);
+    CHECK(strstr(f.replacement, "bgeu a0, a1, 0x4059a") != NULL);
+    CHECK(strstr(f.replacement, "(8 -> 4 bytes)") != NULL);
+
+    // libmozsqlite3 0x9c1b6: two and two, with the new displacement
+    // inside c.bnez's +/-256, so the pair becomes one two-byte branch.
+    static const uint8_t c2[] = {
+        0x91, 0xc3,                    // c.beqz a5,0x9c1ba
+        0xa1, 0xa8,                    // c.j 0x9c210
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_branch_over_jump, c2, sizeof c2,
+                     0x9c1b6, &f) == 1);
+    CHECK(strstr(f.replacement, "bnez a5, 0x9c210") != NULL);
+    CHECK(strstr(f.replacement, "(4 -> 2 bytes)") != NULL);
+
+    // libgkcodecs 0x202c3e: the same shape with the new displacement at
+    // 350, outside that range, so the branch has to grow to four and
+    // the rewrite is four bytes for four. It still removes an
+    // instruction and a taken branch, so it is reported -- 73 sites.
+    static const uint8_t c0[] = {
+        0x11, 0xc1,                    // c.beqz a0,0x202c42
+        0xb1, 0xaa,                    // c.j 0x202d9c
+        0x28, 0x10,                    // addi a0,sp,40
+    };
+    CHECK(run_window(handle, check_branch_over_jump, c0, sizeof c0,
+                     0x202c3e, &f) == 1);
+    CHECK(strstr(f.replacement, "bnez a0, 0x202d9c") != NULL);
+    CHECK(strstr(f.replacement, "(4 -> 4 bytes)") != NULL);
+
+    // Negatives. Something branches to the jump, which loses its
+    // transfer if the jump goes.
+    static const uint8_t tgt[] = {
+        0x11, 0xc1,                    // c.beqz a0,0x1004
+        0xf5, 0xbf,                    // c.j 0xffe
+        0x82, 0x80,                    // ret
+        0xf5, 0xdd,                    // c.beqz a1,0x1002
+    };
+    CHECK(run_window(handle, check_branch_over_jump, tgt, sizeof tgt,
+                     0x1000, NULL) == 0);
+
+    // The branch does not clear the jump: something else sits between
+    // the jump and where the branch lands.
+    static const uint8_t gap[] = {
+        0x19, 0xc1,                    // c.beqz a0,0x1006
+        0xd5, 0xbf,                    // c.j
+        0x01, 0x00,                    // nop
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_branch_over_jump, gap, sizeof gap,
+                     0x1000, NULL) == 0);
+
+    // `jal ra,X` rather than `j X`: deleting it would stop writing the
+    // link register.
+    static const uint8_t link[] = {
+        0x19, 0xc1,                    // c.beqz a0,0x1006
+        0xef, 0xf0, 0xdf, 0xfe,        // jal ra,0xfec
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_branch_over_jump, link, sizeof link,
+                     0x1000, NULL) == 0);
+
+    // The jump's target is past the branch's +/-4KB, which is the whole
+    // reason the pair is written this way: 122,999 of the 128,361 sites
+    // in the corpus are this and are the encoding working as designed.
+    static const uint8_t far[] = {
+        0x19, 0xc1,                    // c.beqz a0,0x1006
+        0x6f, 0x10, 0xe0, 0x38,        // j 0x2390
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_branch_over_jump, far, sizeof far,
+                     0x1000, NULL) == 0);
+
+    // The jump goes exactly where the branch goes, so both paths
+    // already meet: the pair is dead rather than foldable, and the jump
+    // is check_transfer_to_next's.
+    static const uint8_t same[] = {
+        0x11, 0xc1,                    // c.beqz a0,0x1004
+        0x09, 0xa0,                    // c.j 0x1004
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_branch_over_jump, same, sizeof same,
+                     0x1000, NULL) == 0);
+    CHECK(run_window(handle, check_transfer_to_next, same, sizeof same,
+                     0x1000, &f) == 1);
+    CHECK(f.address == 0x1002);
+}
+
+static void test_transfer_to_next(csh handle)
+{
+    riscvlint_finding f;
+
+    // ripgrep 0x70c9c, the commonest form: a two-byte c.j to the next
+    // instruction, 3,674 of the 3,702 sites.
+    static const uint8_t cj[] = {
+        0x09, 0xa0,                    // c.j 0x70c9e
+        0x83, 0x35, 0x04, 0xfb,        // ld a1,-80(s0)
+    };
+    CHECK(run_window(handle, check_transfer_to_next, cj, sizeof cj,
+                     0x70c9c, &f) == 1);
+    CHECK(f.address == 0x70c9c && f.insn_count == 1);
+    CHECK(strstr(f.replacement, "delete; the jump") != NULL);
+    CHECK(strstr(f.replacement, "(2 bytes)") != NULL);
+
+    // A four-byte jump doing the same. restic has three.
+    static const uint8_t j4[] = {
+        0x6f, 0x00, 0x40, 0x00,        // j 0x1004
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_transfer_to_next, j4, sizeof j4,
+                     0x1000, &f) == 1);
+    CHECK(strstr(f.replacement, "(4 bytes)") != NULL);
+
+    // A conditional branch to the next instruction is the same no-op,
+    // in both widths.
+    static const uint8_t br4[] = {
+        0x63, 0x02, 0xd6, 0x00,        // beq a2,a3,0x1004
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_transfer_to_next, br4, sizeof br4,
+                     0x1000, &f) == 1);
+    CHECK(strstr(f.replacement, "delete; the branch") != NULL);
+    static const uint8_t br2[] = {
+        0x89, 0xc1,                    // c.beqz a1,0x1002
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_transfer_to_next, br2, sizeof br2,
+                     0x1000, NULL) == 1);
+
+    // `jal ra,X` writes the link register, which makes it a PC
+    // materialization rather than a no-op. 16 sites in Firefox.
+    static const uint8_t link[] = {
+        0xef, 0x00, 0x40, 0x00,        // jal ra,0x1004
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_transfer_to_next, link, sizeof link,
+                     0x1000, NULL) == 0);
+
+    // A jump anywhere else is a jump.
+    static const uint8_t away[] = {
+        0x35, 0xa0,                    // c.j 0x102c
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_transfer_to_next, away, sizeof away,
+                     0x1000, NULL) == 0);
+}
+
 // ---- conditions and branches ----
 
 static void test_decode_condition(void)
@@ -1876,6 +2112,9 @@ int main(void)
     test_redundant_ext_check(handle);
     test_zcb_check(handle);
     test_window_checks(handle);
+    test_decode_jump();
+    test_branch_over_jump(handle);
+    test_transfer_to_next(handle);
 
     cs_close(&handle);
     if (failures) {

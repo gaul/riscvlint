@@ -3,8 +3,8 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Seventeen checks are implemented and four measured candidates are
-waiting, the largest of them a run of byte-at-a-time zero stores one
+Nineteen checks are implemented and two measured candidates are
+waiting, the larger of them a run of byte-at-a-time zero stores one
 wider store would do, 6,348 sites and 31,809 bytes.
 [TODO.md](TODO.md) is the ledger behind them: every candidate that was
 measured, the population it came back with, and the ones rejected on
@@ -13,7 +13,7 @@ intuition, and what did not get written was rejected the same way.
 
 ## Checks
 
-Seventeen of them. Every figure below is what the check itself reports
+Nineteen of them. Every figure below is what the check itself reports
 over the [corpus](#corpus) -- 73,139,165 instructions of three
 toolchains -- rather than what a mining tool estimated for it. The two
 have differed by an order of magnitude every time both were measured.
@@ -25,6 +25,8 @@ have differed by an order of magnitude every time both were measured.
 | slli + srli foldable to zext.w | 2 | 52 | 18,071 | 18,125 | 50,178 |
 | redundant stack-pointer restore | 100,718 | 11,683 | 0 | 112,401 | 449,604 |
 | comparison a branch could have made | 2,895 | 42 | 0 | 2,937 | 7,578 |
+| conditional branch over an unconditional jump | 4,691 | 340 | 331 | 5,362 | 15,514 |
+| transfer to the instruction that follows it | 2,851 | 831 | 20 | 3,702 | 7,458 |
 | redundant reload | 2,086 | 231 | 4,408 | 6,725 | 9,918 |
 | load of a just-stored value | 3,676 | 267 | 4,041 | 7,984 | 6,866 |
 | load of a value the register still holds | 10,445 | 519 | 5,592 | 16,556 | 41,232 |
@@ -37,7 +39,7 @@ have differed by an order of magnitude every time both were measured.
 | instruction compressible to a Zcb form | 705 | 181 | 29,762 | 30,648 | 61,296 |
 | redundant sign or zero extension | 6,589 | 333 | 1,593 | 8,515 | 20,864 |
 | dead register definition | 11,741 | 248 | 7,876 | 19,865 | 54,570 |
-| **total** | **315,387** | **191,297** | **3,065,050** | **3,571,734** | **8,004,210** |
+| **total** | **322,929** | **192,468** | **3,065,401** | **3,580,798** | **8,027,182** |
 
 Do not read the total row as a result. One row is 84% of it, and that
 row is Go's assembler declining to select RVC at all, which is a
@@ -158,6 +160,57 @@ handful of `jalr ra,0(ra)` that were already two.
   the raw population is a difference the code goes on to use.
   `sub rd,a,b; beqz rd` is usually a subtraction whose result is wanted,
   not a comparison.
+
+* **conditional branch over an unconditional jump** -- `beqz a0,L` +
+  `j X` + `L:` is `bnez a0,X` with the jump gone. Every conditional
+  branch inverts: beq/bne, blt/bge and bltu/bgeu are each other with the
+  low bit of funct3 flipped.
+
+  ```
+   e8254: bne s1, s5, 0xe825c
+   e8258: j 0xe91a4               -> beq s1, s5, 0xe91a4
+  ```
+
+  The shape is 128,361 sites in the corpus and almost all of it is the
+  encoding working as designed: the branch reaches +/-4KB and the jump
+  reaches +/-1MB, so an assembler that cannot encode the branch writes
+  this pair instead. 122,999 have a target the branch could not have
+  reached; the 5,362 that do are the findings.
+
+  Two preconditions. The jump must not itself be a branch target, or the
+  paths that reach it lose their transfer -- a bit lookup in the table
+  the driver already builds. And it must be `j` rather than `jal`: the
+  second writes a link register that would stop being written.
+
+  The inverted branch is priced at the original's own encoding class. A
+  four-byte branch stays four even where the new displacement would fit
+  `c.beqz`, because Go leaves compressible branches wide and that saving
+  is the compression check's rather than this one's. Four shapes come
+  out of that: 2,468 sites where both halves are four bytes and the fold
+  saves four, 2,632 where one half is two and it saves two, 189 where
+  both are two and the pair becomes one `c.bnez`, and 73 where both are
+  two and the new target is outside `c.bnez`'s +/-256, so four bytes
+  become four. Those last are still reported: an instruction and a taken
+  branch go, and the finding says the size did not change.
+
+* **transfer to the instruction that follows it** -- a relative transfer
+  whose target is the next instruction. Control arrives there either
+  way, so it does nothing.
+
+  ```
+   70c9c: j 0x70c9e
+   70c9e: ld a1, -0x50(s0)        -> delete the j
+  ```
+
+  3,674 of the 3,702 are a two-byte `c.j`, a block-placement leftover in
+  LLVM's output: 2,851 C++ and 831 Rust against 20 in Go. The rest are
+  three four-byte jumps and 25 conditional branches doing the same
+  thing.
+
+  `jal rd,next` with rd other than x0 is not reported. It writes a link
+  register, which makes it a PC materialization rather than a no-op --
+  16 sites, all in Firefox, and the one thing separating this check from
+  a wrong one.
 
 * **redundant reload** -- the same (base, displacement, width,
   signedness) loaded twice with nothing in between that could have

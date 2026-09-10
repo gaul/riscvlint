@@ -29,6 +29,9 @@ dead register definition at offset: 0x5e: -> delete; nothing reads a5 (2 bytes) 
 dead register definition at offset: 0x62: -> delete; nothing reads a6 (2 bytes) (1 instructions)
   li a6, 7
 
+transfer to the instruction that follows it at offset: 0x74: -> delete; the branch goes where control already goes (2 bytes) (1 instructions)
+  beqz a2, 0x76
+
 Optimization opportunities by type:
        3  dead register definition
        2  dead store to a frame slot
@@ -36,5 +39,6 @@ Optimization opportunities by type:
        1  call pair foldable to jal
        1  constant re-materialization
        1  load of a just-stored value
+       1  transfer to the instruction that follows it
 
-10 optimization opportunities in 63 instructions
+11 optimization opportunities in 63 instructions

@@ -642,12 +642,9 @@ bool rv_c_form(uint32_t w, unsigned size, char *out, size_t outsz)
         break;
     case 0x6fu: {                                     // jal
         // c.jal is RV32-only, so only the x0 link compresses here.
-        if (rd != 0) break;
-        uint64_t imm = (((uint64_t)(w >> 31) & 1u) << 20) |
-                       (((uint64_t)(w >> 12) & 0xffu) << 12) |
-                       (((uint64_t)(w >> 20) & 1u) << 11) |
-                       (((uint64_t)(w >> 21) & 0x3ffu) << 1);
-        int64_t o = sign_extend(imm, 21);
+        unsigned jrd;
+        int64_t o;
+        if (!rv_decode_jump(w, 4, &jrd, &o) || jrd != 0) break;
         if (o >= -2048 && o <= 2046) name = "c.j";
         break;
     }
@@ -1014,6 +1011,37 @@ bool rv_decode_cond_branch(uint32_t w, unsigned size, unsigned *rs1,
                    (((uint64_t)(w >> 3) & 0x3u) << 1) |
                    (((uint64_t)(w >> 2) & 1u) << 5);
     *off = sign_extend(imm, 9);
+    return true;
+}
+
+bool rv_decode_jump(uint32_t w, unsigned size, unsigned *rd, int64_t *off)
+{
+    if (size == 4) {
+        if (RV_OPCODE(w) != RV_OP_JAL) return false;
+        *rd = (w >> 7) & 0x1fu;
+        uint64_t imm = (((uint64_t)(w >> 31) & 1u) << 20) |
+                       (((uint64_t)(w >> 12) & 0xffu) << 12) |
+                       (((uint64_t)(w >> 20) & 1u) << 11) |
+                       (((uint64_t)(w >> 21) & 0x3ffu) << 1);
+        *off = sign_extend(imm, 21);
+        return true;
+    }
+    if (size != 2) return false;
+    if ((w & 0xe003u) != 0xa001u) return false;             // c.j
+    *rd = 0;
+    // CJ packs imm[11|4|9:8|10|6|7|3:1|5] into bits 12:2, in that order.
+    // It is the same kind of scattered field the CB format above got
+    // wrong once, so it has a unit test against the assembler's own
+    // output rather than against this reading of the manual.
+    uint64_t imm = (((uint64_t)(w >> 12) & 1u) << 11) |
+                   (((uint64_t)(w >> 11) & 1u) << 4) |
+                   (((uint64_t)(w >> 9) & 0x3u) << 8) |
+                   (((uint64_t)(w >> 8) & 1u) << 10) |
+                   (((uint64_t)(w >> 7) & 1u) << 6) |
+                   (((uint64_t)(w >> 6) & 1u) << 7) |
+                   (((uint64_t)(w >> 3) & 0x7u) << 1) |
+                   (((uint64_t)(w >> 2) & 1u) << 5);
+    *off = sign_extend(imm, 12);
     return true;
 }
 
@@ -2643,6 +2671,109 @@ bool check_cond_to_branch(riscvlint_state *state, const cs_insn *insn,
                  "%s %s, %s, 0x%" PRIx64 " (%u -> %u bytes)",
                  branch_name(f3, rb), rv_reg_name(ra), rv_reg_name(rb),
                  taken, before, after);
+    return true;
+}
+
+// ---- a conditional branch over an unconditional jump ----
+
+bool check_branch_over_jump(riscvlint_state *state, const cs_insn *insn,
+                            riscvlint_finding *finding)
+{
+    uint32_t w1;
+    if (!riscvlint_word_at(state, insn->address, &w1)) return false;
+    unsigned rs1, rs2, f3;
+    int64_t boff;
+    if (!rv_decode_cond_branch(w1, insn->size, &rs1, &rs2, &f3, &boff))
+        return false;
+
+    uint64_t second = insn->address + insn->size;
+    uint32_t w2;
+    if (!riscvlint_word_at(state, second, &w2)) return false;
+    unsigned jsize = (w2 & 3u) == 3u ? 4u : 2u;
+    unsigned jrd;
+    int64_t joff;
+    // `jal ra,X` would stop writing the link register if it went, so
+    // only the x0 link is a jump this can delete.
+    if (!rv_decode_jump(w2, jsize, &jrd, &joff) || jrd != 0) return false;
+
+    // The branch has to clear exactly the jump: its target is the
+    // instruction the jump would fall through to.
+    if ((int64_t)insn->address + boff != (int64_t)second + (int64_t)jsize)
+        return false;
+
+    // Something branching to the jump loses its transfer when it goes.
+    if (riscvlint_is_branch_target(state, second)) return false;
+
+    // An unlinked object leaves both displacements as placeholders, so
+    // the shape is an artefact of the relocations rather than the code.
+    if (riscvlint_is_relocated(state, insn->address) ||
+        riscvlint_is_relocated(state, second))
+        return false;
+
+    int64_t target = (int64_t)second + joff;
+    // Where the jump goes exactly where the branch already goes, both
+    // paths already meet and the pair is dead rather than foldable.
+    // check_transfer_to_next has the jump.
+    if (target == (int64_t)insn->address + boff) return false;
+
+    int64_t reach = target - (int64_t)insn->address;
+    if (reach < -4096 || reach > 4094 || (reach & 1)) return false;
+
+    // beq/bne, blt/bge and bltu/bgeu are each other with the low bit of
+    // funct3 flipped, so every conditional branch inverts.
+    unsigned inv = f3 ^ 1u;
+    // Priced at the branch's own encoding class. Asking
+    // rv_branch_encoded_size of a four-byte branch could answer two --
+    // Go leaves compressible branches wide -- and that saving is the
+    // compression check's, not this one's.
+    unsigned nbr = insn->size == 2
+                       ? rv_branch_encoded_size(inv, rs1, rs2, reach)
+                       : 4u;
+    unsigned before = insn->size + jsize;
+
+    finding->title = "conditional branch over an unconditional jump";
+    finding->address = insn->address;
+    finding->insn_count = 2;
+    const char *name = branch_name(inv, rs2);
+    if (rs2 == 0 && (inv == 0u || inv == 1u))
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "%s %s, 0x%" PRIx64 " (%u -> %u bytes)", name,
+                 rv_reg_name(rs1), (uint64_t)target, before, nbr);
+    else
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "%s %s, %s, 0x%" PRIx64 " (%u -> %u bytes)", name,
+                 rv_reg_name(rs1), rv_reg_name(rs2), (uint64_t)target,
+                 before, nbr);
+    return true;
+}
+
+// ---- a transfer to the instruction that follows it ----
+
+bool check_transfer_to_next(riscvlint_state *state, const cs_insn *insn,
+                            riscvlint_finding *finding)
+{
+    uint32_t w;
+    if (!riscvlint_word_at(state, insn->address, &w)) return false;
+
+    unsigned rs1, rs2, f3, rd;
+    int64_t off;
+    const char *what;
+    if (rv_decode_cond_branch(w, insn->size, &rs1, &rs2, &f3, &off))
+        what = "branch";
+    else if (rv_decode_jump(w, insn->size, &rd, &off) && rd == 0)
+        what = "jump";
+    else
+        return false;
+    if ((int64_t)insn->address + off != (int64_t)(insn->address + insn->size))
+        return false;
+    if (riscvlint_is_relocated(state, insn->address)) return false;
+
+    finding->title = "transfer to the instruction that follows it";
+    finding->address = insn->address;
+    finding->insn_count = 1;
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "delete; the %s goes where control already goes (%u bytes)",
+             what, insn->size);
     return true;
 }
 

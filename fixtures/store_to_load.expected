@@ -26,6 +26,9 @@ call pair foldable to jal at offset: 0x62: -> jal ra, 0x88 (2 instructions)
   auipc ra, 0
   jalr 0x26(ra)
 
+transfer to the instruction that follows it at offset: 0x74: -> delete; the branch goes where control already goes (2 bytes) (1 instructions)
+  beqz a2, 0x76
+
 load of a just-stored value at offset: 0x80: -> mv a1, a0; stored at 0x7e (2 -> 2 bytes) (1 instructions)
   ld a1, 0x80(sp)
 
@@ -37,5 +40,6 @@ Optimization opportunities by type:
        1  call pair foldable to jal
        1  load of a value the register still holds
        1  redundant reload
+       1  transfer to the instruction that follows it
 
-11 optimization opportunities in 61 instructions
+12 optimization opportunities in 61 instructions

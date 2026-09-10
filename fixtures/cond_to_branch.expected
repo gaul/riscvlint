@@ -25,8 +25,12 @@ comparison a branch could have made at offset: 0x46: -> bnez a0, 0x50 (6 -> 2 by
 dead register definition at offset: 0x70: -> delete; nothing reads a5 (4 bytes) (1 instructions)
   sltu a5, a0, a1
 
+transfer to the instruction that follows it at offset: 0x90: -> delete; the branch goes where control already goes (2 bytes) (1 instructions)
+  beqz a0, 0x92
+
 Optimization opportunities by type:
        6  comparison a branch could have made
        1  dead register definition
+       1  transfer to the instruction that follows it
 
-7 optimization opportunities in 67 instructions
+8 optimization opportunities in 67 instructions
