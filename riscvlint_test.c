@@ -1145,6 +1145,29 @@ static void test_window_checks(csh handle)
     CHECK(run_window(handle, check_redundant_reload, stored, sizeof stored,
                      0x1000, NULL) == 0);
 
+    // A store to a disjoint range through the same base provably misses
+    // what the first load read, so the claim stands.
+    static const uint8_t disjoint[] = {
+        0x42, 0x65,                    // c.ldsp a0,16(sp)
+        0x3a, 0xf0,                    // c.sdsp a4,32(sp)
+        0xc2, 0x66,                    // c.ldsp a3,16(sp)
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_redundant_reload, disjoint, sizeof disjoint,
+                     0x1000, &f) == 1);
+    CHECK(strstr(f.replacement, "mv a3, a0") != NULL);
+
+    // The same base with the ranges overlapping: 20(sp) lands inside the
+    // eight bytes at 16(sp), so it does not miss them.
+    static const uint8_t overlap[] = {
+        0x42, 0x65,                    // c.ldsp a0,16(sp)
+        0x3a, 0xca,                    // c.swsp a4,20(sp)
+        0xc2, 0x66,                    // c.ldsp a3,16(sp)
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_redundant_reload, overlap, sizeof overlap,
+                     0x1000, NULL) == 0);
+
     // A frame slot stored twice with nothing reading it.
     static const uint8_t deadst[] = {
         0x2a, 0xe8,                    // c.sdsp a0,16(sp)
@@ -1300,6 +1323,28 @@ static void test_window_checks(csh handle)
     CHECK(strstr(f.replacement, "sext.h a6, a0") != NULL);
     CHECK(run_window_exts(handle, check_store_to_load, sexth, sizeof sexth,
                           0x1000, RISCVLINT_EXT_DECLARED, NULL) == 0);
+
+    // The same disjointness test, asked of a store's held value: a
+    // second store elsewhere in the frame cannot have changed the bytes
+    // the first one wrote.
+    static const uint8_t fwd_disjoint[] = {
+        0x2a, 0xe8,                    // c.sdsp a0,16(sp)
+        0x3a, 0xf0,                    // c.sdsp a4,32(sp)
+        0xc2, 0x65,                    // c.ldsp a1,16(sp)
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_store_to_load, fwd_disjoint,
+                     sizeof fwd_disjoint, 0x1000, &f) == 1);
+    CHECK(strstr(f.replacement, "mv a1, a0") != NULL);
+
+    static const uint8_t fwd_overlap[] = {
+        0x2a, 0xe8,                    // c.sdsp a0,16(sp)
+        0x3a, 0xca,                    // c.swsp a4,20(sp)
+        0xc2, 0x65,                    // c.ldsp a1,16(sp)
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_store_to_load, fwd_overlap,
+                     sizeof fwd_overlap, 0x1000, NULL) == 0);
 
     // Two loads after one store. The first is this check's; the second
     // is check_redundant_reload's, whose source is the nearer of the

@@ -1,6 +1,8 @@
-// Integration fixture for the three checks that read the windowed
-// memory and constant table: check_redundant_reload, check_dead_store
-// and check_const_remat.
+// Integration fixture for the checks that read the windowed memory and
+// constant table: check_redundant_reload, check_dead_store and
+// check_const_remat. check_store_to_load reads it too and has a fixture
+// of its own, but it fires here as well wherever a case stores a value
+// and reads it straight back.
 //
 // None of these can be decided from a pair -- the distances cluster at
 // 4-15 instructions in the corpus -- so every sequence here puts
@@ -43,12 +45,27 @@ _start:
     ld      a7, 48(sp)
     sd      a4, 32(sp)
 
+    // 5) A store to a disjoint slot through the same base cannot have
+    //    changed what the first load read, so the second load is still a
+    //    move. Case 4 asks that disjointness question about an unread
+    //    store; this asks it about a held value.
+    ld      a0, 112(sp)
+    sd      a4, 128(sp)
+    ld      a3, 112(sp)
+
     // Negatives:
-    // N1) A store between two loads. Proving it lands elsewhere needs
-    //     more than the encoding gives, so the held value is dropped.
+    // N1) A store through another base between two loads. Proving it
+    //     lands elsewhere needs more than the encoding gives, so the
+    //     held value is dropped.
     ld      a0, 24(a1)
     sd      a4, 0(a3)
     ld      a3, 24(a1)
+
+    // N1b) Through the same base with the ranges overlapping, which is
+    //      the half of the disjointness test that says no.
+    ld      a0, 136(sp)
+    sw      a4, 140(sp)
+    ld      a3, 136(sp)
 
     // N2) The base is overwritten, so the address the second load
     //     computes is not the address the first one used.

@@ -1825,11 +1825,21 @@ void riscvlint_state_observe(riscvlint_state *state, const cs_insn *insn)
         for (int j = 0; j < state->win.nslots; j++) {
             rvl_slot *sl = &state->win.slots[j];
             if (store) {
-                // Any store at all ends every held value. Proving two
-                // addresses distinct needs more than the encoding gives,
-                // and the reload rewrite is only worth having if it is
-                // certainly right.
-                sl->held = false;
+                // A store ends a held value unless it provably lands
+                // somewhere else, which is the same question the branch
+                // below asks about `unread` and gets the same answer:
+                // through this base a disjoint byte range misses it,
+                // through any other base nothing is provable.
+                //
+                // The rule used to be that any store at all ended every
+                // held value. It cost more than it looked like it would.
+                // A spill sequence writes several adjacent slots before
+                // reading any of them back, so the first claim died at
+                // the second store -- 6,585 sites of check_store_to_load
+                // alone, two thirds of that family.
+                if (sl->base != base ||
+                    ranges_overlap(sl->disp, sl->width, off, width))
+                    sl->held = false;
                 // A store that lands on the same bytes supersedes an
                 // unread one; anywhere else it neither reads nor
                 // overwrites, so the earlier claim stands.

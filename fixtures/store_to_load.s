@@ -50,10 +50,17 @@ _start:
 
     // 6) The base does not have to be the frame. Nothing here claims a
     //    slot went unread -- only that nothing wrote it in between --
-    //    and any store the decoder cannot place ends the window anyway.
+    //    and a store that cannot be shown to miss the slot ends the
+    //    window anyway.
     sd      a0, 48(a3)
     addi    a2, a2, 1
     ld      a1, 48(a3)
+
+    // 7) A second store to a disjoint slot through the same base
+    //    cannot have changed the bytes the first one wrote.
+    sd      a0, 144(sp)
+    sd      a4, 152(sp)
+    ld      a1, 144(sp)
 
     // Negatives:
     // N1) The load writes the register the store read, so the value
@@ -69,10 +76,16 @@ _start:
     addi    a2, a2, 1
     ld      a1, 64(sp)
 
-    // N3) A store the decoder cannot place may have landed on the slot.
+    // N3) A store through another base may have landed on the slot.
     sd      a0, 72(sp)
     sd      a4, 0(a3)
     ld      a1, 72(sp)
+
+    // N3b) Through the same base with the ranges overlapping, which is
+    //      the half of the disjointness test that says no.
+    sd      a0, 160(sp)
+    sw      a4, 164(sp)
+    ld      a1, 160(sp)
 
     // N4) The register the store read is overwritten, so there is
     //     nothing left to move from.

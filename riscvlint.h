@@ -514,9 +514,11 @@ bool check_base_add_to_offset(riscvlint_state *state, const cs_insn *insn,
 //
 // This one carries a soundness caveat no binary can resolve: a load from
 // a volatile or device address must be repeated, and nothing in the
-// encoding says which loads those are. The window is otherwise strict --
-// any store, call, fence, atomic or system instruction ends it, as does
-// a write to either the base or the register holding the value.
+// encoding says which loads those are. The window is otherwise strict:
+// a call, fence, atomic or system instruction ends it, as does a write
+// to either the base or the register holding the value, as does any
+// store that cannot be shown to land elsewhere -- through this base a
+// disjoint byte range shows it, through any other base nothing does.
 bool check_redundant_reload(riscvlint_state *state, const cs_insn *insn,
                             riscvlint_finding *finding);
 
@@ -530,8 +532,8 @@ bool check_redundant_reload(riscvlint_state *state, const cs_insn *insn,
 // store stays and the load becomes a register operation -- so there is
 // no liveness query, and both of the questions there are look backward
 // into the window that is already there: the record goes when the base
-// or the stored register is written, and when any store lands that the
-// decoder cannot place.
+// or the stored register is written, and when a store lands that
+// cannot be shown to miss it.
 //
 // Floating-point accesses are refused on both sides. The window drops a
 // held value when the register holding it is written, and its write

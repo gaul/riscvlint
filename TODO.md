@@ -46,11 +46,11 @@ records where a first figure was wrong and why.
 | 2 | Zba shift-add | 13,412 | 180,591 | **implemented** |
 | 6 | constant re-materialization | 10,998 | 329,926 | **implemented** |
 | 9 | extension the producer already guarantees | 8,515 | - | **implemented** |
+| 14 | a slot stored and then loaded back | 7,984 | 162,811 | **implemented** |
+| 4 | redundant reloads | 6,725 | 33,110 | **implemented** |
 | 12 | `addi` folded into a memory offset | 6,344 | 86,564 | **implemented** |
-| 4 | redundant reloads | 5,028 | 33,110 | **implemented** |
 | 10 | dead store to a frame slot | 4,376 | 15,199 | **implemented** |
 | 7 | compare-then-branch folding | 2,937 | 26,513 | **implemented** |
-| 14 | a slot stored and then loaded back | 2,442 | 162,811 | **implemented** |
 
 Where the raw figure comes from: `pairscan` for rows 1, 2 and 3 (the two
 Zba rows read shift-blind, which is exactly what a collapsed file
@@ -291,7 +291,7 @@ not appear in the Go corpus and totals 341 sites overall, so it is not
 worth a check; the zext check rejects it explicitly rather than
 mis-folding it.
 
-### 4. Redundant reloads -- 5,028 of 33,110  [implemented]
+### 4. Redundant reloads -- 6,725 of 33,110  [implemented]
 
 Same (base, displacement, size) loaded twice with no intervening store,
 call or fence: 33,110 by `defuse`'s count -- heap sz8 21,368, sp sz8
@@ -299,9 +299,10 @@ call or fence: 33,110 by `defuse`'s count -- heap sz8 21,368, sp sz8
 Distances cluster at 4-15 instructions, so this one genuinely needs the
 window; no pair check can see it.
 
-`check_redundant_reload` reports 5,028 of those, split in "The windowed
+`check_redundant_reload` reports 6,725 of those, split in "The windowed
 memory table" below, which also records the three rules the mining tools
-did not have.
+did not have -- and the one the window itself was missing, which was
+worth 1,697 of this figure.
 
 ### 8. Frame-pointer teardown over a static frame -- 112,401  [implemented]
 
@@ -573,26 +574,26 @@ by requiring the destination to be the first source.
 
 ## The windowed memory table, and the four checks it serves  [implemented]
 
-`check_redundant_reload`, `check_dead_store` and `check_const_remat` all
-need the same thing: a region-local record of what is already in a
-register and what is already in a frame slot. `riscvlint_state_observe`
-owns it and the driver calls it once per instruction **after** the
-checks, so each of the three judges the instruction under the cursor
-against the table as it stood before it.
+`check_redundant_reload`, `check_dead_store`, `check_const_remat` and
+`check_store_to_load` all need the same thing: a region-local record of
+what is already in a register and what is already in a frame slot.
+`riscvlint_state_observe` owns it and the driver calls it once per
+instruction **after** the checks, so each of the four judges the
+instruction under the cursor against the table as it stood before it.
 
 Measured by the checks themselves:
 
-| corpus | reload | dead store | re-materialization |
-|---|---:|---:|---:|
-| C++ | 1,972 | 203 | 8,970 |
-| Go | 2,837 | 4,172 | 1,457 |
-| Rust | 219 | 1 | 571 |
-| **total** | **5,028** | **4,376** | **10,998** |
+| corpus | reload | dead store | re-materialization | just-stored |
+|---|---:|---:|---:|---:|
+| C++ | 2,086 | 203 | 8,970 | 3,676 |
+| Go | 4,408 | 4,172 | 1,457 | 4,041 |
+| Rust | 231 | 1 | 571 | 267 |
+| **total** | **6,725** | **4,376** | **10,998** | **7,984** |
 
 ### What the mining tools had wrong
 
 The shape counts these replace are 33,110 reloads and 15,199 dead
-stores. The checks find 15% and 29% of that, and most of the difference
+stores. The checks find 20% and 29% of that, and most of the difference
 is not a precondition being applied -- it is three rules `defuse` and
 `candscan` did not have. Each was found by reading the disassembly around a
 finding, and none by any test:
@@ -622,8 +623,13 @@ even when it looks like a population, and the way to find out is to read
 the code under a finding rather than to trust the count.
 
 What survives was checked against an independent pass over objdump's
-output -- all 83 of ripgrep's reload findings, and each of its
-dead-store findings by hand.
+output -- all 83 of ripgrep's reload findings at the time, and each of
+its dead-store findings by hand. Relaxing the store rule later added two
+reload findings there and took its just-stored count from 17 to 42, and
+those are the only sites in ripgrep with a store between the two halves;
+the two, and three of the twenty-five, were read the same way. That 83
+is also a check on the arithmetic: it is what is left when the newly
+admitted findings are subtracted from today's 85.
 
 ### Re-materialization went up, and the corpus is why
 
@@ -651,16 +657,18 @@ anything.
 
 Two accesses through the same base with disjoint byte ranges provably
 miss each other, and that is the only aliasing question the window
-answers positively. Through different bases it answers nothing: any
-store at all ends every held value, and any load through another base
-takes away every claim that a store was unread.
+answers positively. It answers it in both directions: a store that
+misses a held value leaves it held, and a load that misses an unread
+store leaves the store unread. Through different bases it answers
+nothing -- any store ends every held value, and any load takes away
+every claim that a store was unread.
 
 Store-to-load forwarding -- `sd a0,8(sp)` then `ld a1,8(sp)` becoming
-`mv a1,a0` -- is a real redundancy this window could see and does not
-claim. It is a different rewrite from collapsing two loads, and it now
-has a number of its own: candidate 14, below.
+`mv a1,a0` -- was for a long time a real redundancy this window could
+see and did not claim. It is a different rewrite from collapsing two
+loads, and it is now a check of its own: candidate 14, below.
 
-### 14. A slot stored and then loaded back -- 2,442 of 162,811  [implemented]
+### 14. A slot stored and then loaded back -- 7,984 of 162,811  [implemented]
 
 `sd rD,K(rB)` then `ld rT,K(rB)` reads back the bytes the store just
 wrote, so the load is `mv rT,rD`. The paragraph above records it as a
@@ -683,42 +691,60 @@ Three numbers, and the distance between them is the entry:
 |---|---:|---:|---:|---:|
 | shapes reaching a matching load | 162,811 | 134,458 | 20,340 | 8,013 |
 | foldable by the probe's rules | 9,737 | 5,344 | 4,119 | 274 |
-| reported by the check | 2,442 | 1,457 | 843 | 142 |
+| reported by the check | 7,984 | 3,676 | 4,041 | 267 |
 
-libxul alone holds 4,542 of the probe's C++ figure. The check saves 1,766
-bytes across the corpus, which is the smaller half of what it does: 883
-of its 2,442 sites are a four-byte load becoming a two-byte `mv`, and
-every one of the 2,442 is a memory access that stops happening.
+libxul alone holds 4,542 of the probe's C++ figure. The check saves 6,866
+bytes across the corpus, which is the smaller half of what it does: 3,433
+of its 7,984 sites are a four-byte load becoming a two-byte `mv`, and
+every one of the 7,984 is a memory access that stops happening.
 
-### What the check will not claim that the probe does
+### The rule this candidate changed
 
-The probe keeps a held value across a store to a disjoint range through
-the same base. The window `riscvlint_state_observe` owns ends every held
-value at any store at all, and run under that rule the probe returns
-3,152 rather than 9,737 -- so 6,585 sites, two thirds of the family, are
-that one difference. They are not an exotic shape: a spill sequence that
-writes several adjacent slots before reading any of them back loses its
-first claim at its second store.
+The check first reported 2,442, and the missing two thirds were one rule
+rather than anything in the encoding. `riscvlint_state_observe` used to
+end every held value at any store at all, where the probe keeps one
+across a store to a disjoint range through the same base. Run the probe
+under the old rule and it returns 3,152 instead of 9,737, which sized
+the gap at 6,585 before anything was changed to close it.
 
-The window already proves disjointness the other way for its `unread`
+The shape behind them is ordinary: a spill sequence writes several
+adjacent slots before reading any of them back, so the first claim died
+at the second store.
+
+    sb  a0, 3(s1)
+    sb  a0, 8(s1)
+    sb  a0, 9(s1)
+    sb  a0, 10(s1)
+    sb  a0, 11(s1)
+    lb  a1, 3(s1)          -> sext.b a1, a0
+
+The window already proved disjointness the other way for its `unread`
 flag -- a store lands on the same bytes or it "neither reads nor
-overwrites" -- so the strict rule on `held` is not a limit of what the
-encoding gives. Relaxing it would change a table check_redundant_reload
-reads too, and with it a published figure, so it is recorded here rather
-than done in the same commit as the check.
+overwrites" -- so the strict rule on `held` was never a limit of what
+the encoding gives, just an asymmetry. `held` now asks the same
+question, and the two checks that read it both moved:
 
-The other 710:
+| check | strict rule | disjointness rule |
+|---|---:|---:|
+| a slot stored and then loaded back | 2,442 | 7,984 |
+| redundant reload | 5,028 | 6,725 |
+
+### What the check still will not claim that the probe does
+
+The remaining 1,753:
 
 * 409 are floating-point pairs, refused on both sides. The window drops
   a held value when the register holding it is written, and its write
   scan reads `cs_reg_to_num`, which cannot see the f registers at all --
   so an f-register claim would never be taken away.
-* 301 are the byte rule, the stand-down and relocated sites together.
+* 1,344 are the byte rule, the stand-down and relocated sites together.
   Every extension form is four bytes, so against a load the assembler
   already compressed the rewrite spends two bytes to save an access,
   which is the trade check_const_remat refuses. And where a redundant
   reload of the same address is also available, that check has the
-  nearer source, so this one reports nothing rather than the site twice.
+  nearer source, so this one reports nothing rather than the site twice
+  -- those sites are in the tool's output, under the other check's
+  name.
 
 What the probe's 9,737 turn into, and what each spelling costs:
 
@@ -1157,10 +1183,7 @@ that can only ask about `mv` and `li` cannot see a `%pcrel_lo` addi.
 
 What would come after those two is not on this list, because nothing
 here has measured it. `candscan` still carries the probes for the shapes
-that came back empty, which is where a new candidate would start. The
-other thing waiting is not a candidate at all: the window ends every
-held value at any store, and 6,585 of candidate 14's sites are that rule
-rather than anything the encoding withholds.
+that came back empty, which is where a new candidate would start.
 
 ### Missed compression in the base C extension  [implemented]
 
@@ -1184,10 +1207,10 @@ them compressed, 53,690,808 pairs:
 | 4 | dead register definitions | 11,989 | 117,538 |
 | 5 | constant re-materialization | 9,541 | 230,973 |
 | 6 | extension the producer already guarantees | 6,922 | 6,611 |
-| 7 | `addi` folded into a memory offset | 3,351 | 58,930 |
-| 8 | a comparison a branch could have made | 2,937 | 26,417 |
-| 9 | redundant reloads | 2,191 | 29,193 |
-| 10 | a slot stored and then loaded back | 1,599 | 142,471 |
+| 7 | a slot stored and then loaded back | 3,943 | 142,471 |
+| 8 | `addi` folded into a memory offset | 3,351 | 58,930 |
+| 9 | a comparison a branch could have made | 2,937 | 26,417 |
+| 10 | redundant reloads | 2,317 | 29,193 |
 | 11 | Zcb-compressible, target declares Zcb | 886 | - |
 | 12 | dead store to a frame slot | 204 | 6,920 |
 | - | Zba shift-add | 232 | 49,881 |
@@ -1198,7 +1221,7 @@ them compressed, 53,690,808 pairs:
 
 Both columns are measured over this cohort of the current corpus, and no
 row's raw figure carries a precondition -- that is what the actionable
-column is for, and row 10's two columns are the widest apart of any here
+column is for, and row 7's two columns are the widest apart of any here
 for a reason candidate 14 sets out.
 
 Row 1 used to read "121,543+", the `pairscan -x` pairs
