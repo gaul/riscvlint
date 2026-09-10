@@ -1225,11 +1225,36 @@ second instruction writes it is one dominant idiom plus nothing.
 
 # Remaining candidates, ranked
 
-Fifteen checks are implemented, and the backlog holds one entry: a
-bit-cast routed through a frame slot, 3,258 sites. It is counted by
-`candscan`'s `fwd|` probe as a reason a forward is not available, which
-is a weaker measurement than a probe of its own -- it has not had its
-own preconditions applied.
+Fifteen checks are implemented and seven candidates are measured and
+unwritten. Every figure below is from a `candscan` probe carrying the
+check's own preconditions -- the window's aliasing rule, the generation
+tests, the byte rule -- rather than from a shape count, and every one
+was read out of a disassembler before it was believed:
+
+| # | candidate | C++ | Rust | Go | sites | bytes |
+|---|---|---:|---:|---:|---:|---:|
+| 16 | the same frame address computed twice | 25,251 | 5,660 | 3,776 | 34,687 | 52,960 |
+| 17 | a run of zero stores one wider store would do | 4,913 | 143 | 1,292 | 6,348 | 31,809 |
+| 18 | a store of bytes the slot already holds | 1,553 | 238 | 5,539 | 7,330 | 22,186 |
+| 19 | a conditional branch over an unconditional jump | 4,691 | 340 | 331 | 5,362 | 15,514 |
+| 20 | the same arithmetic computed twice | 2,657 | 126 | 1,804 | 4,587 | 9,314 |
+| 21 | a transfer to the instruction that follows it | 2,867 | 831 | 20 | 3,718 | 7,522 |
+| 22 | a bit-cast routed through a frame slot | 3,238 | 0 | 20 | 3,258 | - |
+
+The byte column is the whole ordering argument. By site count 16 is five
+times 18; by bytes it is twice, because 16 shortens an instruction by
+two and 18 deletes one. 22 has no byte figure because it has never had
+a probe of its own -- it is still counted only as a reason some other
+fold is unavailable, which is the weakest measurement on this page.
+
+Written against what is already in `riscvlint.c`, the order is not the
+same. 18 needs nothing new: the window holds base, displacement, width
+and the register, and the check is the existing one read backwards. 19
+and 21 need no state at all, two adjacent instructions and a range test.
+16 and 20 want a table the checker does not have -- a region-local
+record of computations, which is `check_const_remat`'s constant table
+generalised from `li` to everything that writes one GPR. 17 needs a run
+tracker and a cover cost, and nothing else.
 
 Everything else this file ever sized is written. The last entry, base-C
 compression, was recorded at 384 sites on the strength of the two RVC
@@ -1238,9 +1263,187 @@ rules a shape token could decide; the full encodability pass found
 whose immediates were relocations when the assembler saw them. A census
 that can only ask about `mv` and `li` cannot see a `%pcrel_lo` addi.
 
-What would come after those two is not on this list, because nothing
-here has measured it. `candscan` still carries the probes for the shapes
-that came back empty, which is where a new candidate would start.
+### 16. The same frame address computed twice -- 34,687
+
+`addi rd,sp,K` or `addi rd,s0,-K` computing an address a live register
+already holds, which is `mv rd,rprev` -- or a deletion where the address
+is already in rd, 515 of the sites. ripgrep, adjacent:
+
+```
+   6f730: addi a0, s0, -0x70
+   6f734: addi s3, s0, -0x70      -> mv s3, a0
+```
+
+25,251 C++, 5,660 Rust, 3,776 Go. 8,690 of them are already two bytes --
+`c.addi4spn` -- and `c.mv` in place of one saves nothing, so the byte
+figure counts the 25,482 four-byte rewrites at two bytes each and the
+515 deletes at what they are encoded in, and no more. That is the same
+byte rule `check_const_remat` applies, and here it removes a quarter of
+the population rather than 97% of it.
+
+The preconditions are generation tests rather than walks: the base
+register unmoved since the first `addi`, and the earlier result still in
+the register that received it. A conditional branch between the two does
+not matter, for the reason the window's held values do not care about
+one -- the second instruction is reached by falling through, and a side
+entry resets the region. 4,972 sites across the probe's whole family sit
+behind such a branch.
+
+This is not the `auipc`+`addi` symbol address measured at 39 and
+rejected above. That one is a linker-relaxed global address; this is a
+frame slot, and the two populations do not overlap.
+
+### 17. A run of zero stores one wider store would do -- 6,348
+
+GCC zeroes a frame buffer one byte at a time. libQt6Core, seven in a
+row, 28 bytes of instructions to zero 7 bytes of frame:
+
+```
+   f65ca: sb zero, -0x6f(s0)
+   f65ce: sb zero, -0x6e(s0)
+   ...
+   f65e2: sb zero, -0x69(s0)
+```
+
+Covering [-111,-104) with stores whose offsets are naturally aligned
+takes three -- `sb -111`, `sh -110`, `sw -108` -- so 16 of the 28 bytes
+go. Only a zero value merges: `sd rD` in place of two `sw rD` would
+write rD's high half to the second slot, and nothing says a register's
+halves are the two values that were stored.
+
+Two things this measurement had wrong before it was right, both worth
+recording because both inflate:
+
+* **Read as pairs it is the wrong shape.** Adjacent pairs come to 50,755
+  sites; the same code read as runs is 30,321. A run of seven `sb` is
+  one finding worth 16 bytes, not three pair-merges worth 4 each, and
+  the pair count cannot see the difference.
+* **Pricing the survivors as compressible credits candidate 3.** Four
+  `sd zero,K(sp)` cover 32 bytes and merge into nothing at all, and Go
+  leaves them uncompressed; a cost model that gave the merged store
+  `c.sdsp` reported 11,333 Go sites and 61,388 bytes whose whole saving
+  was the compression candidate 3 already counts. Priced in the encoding
+  the run itself uses, Go's sp figure is 1,239 sites and 5,906 bytes
+  rather than 12,572 and 67,294.
+
+Restricted to sp and fp, where the ABI fixes the base alignment and the
+offset decides the rest. Another 23,973 sites and 232,960 bytes -- four
+times the sites and seven times the bytes -- run through a base whose
+alignment the encoding does not give, and those are the ones where a
+byte-at-a-time store may be the deliberate choice rather than the missed
+one. The frame sites are the ones where the compiler knew the alignment
+and emitted the run anyway.
+
+### 18. A store of bytes the slot already holds -- 7,330
+
+The dual of candidate 15: that one deletes a load whose destination
+already holds the value, this deletes a store whose slot already does.
+ripgrep, adjacent:
+
+```
+  14cd22: ld s2, -0x178(s0)
+  14cd26: sd s2, -0x178(s0)      -> delete
+```
+
+7,011 of the 7,330 are sp- or fp-relative. The record is established by
+a load (1,372 sites) or by an earlier store (5,958), because both leave
+the slot equal to a named register, and the store's width has to match
+the record's exactly: a narrower store leaves the high bytes alone and a
+wider one writes bytes the record never covered.
+
+The overlap with `check_dead_store` is 336 sites, not 5,958. A store
+that repeats an earlier store to the same slot is a dead store seen from
+the other end -- but only when the overwrite is certain, and 5,622 of
+these have a conditional branch between the two, which is exactly the
+case `check_dead_store` must decline (the N12 rule above). Deleting the
+*second* store is sound whether or not the branch is taken; deleting the
+first is not. Go is 5,539 of the population and 5,370 of the branch
+cases, and it is one shape: a slot spilled before a test and spilled
+again from the path that falls through it.
+
+```
+   17be4: sd a0, 0x70(sp)
+   17bf4: bnez t0, 0x17ed0
+   17bfc: sd a0, 0x70(sp)        -> delete
+```
+
+### 19. A conditional branch over an unconditional jump -- 5,362
+
+`beqz a0,L` + `j X` + `L:` is `bnez a0,X` with the jump gone, whenever X
+is inside the branch's +/-4KB. libQt6Core:
+
+```
+   e8254: bne s1, s5, 0xe825c
+   e8258: j 0xe91a4               -> beq s1, s5, 0xe91a4
+```
+
+The shape itself is 128,361 sites and almost all of it is the standard
+way to spell a conditional branch out of range: 122,999 have a target
+the branch could not reach, which is not a finding but the encoding
+working as designed. 5,362 are in range. 73 of those save nothing -- a
+two-byte `c.beqz` whose new target is outside its own +/-256 has to grow
+to four, giving back what the jump gave -- and the byte figure excludes
+them.
+
+The jump must not itself be a branch target, or the paths that reach it
+lose their transfer. That is the only precondition, and it is a bit
+lookup in the table `mark_branch_targets` already builds.
+
+### 20. The same arithmetic computed twice -- 4,587
+
+Candidate 16 without the frame-address idiom in it: the same mnemonic,
+the same sources, the same immediate, with nothing written in between.
+1,002 of the sites are already in the destination register and delete.
+
+```
+   c69d4: srliw a3, a5, 0x17
+   c69d8: srliw a2, a5, 0x17      -> mv a2, a3
+```
+
+```
+   43934: sext.w t1, t0
+   43938: bltz t1, 0x43972
+   4393c: sext.w t0, t0           -> mv t0, t1
+```
+
+Eligibility is structural rather than a mnemonic list, because the match
+is on the mnemonic anyway: one GPR written, no memory operand, not a
+transfer, and not one of the instructions whose result is not a function
+of its register operands -- `csrr` and `rdtime` read state the window
+does not model, the f-prefixed GPR writers read the other register file,
+`li` and `lui` are candidate 6, `auipc` is the address
+re-materialization rejected above at 39, and `mv` is move coalescing,
+rejected at 192.
+
+One rule here was a false positive before it was a rule: a record whose
+def wrote one of its own sources (`add a0,a0,a1`) does not leave that
+source in the register the record names, so the generation test would be
+asking the wrong question and every later `add rd,a0,a1` would match.
+
+### 21. A transfer to the instruction that follows it -- 3,718
+
+```
+   70c9c: j 0x70c9e
+   70c9e: ld a1, -0x50(s0)        -> delete the j
+```
+
+3,674 of the 3,718 are a two-byte `c.j` to the next instruction. By
+cohort it is 2,867 C++, 831 Rust and 20 Go -- a block-placement leftover
+in LLVM's output. The smallest candidate here and the smallest check:
+no state, no window, one comparison against the address that follows.
+
+### 22. A bit-cast routed through a frame slot -- 3,258
+
+`fsd fa0,K(sp)` then `ld a0,K(sp)`, which `fmv.x.d` does in one
+instruction and no memory at all. Counted by the `fwd|` probe as a
+reason a store-to-load forward is unavailable -- 3,238 C++ and 20 Go --
+rather than by a probe of its own, so it is the one row here that has
+not had its own preconditions applied.
+
+The same probe says the FP-to-FP case is not worth a check: 409 sites
+where both halves are floating point (`fwd|fmv.s` 396, `fwd|fmv.d` 13),
+all of them C++. Extending the window to the second register file buys
+those 409 and this 3,258, and nothing else that has been measured.
 
 ### Missed compression in the base C extension  [implemented]
 

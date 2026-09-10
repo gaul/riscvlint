@@ -465,12 +465,116 @@ typedef struct { bool live; int base; unsigned bgen; int64_t disp; int sz;
 static fwdrec fwds[48];
 static int nfwds;
 
+// ---- a store of bytes the slot already holds ----
+//
+// The dual of the candidate above it: that one deletes a load whose
+// destination already holds the value, this one deletes a store whose
+// slot already holds it. `ld a0,K(sp)` ... `sd a0,K(sp)` writes back
+// exactly what it read.
+//
+// A record is established by a load as well as by a store, because both
+// leave the slot equal to a named register, and it survives exactly the
+// accesses this window can prove miss it. The store's width has to match
+// the record's: a narrower store leaves the high bytes alone and a wider
+// one writes bytes the record never covered.
+typedef struct { bool live; int base; unsigned bgen; int64_t disp; int sz;
+                 int data; unsigned dgen; bool fp; bool xbr; bool fromst;
+                 long idx; uint64_t adr; } holdrec;
+static holdrec holds[48];
+static int nholds;
+
+// ---- a run of zero stores one wider store would do ----
+//
+// The pairwise question above undercounts what is actually there: GCC
+// zeroes a frame buffer one `sb` at a time, seven in a row, and the
+// opportunity is the whole run rather than three disjoint pairs. This
+// tracks a contiguous byte range built by consecutive zero stores and
+// prices it against the cheapest aligned cover of the same range.
+static struct {
+    bool live; int base; unsigned bgen; long lastidx;
+    int64_t lo, hi; int n; unsigned bytes; uint64_t adr, last;
+} zr;
+
+// How many aligned zero stores it takes to cover [lo,hi): the widest
+// store whose natural alignment the offset satisfies, repeatedly.
+static int zr_cover(int64_t lo, int64_t hi)
+{
+    int n = 0;
+    for (int64_t pos = lo; pos < hi; ) {
+        int64_t w = 8;
+        while (w > 1 && (pos % w != 0 || pos + w > hi)) w /= 2;
+        n++;
+        pos += w;
+    }
+    return n;
+}
+
+static void show(const char *key, uint64_t from, uint64_t to);
+
+static void zr_flush(void)
+{
+    if (zr.live && zr.n >= 2) {
+        int k = zr_cover(zr.lo, zr.hi);
+        // Price the survivors at the same encoding the run already used.
+        // Crediting a merged `sd zero,K(sp)` with `c.sdsp` would report
+        // Go's uncompressed stores as a merge when what they are is the
+        // missed compression candidate 3 already counts, and four `sd`
+        // covering 32 bytes merge into nothing at all.
+        unsigned unit = zr.bytes / (unsigned)zr.n;
+        unsigned cost = (unsigned)k * unit;
+        if (k < zr.n && cost < zr.bytes) {
+            char key[80];
+            const char *bk = zr.base == 2 ? "sp"
+                             : zr.base == 8 ? "fp" : "other";
+            snprintf(key, sizeof key, "zrun|%d stores -> %d|%s", zr.n, k, bk);
+            bump(key, zr.n);
+            snprintf(key, sizeof key, "zrun|BYTES|%s|%u", bk,
+                     zr.bytes - cost);
+            bump(key, zr.n);
+            snprintf(key, sizeof key, "zrun|TOTAL|%s", bk);
+            bump(key, zr.n);
+            show(key, zr.adr, zr.last);
+        }
+    }
+    zr.live = false;
+}
+
 static void creset(void)
 {
     memset(cd, 0, sizeof cd);
     namats = 0;
     nstores = 0;
     nfwds = 0;
+    nholds = 0;
+    zr_flush();
+}
+
+// ---- the same computation performed twice ----
+//
+// `check_const_remat` asks this question about `li`; this asks it about
+// everything else that writes one register as a function of registers.
+// Eligibility is structural rather than a mnemonic whitelist, because
+// the match itself is on the mnemonic: two instructions with the same
+// mnemonic, the same sources and the same immediate compute the same
+// value. What the test has to exclude is instructions whose result is
+// not a function of their register operands at all.
+static bool cse_eligible(const cs_insn *insn, const char *m, int nw)
+{
+    if (nw != 1) return false;
+    if (is_call(insn) || has_group(insn, RISCV_GRP_BRANCH_RELATIVE) ||
+        has_group(insn, RISCV_GRP_JUMP) || has_group(insn, RISCV_GRP_RET))
+        return false;
+    const cs_riscv *a = &insn->detail->riscv;
+    for (int i = 0; i < a->op_count; i++)
+        if (a->operands[i].type == RISCV_OP_MEM) return false;
+    // csrr/rdtime read state this window does not model; the f-prefixed
+    // GPR writers (`fmv.x.d`, `fcvt.l.d`, `feq.d` ...) read the other
+    // register file; li/lui/auipc are constants, which candidate 6 has,
+    // and `mv` is move coalescing, which was measured and rejected.
+    if (!strncmp(m, "csr", 3) || !strncmp(m, "rd", 2) || m[0] == 'f')
+        return false;
+    return strcmp(m, "li") && strcmp(m, "lui") && strcmp(m, "auipc") &&
+           strcmp(m, "mv");
 }
 
 static int op_reg(const cs_insn *in, int i)
@@ -659,6 +763,9 @@ static void scan_section(csh handle, const char *path, const uint8_t *code,
     size_t remain = size;
     uint64_t addr = vaddr;
     long idx = 0;
+    bool prev_cb = false;
+    uint64_t prev_cb_addr = 0, prev_cb_tgt = 0;
+    unsigned prev_cb_size = 0;
     creset();
     memset(cgen, 0, sizeof cgen);
 
@@ -1218,6 +1325,208 @@ static void scan_section(csh handle, const char *path, const uint8_t *code,
             }
         }
 
+        // ---- a store of bytes the slot already holds ----
+        {
+            const cs_riscv *ra = &insn->detail->riscv;
+            int mbase = -1; int64_t mdisp = 0; bool hasmem = false;
+            for (int i = 0; i < ra->op_count; i++)
+                if (ra->operands[i].type == RISCV_OP_MEM) {
+                    hasmem = true;
+                    mbase = reg_slot(ra->operands[i].mem.base);
+                    mdisp = ra->operands[i].mem.disp;
+                }
+            bool st = false, isfp = false;
+            int w = mem_width(m, &st, &isfp);
+            if (!w && (hasmem || m[0] == 'v' || !strncmp(m, "fence", 5) ||
+                       !strncmp(m, "amo", 3) || !strncmp(m, "lr.", 3) ||
+                       !strncmp(m, "sc.", 3))) {
+                nholds = 0;
+            } else if (w && mbase >= 0) {
+                if (st) {
+                    for (int i = 0; i < nholds; i++) {
+                        holdrec *r = &holds[i];
+                        if (!r->live || r->base != mbase || r->disp != mdisp ||
+                            r->sz != w || r->data != d0)
+                            continue;
+                        long dd = idx - r->idx;
+                        char key[96];
+                        if (cgen[mbase] != r->bgen) {
+                            snprintf(key, sizeof key,
+                                     "silent|base moved since the record|%s",
+                                     mbase == 2 ? "sp" : "other");
+                            bump(key, dd);
+                        } else if (d0 >= 0 && cgen[d0] != r->dgen) {
+                            bump("silent|source overwritten", dd);
+                        } else {
+                            snprintf(key, sizeof key, "silent|%s back|%s|%s",
+                                     r->fromst ? "stored" : "loaded", m,
+                                     isfp ? "fp" : "gpr");
+                            bump(key, dd);
+                            // A store-established record with no branch
+                            // between the two is a site check_dead_store
+                            // already reports, from the other end: it
+                            // deletes the first store, this would delete
+                            // the second. With a branch between, only
+                            // this one is sound.
+                            snprintf(key, sizeof key, "silent|%s|%s",
+                                     r->fromst ? "second store"
+                                               : "written back after a load",
+                                     r->xbr ? "branch between"
+                                            : "straight line");
+                            bump(key, dd);
+                            bump(r->base == 2 || r->base == 8
+                                     ? "silent|base sp/fp"
+                                     : "silent|base other", dd);
+                            snprintf(key, sizeof key, "silent|BYTES|%u",
+                                     insn->size);
+                            bump(key, dd);
+                            if (r->xbr) bump("silent|xbr", dd);
+                            bump("silent|TOTAL", dd);
+                            show("silent", r->adr, here);
+                        }
+                        break;
+                    }
+                    // A store replaces the bytes it overlaps and provably
+                    // misses the ones it does not; a load changes nothing.
+                    for (int i = 0; i < nholds; i++)
+                        if (holds[i].live &&
+                            !(holds[i].base == mbase &&
+                              (mdisp + w <= holds[i].disp ||
+                               holds[i].disp + holds[i].sz <= mdisp)))
+                            holds[i].live = false;
+                }
+                // The load's own write has not been booked yet, so its
+                // generation is one ahead; a load that overwrites its own
+                // base names an address the record no longer describes.
+                bool rec = st ? (d0 >= -1) : (d0 >= 0 && d0 != mbase);
+                if (rec && nholds < 48)
+                    holds[nholds++] = (holdrec){
+                        true, mbase, cgen[mbase], mdisp, w, d0,
+                        d0 >= 0 ? cgen[d0] + (st ? 0u : 1u) : 0u,
+                        isfp, false, st, idx, here};
+            }
+            // The run ends at the first instruction that is not the
+            // next zero store abutting it; a wider store may only stand
+            // in for the whole contiguous range.
+            bool zst = w && st && mbase >= 0 && d0 == -1;
+            if (zst && zr.live && zr.base == mbase && cgen[mbase] == zr.bgen &&
+                idx == zr.lastidx + 1 &&
+                (mdisp == zr.hi || mdisp + w == zr.lo)) {
+                if (mdisp < zr.lo) zr.lo = mdisp;
+                if (mdisp + w > zr.hi) zr.hi = mdisp + w;
+                zr.n++; zr.bytes += insn->size; zr.lastidx = idx;
+                zr.last = here;
+            } else {
+                zr_flush();
+                if (zst) {
+                    zr.live = true; zr.base = mbase; zr.bgen = cgen[mbase];
+                    zr.lastidx = idx; zr.lo = mdisp; zr.hi = mdisp + w;
+                    zr.n = 1; zr.bytes = insn->size; zr.adr = here;
+                    zr.last = here;
+                }
+            }
+
+            if (!zst) zr_flush();
+            if (is_call(insn)) nholds = 0;
+        }
+
+        // ---- the same computation performed twice ----
+        if (d0 >= 1 && d0 <= 31 && s1 < 32 && s2 < 32 &&
+            cse_eligible(insn, m, nw)) {
+            int cs1 = s1 >= 0 ? s1 : -1, cs2 = s2 >= 0 ? s2 : -1;
+            for (int j = 1; j <= 31; j++) {
+                const cdr *r = &cd[j];
+                if (!r->live || strcmp(r->mn, m)) continue;
+                if (r->rs1 != cs1 || r->rs2 != cs2) continue;
+                // A def that wrote one of its own sources does not leave
+                // that source in the register the record names, so the
+                // generation test below would be asking the wrong thing.
+                if (j == r->rs1 || j == r->rs2) continue;
+                if (r->has_imm != hasi2 || (hasi2 && r->imm != i2)) continue;
+                if (r->rs1 >= 0 && cgen[r->rs1] != r->g1) continue;
+                if (r->rs2 >= 0 && cgen[r->rs2] != r->g2) continue;
+                long dd = idx - r->idx;
+                char key[96];
+                if (j == d0) {
+                    snprintf(key, sizeof key, "cse|DELETE|%s", m);
+                    bump(key, dd);
+                    snprintf(key, sizeof key, "cse|DELETE|%s|%u bytes",
+                             !strcmp(m, "addi") && (cs1 == 2 || cs1 == 8)
+                                 ? "FRAME ADDRESS" : "ARITHMETIC",
+                             insn->size);
+                    bump(key, dd);
+                    bump(!strcmp(m, "addi") && (cs1 == 2 || cs1 == 8)
+                             ? "cse|DELETE|FRAME ADDRESS"
+                             : "cse|DELETE|ARITHMETIC", dd);
+                    snprintf(key, sizeof key, "cse|DELETE|BYTES|%u",
+                             insn->size);
+                    bump(key, dd);
+                    bump("cse|DELETE|TOTAL", dd);
+                } else {
+                    snprintf(key, sizeof key, "cse|%s", m);
+                    bump(key, dd);
+                    // `addi rd,sp/s0,K` is a frame address rather than a
+                    // computation, and it is most of this family. Read as
+                    // one number the family is large and unremarkable.
+                    bool frame = !strcmp(m, "addi") &&
+                                 (cs1 == 2 || cs1 == 8);
+                    snprintf(key, sizeof key, "cse|%s|%u bytes",
+                             frame ? "FRAME ADDRESS" : "ARITHMETIC",
+                             insn->size);
+                    bump(key, dd);
+                    bump(frame ? "cse|FRAME ADDRESS" : "cse|ARITHMETIC", dd);
+                    bump(insn->size == 2 ? "cse|already 2 bytes"
+                                         : "cse|4 bytes -> mv", dd);
+                    if (insn->size == 4) bump("cse|BYTES|2", dd);
+                }
+                if (r->xbr) bump("cse|xbr", dd);
+                bump("cse|TOTAL", dd);
+                show(key, r->addr, here);
+                break;
+            }
+        }
+
+        // ---- a transfer to the instruction that follows it, and a
+        //      conditional branch over an unconditional jump ----
+        {
+            bool tgt_here = (bits[off / 2 / 8] & (1u << (off / 2 % 8))) != 0;
+            uint64_t t = has_group(insn, RISCV_GRP_BRANCH_RELATIVE)
+                             ? branch_target(insn) : 0;
+            char key[80];
+            if (t && t == next) {
+                snprintf(key, sizeof key, "jnext|%s|%u bytes",
+                         is_cond_branch(insn) ? "branch" : "jump", insn->size);
+                bump(key, -1);
+                bump("jnext|TOTAL", -1);
+                show("jnext", here, next);
+            }
+            // `beqz a0,L` + `j X` + `L:` is `bnez a0,X` with the jump
+            // gone. The jump must not be a branch target itself, or the
+            // paths that reach it lose their transfer.
+            if (prev_cb && !tgt_here && !strcmp(m, "j") && t &&
+                prev_cb_tgt == next) {
+                int64_t reach = (int64_t)t - (int64_t)prev_cb_addr;
+                bool inrange = reach >= -4096 && reach <= 4094;
+                unsigned nbr = (prev_cb_size == 2 && reach >= -256 &&
+                                reach <= 254) ? 2u : 4u;
+                snprintf(key, sizeof key, "brinv|%s|branch %u|j %u",
+                         inrange ? "in range" : "out of range",
+                         prev_cb_size, insn->size);
+                bump(key, -1);
+                if (inrange) {
+                    snprintf(key, sizeof key, "brinv|BYTES|%u",
+                             insn->size + prev_cb_size - nbr);
+                    bump(key, -1);
+                    bump("brinv|TOTAL", -1);
+                    show("brinv", prev_cb_addr, here);
+                }
+            }
+            prev_cb = is_cond_branch(insn);
+            prev_cb_addr = here;
+            prev_cb_tgt = prev_cb ? t : 0;
+            prev_cb_size = insn->size;
+        }
+
         // ---- frame pointer set from sp, later used to restore it ----
         {
             bool wr_sp = false, wr_fp = false;
@@ -1336,6 +1645,7 @@ static void scan_section(csh handle, const char *path, const uint8_t *code,
         if (is_cond_branch(insn)) {
             for (int i = 0; i < NSLOT; i++) cd[i].xbr = true;
             for (int i = 0; i < nfwds; i++) fwds[i].xbr = true;
+            for (int i = 0; i < nholds; i++) holds[i].xbr = true;
         }
         if (isc || uncond_transfer(insn)) creset();
     }

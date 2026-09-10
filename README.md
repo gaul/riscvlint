@@ -3,8 +3,9 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Fifteen checks are implemented. One measured candidate is waiting: a
-bit-cast routed through a frame slot, 3,258 sites.
+Fifteen checks are implemented and seven measured candidates are
+waiting, the largest of them a frame address computed twice, 34,687
+sites and 52,960 bytes.
 [TODO.md](TODO.md) is the ledger behind them: every candidate that was
 measured, the population it came back with, and the ones rejected on
 that evidence. What got written was decided by the corpus rather than by
