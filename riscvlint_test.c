@@ -1346,6 +1346,58 @@ static void test_window_checks(csh handle)
     CHECK(run_window(handle, check_store_to_load, fwd_overlap,
                      sizeof fwd_overlap, 0x1000, NULL) == 0);
 
+    // ---- a load whose destination already holds what it would load ----
+
+    // Stored and read straight back into the register it came from.
+    static const uint8_t back[] = {
+        0x2a, 0xe8,                    // c.sdsp a0,16(sp)
+        0x05, 0x06,                    // c.addi a2,1
+        0x42, 0x65,                    // c.ldsp a0,16(sp)
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_redundant_load, back, sizeof back,
+                     0x1000, &f) == 1);
+    CHECK(f.address == 0x1004 && f.insn_count == 1);
+    CHECK(strstr(f.replacement, "a0 still holds 16(sp) from the store") != NULL);
+
+    // The same load twice recomputes the same value at any width.
+    static const uint8_t twiceld[] = {
+        0x88, 0x6a,                    // c.ld a0,16(a3)
+        0x05, 0x06,                    // c.addi a2,1
+        0x88, 0x6a,                    // c.ld a0,16(a3)
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_redundant_load, twiceld, sizeof twiceld,
+                     0x1000, NULL) == 1);
+
+    // Stored and read back at half the width. `lw` leaves a0
+    // sign-extended from bit 31, which is a0 again only if it already
+    // was, and the pair does not say.
+    static const uint8_t halfback[] = {
+        0x2a, 0xc8,                    // c.swsp a0,16(sp)
+        0x05, 0x06,                    // c.addi a2,1
+        0x42, 0x45,                    // c.lwsp a0,16(sp)
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_redundant_load, halfback, sizeof halfback,
+                     0x1000, NULL) == 0);
+
+    // lb and lbu are the same width and not the same value.
+    static const uint8_t signs[] = {
+        0x03, 0xc5, 0x36, 0x00,        // lbu a0,3(a3)
+        0x03, 0x85, 0x36, 0x00,        // lb a0,3(a3)
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_redundant_load, signs, sizeof signs,
+                     0x1000, NULL) == 0);
+
+    // The two checks that rewrite a load into a move both refuse this
+    // shape, which is what leaves it to this one.
+    CHECK(run_window(handle, check_redundant_reload, twiceld, sizeof twiceld,
+                     0x1000, NULL) == 0);
+    CHECK(run_window(handle, check_store_to_load, back, sizeof back,
+                     0x1000, NULL) == 0);
+
     // Two loads after one store. The first is this check's; the second
     // is check_redundant_reload's, whose source is the nearer of the
     // two, so this one reports the site once rather than twice.

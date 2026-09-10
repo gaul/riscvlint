@@ -43,6 +43,7 @@ records where a first figure was wrong and why.
 | 11 | Zcb-compressible 4-byte encodings | 30,648 | 386,257 | **implemented** |
 | 5 | dead register definitions | 19,865 | 120,647 | **implemented** |
 | 3 | Zba `zext.w` | 18,125 | 203,831 | **implemented** |
+| 15 | a load into the register that still holds it | 16,556 | - | **implemented** |
 | 2 | Zba shift-add | 13,412 | 180,591 | **implemented** |
 | 6 | constant re-materialization | 10,998 | 329,926 | **implemented** |
 | 9 | extension the producer already guarantees | 8,515 | - | **implemented** |
@@ -55,9 +56,10 @@ records where a first figure was wrong and why.
 Where the raw figure comes from: `pairscan` for rows 1, 2 and 3 (the two
 Zba rows read shift-blind, which is exactly what a collapsed file
 forces); `defuse` for 4, 5, 6 and 7; `candscan` for 8, 10, 11, 12 and 14.
-Row 9 has no dash-free entry because no shape scan sizes it -- the
-producer has to be tracked, which is `candscan`'s job and not
-`pairscan`'s. Row 13's raw entry is in its own section: a shape token
+Rows 9 and 15 have no dash-free entry because no shape scan sizes
+them whole -- row 9's producer has to be tracked, which is `candscan`'s
+job and not `pairscan`'s, and row 15 is half a shape `candscan` counts
+only as a reason some other fold is unavailable. Row 13's raw entry is in its own section: a shape token
 can only ask about `mv` and `li`, and that census found 384.
 
 Sections below carry the `#` from that table and appear in the order they
@@ -572,23 +574,22 @@ one earned its place -- `addw a5,a1,a5` compresses because the assembler
 swaps the operands, and a first version of this decoder missed 25 sites
 by requiring the destination to be the first source.
 
-## The windowed memory table, and the four checks it serves  [implemented]
+## The windowed memory table, and the five checks it serves  [implemented]
 
-`check_redundant_reload`, `check_dead_store`, `check_const_remat` and
-`check_store_to_load` all need the same thing: a region-local record of
-what is already in a register and what is already in a frame slot.
+Five checks need the same thing: a region-local record of what is
+already in a register and what is already in a frame slot.
 `riscvlint_state_observe` owns it and the driver calls it once per
-instruction **after** the checks, so each of the four judges the
+instruction **after** the checks, so each of the five judges the
 instruction under the cursor against the table as it stood before it.
 
 Measured by the checks themselves:
 
-| corpus | reload | dead store | re-materialization | just-stored |
-|---|---:|---:|---:|---:|
-| C++ | 2,086 | 203 | 8,970 | 3,676 |
-| Go | 4,408 | 4,172 | 1,457 | 4,041 |
-| Rust | 231 | 1 | 571 | 267 |
-| **total** | **6,725** | **4,376** | **10,998** | **7,984** |
+| corpus | reload | dead store | remat | just-stored | still holds |
+|---|---:|---:|---:|---:|---:|
+| C++ | 2,086 | 203 | 8,970 | 3,676 | 10,445 |
+| Go | 4,408 | 4,172 | 1,457 | 4,041 | 5,592 |
+| Rust | 231 | 1 | 571 | 267 | 519 |
+| **total** | **6,725** | **4,376** | **10,998** | **7,984** | **16,556** |
 
 ### What the mining tools had wrong
 
@@ -813,10 +814,8 @@ Three rows are separate candidates rather than losses.
 "The value is already in the register the load writes" is the shape where
 the load is redundant by itself: `sw a0,-0x468(s0)` ... `lw a0,-0x468(s0)`
 with nothing writing a0 in between, so the reload reads back a value that
-never left. Where the register is `ra` or a callee-saved one it is a whole
-prologue and epilogue built around nothing -- candidate 5 already deletes
-the `addi s0,sp,K` in the middle of such a frame, and the memory accesses
-around it are unclaimed. 15,387 across the corpus.
+never left. 15,387 across the corpus, and the larger finding of the two:
+it is candidate 15, below.
 
 "Different register files" is a bit-cast through memory, and in the
 corpus it is nearly always the 32-bit one:
@@ -833,6 +832,66 @@ libxul, and 2,005 of the 3,258 have the two instructions adjacent.
 The `zero` row is a third: the rewrite there is `li rT,0` rather than a
 move, which is better than the one this candidate claims -- it drops the
 dependency as well as the load. 1,836 sites.
+
+### 15. A load into the register that still holds it -- 16,556  [implemented]
+
+The shape candidate 14 counts only as a reason a forward is unavailable,
+and the larger finding of the two. `sd a0,K(rB)` then `ld a0,K(rB)`, or
+the same load twice: the destination is the register the value is
+already in, so there is no move to make and the load itself goes.
+
+Both of the checks above refuse it for exactly that reason -- each
+rewrites a load into a move, and there is no move to make -- which is
+what left it unclaimed until it had a check of its own. It deletes an
+instruction rather than shortening one, which puts its byte figure ahead
+of any other the window produces.
+
+| corpus | from a store | from a load | sites | bytes |
+|---|---:|---:|---:|---:|
+| C++ | 8,733 | 1,712 | 10,445 | 23,822 |
+| Go | 4,933 | 659 | 5,592 | 15,888 |
+| Rust | 374 | 145 | 519 | 1,522 |
+| **total** | **14,040** | **2,516** | **16,556** | **41,232** |
+
+The two halves come from different mistakes. The store half is
+overwhelmingly a prologue and epilogue built around nothing:
+
+    7fade: sd   ra, 8(sp)
+    7fae0: addi s0, sp, 16
+    ...                          (no call, so nothing writes ra)
+    7fb00: ld   s0, 0(sp)
+    7fb02: ld   ra, 8(sp)        -> delete
+
+Candidate 5 already deletes the `addi s0,sp,K` in the middle of such a
+frame and this takes the reload of `ra`, so between them the idiom is
+down to its two stores. Those stay: an unwinder is told `ra` lives in
+that slot, and nothing here proves it is never read.
+
+The load half is a value read twice across something that cannot have
+changed it:
+
+    fc5f2: ld   a0, 8(a1)
+    fc5f4: beqz a0, ...
+    fc5f6: ld   a0, 8(a1)        -> delete
+
+Both halves have to be exact, and the store half is exact only at the
+full width. `sw a0,K(sp)` then `lw a0,K(sp)` leaves a0 sign-extended
+from bit 31, which is a0 again only if it already was -- a fact about
+the value rather than about the two encodings. The `guarantees` table
+`check_redundant_extension` keeps would answer it, but not from here:
+that check updates the table during the check pass, so by the time this
+one runs the entry describes the load being judged rather than the
+register before it. The load half needs no such condition, because two
+loads of the same kind from the same unchanged bytes produce the same
+value at any width.
+
+That is the whole of the gap to `candscan`'s figure. The probe counts
+15,387 store-then-load shapes whose register still holds the value
+against this check's 14,040, and the 1,347 are the narrower widths, the
+floating-point pairs the window does not track, and relocated sites. The
+probe never looked for the load-then-load half at all, which is why the
+pooled table gives this row no raw figure: half of it has never been
+sized by a shape scan.
 
 ### 12. `addi` folded into a memory offset -- 6,344  [implemented]
 
@@ -1166,13 +1225,11 @@ second instruction writes it is one dominant idiom plus nothing.
 
 # Remaining candidates, ranked
 
-Fourteen checks are implemented, and the backlog holds the two shapes
-candidate 14 turned up while being sized -- a slot reloaded into the
-register that still holds it, 15,387 sites, and a bit-cast routed
-through a frame slot, 3,258. Both are counted by `candscan`'s `fwd|`
-probe as reasons a forward is not available, which is a weaker
-measurement than a probe of their own: neither has had its own
-preconditions applied.
+Fifteen checks are implemented, and the backlog holds one entry: a
+bit-cast routed through a frame slot, 3,258 sites. It is counted by
+`candscan`'s `fwd|` probe as a reason a forward is not available, which
+is a weaker measurement than a probe of its own -- it has not had its
+own preconditions applied.
 
 Everything else this file ever sized is written. The last entry, base-C
 compression, was recorded at 384 sites on the strength of the two RVC
@@ -1205,14 +1262,15 @@ them compressed, 53,690,808 pairs:
 | 2 | frame-pointer teardown over a static frame | 112,401 | 135,045 |
 | 3 | base-C-compressible, on a toolchain that compresses | 22,596 | 384 |
 | 4 | dead register definitions | 11,989 | 117,538 |
-| 5 | constant re-materialization | 9,541 | 230,973 |
-| 6 | extension the producer already guarantees | 6,922 | 6,611 |
-| 7 | a slot stored and then loaded back | 3,943 | 142,471 |
-| 8 | `addi` folded into a memory offset | 3,351 | 58,930 |
-| 9 | a comparison a branch could have made | 2,937 | 26,417 |
-| 10 | redundant reloads | 2,317 | 29,193 |
-| 11 | Zcb-compressible, target declares Zcb | 886 | - |
-| 12 | dead store to a frame slot | 204 | 6,920 |
+| 5 | a load into the register that still holds it | 10,964 | - |
+| 6 | constant re-materialization | 9,541 | 230,973 |
+| 7 | extension the producer already guarantees | 6,922 | 6,611 |
+| 8 | a slot stored and then loaded back | 3,943 | 142,471 |
+| 9 | `addi` folded into a memory offset | 3,351 | 58,930 |
+| 10 | a comparison a branch could have made | 2,937 | 26,417 |
+| 11 | redundant reloads | 2,317 | 29,193 |
+| 12 | Zcb-compressible, target declares Zcb | 886 | - |
+| 13 | dead store to a frame slot | 204 | 6,920 |
 | - | Zba shift-add | 232 | 49,881 |
 | - | Zbb/Zbs/Zcb idioms on an RVA23 target | 1,025 | - |
 | - | move coalescing | 192 | 73,017 |
@@ -1221,8 +1279,10 @@ them compressed, 53,690,808 pairs:
 
 Both columns are measured over this cohort of the current corpus, and no
 row's raw figure carries a precondition -- that is what the actionable
-column is for, and row 7's two columns are the widest apart of any here
-for a reason candidate 14 sets out.
+column is for, and row 8's two columns are the widest apart of any here
+for a reason candidate 14 sets out. Row 5 has no raw figure at all: its
+shape is one `candscan` counts only as a reason some other fold is
+unavailable, which candidate 15 explains.
 
 Row 1 used to read "121,543+", the `pairscan -x` pairs
 whose `auipc` immediate was inside `jal`'s reach, and the plus sign was
@@ -1231,7 +1291,7 @@ it is the mistake "Raw fields versus decoded values" below is about, so
 the row now carries the family total instead.
 
 Two rows have a raw figure *smaller* than the actionable one, which is
-worth knowing rather than hiding. Row 6: `candscan` keys the producer on
+worth knowing rather than hiding. Row 7: `candscan` keys the producer on
 a mnemonic and the check also bounds the value by an `andi` mask, so the
 check sees shapes the scan cannot. Row 3 is the row where a shape scan
 was least use at all -- it can only ask about `mv` and `li`, and the
@@ -1239,12 +1299,12 @@ answer is 384 wide `mv` out of 4,629,930 and 0 wide in-range `li` out of
 3,065,349, against 22,596 from the full encodability pass.
 
 The `redundant mask after lbu` row is gone from this table: it was 142
-here and is now part of candidate 6, which subsumes it at 2,634 in this
+here and is now part of row 7, which subsumes it at 2,634 in this
 cohort once the window is a region rather than a pair.
 
-Items 2 and 6 are the two toolchains taking turns. Candidate 2 is
+Items 2 and 7 are the two toolchains taking turns. Candidate 2 is
 100,716 libLLVM and 0 libQt6Core -- clang and rustc restore sp from the
-frame pointer unconditionally, GCC does not. Candidate 6 is 3,433
+frame pointer unconditionally, GCC does not. Candidate 7 is 3,433
 Qt6Core against 817 libLLVM -- GCC re-extends a value its own load
 already extended, clang mostly does not. Neither would have been visible
 in a corpus with one C++ compiler in it.

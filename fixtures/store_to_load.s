@@ -64,8 +64,9 @@ _start:
 
     // Negatives:
     // N1) The load writes the register the store read, so the value
-    //     never left and the load is redundant by itself. A different
-    //     finding, and not one this check makes.
+    //     never left and the load is redundant by itself. That is
+    //     check_redundant_load's finding, which the expected output
+    //     shows here, and not one this check makes.
     sd      a0, 56(sp)
     addi    a2, a2, 1
     ld      a0, 56(sp)

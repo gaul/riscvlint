@@ -1,0 +1,25 @@
+load of a value the register still holds at offset: 0x4: -> delete; a0 still holds 8(sp) from the store at 0x0 (2 bytes) (1 instructions)
+  ld a0, 8(sp)
+
+load of a value the register still holds at offset: 0xa: -> delete; a0 still holds 16(a3) from the load at 0x6 (2 bytes) (1 instructions)
+  ld a0, 0x10(a3)
+
+load of a value the register still holds at offset: 0x12: -> delete; a0 still holds 24(a3) from the load at 0xc (4 bytes) (1 instructions)
+  lbu a0, 0x18(a3)
+
+load of a value the register still holds at offset: 0x1a: -> delete; a0 still holds 32(a3) from the load at 0x16 (2 bytes) (1 instructions)
+  lw a0, 0x20(a3)
+
+dead register definition at offset: 0x2e: -> delete; nothing reads a0 (2 bytes) (1 instructions)
+  mv a0, a1
+
+call pair foldable to jal at offset: 0x40: -> jal ra, 0x58 (2 instructions)
+  auipc ra, 0
+  jalr 0x18(ra)
+
+Optimization opportunities by type:
+       4  load of a value the register still holds
+       1  call pair foldable to jal
+       1  dead register definition
+
+6 optimization opportunities in 39 instructions

@@ -3,8 +3,8 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Fourteen checks are implemented. Two measured candidates are waiting,
-both of them shapes the fourteenth turned up while being sized.
+Fifteen checks are implemented. One measured candidate is waiting: a
+bit-cast routed through a frame slot, 3,258 sites.
 [TODO.md](TODO.md) is the ledger behind them: every candidate that was
 measured, the population it came back with, and the ones rejected on
 that evidence. What got written was decided by the corpus rather than by
@@ -12,7 +12,7 @@ intuition, and what did not get written was rejected the same way.
 
 ## Checks
 
-Fourteen of them. Every figure below is what the check itself reports
+Fifteen of them. Every figure below is what the check itself reports
 over the [corpus](#corpus) -- 73,139,165 instructions of three
 toolchains -- rather than what a mining tool estimated for it. The two
 have differed by an order of magnitude every time both were measured.
@@ -26,6 +26,7 @@ have differed by an order of magnitude every time both were measured.
 | comparison a branch could have made | 2,895 | 42 | 0 | 2,937 | 7,578 |
 | redundant reload | 2,086 | 231 | 4,408 | 6,725 | 9,918 |
 | load of a just-stored value | 3,676 | 267 | 4,041 | 7,984 | 6,866 |
+| load of a value the register still holds | 10,445 | 519 | 5,592 | 16,556 | 41,232 |
 | dead store to a frame slot | 203 | 1 | 4,172 | 4,376 | 16,714 |
 | constant re-materialization | 8,970 | 571 | 1,457 | 10,998 | 21,996 |
 | base add foldable into memory offset | 2,922 | 429 | 2,993 | 6,344 | 19,574 |
@@ -33,11 +34,11 @@ have differed by an order of magnitude every time both were measured.
 | instruction compressible to a Zcb form | 705 | 181 | 29,762 | 30,648 | 61,296 |
 | redundant sign or zero extension | 6,589 | 333 | 1,593 | 8,515 | 20,864 |
 | dead register definition | 11,741 | 248 | 7,876 | 19,865 | 54,570 |
-| **total** | **282,513** | **187,103** | **3,049,202** | **3,518,818** | **7,880,572** |
+| **total** | **292,958** | **187,622** | **3,054,794** | **3,535,374** | **7,921,804** |
 
-Do not read the total row as a result. One row is 85% of it, and that
+Do not read the total row as a result. One row is 84% of it, and that
 row is Go's assembler declining to select RVC at all, which is a
-different kind of finding from the thirteen around it. The byte column for
+different kind of finding from the fourteen around it. The byte column for
 the call-pair row is arithmetic rather than measurement: that check does
 not print a size, and every site is eight bytes in and four out except a
 handful of `jalr ra,0(ra)` that were already two.
@@ -174,7 +175,7 @@ handful of `jalr ra,0(ra)` that were already two.
   than a doubleword it is the extension the load's own signedness
   implies, and `zext.w` and the halfword forms need Zba or Zbb.
 
-  The cheapest of the four to decide, because nothing is deleted -- the
+  The cheapest of the five to decide, because nothing is deleted -- the
   store stays and the load becomes a register operation, so there is no
   liveness query at all. It reports one rewrite per site: where a
   redundant reload of the same address is also available, that check has
@@ -187,6 +188,26 @@ handful of `jalr ra,0(ra)` that were already two.
   Floating point is refused on both sides for a different reason -- the
   window drops a held value when the register holding it is written, and
   its write scan cannot see the f registers at all.
+
+* **load of a value the register still holds** -- the same shape one
+  step further: the load's destination is the register the value is
+  already in, so there is no move to make and the load itself goes.
+  `sd ra,8(sp)` at the top of a function and `ld ra,8(sp)` at the bottom
+  with no call between them is the commonest form of it, and a second
+  `ld a0,8(a1)` after a `beqz` on the first is the next.
+
+  The two checks above both refuse this shape, because both rewrite a
+  load into a move and there is no move to make. That leaves it here,
+  and it deletes an instruction rather than shortening one -- 41,232
+  bytes, the largest of the five figures the window's checks produce and
+  nearly twice the next.
+
+  Each of its two shapes has to be exact. The same load again recomputes
+  the same value from the same bytes at any width; a store read back
+  into the register it came from is exact only at the full width, since
+  `sw a0,K(sp)` then `lw a0,K(sp)` leaves a0 sign-extended from bit 31,
+  which is a0 again only if it already was. It carries the reload
+  check's volatile caveat for the same reason.
 
 * **dead store to a frame slot** -- the same slot stored twice with
   nothing reading it in between. The store analogue of a dead register

@@ -2135,6 +2135,53 @@ bool check_store_to_load(riscvlint_state *state, const cs_insn *insn,
     return false;
 }
 
+bool check_redundant_load(riscvlint_state *state, const cs_insn *insn,
+                          riscvlint_finding *finding)
+{
+    if (insn->size != 2 && insn->size != 4) return false;
+    uint32_t w;
+    if (!riscvlint_word_at(state, insn->address, &w)) return false;
+    rv_mem_kind kind;
+    unsigned data, base;
+    int64_t off;
+    if (!rv_decode_mem(w, insn->size, &kind, &data, &base, &off)) return false;
+    if (rv_mem_is_store(kind) || rv_mem_is_fp(kind)) return false;
+    if (data == 0) return false;
+    if (riscvlint_is_relocated(state, insn->address)) return false;
+
+    for (int i = 0; i < state->win.nslots; i++) {
+        const rvl_slot *sl = &state->win.slots[i];
+        if (!sl->held || sl->data != data) continue;
+        if (sl->base != base || sl->disp != off) continue;
+        // Two ways the register can already hold what this load would
+        // put in it, and both have to be exact rather than merely
+        // likely. The same load again recomputes the same value from
+        // the same bytes, whatever its width. A store back is exact
+        // only at the full width: `sw a0,K(sp)` then `lw a0,K(sp)`
+        // leaves a0 sign-extended from bit 31, which is a0 again only
+        // if it was already, and that is a fact about the value rather
+        // than about the two encodings.
+        if (sl->kind != kind &&
+            !(sl->kind == RV_MEM_SD && kind == RV_MEM_LD))
+            continue;
+
+        finding->title = "load of a value the register still holds";
+        finding->address = insn->address;
+        finding->insn_count = 1;
+        // Which of the two shapes it was is worth printing rather
+        // than leaving to whoever reads the disassembly: they come from
+        // different mistakes, and their populations are nothing alike.
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "delete; %s still holds %" PRId64 "(%s) from the %s at "
+                 "0x%" PRIx64 " (%u bytes)", rv_reg_name(data), off,
+                 rv_reg_name(base), rv_mem_is_store(sl->kind) ? "store"
+                                                              : "load",
+                 sl->addr, insn->size);
+        return true;
+    }
+    return false;
+}
+
 bool check_dead_store(riscvlint_state *state, const cs_insn *insn,
                       riscvlint_finding *finding)
 {
