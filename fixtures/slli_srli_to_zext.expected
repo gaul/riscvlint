@@ -16,11 +16,15 @@ slli + srli foldable to zext.w at offset: 0xa: -> zext.w a6, a6 (6 -> 4 bytes) (
 dead register definition at offset: 0x20: -> delete; nothing reads a4 (4 bytes) (1 instructions)
   slli a4, a2, 0x20
 
+computation a live register already holds at offset: 0x20: -> delete; a4 already holds this from 0x18 (4 bytes) (1 instructions)
+  slli a4, a2, 0x20
+
 dead register definition at offset: 0x2e: -> delete; nothing reads a4 (2 bytes) (1 instructions)
   srli a4, a4, 0x20
 
 Optimization opportunities by type:
        3  dead register definition
        3  slli + srli foldable to zext.w
+       1  computation a live register already holds
 
-6 optimization opportunities in 21 instructions
+7 optimization opportunities in 21 instructions

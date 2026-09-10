@@ -3,9 +3,9 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Sixteen checks are implemented and six measured candidates are
-waiting, the largest of them a frame address computed twice, 34,687
-sites and 52,960 bytes.
+Seventeen checks are implemented and four measured candidates are
+waiting, the largest of them a run of byte-at-a-time zero stores one
+wider store would do, 6,348 sites and 31,809 bytes.
 [TODO.md](TODO.md) is the ledger behind them: every candidate that was
 measured, the population it came back with, and the ones rejected on
 that evidence. What got written was decided by the corpus rather than by
@@ -13,7 +13,7 @@ intuition, and what did not get written was rejected the same way.
 
 ## Checks
 
-Sixteen of them. Every figure below is what the check itself reports
+Seventeen of them. Every figure below is what the check itself reports
 over the [corpus](#corpus) -- 73,139,165 instructions of three
 toolchains -- rather than what a mining tool estimated for it. The two
 have differed by an order of magnitude every time both were measured.
@@ -31,12 +31,13 @@ have differed by an order of magnitude every time both were measured.
 | dead store to a frame slot | 203 | 1 | 4,172 | 4,376 | 16,714 |
 | store of a value the slot already holds | 1,199 | 225 | 5,341 | 6,765 | 20,194 |
 | constant re-materialization | 8,970 | 571 | 1,457 | 10,998 | 21,996 |
+| computation a live register already holds | 21,230 | 3,450 | 4,915 | 29,595 | 62,212 |
 | base add foldable into memory offset | 2,922 | 429 | 2,993 | 6,344 | 19,574 |
 | instruction compressible to a base C form | 21,361 | 1,235 | 2,961,593 | 2,984,189 | 5,968,378 |
 | instruction compressible to a Zcb form | 705 | 181 | 29,762 | 30,648 | 61,296 |
 | redundant sign or zero extension | 6,589 | 333 | 1,593 | 8,515 | 20,864 |
 | dead register definition | 11,741 | 248 | 7,876 | 19,865 | 54,570 |
-| **total** | **294,157** | **187,847** | **3,060,135** | **3,542,139** | **7,941,998** |
+| **total** | **315,387** | **191,297** | **3,065,050** | **3,571,734** | **8,004,210** |
 
 Do not read the total row as a result. One row is 84% of it, and that
 row is Go's assembler declining to select RVC at all, which is a
@@ -177,7 +178,7 @@ handful of `jalr ra,0(ra)` that were already two.
   than a doubleword it is the extension the load's own signedness
   implies, and `zext.w` and the halfword forms need Zba or Zbb.
 
-  The cheapest of the six to decide, because nothing is deleted -- the
+  The cheapest of the seven to decide, because nothing is deleted -- the
   store stays and the load becomes a register operation, so there is no
   liveness query at all. It reports one rewrite per site: where a
   redundant reload of the same address is also available, that check has
@@ -201,8 +202,8 @@ handful of `jalr ra,0(ra)` that were already two.
   The two checks above both refuse this shape, because both rewrite a
   load into a move and there is no move to make. That leaves it here,
   and it deletes an instruction rather than shortening one -- 41,232
-  bytes, the largest of the six figures the window's checks produce and
-  nearly twice the next.
+  bytes, which was the largest figure the window's checks produced until
+  the computation table was added below.
 
   Each of its two shapes has to be exact. The same load again recomputes
   the same value from the same bytes at any width; a store read back
@@ -256,11 +257,11 @@ handful of `jalr ra,0(ra)` that were already two.
   fit `c.li`, and on a toolchain that left the `li` wide to begin with
   the rewrite saves nothing.
 
-  These three read one table, filled by `riscvlint_state_observe`, which
-  the driver calls once per instruction *after* the checks -- each of
-  them judges the instruction under the cursor against the table as it
-  stood before it. None can be decided from a pair; the distances cluster
-  at 4-15 instructions, which is why no pair scan ever saw them.
+  These all read one structure, filled by `riscvlint_state_observe`,
+  which the driver calls once per instruction *after* the checks -- each
+  of them judges the instruction under the cursor against it as it stood
+  before. None can be decided from a pair; the distances cluster at 4-15
+  instructions, which is why no pair scan ever saw them.
 
   The first corpus run produced three classes of false positive, each
   found by reading the disassembly around a finding rather than by any
@@ -281,6 +282,61 @@ handful of `jalr ra,0(ra)` that were already two.
   What survives is checked against an independent pass over objdump's
   output: all 83 of ripgrep's reload findings, and every one of its
   dead-store findings by hand.
+
+* **computation a live register already holds** -- the question above
+  widened from `li` to everything that writes one register as a function
+  of registers: the same mnemonic over the same sources with the same
+  immediate, where nothing has moved since. It is `mv rd,rprev`, or a
+  deletion where the register about to be written already holds it.
+
+  ```
+   6f730: addi a0, s0, -0x70
+   6f734: addi s3, s0, -0x70      -> mv s3, a0
+  ```
+
+  Two populations that were sized as separate candidates and turned out
+  to be one check: a frame address, which is most of it, and ordinary
+  arithmetic. Nothing in the check tells them apart -- the probe that
+  measured them told them apart with one boolean, and the check does not
+  need even that.
+
+  29,595 sites and 62,212 bytes, the largest of the window's figures and
+  fourth-largest of any check here by bytes. On C++ it is 21,230 sites,
+  fourth again and within 131 of base-C compression; across C++ and Rust
+  together it passes it. 28,052 become a move and 1,543 delete; the
+  delete is tried first, because it is worth more.
+
+  Eligibility is structural rather than a list of mnemonics, because the
+  match is on the mnemonic anyway: one register written, no memory
+  operand, not a transfer, and not one of the instructions whose result
+  is not a function of its register operands -- `csrr` and `rdtime` read
+  state this does not model, the f-prefixed writers of a general
+  register read the other register file, `li` and `lui` are the check
+  above, `auipc` is address re-materialization (measured at 39 and
+  rejected) and `mv` is move coalescing (192, rejected).
+
+  Two rules were false positives before they were rules. A computation
+  whose destination is one of its own sources -- `add a0,a0,a1` -- is
+  not recorded at all, since nothing is left that can name the value it
+  read; without that, every later `add rd,a0,a1` matches it. And sp, gp
+  and tp are never reported: `addi sp,s0,-K` over a frame that never
+  moved is the stack-pointer restore above, which says more, and the
+  other two hold what the ABI says they hold.
+
+  The table this reads is the one place the window's three tables have
+  to be told apart. A memory record is a claim about a place and a
+  computation record is a claim about a register, so an access through
+  an address the decoder cannot name -- a vector load or store -- takes
+  the first kind and leaves the second, as do a fence, an atomic and a
+  CSR read. Written without that distinction the check found 456 of
+  ripgrep's 646 sites instead of 601.
+
+  Where a match is already spelled in two bytes it is not reported:
+  `c.addi4spn` names the destination and so would `c.mv`, so the rewrite
+  saves nothing and trades an instruction that depends on nothing for
+  one that depends on another register. That is the same byte rule the
+  constant check applies, and here it removes a quarter of the
+  population rather than 97% of it.
 
 * **base add foldable into memory offset** -- `addi rd,rs,imm1` followed by
   `<load|store> rt,imm2(rd)` is one access at `imm1+imm2` from `rs`

@@ -41,6 +41,7 @@ records where a first figure was wrong and why.
 | 1 | `auipc`+`jalr` within `jal` reach | 292,299 | 2,378,898 | **implemented** |
 | 8 | frame-pointer teardown over a static frame | 112,401 | 135,045 | **implemented** |
 | 11 | Zcb-compressible 4-byte encodings | 30,648 | 386,257 | **implemented** |
+| 16+20 | a computation a live register already holds | 29,595 | 39,274 | **implemented** |
 | 5 | dead register definitions | 19,865 | 120,647 | **implemented** |
 | 3 | Zba `zext.w` | 18,125 | 203,831 | **implemented** |
 | 15 | a load into the register that still holds it | 16,556 | - | **implemented** |
@@ -56,8 +57,8 @@ records where a first figure was wrong and why.
 
 Where the raw figure comes from: `pairscan` for rows 1, 2 and 3 (the two
 Zba rows read shift-blind, which is exactly what a collapsed file
-forces); `defuse` for 4, 5, 6 and 7; `candscan` for 8, 10, 11, 12, 14 and 18.
-Rows 9 and 15 have no dash-free entry because no shape scan sizes
+forces); `defuse` for 4, 5, 6 and 7; `candscan` for 8, 10, 11, 12, 14,
+16+20 and 18. Rows 9 and 15 have no dash-free entry because no shape scan sizes
 them whole -- row 9's producer has to be tracked, which is `candscan`'s
 job and not `pairscan`'s, and row 15 is half a shape `candscan` counts
 only as a reason some other fold is unavailable. Row 13's raw entry is in its own section: a shape token
@@ -575,22 +576,55 @@ one earned its place -- `addw a5,a1,a5` compresses because the assembler
 swaps the operands, and a first version of this decoder missed 25 sites
 by requiring the destination to be the first source.
 
-## The windowed memory table, and the six checks it serves  [implemented]
+## The windowed memory table, and the seven checks it serves  [implemented]
 
-Six checks need the same thing: a region-local record of what is
+Seven checks need the same thing: a region-local record of what is
 already in a register and what is already in a frame slot.
 `riscvlint_state_observe` owns it and the driver calls it once per
-instruction **after** the checks, so each of the six judges the
+instruction **after** the checks, so each of the seven judges the
 instruction under the cursor against the table as it stood before it.
+
+It is three tables in one structure with one owner and one region
+discipline: the memory slots, the constant table, and the computation
+table candidates 16 and 20 added. They do not have the same lifetime,
+which is the subject of "What the three tables do not share" below.
 
 Measured by the checks themselves:
 
-| corpus | reload | dead store | remat | just-stored | still holds | silent store |
-|---|---:|---:|---:|---:|---:|---:|
-| C++ | 2,086 | 203 | 8,970 | 3,676 | 10,445 | 1,199 |
-| Go | 4,408 | 4,172 | 1,457 | 4,041 | 5,592 | 5,341 |
-| Rust | 231 | 1 | 571 | 267 | 519 | 225 |
-| **total** | **6,725** | **4,376** | **10,998** | **7,984** | **16,556** | **6,765** |
+| corpus | reload | dead store | remat | just-stored | still holds | silent store | computation |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| C++ | 2,086 | 203 | 8,970 | 3,676 | 10,445 | 1,199 | 21,230 |
+| Go | 4,408 | 4,172 | 1,457 | 4,041 | 5,592 | 5,341 | 4,915 |
+| Rust | 231 | 1 | 571 | 267 | 519 | 225 | 3,450 |
+| **total** | **6,725** | **4,376** | **10,998** | **7,984** | **16,556** | **6,765** | **29,595** |
+
+### What the three tables do not share
+
+A record in the memory table is a claim about a *place*: the bytes at
+(base, disp) are what some access left there. A record in the constant
+or computation table is a claim about a *register*. Nothing that
+happens to memory can disturb the second kind, and three events in the
+corpus separate them:
+
+* **An access through an address the decoder cannot name.** A vector
+  load or store lands somewhere `rv_decode_mem` cannot say, so every
+  place claim goes -- but the register claims stand, because whatever
+  the instruction wrote is already gone from the write scan that runs
+  first. `vse64.v v8,(a0)` between two `addi a0,s0,-K` is **145 of
+  ripgrep's 646 probe sites**, and dropping the whole window at it lost
+  every one.
+* **A fence or an atomic.** Both change memory; an atomic writes one
+  register, and the write scan sees it. 3 more of ripgrep's 646.
+* **A CSR access.** `csrr t0,vlenb` is how a vector prologue asks the
+  hardware its own register width, and it writes t0 and nothing else.
+  It shares opcode 0x73 with `ecall`, which can change anything, and the
+  funct3 field tells them apart: 25 of libLLVM's 17,132 probe sites are
+  a `csrr` between the two halves.
+
+The constant table does not take advantage of any of the three -- it is
+still dropped wherever the memory window is. Nothing here re-measures
+candidate 6 to find out what that costs; the observation is recorded
+rather than acted on.
 
 ### What the mining tools had wrong
 
@@ -1226,7 +1260,7 @@ second instruction writes it is one dominant idiom plus nothing.
 
 # Remaining candidates, ranked
 
-Sixteen checks are implemented and six candidates are measured and
+Seventeen checks are implemented and four candidates are measured and
 unwritten. Every figure below is from a `candscan` probe carrying the
 check's own preconditions -- the window's aliasing rule, the generation
 tests, the byte rule -- rather than from a shape count, and every one
@@ -1234,31 +1268,29 @@ was read out of a disassembler before it was believed:
 
 | # | candidate | C++ | Rust | Go | sites | bytes |
 |---|---|---:|---:|---:|---:|---:|
-| 16 | the same frame address computed twice | 25,251 | 5,660 | 3,776 | 34,687 | 52,960 |
 | 17 | a run of zero stores one wider store would do | 4,913 | 143 | 1,292 | 6,348 | 31,809 |
 | 19 | a conditional branch over an unconditional jump | 4,691 | 340 | 331 | 5,362 | 15,514 |
-| 20 | the same arithmetic computed twice | 2,657 | 126 | 1,804 | 4,587 | 9,314 |
 | 21 | a transfer to the instruction that follows it | 2,867 | 831 | 20 | 3,718 | 7,522 |
 | 22 | a bit-cast routed through a frame slot | 3,238 | 0 | 20 | 3,258 | - |
 
-The byte column is the whole ordering argument. By site count 16 is six
-times 19; by bytes it is three, because 16 shortens an instruction by
-two and 19 removes a jump. 22 has no byte figure because it has never
-had a probe of its own -- it is still counted only as a reason some
-other fold is unavailable, which is the weakest measurement on this
-page.
+The byte column is the whole ordering argument: 17 is larger than 19 by
+sites and twice as large by bytes, because 17 removes several stores and
+19 removes a jump. 22 has no byte figure because it has never had a
+probe of its own -- it is still counted only as a reason some other fold
+is unavailable, which is the weakest measurement on this page.
 
 Written against what is already in `riscvlint.c`, the order is not the
 same. 19 and 21 need no state at all, two adjacent instructions and a
-range test. 16 and 20 want a table the checker does not have -- a
-region-local record of computations, which is `check_const_remat`'s
-constant table generalised from `li` to everything that writes one GPR.
-17 needs a run tracker and a cover cost, and nothing else.
+range test; 19's one precondition is a bit lookup in the table
+`mark_branch_targets` already builds. 17 needs a run tracker and a cover
+cost, and a finding that spans up to eight instructions where every
+finding the tool emits today spans one or two.
 
-18 was the one that needed nothing new, and it is written: the window
-already held base, displacement, width and register, and the check is
-the dead store read backwards. Its section below records what the probe
-had right and what it did not.
+Two candidates left this table by being written. 18 needed nothing new
+-- the window already held base, displacement, width and register, and
+the check is the dead store read backwards. 16 and 20 turned out to be
+one check rather than two; their joint section below says why, and what
+it cost to find out.
 
 Everything else this file ever sized is written. The last entry, base-C
 compression, was recorded at 384 sites on the strength of the two RVC
@@ -1267,7 +1299,16 @@ rules a shape token could decide; the full encodability pass found
 whose immediates were relocations when the assembler saw them. A census
 that can only ask about `mv` and `li` cannot see a `%pcrel_lo` addi.
 
-### 16. The same frame address computed twice -- 34,687
+### 16 and 20. A computation a live register already holds -- 29,595 of 39,274  [implemented]
+
+These were sized as two candidates and are one check. They come out of
+one probe, split by one boolean: `cse|FRAME ADDRESS` is `addi` whose
+base is sp or s0, `cse|ARITHMETIC` is everything else, and nothing in
+`check_comp_remat` tells them apart. Same table, same match, same byte
+rule. Written together the family is `cse|TOTAL` -- 27,908 C++, 5,786
+Rust, 5,580 Go, which is 34,687 + 4,587 to the site.
+
+#### 16, as measured -- 34,687
 
 `addi rd,sp,K` or `addi rd,s0,-K` computing an address a live register
 already holds, which is `mv rd,rprev` -- or a deletion where the address
@@ -1296,6 +1337,72 @@ behind such a branch.
 This is not the `auipc`+`addi` symbol address measured at 39 and
 rejected above. That one is a linker-relaxed global address; this is a
 frame slot, and the two populations do not overlap.
+
+#### What the check reports -- 29,595 and 62,212 bytes
+
+| corpus | sites | bytes | delete | mv |
+|---|---:|---:|---:|---:|
+| C++ | 21,230 | 43,756 | 650 | 20,580 |
+| Rust | 3,450 | 6,924 | 20 | 3,430 |
+| Go | 4,915 | 11,532 | 873 | 4,042 |
+| **total** | **29,595** | **62,212** | **1,543** | **28,052** |
+
+The check and the probe agree exactly, in all three cohorts, once the
+probe is asked the check's own question rather than the family's. That
+question is one key rather than two splits -- `cse|CHECK|reported`
+against `cse|CHECK|no saving at 2 bytes` and `cse|CHECK|rd is sp/gp/tp`
+-- because the two conditions are independent and subtracting them
+separately double-counts wherever they meet. That was the arithmetic
+candidate 18's reconciliation got wrong before it was measured jointly,
+and the lesson is the only reason this one came out clean.
+
+What the probe counts and the check does not report:
+
+* **9,622 already spelled in two bytes.** `c.addi4spn` names the
+  destination and `c.mv` would name it too, so the rewrite saves nothing
+  and trades an instruction that depends on nothing for one that depends
+  on another register. Same byte rule as candidate 6, where it removes
+  97% of the population; here it removes a quarter.
+* **64 writing sp, gp or tp.** `addi sp,s0,-K` over a frame that never
+  moved is `check_redundant_sp_restore`'s finding, which says more; the
+  other two hold what the ABI says they hold. 27 of ripgrep's 646 probe
+  sites write one of the three, and 26 of those are already reported as
+  that restore.
+
+The delete/mv split is the one place the check reports *more* than the
+probe: 1,543 against 1,517. The probe scans registers in order and takes
+the first match, so where both the destination and some other register
+hold the value it reports the move; the check tries the destination
+first, because deleting is worth more than moving.
+
+#### Where the probe and the check part
+
+Nowhere, in the end -- but three rules had to be found first, and each
+was worth a measurement. All three are the same distinction: a record in
+the memory table is a claim about a place, and a record in the
+computation table is a claim about a register, so a memory event takes
+the first kind and leaves the second. Written the obvious way -- drop
+the whole window wherever the window is dropped today -- the check
+reported 456 of ripgrep's 646 sites instead of 601. The vector case was
+145 of that 190, the fence and atomic 3, and a `csrr` between the halves
+another 25 in libLLVM. "What the three tables do not share" above has
+the detail.
+
+#### What it collides with -- 232 of 29,595
+
+Measured by intersecting the check's own reported addresses with every
+other check's, per binary: 140 base-C compressible, 33 Zcb, 25 redundant
+extension, 23 dead register definition, 11 `zext.w`. 0.78% of the
+family, against 16,913 double-reports the other sixteen checks already
+carry between them.
+
+No stand-down was written for any of them, which is the opposite of the
+decision candidate 18 needed. There the two findings *contradicted*:
+`check_dead_store` deletes the first of two stores and
+`check_silent_store` deletes the second, and applying both loses the
+value. Here they agree -- an instruction that is both compressible and
+redundant is both, and either rewrite is sound on its own. What is
+double-counted is bytes, not correctness.
 
 ### 17. A run of zero stores one wider store would do -- 6,348
 
@@ -1447,7 +1554,10 @@ The jump must not itself be a branch target, or the paths that reach it
 lose their transfer. That is the only precondition, and it is a bit
 lookup in the table `mark_branch_targets` already builds.
 
-### 20. The same arithmetic computed twice -- 4,587
+### 20. The same arithmetic computed twice -- 4,587  [implemented]
+
+Written as part of candidate 16 above, which has the check's figures and
+its reconciliation. This section is what the probe measured on its own.
 
 Candidate 16 without the frame-address idiom in it: the same mnemonic,
 the same sources, the same immediate, with nothing written in between.
@@ -1521,18 +1631,19 @@ them compressed, 53,690,808 pairs:
 |---|---|---:|---:|
 | 1 | `auipc`+`jalr` within `jal` reach | 292,243 | 2,378,734 |
 | 2 | frame-pointer teardown over a static frame | 112,401 | 135,045 |
-| 3 | base-C-compressible, on a toolchain that compresses | 22,596 | 384 |
-| 4 | dead register definitions | 11,989 | 117,538 |
-| 5 | a load into the register that still holds it | 10,964 | - |
-| 6 | constant re-materialization | 9,541 | 230,973 |
-| 7 | extension the producer already guarantees | 6,922 | 6,611 |
-| 8 | a slot stored and then loaded back | 3,943 | 142,471 |
-| 9 | `addi` folded into a memory offset | 3,351 | 58,930 |
-| 10 | a comparison a branch could have made | 2,937 | 26,417 |
-| 11 | redundant reloads | 2,317 | 29,193 |
-| 12 | a store of bytes the slot already holds | 1,424 | 1,791 |
-| 13 | Zcb-compressible, target declares Zcb | 886 | - |
-| 14 | dead store to a frame slot | 204 | 6,920 |
+| 3 | a computation a live register already holds | 24,680 | 33,694 |
+| 4 | base-C-compressible, on a toolchain that compresses | 22,596 | 384 |
+| 5 | dead register definitions | 11,989 | 117,538 |
+| 6 | a load into the register that still holds it | 10,964 | - |
+| 7 | constant re-materialization | 9,541 | 230,973 |
+| 8 | extension the producer already guarantees | 6,922 | 6,611 |
+| 9 | a slot stored and then loaded back | 3,943 | 142,471 |
+| 10 | `addi` folded into a memory offset | 3,351 | 58,930 |
+| 11 | a comparison a branch could have made | 2,937 | 26,417 |
+| 12 | redundant reloads | 2,317 | 29,193 |
+| 13 | a store of bytes the slot already holds | 1,424 | 1,791 |
+| 14 | Zcb-compressible, target declares Zcb | 886 | - |
+| 15 | dead store to a frame slot | 204 | 6,920 |
 | - | Zba shift-add | 232 | 49,881 |
 | - | Zbb/Zbs/Zcb idioms on an RVA23 target | 1,025 | - |
 | - | move coalescing | 192 | 73,017 |
@@ -1541,10 +1652,17 @@ them compressed, 53,690,808 pairs:
 
 Both columns are measured over this cohort of the current corpus, and no
 row's raw figure carries a precondition -- that is what the actionable
-column is for, and row 8's two columns are the widest apart of any here
-for a reason candidate 14 sets out. Row 5 has no raw figure at all: its
+column is for, and row 9's two columns are the widest apart of any here
+for a reason candidate 14 sets out. Row 6 has no raw figure at all: its
 shape is one `candscan` counts only as a reason some other fold is
 unavailable, which candidate 15 explains.
+
+Row 3 is the newest and the one that changes this table's shape: it is
+the first check to place above base-C compression in the cohort where
+GCC and LLVM leave almost no compression on the table at all. Its two
+columns are close because the probe carries nearly every precondition
+the check does: of the 9,014 between them, 8,959 are matches already
+spelled in two bytes, where a `c.mv` saves nothing, and 55 write sp.
 
 Row 1 used to read "121,543+", the `pairscan -x` pairs
 whose `auipc` immediate was inside `jal`'s reach, and the plus sign was
@@ -1553,18 +1671,18 @@ it is the mistake "Raw fields versus decoded values" below is about, so
 the row now carries the family total instead.
 
 Two rows have a raw figure *smaller* than the actionable one, which is
-worth knowing rather than hiding. Row 7: `candscan` keys the producer on
+worth knowing rather than hiding. Row 8: `candscan` keys the producer on
 a mnemonic and the check also bounds the value by an `andi` mask, so the
-check sees shapes the scan cannot. Row 3 is the row where a shape scan
+check sees shapes the scan cannot. Row 4 is the row where a shape scan
 was least use at all -- it can only ask about `mv` and `li`, and the
 answer is 384 wide `mv` out of 4,629,930 and 0 wide in-range `li` out of
 3,065,349, against 22,596 from the full encodability pass.
 
 The `redundant mask after lbu` row is gone from this table: it was 142
-here and is now part of row 7, which subsumes it at 2,634 in this
+here and is now part of row 8, which subsumes it at 2,634 in this
 cohort once the window is a region rather than a pair.
 
-Items 2 and 7 are the two toolchains taking turns. Candidate 2 is
+Items 2 and 8 are the two toolchains taking turns. Candidate 2 is
 100,716 libLLVM and 0 libQt6Core -- clang and rustc restore sp from the
 frame pointer unconditionally, GCC does not. Candidate 7 is 3,433
 Qt6Core against 817 libLLVM -- GCC re-extends a value its own load

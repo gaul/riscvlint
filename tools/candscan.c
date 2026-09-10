@@ -1491,6 +1491,19 @@ static void scan_section(csh handle, const char *path, const uint8_t *code,
                     if (insn->size == 4) bump("cse|BYTES|2", dd);
                 }
                 if (r->xbr) bump("cse|xbr", dd);
+                // What the written check reports of this family, as one
+                // key rather than two splits: sp, gp and tp stand down,
+                // and a match already spelled in two bytes saves
+                // nothing unless it deletes. Subtracting the two splits
+                // separately double-counts wherever they meet, which is
+                // the arithmetic candidate 18's reconciliation got
+                // wrong before it was measured jointly.
+                if (d0 == 2 || d0 == 3 || d0 == 4)
+                    bump("cse|CHECK|rd is sp/gp/tp", dd);
+                else if (j == d0 || insn->size == 4)
+                    bump("cse|CHECK|reported", dd);
+                else
+                    bump("cse|CHECK|no saving at 2 bytes", dd);
                 bump("cse|TOTAL", dd);
                 show(key, r->addr, here);
                 break;

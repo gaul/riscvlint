@@ -1,0 +1,120 @@
+dead register definition at offset: 0x0: -> delete; nothing reads a0 (4 bytes) (1 instructions)
+  addi a0, s0, -0x70
+
+dead register definition at offset: 0x6: -> delete; nothing reads a3 (4 bytes) (1 instructions)
+  addi a3, s0, -0x70
+
+computation a live register already holds at offset: 0x6: -> mv a3, a0; computed at 0x0 (4 -> 2 bytes) (1 instructions)
+  addi a3, s0, -0x70
+
+computation a live register already holds at offset: 0x12: -> delete; a4 already holds this from 0xa (4 bytes) (1 instructions)
+  slli a4, a2, 0x20
+
+dead register definition at offset: 0x16: -> delete; nothing reads a3 (4 bytes) (1 instructions)
+  srliw a3, a5, 0x17
+
+dead register definition at offset: 0x1a: -> delete; nothing reads a2 (2 bytes) (1 instructions)
+  addi a2, a2, 1
+
+computation a live register already holds at offset: 0x1c: -> mv a2, a3; computed at 0x16 (4 -> 2 bytes) (1 instructions)
+  srliw a2, a5, 0x17
+
+dead register definition at offset: 0x20: -> delete; nothing reads a0 (4 bytes) (1 instructions)
+  addi a0, s0, -0x60
+
+dead register definition at offset: 0x26: -> delete; nothing reads a3 (4 bytes) (1 instructions)
+  addi a3, s0, -0x60
+
+computation a live register already holds at offset: 0x26: -> mv a3, a0; computed at 0x20 (4 -> 2 bytes) (1 instructions)
+  addi a3, s0, -0x60
+
+dead register definition at offset: 0x36: -> delete; nothing reads a0 (4 bytes) (1 instructions)
+  addi a0, s0, -0x50
+
+computation a live register already holds at offset: 0x36: -> mv a0, a3; computed at 0x2a (4 -> 2 bytes) (1 instructions)
+  addi a0, s0, -0x50
+
+dead register definition at offset: 0x3a: -> delete; nothing reads a0 (4 bytes) (1 instructions)
+  addi a0, s0, -0x40
+
+dead register definition at offset: 0x40: -> delete; nothing reads a3 (4 bytes) (1 instructions)
+  addi a3, s0, -0x40
+
+computation a live register already holds at offset: 0x40: -> mv a3, a0; computed at 0x3a (4 -> 2 bytes) (1 instructions)
+  addi a3, s0, -0x40
+
+dead register definition at offset: 0x4e: -> delete; nothing reads a3 (4 bytes) (1 instructions)
+  add a3, a0, a1
+
+dead register definition at offset: 0x56: -> delete; nothing reads a2 (2 bytes) (1 instructions)
+  addi a2, a2, 1
+
+dead register definition at offset: 0x5c: -> delete; nothing reads a0 (4 bytes) (1 instructions)
+  addi a0, s0, -0x30
+
+dead register definition at offset: 0x62: -> delete; nothing reads a3 (4 bytes) (1 instructions)
+  addi a3, s0, -0x30
+
+dead register definition at offset: 0x66: -> delete; nothing reads a0 (4 bytes) (1 instructions)
+  addi a0, s0, -0x28
+
+dead register definition at offset: 0x6a: -> delete; nothing reads a0 (2 bytes) (1 instructions)
+  li a0, 0
+
+dead register definition at offset: 0x6c: -> delete; nothing reads a3 (4 bytes) (1 instructions)
+  addi a3, s0, -0x28
+
+dead register definition at offset: 0x70: -> delete; nothing reads a0 (4 bytes) (1 instructions)
+  addi a0, s0, -0x20
+
+dead register definition at offset: 0x74: -> delete; nothing reads a3 (4 bytes) (1 instructions)
+  addi a3, s0, -0x18
+
+call pair foldable to jal at offset: 0x84: -> jal ra, 0xbe (2 instructions)
+  auipc ra, 0
+  jalr 0x3a(ra)
+
+dead register definition at offset: 0x8c: -> delete; nothing reads a3 (4 bytes) (1 instructions)
+  addi a3, s0, -0x10
+
+dead register definition at offset: 0x90: -> delete; nothing reads a0 (4 bytes) (1 instructions)
+  addi a0, s0, -8
+
+dead register definition at offset: 0x96: -> delete; nothing reads a3 (4 bytes) (1 instructions)
+  addi a3, s0, -8
+
+dead register definition at offset: 0x9a: -> delete; nothing reads a0 (4 bytes) (1 instructions)
+  mv a0, a1
+
+instruction compressible to a base C form at offset: 0x9a: -> c.mv (4 -> 2 bytes) (1 instructions)
+  mv a0, a1
+
+instruction compressible to a base C form at offset: 0x9e: -> c.addi (4 -> 2 bytes) (1 instructions)
+  addi a2, a2, 1
+
+dead register definition at offset: 0xa2: -> delete; nothing reads a3 (4 bytes) (1 instructions)
+  mv a3, a1
+
+instruction compressible to a base C form at offset: 0xa2: -> c.mv (4 -> 2 bytes) (1 instructions)
+  mv a3, a1
+
+dead register definition at offset: 0xa6: -> delete; nothing reads a0 (4 bytes) (1 instructions)
+  li a0, 0x4d2
+
+instruction compressible to a base C form at offset: 0xaa: -> c.addi (4 -> 2 bytes) (1 instructions)
+  addi a2, a2, 1
+
+dead register definition at offset: 0xae: -> delete; nothing reads a3 (4 bytes) (1 instructions)
+  li a3, 0x4d2
+
+constant re-materialization at offset: 0xae: -> mv a3, a0; 1234 set at 0xa6 (4 -> 2 bytes) (1 instructions)
+  li a3, 0x4d2
+
+Optimization opportunities by type:
+      25  dead register definition
+       6  computation a live register already holds
+       4  instruction compressible to a base C form
+       1  call pair foldable to jal
+       1  constant re-materialization
+
+37 optimization opportunities in 56 instructions

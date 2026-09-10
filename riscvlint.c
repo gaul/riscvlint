@@ -1048,6 +1048,34 @@ typedef struct {
     unsigned size;       // encoded bytes of the access that made the record
 } rvl_slot;
 
+// A computation the region has performed, one record per register.
+// `check_comp_remat` asks of the instruction under the cursor whether
+// some live register already holds the value it is about to compute --
+// the question `check_const_remat` asks about `li`, widened to
+// everything that writes one register as a function of registers.
+//
+// The mnemonic is the key because capstone prints a compressed form and
+// the form it compresses under the same name, so `c.addi4spn a0,sp,16`
+// and `addi s3,sp,16` compare equal on everything that matters.
+//
+// A constant has no inputs, which is why the table beside this one gets
+// away with clearing a record only when its own register is written.
+// This one carries the rule that costs: a record dies when a *source*
+// is written too, since a computation is only still in a register while
+// the values it read are the ones still in its operands.
+typedef struct {
+    bool live;
+    char mn[32];         // capstone's own mnemonic field, whole: a
+                         // truncated key would make two mnemonics that
+                         // share a prefix compare equal
+    int rs1, rs2;        // -1 where absent; x0 counts as absent, since
+                         // nothing can redefine it
+    bool has_imm;
+    int64_t imm;
+    uint64_t addr;       // where the computation was performed
+    unsigned size;       // its encoded bytes, which is what a delete saves
+} rvl_comp;
+
 struct riscvlint_state {
     const uint8_t *code;
     size_t size;
@@ -1085,6 +1113,7 @@ struct riscvlint_state {
         bool const_live[32];
         int64_t const_val[32];
         uint64_t const_addr[32];
+        rvl_comp comp[32];
     } win;
 };
 
@@ -1731,6 +1760,7 @@ void riscvlint_state_drop_window(riscvlint_state *state)
 {
     state->win.nslots = 0;
     memset(state->win.const_live, 0, sizeof state->win.const_live);
+    for (int i = 0; i < 32; i++) state->win.comp[i].live = false;
 }
 
 static rvl_slot *slot_for(riscvlint_state *state, unsigned base, int64_t disp,
@@ -1778,6 +1808,93 @@ static bool decode_const(uint32_t w, unsigned size, unsigned *rd, int64_t *val)
     return false;
 }
 
+// A register operand as the computation table numbers it: -1 for an
+// operand that is absent, an immediate, or x0 -- three things this table
+// cannot tell apart and does not need to, since an alias that names x0
+// and one that omits the operand have different mnemonics, and nothing
+// can redefine x0. -2 is a register the table cannot follow at all,
+// which disqualifies the instruction rather than being recorded as
+// "absent".
+static int comp_reg(const cs_insn *insn, int i)
+{
+    const cs_riscv *a = &insn->detail->riscv;
+    if (i >= a->op_count || a->operands[i].type != RISCV_OP_REG) return -1;
+    unsigned n = cs_reg_to_num(a->operands[i].reg);
+    if (n >= 32) return -2;                 // the other register file
+    return n == 0 ? -1 : (int)n;
+}
+
+static bool comp_imm(const cs_insn *insn, int i, int64_t *v)
+{
+    const cs_riscv *a = &insn->detail->riscv;
+    if (i >= a->op_count || a->operands[i].type != RISCV_OP_IMM) return false;
+    *v = a->operands[i].imm;
+    return true;
+}
+
+// Which instructions this table can follow. The test is structural
+// rather than a list of mnemonics, because the match itself is on the
+// mnemonic: two instructions with the same mnemonic, the same sources
+// and the same immediate compute the same value. What has to be
+// excluded is instructions whose result is not a function of their
+// register operands at all.
+static bool comp_eligible(const cs_insn *insn, unsigned nw)
+{
+    const char *m = insn->mnemonic;
+    if (nw != 1) return false;
+    if (insn_in_group(insn, RISCV_GRP_CALL) ||
+        insn_in_group(insn, RISCV_GRP_BRANCH_RELATIVE) ||
+        insn_in_group(insn, RISCV_GRP_JUMP) ||
+        insn_in_group(insn, RISCV_GRP_RET) ||
+        !strcmp(m, "jal") || !strcmp(m, "jalr"))
+        return false;
+    const cs_riscv *a = &insn->detail->riscv;
+    for (int i = 0; i < a->op_count; i++)
+        if (a->operands[i].type == RISCV_OP_MEM) return false;
+    // csrr and rdtime read state this window does not model; the
+    // f-prefixed writers of a general register read the other register
+    // file; li and lui are check_const_remat's, auipc is the address
+    // re-materialization measured at 39 and rejected, and `mv` is move
+    // coalescing, measured at 192 and rejected. See TODO.md.
+    if (!strncmp(m, "csr", 3) || !strncmp(m, "rd", 2) || m[0] == 'f')
+        return false;
+    return strcmp(m, "li") && strcmp(m, "lui") && strcmp(m, "auipc") &&
+           strcmp(m, "mv");
+}
+
+// The computation an instruction performs, in the form the table
+// records it. False when it is not one this table can follow.
+//
+// `wreg` is the one register cs_regs_access says the instruction writes.
+// The key reads the destination off operand 0, which is where every
+// eligible form puts it; requiring the two to agree means a form that
+// does not is refused rather than recorded against the wrong register.
+static bool comp_key(const cs_insn *insn, unsigned nw, unsigned wreg,
+                     unsigned *rd, rvl_comp *k)
+{
+    if (!comp_eligible(insn, nw)) return false;
+    int d = comp_reg(insn, 0);
+    if (d < 1 || d != (int)wreg) return false;
+    memset(k, 0, sizeof *k);
+    k->rs1 = comp_reg(insn, 1);
+    k->rs2 = comp_reg(insn, 2);
+    if (k->rs1 < -1 || k->rs2 < -1) return false;
+    k->has_imm = comp_imm(insn, 2, &k->imm);
+    snprintf(k->mn, sizeof k->mn, "%s", insn->mnemonic);
+    k->addr = insn->address;
+    k->size = insn->size;
+    k->live = true;
+    *rd = (unsigned)d;
+    return true;
+}
+
+static bool comp_same(const rvl_comp *a, const rvl_comp *b)
+{
+    return a->rs1 == b->rs1 && a->rs2 == b->rs2 &&
+           a->has_imm == b->has_imm && (!a->has_imm || a->imm == b->imm) &&
+           !strcmp(a->mn, b->mn);
+}
+
 void riscvlint_state_observe(riscvlint_state *state, const cs_insn *insn)
 {
     uint32_t w;
@@ -1798,6 +1915,16 @@ void riscvlint_state_observe(riscvlint_state *state, const cs_insn *insn)
         unsigned n = cs_reg_to_num(rw[i]);
         if (n >= 32) continue;
         state->win.const_live[n] = false;
+        state->win.comp[n].live = false;
+        // A computation stays available only while the values it read
+        // are still in the registers it read them from, so losing a
+        // source loses the record. This is the rule the constant table
+        // beside it does not need.
+        for (unsigned j = 1; j < 32; j++)
+            if (state->win.comp[j].live &&
+                (state->win.comp[j].rs1 == (int)n ||
+                 state->win.comp[j].rs2 == (int)n))
+                state->win.comp[j].live = false;
         for (int j = 0; j < state->win.nslots; j++) {
             rvl_slot *sl = &state->win.slots[j];
             if (sl->data == n) sl->held = false;
@@ -1814,9 +1941,15 @@ void riscvlint_state_observe(riscvlint_state *state, const cs_insn *insn)
     bool decoded = rv_decode_mem(w, insn->size, &kind, &data, &base, &off);
     if (!decoded && touches_memory(w, insn->size)) {
         // Something touched memory and we cannot say where. Every claim
-        // in the window is about a place, so none of them survive.
-        riscvlint_state_drop_window(state);
-        return;
+        // about a *place* goes with it -- but the computation table's
+        // claims are about registers, and an access through an address
+        // we cannot name cannot disturb one; whatever it writes, step 1
+        // above already took away. Vector code is where the two part:
+        // `vse64.v v8,(a0)` between two `addi a0,s0,-K` is 145 of
+        // ripgrep's 646 sites, and dropping the whole window at it lost
+        // every one of them.
+        state->win.nslots = 0;
+        memset(state->win.const_live, 0, sizeof state->win.const_live);
     }
     if (decoded) {
         unsigned width = mem_width(kind);
@@ -1888,7 +2021,19 @@ void riscvlint_state_observe(riscvlint_state *state, const cs_insn *insn)
         state->win.const_addr[crd] = insn->address;
     }
 
-    // 4. A conditional branch takes away every claim that a store is
+    // 4. The computation this instruction performs, after the
+    //    invalidation above and never when the destination is one of
+    //    its own sources: `add a0,a0,a1` leaves nothing that can name
+    //    the a0 it read, so a later `add rd,a0,a1` computes something
+    //    else. That was a false positive in the probe before it was a
+    //    rule here.
+    rvl_comp key;
+    unsigned krd;
+    if (nw == 1 && comp_key(insn, nw, cs_reg_to_num(rw[0]), &krd, &key) &&
+        key.rs1 != (int)krd && key.rs2 != (int)krd)
+        state->win.comp[krd] = key;
+
+    // 5. A conditional branch takes away every claim that a store is
     //    dead, and only those. "Dead" means the overwrite is certain to
     //    happen before anyone reads the slot, and a branch is a path on
     //    which it does not happen at all -- the shape is
@@ -1898,17 +2043,33 @@ void riscvlint_state_observe(riscvlint_state *state, const cs_insn *insn)
     //    A held value is not affected. The instruction that would read
     //    it is reached by falling through, so everything recorded here
     //    ran; and if it can also be reached by a branch, it is a side
-    //    entry and step 5 drops the window at it.
+    //    entry and step 7 drops the window at it.
     if (is_cond_branch_raw(w, insn->size))
         for (int j = 0; j < state->win.nslots; j++)
             state->win.slots[j].unread = false;
 
-    // 5. Anything that can change memory or control behind our back.
+    // 6. Anything that can change memory or control behind our back. A
+    //    fence or an atomic is a memory event: it takes the place
+    //    claims and leaves the register claims standing, for the reason
+    //    the unknown-address case above gives. A transfer ends the
+    //    region, and a system instruction can change a register nothing
+    //    here is watching, so those two take everything.
     if (ends_memory_window(w, insn->size)) {
-        riscvlint_state_drop_window(state);
-        return;
+        state->win.nslots = 0;
+        memset(state->win.const_live, 0, sizeof state->win.const_live);
+        // 0x73 is the CSR opcode as well as the environment one, and
+        // the two do not deserve the same answer. A CSR access writes
+        // the register step 1 already saw and nothing else, and no
+        // computation this table follows reads a control register --
+        // the vector and floating-point instructions that do are not
+        // eligible. `csrr t0,vlenb` between the two halves is 25 of
+        // libLLVM's 17,132 probe sites. funct3 == 0 is the environment
+        // half, which can change anything.
+        bool env = RV_OPCODE(w) == 0x73u && ((w >> 12) & 0x7u) == 0;
+        if (rv_ends_region(w, insn->size) || env)
+            for (int i = 0; i < 32; i++) state->win.comp[i].live = false;
     }
-    // 6. A side entry on the next instruction means what follows is not
+    // 7. A side entry on the next instruction means what follows is not
     //    reached only from here.
     if (riscvlint_is_branch_target(state, insn->address + insn->size))
         riscvlint_state_drop_window(state);
@@ -2315,6 +2476,69 @@ bool check_const_remat(riscvlint_state *state, const cs_insn *insn,
                  "mv %s, %s; %" PRId64 " set at 0x%" PRIx64 " (4 -> %u bytes)",
                  rv_reg_name(rd), rv_reg_name(r), val,
                  state->win.const_addr[r], mv_bytes());
+        return true;
+    }
+    return false;
+}
+
+// ---- a computation a live register already holds ----
+
+bool check_comp_remat(riscvlint_state *state, const cs_insn *insn,
+                      riscvlint_finding *finding)
+{
+    cs_regs rr, rw;
+    uint8_t nr = 0, nw = 0;
+    if (cs_regs_access(state->handle, insn, rr, &nr, rw, &nw) != CS_ERR_OK)
+        return false;
+    if (nw != 1) return false;
+    rvl_comp key;
+    unsigned rd;
+    if (!comp_key(insn, nw, cs_reg_to_num(rw[0]), &rd, &key)) return false;
+    // sp, gp and tp hold what the ABI says they hold rather than a value
+    // a region computed, and the one shape that writes sp this way --
+    // `addi sp,s0,-K` restoring a frame that never moved -- is
+    // check_redundant_sp_restore's finding, which says why. Excluding
+    // them here is what keeps the two checks off each other's sites: 27
+    // of ripgrep's 646 probe sites write one of the three, and 26 of
+    // those are already reported as that restore.
+    if (rd == 2 || rd == 3 || rd == 4) return false;
+    // A relocated immediate is a placeholder the linker fills, so two
+    // instructions carrying it are not yet known to compute the same
+    // value.
+    if (riscvlint_is_relocated(state, insn->address)) return false;
+
+    // The destination register first. Where it already holds the value,
+    // the instruction goes away instead of turning into a move, which
+    // is worth more -- and worth more than whatever a scan in register
+    // order would have found first.
+    const rvl_comp *own = &state->win.comp[rd];
+    if (own->live && comp_same(own, &key)) {
+        finding->title = "computation a live register already holds";
+        finding->address = insn->address;
+        finding->insn_count = 1;
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "delete; %s already holds this from 0x%" PRIx64 " (%u bytes)",
+                 rv_reg_name(rd), own->addr, insn->size);
+        return true;
+    }
+
+    // Anywhere else the rewrite is `c.mv rd,r`, which names any two
+    // non-zero registers and costs two bytes. Against a computation
+    // already spelled in two it saves nothing and trades an instruction
+    // that depends on nothing for one that depends on another register
+    // -- the same trade check_const_remat declines inside c.li's range,
+    // and 9,622 of the 39,274 sites in the corpus.
+    if (insn->size != 4) return false;
+    for (unsigned r = 1; r < 32; r++) {
+        if (r == rd || !state->win.comp[r].live) continue;
+        if (!comp_same(&state->win.comp[r], &key)) continue;
+        finding->title = "computation a live register already holds";
+        finding->address = insn->address;
+        finding->insn_count = 1;
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "mv %s, %s; computed at 0x%" PRIx64 " (4 -> %u bytes)",
+                 rv_reg_name(rd), rv_reg_name(r), state->win.comp[r].addr,
+                 mv_bytes());
         return true;
     }
     return false;

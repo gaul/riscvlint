@@ -344,24 +344,34 @@ unsigned rv_branch_encoded_size(unsigned funct3, unsigned rs1, unsigned rs2,
 
 // ---- the windowed memory and constant table ----
 //
-// Six checks -- redundant reload, dead store, constant
+// Seven checks -- redundant reload, dead store, constant
 // re-materialization, the load of a just-stored value, the load of a
-// value the register still holds and the store of a value the slot
-// already holds -- need the same thing: a region-local record of what is
-// already in a register and what is already in a frame slot. None of
-// them can be decided from a pair, which is why the distances cluster at
-// 4-15 instructions and why no pair scan ever saw them.
+// value the register still holds, the store of a value the slot already
+// holds and the computation a live register already holds -- need the
+// same thing: a region-local record of what is already in a register
+// and what is already in a frame slot. None of them can be decided from
+// a pair, which is why the distances cluster at 4-15 instructions and
+// why no pair scan ever saw them.
+//
+// It is three tables under one owner: the memory slots, the constant
+// table and the computation table. They do not have the same lifetime.
+// A slot is a claim about a *place*, and the other two are claims about
+// a *register*, so an event that reaches memory and not the register
+// file takes the first kind and leaves the last -- an access through an
+// address rv_decode_mem cannot name, a fence, an atomic, a CSR read.
+// The constant table does not yet take advantage of that; only the
+// computation table does, and TODO.md records what it is worth.
 //
 // The driver calls this once per instruction, **after** the checks have
-// run, because each of the six judges the instruction under the cursor
+// run, because each of the seven judges the instruction under the cursor
 // against the table as it stood before it. Recording an instruction also
 // clears the table when the *next* address is a side entry, which is
 // what keeps a check from reading a value across a branch into the
 // middle of a region.
 //
 // The two other stateful checks carry a scalar or two and update it
-// inline. This one is a table six checks read, so it gets a single
-// owner rather than six writers racing to keep it consistent.
+// inline. This one is a table seven checks read, so it gets a single
+// owner rather than seven writers racing to keep it consistent.
 void riscvlint_state_observe(riscvlint_state *state, const cs_insn *insn);
 
 // Drops the whole window. The driver calls it where it cannot keep the
@@ -529,7 +539,7 @@ bool check_redundant_reload(riscvlint_state *state, const cs_insn *insn,
 // is the extension the load's own signedness implies, and two of those
 // spellings need Zba or Zbb.
 //
-// This is the cheapest of the six to decide. Nothing is deleted -- the
+// This is the cheapest of the seven to decide. Nothing is deleted -- the
 // store stays and the load becomes a register operation -- so there is
 // no liveness query, and both of the questions there are look backward
 // into the window that is already there: the record goes when the base
@@ -603,6 +613,44 @@ bool check_silent_store(riscvlint_state *state, const cs_insn *insn,
 // for a dependent one, so it is not reported.
 bool check_const_remat(riscvlint_state *state, const cs_insn *insn,
                        riscvlint_finding *finding);
+
+// The same question widened from `li` to everything that writes one
+// register as a function of registers: a computation whose result is
+// still live in a register, which is `mv rd,rprev`, or a deletion where
+// the register it is about to write already holds it.
+//
+// Most of the population is a frame address -- `addi rd,sp,K` or
+// `addi rd,s0,-K` -- and the rest is ordinary arithmetic. They are one
+// check rather than two: the same table, the same match, the same byte
+// rule, told apart only by whether the mnemonic is `addi` and the base
+// is a frame register. Sized separately at 34,687 and 4,587, they were
+// two rows of the ranked backlog before they were one check.
+//
+// The table this reads carries the rule the constant table does not
+// need: a record dies when a *source* is written, not only when its own
+// register is. Two rules came out of the probe as false positives
+// first. A computation whose destination is one of its own sources
+// (`add a0,a0,a1`) is not recorded at all, because nothing is left that
+// can name the value it read. And an instruction whose result is not a
+// function of its register operands -- `csrr`, `rdtime`, the f-prefixed
+// writers of a general register -- is refused, which is a structural
+// test rather than a list, since the match is on the mnemonic anyway.
+//
+// A conditional branch between the two does not matter, for the reason
+// the window's held values do not care about one: the second
+// instruction is reached by falling through, and a side entry resets
+// the region. 4,972 sites sit behind such a branch.
+//
+// sp, gp and tp are not reported. `addi sp,s0,-K` over a frame that
+// never moved is check_redundant_sp_restore's finding and says more,
+// and the other two hold what the ABI says they hold.
+//
+// Measured population: 29,595 sites and 62,212 bytes -- C++ 21,230,
+// Rust 3,450, Go 4,915 -- of which 28,052 become a move and 1,543
+// delete. It matches its probe exactly in all three cohorts. See
+// TODO.md.
+bool check_comp_remat(riscvlint_state *state, const cs_insn *insn,
+                      riscvlint_finding *finding);
 
 // A comparison materialized into a register and then tested with
 // `beqz`/`bnez`, where one branch would do both. The flagless analogue

@@ -1513,6 +1513,189 @@ static void test_window_checks(csh handle)
     CHECK(run_window(handle, check_redundant_reload, twice, sizeof twice,
                      0x1000, &f) == 1);
     CHECK(f.address == 0x1006);
+
+    // ---- a computation a live register already holds ----
+
+    // A frame address computed twice with only arithmetic between them.
+    // The second is four bytes because a3 is not a register c.addi4spn
+    // can name, and c.mv can name any two.
+    static const uint8_t comp[] = {
+        0x13, 0x05, 0x04, 0xf9,        // addi a0,s0,-112
+        0x05, 0x06,                    // c.addi a2,1
+        0x93, 0x06, 0x04, 0xf9,        // addi a3,s0,-112
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_comp_remat, comp, sizeof comp,
+                     0x1000, &f) == 1);
+    CHECK(f.address == 0x1006 && f.insn_count == 1);
+    CHECK(strstr(f.replacement, "mv a3, a0") != NULL);
+    CHECK(strstr(f.replacement, "computed at 0x1000") != NULL);
+    CHECK(strstr(f.replacement, "(4 -> 2 bytes)") != NULL);
+
+    // The register the instruction is about to write already holds the
+    // value, so it goes away rather than becoming a move -- four bytes
+    // rather than two.
+    static const uint8_t compdel[] = {
+        0x13, 0x17, 0x06, 0x02,        // slli a4,a2,32
+        0x93, 0x57, 0x07, 0x02,        // srli a5,a4,32
+        0x13, 0x17, 0x06, 0x02,        // slli a4,a2,32
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_comp_remat, compdel, sizeof compdel,
+                     0x1000, &f) == 1);
+    CHECK(f.address == 0x1008);
+    CHECK(strstr(f.replacement, "delete; a4 already holds this") != NULL);
+    CHECK(strstr(f.replacement, "from 0x1000 (4 bytes)") != NULL);
+
+    // A conditional branch over the second does not matter: it is
+    // reached by falling through, so everything the record saw ran.
+    static const uint8_t compbr[] = {
+        0x13, 0x05, 0x04, 0xf9,        // addi a0,s0,-112
+        0x19, 0xc2,                    // c.beqz a2,0x100a
+        0x93, 0x06, 0x04, 0xf9,        // addi a3,s0,-112
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_comp_remat, compbr, sizeof compbr,
+                     0x1000, &f) == 1);
+    CHECK(f.address == 0x1006);
+
+    // A vector store through an address the decoder cannot follow takes
+    // every claim about a place, and no claim about a register. This is
+    // the whole difference between the two tables' lifetimes, and 145 of
+    // ripgrep's 646 probe sites.
+    static const uint8_t compvec[] = {
+        0x93, 0x06, 0x04, 0xf9,        // addi a3,s0,-112
+        0x57, 0x70, 0x81, 0xcd,        // vsetivli zero,2,e64,m1,ta,ma
+        0x27, 0xf4, 0x06, 0x02,        // vse64.v v8,(a3)
+        0x13, 0x05, 0x04, 0xf9,        // addi a0,s0,-112
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_comp_remat, compvec, sizeof compvec,
+                     0x1000, &f) == 1);
+    CHECK(f.address == 0x100c);
+    CHECK(strstr(f.replacement, "mv a0, a3") != NULL);
+
+    // Negatives. A match already spelled in two bytes: c.addi4spn can
+    // name both destinations, so c.mv would save nothing and trade an
+    // independent instruction for a dependent one.
+    static const uint8_t compnarrow[] = {
+        0x08, 0x08,                    // c.addi4spn a0,sp,16
+        0x05, 0x06,                    // c.addi a2,1
+        0x0c, 0x08,                    // c.addi4spn a1,sp,16
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_comp_remat, compnarrow, sizeof compnarrow,
+                     0x1000, NULL) == 0);
+
+    // A def that wrote one of its own sources leaves nothing that can
+    // name the value it read, so it is not recorded at all. Without the
+    // rule every later `add rd,a0,a1` matches this record.
+    static const uint8_t compself[] = {
+        0x2e, 0x95,                    // c.add a0,a1
+        0x05, 0x06,                    // c.addi a2,1
+        0xb3, 0x06, 0xb5, 0x00,        // add a3,a0,a1
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_comp_remat, compself, sizeof compself,
+                     0x1000, NULL) == 0);
+
+    // sp holds what the ABI says it holds, and this shape --
+    // `addi sp,s0,-K` over a frame that never moved -- is
+    // check_redundant_sp_restore's finding, which says why.
+    static const uint8_t compsp[] = {
+        0x13, 0x01, 0x04, 0xf9,        // addi sp,s0,-112
+        0x05, 0x06,                    // c.addi a2,1
+        0x13, 0x01, 0x04, 0xf9,        // addi sp,s0,-112
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_comp_remat, compsp, sizeof compsp,
+                     0x1000, NULL) == 0);
+
+    // The source moved, so the second computes a different address.
+    static const uint8_t compsrc[] = {
+        0x13, 0x05, 0x04, 0xf9,        // addi a0,s0,-112
+        0x21, 0x04,                    // c.addi s0,8
+        0x93, 0x06, 0x04, 0xf9,        // addi a3,s0,-112
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_comp_remat, compsrc, sizeof compsrc,
+                     0x1000, NULL) == 0);
+
+    // The register holding the earlier result is overwritten, so there
+    // is nothing left to move from.
+    static const uint8_t compdst[] = {
+        0x13, 0x05, 0x04, 0xf9,        // addi a0,s0,-112
+        0x01, 0x45,                    // c.li a0,0
+        0x93, 0x06, 0x04, 0xf9,        // addi a3,s0,-112
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_comp_remat, compdst, sizeof compdst,
+                     0x1000, NULL) == 0);
+
+    // A different immediate is a different computation.
+    static const uint8_t compimm[] = {
+        0x13, 0x05, 0x04, 0xf9,        // addi a0,s0,-112
+        0x93, 0x06, 0x04, 0xfa,        // addi a3,s0,-96
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_comp_remat, compimm, sizeof compimm,
+                     0x1000, NULL) == 0);
+
+    // So is a different mnemonic over the same operands: srliw is a
+    // 32-bit shift and srli is a 64-bit one.
+    static const uint8_t compmn[] = {
+        0x9b, 0xd6, 0x77, 0x01,        // srliw a3,a5,23
+        0x05, 0x06,                    // c.addi a2,1
+        0x13, 0xd6, 0x77, 0x01,        // srli a2,a5,23
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_comp_remat, compmn, sizeof compmn,
+                     0x1000, NULL) == 0);
+
+    // `mv` is move coalescing, measured at 192 of 73,017 and rejected.
+    static const uint8_t compmv[] = {
+        0x13, 0x85, 0x05, 0x00,        // mv a0,a1
+        0x13, 0x06, 0x16, 0x00,        // addi a2,a2,1
+        0x93, 0x86, 0x05, 0x00,        // mv a3,a1
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_window(handle, check_comp_remat, compmv, sizeof compmv,
+                     0x1000, NULL) == 0);
+
+    // `li` is check_const_remat's, which reports this site and keys on
+    // the value rather than on the operands that made it.
+    static const uint8_t compli[] = {
+        0x13, 0x05, 0x20, 0x4d,        // li a0,1234
+        0x13, 0x06, 0x16, 0x00,        // addi a2,a2,1
+        0x93, 0x06, 0x20, 0x4d,        // li a3,1234
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_window(handle, check_comp_remat, compli, sizeof compli,
+                     0x1000, NULL) == 0);
+    CHECK(run_window(handle, check_const_remat, compli, sizeof compli,
+                     0x1000, NULL) == 1);
+
+    // A call ends the region: it can write any caller-saved register.
+    static const uint8_t compcall[] = {
+        0x13, 0x05, 0x04, 0xf9,        // addi a0,s0,-112
+        0x97, 0x00, 0x00, 0x00,        // auipc ra,0
+        0xe7, 0x80, 0xe0, 0x00,        // jalr 14(ra)
+        0x93, 0x06, 0x04, 0xf9,        // addi a3,s0,-112
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_comp_remat, compcall, sizeof compcall,
+                     0x1000, NULL) == 0);
+
+    // A side entry on the second: what follows is not reached only from
+    // the first.
+    static const uint8_t compside[] = {
+        0x13, 0x05, 0x04, 0xf9,        // addi a0,s0,-112
+        0x09, 0xc2,                    // c.beqz a2,0x1006
+        0x93, 0x06, 0x04, 0xf9,        // addi a3,s0,-112
+        0x82, 0x80,                    // ret
+    };
+    CHECK(run_window(handle, check_comp_remat, compside, sizeof compside,
+                     0x1000, NULL) == 0);
 }
 
 // ---- conditions and branches ----

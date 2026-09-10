@@ -26,11 +26,15 @@ dead register definition at offset: 0x14: -> delete; nothing reads s0 (2 bytes) 
 dead register definition at offset: 0x1e: -> delete; nothing reads s0 (2 bytes) (1 instructions)
   add s0, s0, s0
 
+computation a live register already holds at offset: 0x28: -> delete; s0 already holds this from 0x20 (4 bytes) (1 instructions)
+  slli s0, t2, 2
+
 dead register definition at offset: 0x36: -> delete; nothing reads s0 (2 bytes) (1 instructions)
   add s0, s0, t2
 
 Optimization opportunities by type:
        5  dead register definition
        4  slli + add foldable to shNadd
+       1  computation a live register already holds
 
-9 optimization opportunities in 23 instructions
+10 optimization opportunities in 23 instructions

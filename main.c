@@ -275,6 +275,7 @@ static const riscvlint_check_fn checks[] = {
     check_dead_store,
     check_silent_store,
     check_const_remat,
+    check_comp_remat,
     check_cond_to_branch,
 };
 
@@ -326,7 +327,7 @@ static void scan_section(csh handle, riscvlint_state *state,
             if (checks[i](state, insn, &f))
                 report(&f, handle, state, base, map_len, eh);
         }
-        // After the checks: the three that read the window judge this
+        // After the checks: the seven that read the window judge this
         // instruction against the table as it stood before it.
         riscvlint_state_observe(state, insn);
     }

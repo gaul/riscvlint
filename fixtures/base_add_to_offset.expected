@@ -47,6 +47,9 @@ dead register definition at offset: 0x42: -> delete; nothing reads a5 (2 bytes) 
 dead register definition at offset: 0x4a: -> delete; nothing reads a5 (2 bytes) (1 instructions)
   li a5, 0
 
+computation a live register already holds at offset: 0x5e: -> delete; a5 already holds this from 0x54 (4 bytes) (1 instructions)
+  addi a5, a0, 8
+
 dead register definition at offset: 0x64: -> delete; nothing reads a5 (2 bytes) (1 instructions)
   li a5, 0
 
@@ -59,5 +62,6 @@ dead register definition at offset: 0x76: -> delete; nothing reads a5 (2 bytes) 
 Optimization opportunities by type:
       10  dead register definition
        7  base add foldable into memory offset
+       1  computation a live register already holds
 
-17 optimization opportunities in 49 instructions
+18 optimization opportunities in 49 instructions
