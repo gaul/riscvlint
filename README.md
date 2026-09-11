@@ -3,17 +3,16 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Twenty checks are implemented and one measured candidate is left: a
-bit-cast routed through a frame slot, 3,258 sites, and the only row of
-the ledger that has never had a probe carrying its own preconditions.
-[TODO.md](TODO.md) is the ledger behind them: every candidate that was
+Twenty-one checks are implemented and the ledger's candidate list is
+empty. [TODO.md](TODO.md) is that ledger: every candidate that was
 measured, the population it came back with, and the ones rejected on
-that evidence. What got written was decided by the corpus rather than by
-intuition, and what did not get written was rejected the same way.
+that evidence.
+What got written was decided by the corpus rather than by intuition,
+and what did not get written was rejected the same way.
 
 ## Checks
 
-Twenty of them. Every figure below is what the check itself reports
+Twenty-one of them. Every figure below is what the check itself reports
 over the [corpus](#corpus) -- 73,139,165 instructions of three
 toolchains -- rather than what a mining tool estimated for it. The two
 have differed by an order of magnitude every time both were measured.
@@ -32,6 +31,7 @@ have differed by an order of magnitude every time both were measured.
 | load of a value the register still holds | 10,445 | 519 | 5,592 | 16,556 | 41,232 |
 | dead store to a frame slot | 203 | 1 | 4,172 | 4,376 | 16,714 |
 | run of zero stores one wider store would do | 4,913 | 143 | 1,292 | 6,348 | 32,960 |
+| bit-cast routed through a frame slot | 1,145 | 0 | 10 | 1,155 | 0 |
 | store of a value the slot already holds | 1,199 | 225 | 5,341 | 6,765 | 20,194 |
 | constant re-materialization | 8,970 | 571 | 1,457 | 10,998 | 21,996 |
 | computation a live register already holds | 21,230 | 3,450 | 4,915 | 29,595 | 62,212 |
@@ -40,7 +40,7 @@ have differed by an order of magnitude every time both were measured.
 | instruction compressible to a Zcb form | 705 | 181 | 29,762 | 30,648 | 61,296 |
 | redundant sign or zero extension | 6,589 | 333 | 1,593 | 8,515 | 20,864 |
 | dead register definition | 11,741 | 248 | 7,876 | 19,865 | 54,570 |
-| **total** | **327,842** | **192,611** | **3,066,693** | **3,587,146** | **8,060,142** |
+| **total** | **328,987** | **192,611** | **3,066,703** | **3,588,301** | **8,060,142** |
 
 Do not read the total row as a result. One row is 84% of it, and that
 row is Go's assembler declining to select RVC at all, which is a
@@ -437,6 +437,36 @@ handful of `jalr ra,0(ra)` that were already two.
   one that depends on another register. That is the same byte rule the
   constant check applies, and here it removes a quarter of the
   population rather than 97% of it.
+
+* **bit-cast routed through a frame slot** -- a value moved between the
+  two register files by storing it to a slot and loading it back, where
+  one instruction does it and touches no memory.
+
+  ```
+   fa84: fsw ft6, 256(sp)
+   fa88: lw  s1,  256(sp)       -> fmv.x.w s1, ft6
+  ```
+
+  Both widths and both directions: `fmv.x.w`, `fmv.w.x`, `fmv.x.d`,
+  `fmv.d.x`. The pairing has to be exact on width and on what the load
+  does with the bits -- `fmv.x.w` sign-extends the 32 it moves and so
+  does `lw`, but `lwu` does not, so that pairing is not one of these.
+
+  This is the one check here whose value is not bytes, and the table
+  above says so: none of the four moves has a compressed spelling, so
+  the rewrite breaks even against a four-byte load and would cost two
+  against a two-byte one. It is refused there -- 869 of the 2,380 sites
+  the probe finds are a `c.lwsp` or a `c.ldsp` reading the slot back.
+  What the remaining 1,155 remove is a load, a store-to-load dependency
+  through memory, and often the frame slot with it.
+
+  It is also the reason the windowed table records floating-point
+  accesses at all. Before this check they armed nothing, because the
+  table's write scan could not see the f registers and a claim about one
+  would never have been taken away. Now they do, and every other reader
+  skips a record whose register is in the other file -- an f register
+  and an x register with the same number are two registers, and the
+  record's data field alone cannot tell them apart.
 
 * **base add foldable into memory offset** -- `addi rd,rs,imm1` followed by
   `<load|store> rt,imm2(rd)` is one access at `imm1+imm2` from `rs`

@@ -1,0 +1,45 @@
+bit-cast routed through a frame slot at offset: 0x4: -> fmv.x.w s1, ft6; drops the load, stored at 0x0 (4 -> 4 bytes) (1 instructions)
+  lw s1, 0x100(sp)
+
+bit-cast routed through a frame slot at offset: 0xa: -> fmv.w.x fa5, a2; drops the load, stored at 0x8 (4 -> 4 bytes) (1 instructions)
+  flw fa5, 0x50(sp)
+
+bit-cast routed through a frame slot at offset: 0x1a: -> fmv.d.x fa4, a2; drops the load, stored at 0xe (4 -> 4 bytes) (1 instructions)
+  fld fa4, 0x1e8(s8)
+
+dead register definition at offset: 0x22: -> delete; nothing reads a1 (4 bytes) (1 instructions)
+  slli a1, a0, 4
+
+bit-cast routed through a frame slot at offset: 0x2c: -> fmv.x.d a2, fa4; drops the load, loaded at 0x1e (4 -> 4 bytes) (1 instructions)
+  ld a2, 0(s9)
+
+instruction compressible to a base C form at offset: 0x3a: -> c.ldsp (4 -> 2 bytes) (1 instructions)
+  ld s1, 0x108(sp)
+
+instruction compressible to a base C form at offset: 0x56: -> c.addi (4 -> 2 bytes) (1 instructions)
+  addi s1, s1, 8
+
+base add foldable into memory offset at offset: 0x56: -> lw a0, 264(s1) (8 -> 4 bytes) (2 instructions)
+  addi s1, s1, 8
+  lw a0, 0x100(s1)
+
+instruction compressible to a base C form at offset: 0x62: -> c.sd (4 -> 2 bytes) (1 instructions)
+  sd a4, 0(a3)
+
+instruction compressible to a base C form at offset: 0x6a: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a2, 0x128(sp)
+
+instruction compressible to a base C form at offset: 0x6e: -> c.ldsp (4 -> 2 bytes) (1 instructions)
+  ld a0, 0x128(sp)
+
+load of a just-stored value at offset: 0x6e: -> mv a0, a2; stored at 0x6a (4 -> 2 bytes) (1 instructions)
+  ld a0, 0x128(sp)
+
+Optimization opportunities by type:
+       5  instruction compressible to a base C form
+       4  bit-cast routed through a frame slot
+       1  base add foldable into memory offset
+       1  dead register definition
+       1  load of a just-stored value
+
+12 optimization opportunities in 31 instructions

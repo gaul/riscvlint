@@ -17,6 +17,18 @@ static const char *const rv_reg_names[32] = {
     "s8",   "s9", "s10", "s11", "t3", "t4", "t5", "t6",
 };
 
+static const char *const rv_freg_names[32] = {
+    "ft0", "ft1", "ft2",  "ft3",  "ft4", "ft5", "ft6",  "ft7",
+    "fs0", "fs1", "fa0",  "fa1",  "fa2", "fa3", "fa4",  "fa5",
+    "fa6", "fa7", "fs2",  "fs3",  "fs4", "fs5", "fs6",  "fs7",
+    "fs8", "fs9", "fs10", "fs11", "ft8", "ft9", "ft10", "ft11",
+};
+
+static const char *rv_freg_name(unsigned n)
+{
+    return n < 32 ? rv_freg_names[n] : "f?";
+}
+
 static const char *rv_reg_name(unsigned n)
 {
     return n < 32 ? rv_reg_names[n] : "?";
@@ -1476,6 +1488,21 @@ static unsigned cs_reg_to_num(unsigned r)
     return 32;   // not a general register
 }
 
+// The same for the other register file. Capstone names f0 three times
+// over -- once per width it can hold -- and all three are the same
+// register, which is the whole reason a bit-cast through memory is
+// spelled the way it is.
+static unsigned cs_freg_to_num(unsigned r)
+{
+    if (r >= RISCV_REG_F0_D && r <= RISCV_REG_F31_D)
+        return (unsigned)(r - RISCV_REG_F0_D);
+    if (r >= RISCV_REG_F0_F && r <= RISCV_REG_F31_F)
+        return (unsigned)(r - RISCV_REG_F0_F);
+    if (r >= RISCV_REG_F0_H && r <= RISCV_REG_F31_H)
+        return (unsigned)(r - RISCV_REG_F0_H);
+    return 32;   // not a floating-point register
+}
+
 static bool insn_in_group(const cs_insn *insn, unsigned g)
 {
     for (int i = 0; i < insn->detail->groups_count; i++)
@@ -1948,6 +1975,13 @@ void riscvlint_state_observe(riscvlint_state *state, const cs_insn *insn)
         return;
     }
     for (int i = 0; i < nw; i++) {
+        unsigned fn = cs_freg_to_num(rw[i]);
+        if (fn < 32)
+            for (int j = 0; j < state->win.nslots; j++) {
+                rvl_slot *sl = &state->win.slots[j];
+                if (rv_mem_is_fp(sl->kind) && sl->data == fn)
+                    sl->held = false;
+            }
         unsigned n = cs_reg_to_num(rw[i]);
         if (n >= 32) continue;
         state->win.const_live[n] = false;
@@ -1963,9 +1997,10 @@ void riscvlint_state_observe(riscvlint_state *state, const cs_insn *insn)
                 state->win.comp[j].live = false;
         for (int j = 0; j < state->win.nslots; j++) {
             rvl_slot *sl = &state->win.slots[j];
-            if (sl->data == n) sl->held = false;
+            if (sl->data == n && !rv_mem_is_fp(sl->kind)) sl->held = false;
             // Losing the base loses the address, and with it any claim
-            // about what is or is not at that address.
+            // about what is or is not at that address. A base is always
+            // an x register, whichever file the value came from.
             if (sl->base == n) sl->held = sl->unread = false;
         }
     }
@@ -1990,7 +2025,6 @@ void riscvlint_state_observe(riscvlint_state *state, const cs_insn *insn)
     if (decoded) {
         unsigned width = mem_width(kind);
         bool store = rv_mem_is_store(kind);
-        bool fp = rv_mem_is_fp(kind);
         for (int j = 0; j < state->win.nslots; j++) {
             rvl_slot *sl = &state->win.slots[j];
             if (store) {
@@ -2037,13 +2071,26 @@ void riscvlint_state_observe(riscvlint_state *state, const cs_insn *insn)
             sl->size = insn->size;
             // A store leaves the value in a register just as a load
             // does, and a later load of the same bytes is a move from
-            // it: check_store_to_load. Floating-point accesses arm
-            // nothing either way. The window drops a held value when
-            // the register holding it is written, and the write scan
-            // above reads cs_reg_to_num, which cannot see the f
-            // registers at all -- so an f-register claim would never be
-            // taken away.
-            sl->held = !fp;
+            // it: check_store_to_load. A floating-point access arms a
+            // record too, and its `data` names an f register rather than
+            // an x one -- which is what check_bitcast_through_frame
+            // reads. `rv_mem_is_fp(sl->kind)` is the discriminator;
+            // there is no second field for it, because the kind that
+            // made the record already says which file its register is
+            // in.
+            //
+            // Only check_silent_store has to be told: it matches on
+            // `data` alone, and f10 and x10 are two registers. The
+            // others are safe without being told, and one of them
+            // deserves the argument written down. check_store_to_load
+            // looks for a held *store* record at exactly (base, disp)
+            // and gives up on the first one whose widths do not line
+            // up -- but two store records at the same displacement
+            // always share the byte at that displacement, so a store
+            // arriving there clears whatever was held before it. At
+            // most one is ever held, and if it is the f one there is no
+            // integer forward to lose.
+            sl->held = true;
             sl->unread = store && (base == 2 || base == 8);
         }
     }
@@ -2446,6 +2493,9 @@ bool check_silent_store(riscvlint_state *state, const cs_insn *insn,
 
     for (int i = 0; i < state->win.nslots; i++) {
         const rvl_slot *sl = &state->win.slots[i];
+        // An f register and an x register with the same number are two
+        // registers, and `data` alone cannot tell them apart.
+        if (rv_mem_is_fp(sl->kind)) continue;
         if (!sl->held || sl->data != data) continue;
         if (sl->base != base || sl->disp != off || sl->width != width)
             continue;
@@ -2913,6 +2963,77 @@ bool check_zero_store_run(riscvlint_state *state, const cs_insn *insn,
              "(%s) (%u -> %u bytes)", k, n, hi - lo, lo, rv_reg_name(base),
              bytes, cost);
     return true;
+}
+
+// ---- a bit-cast routed through a frame slot ----
+
+// The move that does in one instruction, and without touching memory,
+// what a store and a load through the same slot do between the two
+// register files. The pairing has to be exact on width and on what the
+// load does with the bits: `fmv.x.w` sign-extends the 32 it moves, and
+// so does `lw`, but `lwu` does not -- so `fsw` and `lwu` is not one of
+// these.
+static const char *bitcast_form(rv_mem_kind held, rv_mem_kind ld)
+{
+    switch (held) {
+    case RV_MEM_FSD: case RV_MEM_FLD:
+        return ld == RV_MEM_LD ? "fmv.x.d" : NULL;
+    case RV_MEM_FSW: case RV_MEM_FLW:
+        return ld == RV_MEM_LW ? "fmv.x.w" : NULL;
+    case RV_MEM_SD: case RV_MEM_LD:
+        return ld == RV_MEM_FLD ? "fmv.d.x" : NULL;
+    case RV_MEM_SW: case RV_MEM_LW:
+        return ld == RV_MEM_FLW ? "fmv.w.x" : NULL;
+    default:
+        return NULL;
+    }
+}
+
+bool check_bitcast_through_frame(riscvlint_state *state, const cs_insn *insn,
+                                 riscvlint_finding *finding)
+{
+    // None of these moves has a compressed spelling, so a two-byte load
+    // would grow by two. What the rewrite buys is the memory access, and
+    // this is the one check here that will not pay bytes for it: 869 of
+    // the 2,380 sites in the corpus are a `c.ldsp` or a `c.fldsp` and
+    // are refused. See TODO.md.
+    if (insn->size != 4) return false;
+    uint32_t w;
+    if (!riscvlint_word_at(state, insn->address, &w)) return false;
+    rv_mem_kind kind;
+    unsigned data, base;
+    int64_t off;
+    if (!rv_decode_mem(w, insn->size, &kind, &data, &base, &off)) return false;
+    if (rv_mem_is_store(kind)) return false;
+    if (riscvlint_is_relocated(state, insn->address)) return false;
+
+    for (int i = 0; i < state->win.nslots; i++) {
+        const rvl_slot *sl = &state->win.slots[i];
+        if (!sl->held) continue;
+        if (sl->base != base || sl->disp != off) continue;
+        // bitcast_form pairs a record with a load only across the two
+        // files, so it is the one place that decides: a same-file pair
+        // is check_store_to_load's site or check_redundant_reload's and
+        // gets no spelling here.
+        const char *name = bitcast_form(sl->kind, kind);
+        // A slot can carry a record per kind, so a width that does not
+        // line up is another record's business rather than the end of
+        // the search.
+        if (!name) continue;
+
+        finding->title = "bit-cast routed through a frame slot";
+        finding->address = insn->address;
+        finding->insn_count = 1;
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "%s %s, %s; drops the load, %s at 0x%" PRIx64
+                 " (4 -> 4 bytes)", name,
+                 rv_mem_is_fp(kind) ? rv_freg_name(data) : rv_reg_name(data),
+                 rv_mem_is_fp(kind) ? rv_reg_name(sl->data)
+                                    : rv_freg_name(sl->data),
+                 rv_mem_is_store(sl->kind) ? "stored" : "loaded", sl->addr);
+        return true;
+    }
+    return false;
 }
 
 // ---- a four-byte encoding the base C extension spells in two ----

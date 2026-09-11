@@ -57,11 +57,12 @@ records where a first figure was wrong and why.
 | 10 | dead store to a frame slot | 4,376 | 15,199 | **implemented** |
 | 21 | a transfer to the instruction that follows it | 3,702 | 3,718 | **implemented** |
 | 7 | compare-then-branch folding | 2,937 | 26,513 | **implemented** |
+| 22 | a bit-cast routed through a frame slot | 1,155 | 3,258 | **implemented** |
 
 Where the raw figure comes from: `pairscan` for rows 1, 2 and 3 (the two
 Zba rows read shift-blind, which is exactly what a collapsed file
 forces); `defuse` for 4, 5, 6 and 7; `candscan` for 8, 10, 11, 12, 14,
-16+20, 17, 18, 19 and 21. Rows 9 and 15 have no dash-free entry because no shape scan sizes
+16+20, 17, 18, 19, 21 and 22. Rows 9 and 15 have no dash-free entry because no shape scan sizes
 them whole -- row 9's producer has to be tracked, which is `candscan`'s
 job and not `pairscan`'s, and row 15 is half a shape `candscan` counts
 only as a reason some other fold is unavailable. Row 13's raw entry is in its own section: a shape token
@@ -1261,33 +1262,26 @@ This is the shape that led to candidate 8, and it is the reason the
 family the number is large and unremarkable, and split on what the
 second instruction writes it is one dominant idiom plus nothing.
 
-# Remaining candidates, ranked
+# Remaining candidates
 
-Twenty checks are implemented and one candidate is measured and
-unwritten. Every figure below is from a `candscan` probe carrying the
-check's own preconditions -- the window's aliasing rule, the generation
-tests, the byte rule -- rather than from a shape count, and every one
-was read out of a disassembler before it was believed:
+None. Twenty-one checks are implemented and every candidate this file
+ever sized is either written or recorded as rejected with the evidence
+that rejected it.
 
-| # | candidate | C++ | Rust | Go | sites | bytes |
-|---|---|---:|---:|---:|---:|---:|
-| 22 | a bit-cast routed through a frame slot | 3,238 | 0 | 20 | 3,258 | - |
+Six left this list by being written, and each cost something different.
+18 needed nothing new -- the window already held base, displacement,
+width and register, and the check is the dead store read backwards. 16
+and 20 turned out to be one check rather than two. 19 and 21 needed no
+state at all: two adjacent instructions, a range test and a bit lookup
+in the table `mark_branch_targets` already builds. 17 needed a run
+tracker, a cover cost, and one more pass at the pricing than the probe
+had had. 22 needed the windowed table extended to the second register
+file, and was the only one whose own figure fell when its preconditions
+were finally applied.
 
-22 has no byte figure because it has never had a probe of its own -- it
-is still counted only as a reason some other fold is unavailable, which
-makes it the weakest measurement on this page. Buying it means extending
-the window to the second register file, for those 3,258 sites and 409
-more where both halves are floating point, and nothing else that has
-been measured.
-
-Five candidates left this table by being written. 18 needed nothing new
--- the window already held base, displacement, width and register, and
-the check is the dead store read backwards. 16 and 20 turned out to be
-one check rather than two; their joint section below says why, and what
-it cost to find out. 19 and 21 needed no state at all: two adjacent
-instructions, a range test and a bit lookup in the table
-`mark_branch_targets` already builds. 17 needed a run tracker, a cover
-cost, and one more pass at the pricing than the probe had had.
+What is left is not a shortage of ideas but a shortage of *measured*
+ones. The rejected sections below are the other half of this file and
+the reason the list is empty rather than long.
 
 Everything else this file ever sized is written. The last entry, base-C
 compression, was recorded at 384 sites on the strength of the two RVC
@@ -1737,18 +1731,99 @@ four-byte and one two-byte. They are the same no-op and are reported.
 four-byte jump that has a `c.j` spelling. Deleting beats compressing,
 and no stand-down is written.
 
-### 22. A bit-cast routed through a frame slot -- 3,258
+### 22. A bit-cast routed through a frame slot -- 1,155 of 3,258  [implemented]
 
 `fsd fa0,K(sp)` then `ld a0,K(sp)`, which `fmv.x.d` does in one
-instruction and no memory at all. Counted by the `fwd|` probe as a
-reason a store-to-load forward is unavailable -- 3,238 C++ and 20 Go --
-rather than by a probe of its own, so it is the one row here that has
-not had its own preconditions applied.
+instruction and no memory at all. It was counted by the `fwd|` probe as
+a reason a store-to-load forward is unavailable -- 3,238 C++ and 20 Go
+-- rather than by a probe of its own, and it was the one row here that
+had never had its own preconditions applied.
 
 The same probe says the FP-to-FP case is not worth a check: 409 sites
 where both halves are floating point (`fwd|fmv.s` 396, `fwd|fmv.d` 13),
-all of them C++. Extending the window to the second register file buys
-those 409 and this 3,258, and nothing else that has been measured.
+all of them C++.
+
+#### What the preconditions cost -- 2,380 of 3,258
+
+A `bitcast|` probe with the check's own rules puts the family at 2,380:
+
+| reason | sites |
+|---|---:|
+| **reportable** | **2,380** |
+| the stored register was overwritten | 850 |
+| the widths or the extension do not line up | 23 |
+| the stored register was x0 | 5 |
+
+878 of the ledger's 3,258 were never opportunities. That is what a
+rejection key measures when nobody asks it a question of its own, and it
+is the last row of this file to have had one.
+
+#### The byte figure, which is zero
+
+| form | sites |
+|---|---:|
+| `fmv.w.x` | 867 |
+| `fmv.x.w` | 1,082 |
+| `fmv.x.d` | 223 |
+| `fmv.d.x` | 208 |
+
+None of the four has a compressed spelling. Against a four-byte load the
+rewrite breaks even; against a two-byte one it costs two, and 869 of the
+2,380 are that. The check refuses those, which leaves **1,155 sites and
+0 bytes** -- 1,145 C++ and 10 Go.
+
+It is the only check here whose value is not bytes. What it removes is a
+load, a store-to-load dependency through memory, and often the frame
+slot with it. The byte rule it does apply is the tool's usual one: never
+report a rewrite that grows the code.
+
+#### What the window bound costs it
+
+1,511 of the 2,380 have a four-byte load, and the check reports 1,155 of
+them. 327 of the difference is the window filling: `RVL_SLOTS` is 24 and
+`slot_for` stops recording once they are gone, so the store never arms a
+record. Rebuilt at 64 the check finds 1,482. The last 29 are the two
+tables keying differently -- the probe holds 48 records keyed on
+(base, displacement, width), and the window holds 24 keyed on
+(base, displacement, *kind*), so the same code fills them at different
+rates.
+
+Raising the bound is now measured rather than guessed, and it is the
+same trade candidate 18's section declines, priced properly for the
+first time. `RVL_SLOTS 64` would add 1,344 sites across six checks:
+
+| check | +sites |
+|---|---:|
+| a slot stored and then loaded back | 688 |
+| a bit-cast routed through a frame slot | 327 |
+| a load into the register that still holds it | 160 |
+| redundant reloads | 87 |
+| dead store to a frame slot | 47 |
+| a store of bytes the slot already holds | 35 |
+
+It stays at 24 here: raising it re-measures six published figures, which
+is a decision of its own rather than part of writing this check.
+
+#### What it cost the table
+
+The window refused floating-point accesses before this, and the comment
+saying so gave the reason: its write scan reads `cs_reg_to_num`, which
+cannot see the f registers, so an f-register claim would never have been
+taken away. Capstone does report them -- `cs_regs_access` on
+`fadd.d fa0,fa0,fa1` names fa0 and fa1 -- so the scan gained a second
+pass and the records arm.
+
+Every other reader of the table then has to skip a record whose register
+is in the other file, since f10 and x10 are two registers and `data`
+alone cannot tell them apart. `rv_mem_is_fp` of the record's kind is the
+discriminator, and exactly one reader needs it: `check_silent_store`,
+which matches on `data`. Two others were given the same guard and both
+turned out to be unreachable, one of them provably:
+`check_store_to_load` looks for a held *store* record at exactly
+(base, displacement) and two store records at the same displacement
+always share the byte there, so a store arriving clears whatever was
+held before it and at most one is ever held. Both guards were removed
+after the corpus confirmed the argument.
 
 ### Missed compression in the base C extension  [implemented]
 
@@ -1782,8 +1857,9 @@ them compressed, 53,690,808 pairs:
 | 14 | a comparison a branch could have made | 2,937 | 26,417 |
 | 15 | redundant reloads | 2,317 | 29,193 |
 | 16 | a store of bytes the slot already holds | 1,424 | 1,791 |
-| 17 | Zcb-compressible, target declares Zcb | 886 | - |
-| 18 | dead store to a frame slot | 204 | 6,920 |
+| 17 | a bit-cast routed through a frame slot | 1,145 | 3,238 |
+| 18 | Zcb-compressible, target declares Zcb | 886 | - |
+| 19 | dead store to a frame slot | 204 | 6,920 |
 | - | Zba shift-add | 232 | 49,881 |
 | - | Zbb/Zbs/Zcb idioms on an RVA23 target | 1,025 | - |
 | - | move coalescing | 192 | 73,017 |

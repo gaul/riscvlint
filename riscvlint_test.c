@@ -1934,6 +1934,168 @@ static void test_transfer_to_next(csh handle)
                      0x1000, NULL) == 0);
 }
 
+// ---- a bit-cast routed through a frame slot ----
+//
+// Corpus encodings at the addresses named.
+
+static void test_bitcast_through_frame(csh handle)
+{
+    riscvlint_finding f;
+
+    // liblgpllibs 0xfa84: the commonest direction, a single stored and
+    // read back into a general register.
+    static const uint8_t xw[] = {
+        0x27, 0x20, 0x61, 0x10,        // fsw ft6,256(sp)
+        0x83, 0x24, 0x01, 0x10,        // lw s1,256(sp)
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_window(handle, check_bitcast_through_frame, xw, sizeof xw,
+                     0xfa84, &f) == 1);
+    CHECK(f.address == 0xfa88 && f.insn_count == 1);
+    CHECK(strstr(f.replacement, "fmv.x.w s1, ft6") != NULL);
+    CHECK(strstr(f.replacement, "stored at 0xfa84") != NULL);
+    CHECK(strstr(f.replacement, "(4 -> 4 bytes)") != NULL);
+
+    // liblgpllibs 0xbfbc: the other direction, off a two-byte store.
+    // The store's own width is not the question -- the load's is, since
+    // the load is what goes.
+    static const uint8_t wx[] = {
+        0xb2, 0xc8,                    // c.swsp a2,80(sp)
+        0x87, 0x27, 0x01, 0x05,        // flw fa5,80(sp)
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_window(handle, check_bitcast_through_frame, wx, sizeof wx,
+                     0xbfbc, &f) == 1);
+    CHECK(strstr(f.replacement, "fmv.w.x fa5, a2") != NULL);
+
+    // libxul 0x3d1034a: at the doubleword, with three instructions
+    // between that touch neither the base nor the stored register.
+    static const uint8_t dx[] = {
+        0x23, 0x34, 0xcc, 0x1e,        // sd a2,488(s8)
+        0x23, 0x34, 0xac, 0x20,        // sd a0,520(s8)
+        0x23, 0x38, 0xbc, 0x20,        // sd a1,528(s8)
+        0x17, 0xc5, 0x71, 0xfc,        // auipc a0,0xfc71c
+        0x07, 0x37, 0x25, 0x27,        // fld fa5,626(a0)
+        0x07, 0x37, 0x8c, 0x1e,        // fld fa4,488(s8)
+    };
+    CHECK(run_window(handle, check_bitcast_through_frame, dx, sizeof dx,
+                     0x3d1034a, &f) == 1);
+    CHECK(f.address == 0x3d1035e);
+    CHECK(strstr(f.replacement, "fmv.d.x fa4, a2") != NULL);
+
+    // libxul 0x3cee998: armed by a *load* rather than a store, and read
+    // back across a conditional branch. The probe this was sized from
+    // arms only from stores and does not model either half.
+    static const uint8_t xd[] = {
+        0x07, 0xb7, 0x0c, 0x00,        // fld fa4,0(s9)
+        0x93, 0x15, 0x45, 0x00,        // slli a1,a0,0x4
+        0x1a, 0x05,                    // c.slli a0,0x6
+        0x0d, 0x8d,                    // c.sub a0,a1
+        0xd3, 0x25, 0xf7, 0xa2,        // feq.d a1,fa4,fa5
+        0x33, 0x84, 0xac, 0x00,        // add s0,s9,a0
+        0xf1, 0xc9,                    // c.beqz a1,+0xd4
+        0x03, 0xb6, 0x0c, 0x00,        // ld a2,0(s9)
+    };
+    CHECK(run_window(handle, check_bitcast_through_frame, xd, sizeof xd,
+                     0x3cee998, &f) == 1);
+    CHECK(f.address == 0x3cee9ae);
+    CHECK(strstr(f.replacement, "fmv.x.d a2, fa4") != NULL);
+    CHECK(strstr(f.replacement, "loaded at 0x3cee998") != NULL);
+
+    // Negatives. A two-byte load: none of the four moves has a
+    // compressed spelling, so the rewrite would cost two bytes. 869 of
+    // the 2,380 sites in the corpus are this, and it is the one place
+    // this check declines to pay bytes for a memory access.
+    static const uint8_t narrow[] = {
+        0x27, 0x20, 0x81, 0x00,        // fsw fs0,0(sp)
+        0x82, 0x45,                    // c.lwsp a1,0(sp)
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_window(handle, check_bitcast_through_frame, narrow,
+                     sizeof narrow, 0x47298, NULL) == 0);
+
+    // A wider load than the store: it reads bytes the store never wrote.
+    static const uint8_t wide[] = {
+        0x27, 0x20, 0x61, 0x10,        // fsw ft6,256(sp)
+        0x83, 0x34, 0x01, 0x10,        // ld s1,256(sp)
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_window(handle, check_bitcast_through_frame, wide, sizeof wide,
+                     0x1000, NULL) == 0);
+
+    // `lwu` zero-extends where `fmv.x.w` sign-extends.
+    static const uint8_t unsgn[] = {
+        0x27, 0x20, 0x61, 0x10,        // fsw ft6,256(sp)
+        0x83, 0x64, 0x01, 0x10,        // lwu s1,256(sp)
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_window(handle, check_bitcast_through_frame, unsgn, sizeof unsgn,
+                     0x1000, NULL) == 0);
+
+    // The f register is overwritten, so there is nothing left to move
+    // from. This is the rule the table could not enforce before it
+    // recorded floating-point accesses at all.
+    static const uint8_t clobber[] = {
+        0x27, 0x20, 0x61, 0x10,        // fsw ft6,256(sp)
+        0x53, 0x73, 0x10, 0x00,        // fadd.s ft6,ft0,ft1
+        0x83, 0x24, 0x01, 0x10,        // lw s1,256(sp)
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_window(handle, check_bitcast_through_frame, clobber,
+                     sizeof clobber, 0x1000, NULL) == 0);
+
+    // The base is overwritten, so the address is not the one the store
+    // used.
+    static const uint8_t rebase[] = {
+        0x27, 0xa0, 0x64, 0x10,        // fsw ft6,256(s1)
+        0x93, 0x84, 0x84, 0x00,        // addi s1,s1,8
+        0x03, 0xa5, 0x04, 0x10,        // lw a0,256(s1)
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_window(handle, check_bitcast_through_frame, rebase,
+                     sizeof rebase, 0x1000, NULL) == 0);
+
+    // A store through another base may have landed on the slot, and
+    // nothing in the encoding says it did not.
+    static const uint8_t alias[] = {
+        0x27, 0x20, 0x61, 0x10,        // fsw ft6,256(sp)
+        0x23, 0xb0, 0xe6, 0x00,        // sd a4,0(a3)
+        0x83, 0x24, 0x01, 0x10,        // lw s1,256(sp)
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_window(handle, check_bitcast_through_frame, alias, sizeof alias,
+                     0x1000, NULL) == 0);
+
+    // Both halves in the same file is check_store_to_load's site, and
+    // that check still reports it with the table now holding records
+    // from both.
+    static const uint8_t same[] = {
+        0x23, 0x30, 0xc1, 0x10,        // sd a2,256(sp)
+        0x03, 0x35, 0x01, 0x10,        // ld a0,256(sp)
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_window(handle, check_bitcast_through_frame, same, sizeof same,
+                     0x1000, NULL) == 0);
+    CHECK(run_window(handle, check_store_to_load, same, sizeof same,
+                     0x1000, &f) == 1);
+    CHECK(strstr(f.replacement, "mv a0, a2") != NULL);
+
+    // The table now holds records from both files, and `data` alone
+    // cannot tell f10 from x10. check_silent_store matches on `data`,
+    // so it is the one reader that has to be told: without the test it
+    // reads this pair as a store of bytes the slot already holds.
+    // The record is armed by a load rather than a store, because a
+    // store to the slot would make this check_dead_store's site and
+    // check_silent_store would stand down before reading `data` at all.
+    static const uint8_t files[] = {
+        0x07, 0x35, 0x01, 0x01,        // fld fa0,16(sp)
+        0x23, 0x38, 0xa1, 0x00,        // sd a0,16(sp)
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_window(handle, check_silent_store, files, sizeof files,
+                     0x1000, NULL) == 0);
+}
+
 // ---- a run of zero stores one wider store would do ----
 //
 // The corpus encodings below are at the addresses named, which is also
@@ -2275,6 +2437,7 @@ int main(void)
     test_branch_over_jump(handle);
     test_transfer_to_next(handle);
     test_zero_store_run(handle);
+    test_bitcast_through_frame(handle);
 
     cs_close(&handle);
     if (failures) {

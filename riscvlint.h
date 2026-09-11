@@ -756,6 +756,40 @@ bool check_transfer_to_next(riscvlint_state *state, const cs_insn *insn,
 bool check_zero_store_run(riscvlint_state *state, const cs_insn *insn,
                           riscvlint_finding *finding);
 
+// A value moved between the two register files by storing it to a frame
+// slot and loading it back:
+//
+//     fsd fa0,K(sp)   ...   ld a0,K(sp)   ->   fmv.x.d a0,fa0
+//
+// and the same in the other direction, at both widths. The move does it
+// in one instruction and no memory at all.
+//
+// This is the one check here whose value is not bytes. None of the four
+// moves has a compressed spelling, so the rewrite breaks even against a
+// four-byte load and would cost two against a two-byte one -- and it is
+// refused there, which is 869 of the 2,380 sites the probe finds. What
+// it removes is a load, a store-to-load dependency through memory, and
+// often the frame slot with them.
+//
+// The pairing has to be exact on width and on what the load does with
+// the bits: `fmv.x.w` sign-extends the 32 it moves and so does `lw`,
+// but `lwu` does not.
+//
+// It is the reason the windowed table records floating-point accesses
+// at all. Every other reader of that table skips a record whose data
+// register is in the other file, since an f register and an x register
+// with the same number are two registers and the record's `data` field
+// alone cannot tell them apart -- `rv_mem_is_fp` of the record's kind
+// is what does.
+// Measured population: 1,155 sites and 0 bytes -- C++ 1,145, Go 10. The
+// probe with the same preconditions finds 2,380, of which 869 have a
+// two-byte load and are refused here; 327 of the rest are lost to the
+// window filling, which TODO.md prices. The ledger carried 3,258 for
+// years, which was a rejection count with no preconditions applied at
+// all.
+bool check_bitcast_through_frame(riscvlint_state *state, const cs_insn *insn,
+                                 riscvlint_finding *finding);
+
 // A four-byte encoding the base C extension spells in two. Like the Zcb
 // check this reports an assembler's choice rather than a compiler's, and
 // on a toolchain that selects RVC at all the residue is nearly nothing:

@@ -402,6 +402,25 @@ static const char *fwd_form(const char *st, const char *ld)
     return NULL;
 }
 
+// ---- a bit-cast routed through a frame slot ----
+//
+// The store-to-load probe above counts a store and a load across the two
+// register files as a reason its own fold is unavailable, and never
+// applied any precondition of its own to them. This does: the move that
+// stands in for the pair exists only for exact widths, and only where
+// the stored register still holds what it stored.
+//
+// `fmv.x.w` sign-extends the 32-bit value it moves, which `lw` does and
+// `lwu` does not, so that pairing is not one of these.
+static const char *bitcast_form(const char *st, const char *ld)
+{
+    if (!strcmp(st, "fsd") && !strcmp(ld, "ld")) return "fmv.x.d";
+    if (!strcmp(st, "fsw") && !strcmp(ld, "lw")) return "fmv.x.w";
+    if (!strcmp(st, "sd") && !strcmp(ld, "fld")) return "fmv.d.x";
+    if (!strcmp(st, "sw") && !strcmp(ld, "flw")) return "fmv.w.x";
+    return NULL;
+}
+
 // ---- per-region tracking ----
 //
 // One record per register: what wrote it, from which sources, how many
@@ -1292,6 +1311,33 @@ static void scan_section(csh handle, const char *path, const uint8_t *code,
                         // a different rewrite from this one, so it is
                         // counted rather than claimed.
                         why = "fwd|across the register files";
+                        // Candidate 22, sized with its own
+                        // preconditions rather than as a rejection.
+                        const char *bf = bitcast_form(r->mn, m);
+                        if (!bf) {
+                            bump("bitcast|width or kind does not match", d);
+                        } else if (r->data < 0) {
+                            bump("bitcast|stored zero", d);
+                        } else if (cgen[r->data] != r->dgen) {
+                            bump("bitcast|source overwritten", d);
+                        } else {
+                            char bk[80];
+                            snprintf(bk, sizeof bk, "bitcast|%s", bf);
+                            bump(bk, d);
+                            bump(r->base == 2 || r->base == 8
+                                     ? "bitcast|base sp/fp"
+                                     : "bitcast|base other", d);
+                            // Every one of these moves is four bytes and
+                            // has no compressed spelling, so the rewrite
+                            // shortens nothing where the load was
+                            // already two and breaks even where it was
+                            // four. What it removes is the memory.
+                            bump(insn->size == 2 ? "bitcast|load already 2 bytes"
+                                                 : "bitcast|load 4 bytes", d);
+                            if (r->xbr) bump("bitcast|xbr", d);
+                            bump("bitcast|TOTAL", d);
+                            show(bk, r->adr, here);
+                        }
                     } else if (r->data < 0) {
                         why = "fwd|stored zero -> li rd,0";
                     } else if (cgen[r->data] != r->dgen) {
