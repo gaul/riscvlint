@@ -1127,6 +1127,13 @@ struct riscvlint_state {
         bool sp_moved;   // something has written sp since
     } fp;
 
+    // The address after the last store of the zero run
+    // check_zero_store_run has already judged. A run is one finding
+    // reported at its first store, so every store inside one has to
+    // stay quiet -- and the driver walks a section in address order,
+    // which is what makes a single watermark enough.
+    uint64_t zrun_end;
+
     // What each register's current value is known to guarantee about its
     // own high bits, for check_redundant_extension. Cleared at every
     // region boundary, so a guarantee is only read on the straight-line
@@ -1189,6 +1196,7 @@ bool riscvlint_state_set_section(riscvlint_state *state, csh handle,
     state->vaddr = vaddr;
     state->handle = handle;
     memset(&state->fp, 0, sizeof state->fp);
+    state->zrun_end = 0;
     memset(state->guarantees, 0, sizeof state->guarantees);
     memset(&state->win, 0, sizeof state->win);
     if (!state->probe) state->probe = cs_malloc(handle);
@@ -2774,6 +2782,136 @@ bool check_transfer_to_next(riscvlint_state *state, const cs_insn *insn,
     snprintf(finding->replacement, sizeof finding->replacement,
              "delete; the %s goes where control already goes (%u bytes)",
              what, insn->size);
+    return true;
+}
+
+// ---- a run of zero stores one wider store would do ----
+
+// The store of x0 covering `bytes` bytes at `off`, priced at the
+// smallest base-C encoding that can hold it.
+static unsigned zrun_cost(unsigned bytes, unsigned base, int64_t off)
+{
+    rv_mem_kind k = bytes == 8 ? RV_MEM_SD : bytes == 4 ? RV_MEM_SW
+                    : bytes == 2 ? RV_MEM_SH : RV_MEM_SB;
+    return rv_mem_encoded_size(k, 0, base, off, false);
+}
+
+// The cheapest cover of [lo,hi) by naturally aligned stores: the widest
+// whose alignment the offset satisfies, repeatedly. Greedy from the low
+// end is minimal, since every width is a power of two and each one has
+// to start on its own multiple. Returns how many stores it takes and
+// writes their encoded bytes to *cost -- one walk for both, so the
+// count and the price cannot drift apart.
+//
+// The offsets are signed and C truncates toward zero, but `pos % w == 0`
+// is still exactly "w divides pos", which is all the test asks.
+static int zrun_cover(int64_t lo, int64_t hi, unsigned base, unsigned *cost)
+{
+    int n = 0;
+    *cost = 0;
+    for (int64_t pos = lo; pos < hi; ) {
+        int64_t w = 8;
+        while (w > 1 && (pos % w != 0 || pos + w > hi)) w /= 2;
+        n++;
+        *cost += zrun_cost((unsigned)w, base, pos);
+        pos += w;
+    }
+    return n;
+}
+
+// A store of x0 to a frame slot at `addr`, decoded from the raw
+// halfwords rather than from capstone, because the run is walked ahead
+// of the driver's own cursor.
+static bool zrun_store(const riscvlint_state *state, uint64_t addr,
+                       unsigned *size, unsigned *base, int64_t *off,
+                       unsigned *width)
+{
+    uint32_t w;
+    if (!riscvlint_word_at(state, addr, &w)) return false;
+    unsigned sz = (w & 3u) == 3u ? 4u : 2u;
+    rv_mem_kind kind;
+    unsigned data, b;
+    int64_t o;
+    if (!rv_decode_mem(w, sz, &kind, &data, &b, &o)) return false;
+    // A floating-point store names f0 rather than x0 with the same
+    // field, and f0 is a value rather than a zero.
+    if (!rv_mem_is_store(kind) || rv_mem_is_fp(kind) || data != 0)
+        return false;
+    // sp and fp are the two bases whose alignment the ABI fixes, which
+    // is what lets the offset decide whether the merged store is
+    // naturally aligned. Through any other base the encoding says
+    // nothing about alignment, and a byte-at-a-time store may be the
+    // deliberate choice rather than the missed one.
+    if (b != 2 && b != 8) return false;
+    if (riscvlint_is_relocated(state, addr)) return false;
+    *size = sz;
+    *base = b;
+    *off = o;
+    *width = mem_width(kind);
+    return true;
+}
+
+bool check_zero_store_run(riscvlint_state *state, const cs_insn *insn,
+                          riscvlint_finding *finding)
+{
+    if (insn->address < state->zrun_end) return false;
+
+    unsigned size, base, width;
+    int64_t off;
+    if (!zrun_store(state, insn->address, &size, &base, &off, &width))
+        return false;
+
+    int64_t lo = off, hi = off + width;
+    unsigned n = 1;
+    // Both sides are priced at the best encoding the base C extension
+    // offers rather than at the bytes the binary happens to carry, which
+    // is what keeps this check off check_c_compressible's ground: where
+    // a run is left wide on a toolchain that does not compress,
+    // shrinking it is already that check's finding, and what is left
+    // here is only what merging saves on top. For a run with no missed
+    // compression in it -- most of them, since `sb zero` and `sh zero`
+    // have no compressed spelling at all -- the two agree and the
+    // finding matches the disassembly byte for byte.
+    unsigned bytes = zrun_cost(width, base, off);
+    uint64_t at = insn->address + size;
+    for (;;) {
+        // A side entry inside the run would reach the merged store
+        // having skipped the ones before it, and the merged store
+        // writes all of them.
+        if (riscvlint_is_branch_target(state, at)) break;
+        unsigned s2, b2, w2;
+        int64_t o2;
+        if (!zrun_store(state, at, &s2, &b2, &o2, &w2) || b2 != base) break;
+        // Only a range the run covers without a gap can be stood in for,
+        // and it may grow at either end.
+        if (o2 == hi) hi = o2 + w2;
+        else if (o2 + w2 == lo) lo = o2;
+        else break;
+        n++;
+        bytes += zrun_cost(w2, b2, o2);
+        at += s2;
+    }
+    state->zrun_end = at;
+    if (n < 2) return false;
+
+    unsigned cost;
+    int k = zrun_cover(lo, hi, base, &cost);
+    // The first test is what the finding claims and the second is its
+    // price. The first never decides on its own: the run's own stores
+    // are already a cover of the range, so an aligned cover that costs
+    // less than they do is necessarily a shorter one -- and where the
+    // run is misaligned enough that the aligned cover is *longer*, it
+    // costs more as well. It stays because it says what the rewrite
+    // does, and because a later change to the pricing would need it.
+    if ((unsigned)k >= n || cost >= bytes) return false;
+
+    finding->title = "run of zero stores one wider store would do";
+    finding->address = insn->address;
+    finding->insn_count = n;
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "%d instead of %u stores for %" PRId64 " bytes at %" PRId64
+             "(%s) (%u -> %u bytes)", k, n, hi - lo, lo, rv_reg_name(base),
+             bytes, cost);
     return true;
 }
 

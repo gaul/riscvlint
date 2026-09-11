@@ -719,6 +719,43 @@ bool check_branch_over_jump(riscvlint_state *state, const cs_insn *insn,
 bool check_transfer_to_next(riscvlint_state *state, const cs_insn *insn,
                             riscvlint_finding *finding);
 
+// A run of consecutive stores of x0 to abutting frame slots, where
+// fewer naturally aligned stores would cover the same bytes. GCC zeroes
+// a frame buffer one byte at a time:
+//
+//     sb zero,-0x6f(s0)   ... seven of them ... sb zero,-0x69(s0)
+//
+// Covering [-111,-104) with aligned stores takes three -- `sb -111`,
+// `sh -110`, `sw -108` -- so 16 of the 28 bytes go.
+//
+// Only a zero value merges. `sd rD` in place of two `sw rD` would write
+// rD's high half to the second slot, and nothing says a register's
+// halves are the two values that were stored.
+//
+// Restricted to sp and fp, where the ABI fixes the base alignment and
+// the offset decides the rest. Another 23,973 sites run through a base
+// whose alignment the encoding does not give, and those are the ones
+// where a byte-at-a-time store may be the deliberate choice.
+//
+// The replacement is priced at the widest encoding the run itself used,
+// never at a compressed form it did not: `c.sdsp` takes a full five-bit
+// rs2, so crediting a merged `sd zero,K(sp)` with it would report Go's
+// uncompressed stores as a merge when what they are is the missed
+// compression check_c_compressible already counts.
+//
+// One finding per run rather than per pair. Read as adjacent pairs the
+// same code is 50,755 sites and read as runs it is 30,321: a run of
+// seven `sb` is one finding worth 16 bytes, not three pair-merges worth
+// four each, and the pair count cannot tell the difference.
+// Measured population: 6,348 sites and 32,960 bytes -- C++ 4,913, Rust
+// 143, Go 1,292, and 4,401 through sp against 1,947 through fp. The
+// sites are the probe's exactly; the bytes are 1,151 higher, because
+// the probe priced the whole replacement at the run's average encoded
+// size and that is not the size of any instruction in a run of mixed
+// widths. See TODO.md.
+bool check_zero_store_run(riscvlint_state *state, const cs_insn *insn,
+                          riscvlint_finding *finding);
+
 // A four-byte encoding the base C extension spells in two. Like the Zcb
 // check this reports an assembler's choice rather than a compiler's, and
 // on a toolchain that selects RVC at all the residue is nearly nothing:

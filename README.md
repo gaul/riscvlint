@@ -3,9 +3,9 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Nineteen checks are implemented and two measured candidates are
-waiting, the larger of them a run of byte-at-a-time zero stores one
-wider store would do, 6,348 sites and 31,809 bytes.
+Twenty checks are implemented and one measured candidate is left: a
+bit-cast routed through a frame slot, 3,258 sites, and the only row of
+the ledger that has never had a probe carrying its own preconditions.
 [TODO.md](TODO.md) is the ledger behind them: every candidate that was
 measured, the population it came back with, and the ones rejected on
 that evidence. What got written was decided by the corpus rather than by
@@ -13,7 +13,7 @@ intuition, and what did not get written was rejected the same way.
 
 ## Checks
 
-Nineteen of them. Every figure below is what the check itself reports
+Twenty of them. Every figure below is what the check itself reports
 over the [corpus](#corpus) -- 73,139,165 instructions of three
 toolchains -- rather than what a mining tool estimated for it. The two
 have differed by an order of magnitude every time both were measured.
@@ -31,6 +31,7 @@ have differed by an order of magnitude every time both were measured.
 | load of a just-stored value | 3,676 | 267 | 4,041 | 7,984 | 6,866 |
 | load of a value the register still holds | 10,445 | 519 | 5,592 | 16,556 | 41,232 |
 | dead store to a frame slot | 203 | 1 | 4,172 | 4,376 | 16,714 |
+| run of zero stores one wider store would do | 4,913 | 143 | 1,292 | 6,348 | 32,960 |
 | store of a value the slot already holds | 1,199 | 225 | 5,341 | 6,765 | 20,194 |
 | constant re-materialization | 8,970 | 571 | 1,457 | 10,998 | 21,996 |
 | computation a live register already holds | 21,230 | 3,450 | 4,915 | 29,595 | 62,212 |
@@ -39,7 +40,7 @@ have differed by an order of magnitude every time both were measured.
 | instruction compressible to a Zcb form | 705 | 181 | 29,762 | 30,648 | 61,296 |
 | redundant sign or zero extension | 6,589 | 333 | 1,593 | 8,515 | 20,864 |
 | dead register definition | 11,741 | 248 | 7,876 | 19,865 | 54,570 |
-| **total** | **322,929** | **192,468** | **3,065,401** | **3,580,798** | **8,027,182** |
+| **total** | **327,842** | **192,611** | **3,066,693** | **3,587,146** | **8,060,142** |
 
 Do not read the total row as a result. One row is 84% of it, and that
 row is Go's assembler declining to select RVC at all, which is a
@@ -297,6 +298,52 @@ handful of `jalr ra,0(ra)` that were already two.
   they claim something about the register a load produced, where `lb`
   and `lbu` are the same bytes and not the same value, and this claims
   something about the bytes, which do not record how they were read.
+
+* **run of zero stores one wider store would do** -- consecutive stores
+  of x0 to abutting frame slots, where fewer naturally aligned stores
+  cover the same bytes. GCC zeroes a frame buffer one byte at a time:
+
+  ```
+   f65ca: sb zero, -0x6f(s0)
+   f65ce: sb zero, -0x6e(s0)
+   ...
+   f65e2: sb zero, -0x69(s0)      -> sb -111; sh -110; sw -108
+  ```
+
+  Covering [-111,-104) takes three, so 16 of those 28 bytes go. One
+  finding per run rather than per pair: read as adjacent pairs the same
+  code is 50,755 sites and read as runs it is 30,321, and the pair count
+  cannot tell a run of seven worth 16 bytes from three merges worth four
+  each.
+
+  Only a zero value merges. `sd rD` in place of two `sw rD` would write
+  rD's high half to the second slot, and nothing says a register's
+  halves are the two values that were stored. Restricted to sp and fp,
+  where the ABI fixes the base alignment and the offset decides the
+  rest; another 23,973 sites run through a base whose alignment the
+  encoding does not give, four times this population, and there a
+  byte-at-a-time store may be the deliberate choice rather than the
+  missed one.
+
+  Both sides of the byte figure are priced at the best encoding the base
+  C extension offers, rather than at the bytes the binary carries. That
+  is what keeps this off the compression check's ground, and it is
+  visible in Go's output:
+
+  ```
+   52ff4: sw zero, 48(sp)         -> c.swsp, 2 bytes         (compression)
+   52ff8: sw zero, 52(sp)         -> c.swsp, 2 bytes         (compression)
+                                  -> one c.sdsp, 2 bytes     (this check)
+  ```
+
+  Eight bytes are there and two survive both rewrites. Priced at what
+  the binary carries this check would claim four of the six and the
+  compression check would claim four as well; priced at the base C best
+  it claims two, the compression check claims four, and the two add up.
+  For a run with no missed compression in it -- most of them, since
+  `sb zero` and `sh zero` have no compressed spelling at all -- the two
+  figures are the same and the finding matches the disassembly byte for
+  byte.
 
 * **constant re-materialization** -- a constant built into a register
   while the same value is still live in another, where the constant is

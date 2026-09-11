@@ -1934,6 +1934,165 @@ static void test_transfer_to_next(csh handle)
                      0x1000, NULL) == 0);
 }
 
+// ---- a run of zero stores one wider store would do ----
+//
+// The corpus encodings below are at the addresses named, which is also
+// where each was read against a disassembler.
+
+static void test_zero_store_run(csh handle)
+{
+    riscvlint_finding f;
+
+    // libQt6Core 0xf65ca: GCC zeroing seven bytes of frame one at a
+    // time. Covering [-111,-104) takes `sb -111`, `sh -110`, `sw -108`,
+    // so 16 of the 28 bytes go -- and it is one finding over seven
+    // instructions rather than seven findings or three pair-merges.
+    static const uint8_t seven[] = {
+        0xa3, 0x08, 0x04, 0xf8,        // sb zero,-111(s0)
+        0x23, 0x09, 0x04, 0xf8,        // sb zero,-110(s0)
+        0xa3, 0x09, 0x04, 0xf8,        // sb zero,-109(s0)
+        0x23, 0x0a, 0x04, 0xf8,        // sb zero,-108(s0)
+        0xa3, 0x0a, 0x04, 0xf8,        // sb zero,-107(s0)
+        0x23, 0x0b, 0x04, 0xf8,        // sb zero,-106(s0)
+        0xa3, 0x0b, 0x04, 0xf8,        // sb zero,-105(s0)
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_window(handle, check_zero_store_run, seven, sizeof seven,
+                     0xf65ca, &f) == 1);
+    CHECK(f.address == 0xf65ca && f.insn_count == 7);
+    CHECK(strstr(f.replacement, "3 instead of 7 stores") != NULL);
+    CHECK(strstr(f.replacement, "7 bytes at -111(s0)") != NULL);
+    CHECK(strstr(f.replacement, "(28 -> 12 bytes)") != NULL);
+
+    // gh 0x52ff4: two uncompressed `sw zero,K(sp)` in Go's output. Both
+    // sides are priced at the best base C encoding, so this reports the
+    // two bytes merging saves and not the four that compressing the two
+    // stores saves -- those are check_c_compressible's, at both
+    // addresses, and the two findings add up to the eight bytes that
+    // are really there.
+    static const uint8_t gowide[] = {
+        0x23, 0x28, 0x01, 0x02,        // sw zero,48(sp)
+        0x23, 0x2a, 0x01, 0x02,        // sw zero,52(sp)
+        0x13, 0x00, 0x00, 0x00,        // nop
+    };
+    CHECK(run_window(handle, check_zero_store_run, gowide, sizeof gowide,
+                     0x52ff4, &f) == 1);
+    CHECK(strstr(f.replacement, "1 instead of 2 stores") != NULL);
+    CHECK(strstr(f.replacement, "(4 -> 2 bytes)") != NULL);
+    CHECK(run_window(handle, check_c_compressible, gowide, sizeof gowide,
+                     0x52ff4, NULL) == 2);
+
+    // libgkcodecs 0x225314: four `c.swsp zero` already compressed, where
+    // the middle two merge into one `c.sdsp` and the ends stay. Nothing
+    // here is compression's to claim, and the saving is the one
+    // instruction at the two bytes it occupies.
+    static const uint8_t four[] = {
+        0x82, 0xc2,                    // c.swsp zero,68(sp)
+        0x82, 0xc4,                    // c.swsp zero,72(sp)
+        0x82, 0xc6,                    // c.swsp zero,76(sp)
+        0x82, 0xc8,                    // c.swsp zero,80(sp)
+        0xa6, 0xce,                    // c.swsp s1,92(sp)
+    };
+    CHECK(run_window(handle, check_zero_store_run, four, sizeof four,
+                     0x225314, &f) == 1);
+    CHECK(f.insn_count == 4);
+    CHECK(strstr(f.replacement, "3 instead of 4 stores") != NULL);
+    CHECK(strstr(f.replacement, "(8 -> 6 bytes)") != NULL);
+
+    // gofmt 0x82198: a run that grows at both ends -- 47, then 48 and
+    // 56 upward, then 46 downward -- and mixes widths, which is the
+    // shape a single average encoded size cannot price.
+    static const uint8_t both[] = {
+        0xa3, 0x07, 0x01, 0x02,        // sb zero,47(sp)
+        0x02, 0xf8,                    // c.sdsp zero,48(sp)
+        0x02, 0xfc,                    // c.sdsp zero,56(sp)
+        0x23, 0x07, 0x01, 0x02,        // sb zero,46(sp)
+        0x13, 0x00, 0x00, 0x00,        // nop
+    };
+    CHECK(run_window(handle, check_zero_store_run, both, sizeof both,
+                     0x82198, &f) == 1);
+    CHECK(f.insn_count == 4);
+    CHECK(strstr(f.replacement, "18 bytes at 46(sp)") != NULL);
+    CHECK(strstr(f.replacement, "(12 -> 8 bytes)") != NULL);
+
+    // Negatives. A gap ends the run rather than being written through:
+    // a wider store would write the bytes between, which nothing asked
+    // for. These four are two runs of two, not one run of four.
+    static const uint8_t gap[] = {
+        0x23, 0x04, 0x01, 0x00,        // sb zero,8(sp)
+        0xa3, 0x04, 0x01, 0x00,        // sb zero,9(sp)
+        0x23, 0x06, 0x01, 0x00,        // sb zero,12(sp)
+        0xa3, 0x06, 0x01, 0x00,        // sb zero,13(sp)
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_window(handle, check_zero_store_run, gap, sizeof gap,
+                     0x1000, &f) == 2);
+    CHECK(f.address == 0x1000 && f.insn_count == 2);
+    CHECK(strstr(f.replacement, "2 bytes at 8(sp)") != NULL);
+
+    // A store of something other than zero ends the run: `sd rD` in
+    // place of two `sw rD` would write rD's high half to the second
+    // slot, and nothing says a register's halves are the two values
+    // that were stored.
+    static const uint8_t nonzero[] = {
+        0x23, 0x04, 0x01, 0x00,        // sb zero,8(sp)
+        0xa3, 0x04, 0xa1, 0x00,        // sb a0,9(sp)
+        0x23, 0x05, 0x01, 0x00,        // sb zero,10(sp)
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_window(handle, check_zero_store_run, nonzero, sizeof nonzero,
+                     0x1000, NULL) == 0);
+
+    // A base whose alignment the encoding does not give. 23,973 sites
+    // and 232,960 bytes run through one, four times the frame
+    // population, and a byte-at-a-time store may be the deliberate
+    // choice there rather than the missed one.
+    static const uint8_t heap[] = {
+        0x23, 0x84, 0x05, 0x00,        // sb zero,8(a1)
+        0xa3, 0x84, 0x05, 0x00,        // sb zero,9(a1)
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_window(handle, check_zero_store_run, heap, sizeof heap,
+                     0x1000, NULL) == 0);
+
+    // Already the cheapest cover: four `sd zero` over 32 bytes merge
+    // into nothing at all. Pricing the survivors as compressible made
+    // this look like a saving of eight, which is the compression
+    // check's figure for the same four instructions.
+    static const uint8_t optimal[] = {
+        0x23, 0x30, 0x01, 0x00,        // sd zero,0(sp)
+        0x23, 0x34, 0x01, 0x00,        // sd zero,8(sp)
+        0x23, 0x38, 0x01, 0x00,        // sd zero,16(sp)
+        0x23, 0x3c, 0x01, 0x00,        // sd zero,24(sp)
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_window(handle, check_zero_store_run, optimal, sizeof optimal,
+                     0x1000, NULL) == 0);
+
+    // `fsw ft0` names f0 with the same field x0 uses, and f0 is a value
+    // rather than a zero. Without the test these two would merge into
+    // one `sd zero,8(sp)`, which is why the pair is chosen to abut.
+    static const uint8_t fp[] = {
+        0x27, 0x24, 0x01, 0x00,        // fsw ft0,8(sp)
+        0x27, 0x26, 0x01, 0x00,        // fsw ft0,12(sp)
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_window(handle, check_zero_store_run, fp, sizeof fp,
+                     0x1000, NULL) == 0);
+
+    // A side entry inside the run: a path arriving there would reach the
+    // merged store having skipped the bytes before it, and the merged
+    // store writes them all.
+    static const uint8_t side[] = {
+        0x23, 0x04, 0x01, 0x00,        // sb zero,8(sp)
+        0xa3, 0x04, 0x01, 0x00,        // sb zero,9(sp)
+        0x67, 0x80, 0x00, 0x00,        // ret
+        0xe3, 0x0c, 0x05, 0xfe,        // beqz a0,0x1004
+    };
+    CHECK(run_window(handle, check_zero_store_run, side, sizeof side,
+                     0x1000, NULL) == 0);
+}
+
 // ---- conditions and branches ----
 
 static void test_decode_condition(void)
@@ -2115,6 +2274,7 @@ int main(void)
     test_decode_jump();
     test_branch_over_jump(handle);
     test_transfer_to_next(handle);
+    test_zero_store_run(handle);
 
     cs_close(&handle);
     if (failures) {

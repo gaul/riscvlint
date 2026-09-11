@@ -50,6 +50,7 @@ records where a first figure was wrong and why.
 | 9 | extension the producer already guarantees | 8,515 | - | **implemented** |
 | 14 | a slot stored and then loaded back | 7,984 | 162,811 | **implemented** |
 | 18 | a store of bytes the slot already holds | 6,765 | 7,330 | **implemented** |
+| 17 | a run of zero stores one wider store would do | 6,348 | 30,321 | **implemented** |
 | 4 | redundant reloads | 6,725 | 33,110 | **implemented** |
 | 12 | `addi` folded into a memory offset | 6,344 | 86,564 | **implemented** |
 | 19 | a conditional branch over an unconditional jump | 5,362 | 128,361 | **implemented** |
@@ -60,7 +61,7 @@ records where a first figure was wrong and why.
 Where the raw figure comes from: `pairscan` for rows 1, 2 and 3 (the two
 Zba rows read shift-blind, which is exactly what a collapsed file
 forces); `defuse` for 4, 5, 6 and 7; `candscan` for 8, 10, 11, 12, 14,
-16+20, 18, 19 and 21. Rows 9 and 15 have no dash-free entry because no shape scan sizes
+16+20, 17, 18, 19 and 21. Rows 9 and 15 have no dash-free entry because no shape scan sizes
 them whole -- row 9's producer has to be tracked, which is `candscan`'s
 job and not `pairscan`'s, and row 15 is half a shape `candscan` counts
 only as a reason some other fold is unavailable. Row 13's raw entry is in its own section: a shape token
@@ -1262,7 +1263,7 @@ second instruction writes it is one dominant idiom plus nothing.
 
 # Remaining candidates, ranked
 
-Nineteen checks are implemented and two candidates are measured and
+Twenty checks are implemented and one candidate is measured and
 unwritten. Every figure below is from a `candscan` probe carrying the
 check's own preconditions -- the window's aliasing rule, the generation
 tests, the byte rule -- rather than from a shape count, and every one
@@ -1270,24 +1271,23 @@ was read out of a disassembler before it was believed:
 
 | # | candidate | C++ | Rust | Go | sites | bytes |
 |---|---|---:|---:|---:|---:|---:|
-| 17 | a run of zero stores one wider store would do | 4,913 | 143 | 1,292 | 6,348 | 31,809 |
 | 22 | a bit-cast routed through a frame slot | 3,238 | 0 | 20 | 3,258 | - |
 
-17 needs a run tracker and a cover cost, and a finding that spans up to
-eight instructions where every finding the tool emits today spans one or
-two. 22 has no byte figure because it has never had a probe of its own
--- it is still counted only as a reason some other fold is unavailable,
-which is the weakest measurement on this page, and buying it means
-extending the window to the second register file for those 3,258 sites
-and 409 more where both halves are floating point.
+22 has no byte figure because it has never had a probe of its own -- it
+is still counted only as a reason some other fold is unavailable, which
+makes it the weakest measurement on this page. Buying it means extending
+the window to the second register file, for those 3,258 sites and 409
+more where both halves are floating point, and nothing else that has
+been measured.
 
-Four candidates left this table by being written. 18 needed nothing new
+Five candidates left this table by being written. 18 needed nothing new
 -- the window already held base, displacement, width and register, and
 the check is the dead store read backwards. 16 and 20 turned out to be
 one check rather than two; their joint section below says why, and what
 it cost to find out. 19 and 21 needed no state at all: two adjacent
 instructions, a range test and a bit lookup in the table
-`mark_branch_targets` already builds.
+`mark_branch_targets` already builds. 17 needed a run tracker, a cover
+cost, and one more pass at the pricing than the probe had had.
 
 Everything else this file ever sized is written. The last entry, base-C
 compression, was recorded at 384 sites on the strength of the two RVC
@@ -1401,7 +1401,7 @@ value. Here they agree -- an instruction that is both compressible and
 redundant is both, and either rewrite is sound on its own. What is
 double-counted is bytes, not correctness.
 
-### 17. A run of zero stores one wider store would do -- 6,348
+### 17. A run of zero stores one wider store would do -- 6,348  [implemented]
 
 GCC zeroes a frame buffer one byte at a time. libQt6Core, seven in a
 row, 28 bytes of instructions to zero 7 bytes of frame:
@@ -1441,6 +1441,72 @@ alignment the encoding does not give, and those are the ones where a
 byte-at-a-time store may be the deliberate choice rather than the missed
 one. The frame sites are the ones where the compiler knew the alignment
 and emitted the run anyway.
+
+#### What the check reports -- 6,348 and 32,960 bytes
+
+| corpus | sp | fp | sites | bytes |
+|---|---:|---:|---:|---:|
+| C++ | 3,153 | 1,760 | 4,913 | 24,340 |
+| Rust | 9 | 134 | 143 | 588 |
+| Go | 1,239 | 53 | 1,292 | 8,032 |
+| **total** | **4,401** | **1,947** | **6,348** | **32,960** |
+
+The site count is the probe's exactly, in both cohort and base splits.
+The byte figure is 1,151 higher, and that is a third pass at the
+pricing rather than a difference of opinion -- the first two are
+recorded above and both were wrong in the same place.
+
+#### The third pricing, and why it is the one that adds up
+
+The probe prices the whole replacement at the run's *average* encoded
+size. That is fine for a run of one width and meaningless for a run of
+several: 100 of the 6,348 mix widths (63 C++, 37 Go), and for those the
+average is not the size of any instruction. gofmt 0x82198 is one:
+
+```
+   82198: sb zero,47(sp)     4 bytes
+   8219c: sd zero,48(sp)     2, c.sdsp
+   8219e: sd zero,56(sp)     2, c.sdsp
+   821a0: sb zero,46(sp)     4 bytes
+```
+
+12 bytes covering [46,64), which three stores cover: `sh 46`, `sd 48`,
+`sd 56` -- 4 + 2 + 2 = 8. The saving is 4. The probe's average of 3 puts
+it at 3, and a first version of the check that priced the whole
+replacement at the run's *widest* encoding put it at 0 and lost the site
+entirely.
+
+What the check does instead is price every store on both sides at the
+smallest base C encoding that can hold it. That is not an accounting
+convenience; it is what makes this check's figure and
+`check_c_compressible`'s add up rather than overlap. gh 0x52ff4:
+
+```
+   52ff4: sw zero,48(sp)     left wide by Go
+   52ff8: sw zero,52(sp)     left wide by Go
+```
+
+Eight bytes are there and one `c.sdsp` would do, so two survive and six
+go. The compression check reports both stores at 4 -> 2, which is four
+of the six. This check reports 4 -> 2, which is the other two. Priced at
+the bytes the binary carries it would have reported 8 -> 2 and the two
+checks would have claimed ten between them against a true six.
+
+The 514 instructions where the two checks meet are all of this shape,
+and none of them is double counted. 507 more sit under a
+`check_dead_store` finding, and those are a real either/or: a slot the
+code goes on to overwrite is better deleted than merged.
+
+#### What the k test is for
+
+`zrun_cover` counts the cheapest aligned cover and the check requires it
+to be shorter than the run. That test never decides on its own: the
+run's own stores are already a cover of the range, so an aligned cover
+that costs less is necessarily a shorter one, and where the run is
+misaligned enough that the aligned cover is *longer*, it costs more as
+well. Removing it changes nothing in any of the three cohorts. It stays
+because it is what the finding claims, and the byte test is only its
+price.
 
 ### 18. A store of bytes the slot already holds -- 6,765 of 7,330  [implemented]
 
@@ -1709,14 +1775,15 @@ them compressed, 53,690,808 pairs:
 | 7 | constant re-materialization | 9,541 | 230,973 |
 | 8 | extension the producer already guarantees | 6,922 | 6,611 |
 | 9 | a conditional branch over an unconditional jump | 5,031 | 117,619 |
-| 10 | a slot stored and then loaded back | 3,943 | 142,471 |
-| 11 | a transfer to the instruction that follows it | 3,682 | 3,698 |
-| 12 | `addi` folded into a memory offset | 3,351 | 58,930 |
-| 13 | a comparison a branch could have made | 2,937 | 26,417 |
-| 14 | redundant reloads | 2,317 | 29,193 |
-| 15 | a store of bytes the slot already holds | 1,424 | 1,791 |
-| 16 | Zcb-compressible, target declares Zcb | 886 | - |
-| 17 | dead store to a frame slot | 204 | 6,920 |
+| 10 | a run of zero stores one wider store would do | 5,056 | - |
+| 11 | a slot stored and then loaded back | 3,943 | 142,471 |
+| 12 | a transfer to the instruction that follows it | 3,682 | 3,698 |
+| 13 | `addi` folded into a memory offset | 3,351 | 58,930 |
+| 14 | a comparison a branch could have made | 2,937 | 26,417 |
+| 15 | redundant reloads | 2,317 | 29,193 |
+| 16 | a store of bytes the slot already holds | 1,424 | 1,791 |
+| 17 | Zcb-compressible, target declares Zcb | 886 | - |
+| 18 | dead store to a frame slot | 204 | 6,920 |
 | - | Zba shift-add | 232 | 49,881 |
 | - | Zbb/Zbs/Zcb idioms on an RVA23 target | 1,025 | - |
 | - | move coalescing | 192 | 73,017 |
@@ -1725,7 +1792,7 @@ them compressed, 53,690,808 pairs:
 
 Both columns are measured over this cohort of the current corpus, and no
 row's raw figure carries a precondition -- that is what the actionable
-column is for, and row 10's two columns are the widest apart of any here
+column is for, and row 11's two columns are the widest apart of any here
 for a reason candidate 14 sets out. Row 6 has no raw figure at all: its
 shape is one `candscan` counts only as a reason some other fold is
 unavailable, which candidate 15 explains.
@@ -1737,12 +1804,17 @@ probe carries nearly every precondition the check does: of the 9,014
 between them, 8,959 are matches already spelled in two bytes, where a
 `c.mv` saves nothing, and 55 write sp.
 
-Rows 9 and 11 are the two ends of how far a raw figure can be from a
+Rows 9 and 12 are the two ends of how far a raw figure can be from a
 population. 9's shape is 117,619 sites here and 5,031 of them are
 findings, because the shape *is* the standard way to spell a branch out
-of range and the question is only whether this one was. 11's two columns
+of range and the question is only whether this one was. 12's two columns
 differ by 16, and every one of those 16 is a `jal` that capstone prints
 like a `j`.
+
+Row 10 has no raw entry because the shape it would count is the wrong
+shape: adjacent zero-store pairs are 50,755 across the whole corpus and
+runs are 30,321, and neither number is about this cohort in particular.
+Candidate 17 sets out why the pair reading is the wrong one.
 
 Row 1 used to read "121,543+", the `pairscan -x` pairs
 whose `auipc` immediate was inside `jal`'s reach, and the plus sign was

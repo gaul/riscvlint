@@ -279,6 +279,7 @@ static const riscvlint_check_fn checks[] = {
     check_cond_to_branch,
     check_branch_over_jump,
     check_transfer_to_next,
+    check_zero_store_run,
 };
 
 static void scan_section(csh handle, riscvlint_state *state,

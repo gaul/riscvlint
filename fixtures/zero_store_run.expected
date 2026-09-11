@@ -1,0 +1,56 @@
+run of zero stores one wider store would do at offset: 0x0: -> 3 instead of 7 stores for 7 bytes at -111(s0) (28 -> 12 bytes) (7 instructions)
+  sb zero, -0x6f(s0)
+  sb zero, -0x6e(s0)
+  sb zero, -0x6d(s0)
+  sb zero, -0x6c(s0)
+  sb zero, -0x6b(s0)
+  sb zero, -0x6a(s0)
+  sb zero, -0x69(s0)
+
+instruction compressible to a base C form at offset: 0x1e: -> c.swsp (4 -> 2 bytes) (1 instructions)
+  sw zero, 0x30(sp)
+
+run of zero stores one wider store would do at offset: 0x1e: -> 1 instead of 2 stores for 8 bytes at 48(sp) (4 -> 2 bytes) (2 instructions)
+  sw zero, 0x30(sp)
+  sw zero, 0x34(sp)
+
+instruction compressible to a base C form at offset: 0x22: -> c.swsp (4 -> 2 bytes) (1 instructions)
+  sw zero, 0x34(sp)
+
+run of zero stores one wider store would do at offset: 0x28: -> 3 instead of 4 stores for 18 bytes at 46(sp) (12 -> 8 bytes) (4 instructions)
+  sb zero, 0x2f(sp)
+  sd zero, 0x30(sp)
+  sd zero, 0x38(sp)
+  sb zero, 0x2e(sp)
+
+run of zero stores one wider store would do at offset: 0x36: -> 3 instead of 4 stores for 16 bytes at 68(sp) (8 -> 6 bytes) (4 instructions)
+  sw zero, 0x44(sp)
+  sw zero, 0x48(sp)
+  sw zero, 0x4c(sp)
+  sw zero, 0x50(sp)
+
+run of zero stores one wider store would do at offset: 0x40: -> 1 instead of 2 stores for 2 bytes at 8(s0) (8 -> 4 bytes) (2 instructions)
+  sb zero, 8(s0)
+  sb zero, 9(s0)
+
+run of zero stores one wider store would do at offset: 0x48: -> 1 instead of 2 stores for 2 bytes at 12(s0) (8 -> 4 bytes) (2 instructions)
+  sb zero, 0xc(s0)
+  sb zero, 0xd(s0)
+
+instruction compressible to a base C form at offset: 0x6a: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd zero, 0(sp)
+
+instruction compressible to a base C form at offset: 0x6e: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd zero, 8(sp)
+
+instruction compressible to a base C form at offset: 0x72: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd zero, 0x10(sp)
+
+instruction compressible to a base C form at offset: 0x76: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd zero, 0x18(sp)
+
+Optimization opportunities by type:
+       6  instruction compressible to a base C form
+       6  run of zero stores one wider store would do
+
+12 optimization opportunities in 47 instructions

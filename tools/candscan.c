@@ -493,6 +493,7 @@ static int nholds;
 static struct {
     bool live; int base; unsigned bgen; long lastidx;
     int64_t lo, hi; int n; unsigned bytes; uint64_t adr, last;
+    unsigned usz; bool mixed;   // whether the run is all one width
 } zr;
 
 // How many aligned zero stores it takes to cover [lo,hi): the widest
@@ -533,6 +534,14 @@ static void zr_flush(void)
             bump(key, zr.n);
             snprintf(key, sizeof key, "zrun|TOTAL|%s", bk);
             bump(key, zr.n);
+            // Where a run mixes encoded widths there is no single
+            // "the encoding the run used", and the average this prices
+            // it at is not a real instruction size. The check written
+            // from this probe prices each store on its own instead.
+            if (zr.mixed) {
+                snprintf(key, sizeof key, "zrun|mixed widths|%s", bk);
+                bump(key, zr.n);
+            }
             show(key, zr.adr, zr.last);
         }
     }
@@ -1426,6 +1435,7 @@ static void scan_section(csh handle, const char *path, const uint8_t *code,
                 if (mdisp < zr.lo) zr.lo = mdisp;
                 if (mdisp + w > zr.hi) zr.hi = mdisp + w;
                 zr.n++; zr.bytes += insn->size; zr.lastidx = idx;
+                if ((unsigned)insn->size != zr.usz) zr.mixed = true;
                 zr.last = here;
             } else {
                 zr_flush();
@@ -1433,6 +1443,7 @@ static void scan_section(csh handle, const char *path, const uint8_t *code,
                     zr.live = true; zr.base = mbase; zr.bgen = cgen[mbase];
                     zr.lastidx = idx; zr.lo = mdisp; zr.hi = mdisp + w;
                     zr.n = 1; zr.bytes = insn->size; zr.adr = here;
+                    zr.usz = insn->size; zr.mixed = false;
                     zr.last = here;
                 }
             }
