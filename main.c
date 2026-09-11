@@ -154,15 +154,17 @@ static const char *find_arch_string(const uint8_t *base, size_t map_len,
 
 // ---- reporting ----
 
-#define MAX_TITLES 16
-
 typedef struct {
     const char *title;
     uint64_t count;
 } tally_entry;
 
-static tally_entry tally[MAX_TITLES];
-static size_t ntitles;
+// One entry per finding class that actually fired. The table grows instead
+// of stopping at a fixed bound: a dropped class leaves the summary silently
+// disagreeing with the total below it, and the bound is easy to outgrow
+// without noticing when a check is added.
+static tally_entry *tally;
+static size_t ntitles, ntitles_cap;
 static bool quiet;      // -q: summary only, for corpus-scale runs
 // -m replaces what the object declares, in both directions: it enables a
 // gated check against a declaration that omits the extension ("what
@@ -178,11 +180,19 @@ static void tally_add(const char *title)
 {
     for (size_t i = 0; i < ntitles; i++)
         if (strcmp(tally[i].title, title) == 0) { tally[i].count++; return; }
-    if (ntitles < MAX_TITLES) {
-        tally[ntitles].title = title;
-        tally[ntitles].count = 1;
-        ntitles++;
+    if (ntitles == ntitles_cap) {
+        size_t cap = ntitles_cap ? ntitles_cap * 2 : 32;
+        tally_entry *grown = realloc(tally, cap * sizeof *grown);
+        if (!grown) {
+            fprintf(stderr, "out of memory tallying findings\n");
+            exit(2);
+        }
+        tally = grown;
+        ntitles_cap = cap;
     }
+    tally[ntitles].title = title;
+    tally[ntitles].count = 1;
+    ntitles++;
 }
 
 // Nearest preceding function symbol, for the "<name+0x..>" in a finding.
