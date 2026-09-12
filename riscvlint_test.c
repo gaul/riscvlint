@@ -2401,6 +2401,136 @@ static void test_c_form(void)
     CHECK(!rv_c_form(0x6588u, 2, f, sizeof f));       // already two bytes
 }
 
+// The ISA census. The encodings are the fixture's, assembled by clang
+// for rv64gc plus the extensions named, so what capstone's feature
+// groups say about them is being checked against what an assembler
+// required to emit them.
+static void test_census(csh handle)
+{
+    static const uint8_t code[] = {
+        0x11, 0x65,                    // c.lui a0,4          C
+        0x97, 0x05, 0x00, 0x00,        // auipc a1,0          baseline
+        0x13, 0x16, 0x45, 0x01,        // slli a2,a0,20       baseline
+        0x9d, 0x46,                    // c.li a3,7           C
+        0x2e, 0x95,                    // c.add a0,a1         C
+        0x18, 0x61,                    // c.ld a4,0(a0)       C
+        0x3a, 0xe4,                    // c.sdsp a4,8(sp)     C
+        0xb3, 0x07, 0xb5, 0x02,        // mul a5,a0,a1        M
+        0x33, 0x58, 0xb5, 0x02,        // divu a6,a0,a1       M
+        0xaf, 0x28, 0x05, 0x10,        // lr.w a7,(a0)        A
+        0xaf, 0x32, 0x65, 0x00,        // amoadd.d t0,t1,(a0) A
+        0x53, 0xf5, 0xc5, 0x00,        // fadd.s fa0,fa1,fa2  F
+        0xd3, 0x76, 0xf7, 0x02,        // fadd.d fa3,fa4,fa5  D
+        0xf3, 0x23, 0x00, 0xc0,        // csrr t2,cycle       Zicsr
+        0x0f, 0x10, 0x00, 0x00,        // fence.i             Zifencei
+        0x33, 0x4e, 0xb5, 0x20,        // sh2add t3,a0,a1     Zba
+        0xb3, 0x7e, 0xb5, 0x40,        // andn t4,a0,a1       Zbb
+        0x13, 0x1f, 0x25, 0x60,        // cpop t5,a0          Zbb
+        0x93, 0x1f, 0x35, 0x28,        // bseti t6,a0,3       Zbs
+        0x33, 0xd5, 0xc5, 0x0e,        // czero.eqz a0,a1,a2  Zicond
+        0x53, 0x05, 0x18, 0xf0,        // fli.s fa0,1.0       Zfa
+        0x71, 0x9d,                    // c.zext.w a0         Zcb + Zba
+        0x0f, 0x00, 0x00, 0x01,        // pause               Zihintpause
+        0x33, 0x00, 0x50, 0x00,        // ntl.all             Zihintntl
+        0x82, 0x80,                    // c.ret               C
+    };
+
+    riscvlint_census *census = riscvlint_census_create();
+    CHECK(census != NULL);
+    if (!census) return;
+    riscvlint_census_scan(census, handle, code, sizeof code, 0x1000);
+
+    CHECK(riscvlint_census_instructions(census) == 25);
+    CHECK(riscvlint_census_skipped(census) == 0);
+    // Only the auipc and the slli need nothing beyond RV64I: the
+    // assembler compressed everything else it could.
+    CHECK(riscvlint_census_baseline(census) == 2);
+
+    CHECK(riscvlint_census_extension_count(census, "C") == 6);
+    CHECK(riscvlint_census_extension_count(census, "M") == 2);
+    CHECK(riscvlint_census_extension_count(census, "A") == 2);
+    CHECK(riscvlint_census_extension_count(census, "F") == 1);
+    CHECK(riscvlint_census_extension_count(census, "D") == 1);
+    CHECK(riscvlint_census_extension_count(census, "Zbb") == 2);
+    CHECK(riscvlint_census_extension_count(census, "Zbs") == 1);
+    CHECK(riscvlint_census_extension_count(census, "Zicond") == 1);
+    CHECK(riscvlint_census_extension_count(census, "Zfa") == 1);
+    CHECK(riscvlint_census_extension_count(census, "Zcb") == 1);
+    CHECK(riscvlint_census_extension_count(census, "") == 0);
+    CHECK(riscvlint_census_extension_count(census, "Zbc") == 0);
+
+    // `c.zext.w` needs Zcb for the encoding and Zba for the instruction,
+    // and is counted under both -- so the per-extension counts sum past
+    // the instruction total, by exactly the one instruction that does.
+    CHECK(riscvlint_census_extension_count(census, "Zba") == 2);
+
+    // Capstone marks no feature group on either of these; the raw-decode
+    // path is the only thing that keeps them out of the baseline.
+    CHECK(riscvlint_census_extension_count(census, "Zicsr") == 1);
+    CHECK(riscvlint_census_extension_count(census, "Zifencei") == 1);
+    CHECK(riscvlint_census_extension_count(census, "Zihintpause") == 1);
+    CHECK(riscvlint_census_extension_count(census, "Zihintntl") == 1);
+
+    CHECK(strcmp(riscvlint_census_profile(census), "RVA23U64") == 0);
+    riscvlint_census_destroy(census);
+
+    // Zba alone is an RVA22 target; the same code with Zba taken out is
+    // an RVA20 one. Neither the hints nor Zifencei move it, which is the
+    // whole reason they are kept off the rungs: `pause` is a FENCE and
+    // `ntl.all` an `add x0,x0,x5` on a core that has neither extension,
+    // and Zifencei is mandated by no RVA U-mode profile at all.
+    static const uint8_t rva22[] = {
+        0x33, 0x4e, 0xb5, 0x20,        // sh2add t3,a0,a1     Zba
+        0x0f, 0x00, 0x00, 0x01,        // pause               Zihintpause
+        0x0f, 0x10, 0x00, 0x00,        // fence.i             Zifencei
+    };
+    census = riscvlint_census_create();
+    CHECK(census != NULL);
+    if (!census) return;
+    riscvlint_census_scan(census, handle, rva22, sizeof rva22, 0x1000);
+    CHECK(strcmp(riscvlint_census_profile(census), "RVA22U64") == 0);
+    riscvlint_census_scan(census, handle, rva22 + 4, sizeof rva22 - 4, 0x2000);
+    CHECK(riscvlint_census_extension_count(census, "Zihintpause") == 2);
+    CHECK(strcmp(riscvlint_census_profile(census), "RVA22U64") == 0);
+    riscvlint_census_destroy(census);
+
+    census = riscvlint_census_create();
+    CHECK(census != NULL);
+    if (!census) return;
+    riscvlint_census_scan(census, handle, rva22 + 4, sizeof rva22 - 4, 0x1000);
+    CHECK(strcmp(riscvlint_census_profile(census), "RVA20U64") == 0);
+    riscvlint_census_destroy(census);
+
+    // An undecodable halfword is resynchronised past and counted, so the
+    // skipped total bounds what the census could have missed. 0x9c00 is
+    // a hole in the compressed quadrant 0 that not even Zcb fills; the
+    // all-zero halfword would not do, since capstone reads it as the
+    // defined `unimp` and counts it as an instruction.
+    static const uint8_t bad[] = {
+        0x00, 0x9c,                    // reserved
+        0x33, 0x4e, 0xb5, 0x20,        // sh2add t3,a0,a1
+    };
+    census = riscvlint_census_create();
+    CHECK(census != NULL);
+    if (!census) return;
+    riscvlint_census_scan(census, handle, bad, sizeof bad, 0x1000);
+    CHECK(riscvlint_census_skipped(census) == 1);
+    CHECK(riscvlint_census_instructions(census) == 1);
+    CHECK(riscvlint_census_extension_count(census, "Zba") == 1);
+    riscvlint_census_destroy(census);
+
+    // NULL is accepted everywhere, which is what lets a caller that
+    // could not allocate one carry on without a branch at every site.
+    riscvlint_census_scan(NULL, handle, code, sizeof code, 0x1000);
+    riscvlint_census_print(NULL, "x", NULL, true);
+    CHECK(riscvlint_census_instructions(NULL) == 0);
+    CHECK(riscvlint_census_skipped(NULL) == 0);
+    CHECK(riscvlint_census_baseline(NULL) == 0);
+    CHECK(riscvlint_census_extension_count(NULL, "C") == 0);
+    CHECK(strcmp(riscvlint_census_profile(NULL), "RVA20U64") == 0);
+    riscvlint_census_destroy(NULL);
+}
+
 int main(void)
 {
     csh handle;
@@ -2438,6 +2568,7 @@ int main(void)
     test_transfer_to_next(handle);
     test_zero_store_run(handle);
     test_bitcast_through_frame(handle);
+    test_census(handle);
 
     cs_close(&handle);
     if (failures) {

@@ -166,6 +166,10 @@ typedef struct {
 static tally_entry *tally;
 static size_t ntitles, ntitles_cap;
 static bool quiet;      // -q: summary only, for corpus-scale runs
+// -i: report which extensions the binary uses instead of what it could
+// drop. It replaces the lint scan rather than adding to it -- the two
+// answer different questions and nothing in the census is a finding.
+static bool census_mode;
 // -m replaces what the object declares, in both directions: it enables a
 // gated check against a declaration that omits the extension ("what
 // would rebuilding for RVA23 buy me?") and disables one against an
@@ -375,28 +379,38 @@ static int scan_file(csh handle, const char *path)
         fprintf(stderr, "%s: section headers out of bounds\n", path);
         rc = -1;
     } else {
-        riscvlint_state *state = riscvlint_state_create();
-        if (!state) { munmap((void *)base, map_len); return -1; }
-        // Say which extension set is in force whenever it was not simply
-        // read from the object. Reporting a Zba finding because nothing
-        // said otherwise is a guess, and a guess the reader cannot see is
-        // the shape of every wrong number this project has produced.
-        unsigned declared = riscvlint_parse_arch(
-            find_arch_string(base, map_len, eh));
-        unsigned effective;
-        if (have_forced) {
-            effective = forced_exts | RISCVLINT_EXT_DECLARED;
-            if (declared & RISCVLINT_EXT_DECLARED)
-                printf("note: %s: -m overrides the arch declared in the "
-                       "object\n", path);
+        const char *arch = find_arch_string(base, map_len, eh);
+        // The census reads the arch string for its own report and gates
+        // nothing on it, so it needs no state and no extension mask.
+        riscvlint_state *state = NULL;
+        riscvlint_census *census = NULL;
+        if (census_mode) {
+            census = riscvlint_census_create();
+            if (!census) { munmap((void *)base, map_len); return -1; }
         } else {
-            effective = declared;
-            if (!(declared & RISCVLINT_EXT_DECLARED))
-                printf("note: %s: no RISC-V arch attributes; "
-                       "extension-gated checks left unrestricted "
-                       "(pass -m to pin)\n", path);
+            state = riscvlint_state_create();
+            if (!state) { munmap((void *)base, map_len); return -1; }
+            // Say which extension set is in force whenever it was not
+            // simply read from the object. Reporting a Zba finding
+            // because nothing said otherwise is a guess, and a guess the
+            // reader cannot see is the shape of every wrong number this
+            // project has produced.
+            unsigned declared = riscvlint_parse_arch(arch);
+            unsigned effective;
+            if (have_forced) {
+                effective = forced_exts | RISCVLINT_EXT_DECLARED;
+                if (declared & RISCVLINT_EXT_DECLARED)
+                    printf("note: %s: -m overrides the arch declared in the "
+                           "object\n", path);
+            } else {
+                effective = declared;
+                if (!(declared & RISCVLINT_EXT_DECLARED))
+                    printf("note: %s: no RISC-V arch attributes; "
+                           "extension-gated checks left unrestricted "
+                           "(pass -m to pin)\n", path);
+            }
+            riscvlint_state_set_extensions(state, effective);
         }
-        riscvlint_state_set_extensions(state, effective);
         const Elf64_Shdr *sh = (const Elf64_Shdr *)(base + eh->e_shoff);
         for (unsigned i = 0; i < eh->e_shnum; i++) {
             if ((sh[i].sh_flags & SHF_EXECINSTR) == 0 ||
@@ -405,10 +419,21 @@ static int scan_file(csh handle, const char *path)
             if (sh[i].sh_offset > map_len ||
                 sh[i].sh_size > map_len - sh[i].sh_offset)
                 continue;
-            scan_section(handle, state, base + sh[i].sh_offset,
-                         sh[i].sh_size, sh[i].sh_addr, base, map_len, eh);
+            if (census)
+                riscvlint_census_scan(census, handle, base + sh[i].sh_offset,
+                                      sh[i].sh_size, sh[i].sh_addr);
+            else
+                scan_section(handle, state, base + sh[i].sh_offset,
+                             sh[i].sh_size, sh[i].sh_addr, base, map_len, eh);
         }
-        riscvlint_state_destroy(state);
+        if (census) {
+            // -q drops the sample addresses, which is the census's
+            // per-finding detail: the same thing -q drops from a scan.
+            riscvlint_census_print(census, path, arch, !quiet);
+            riscvlint_census_destroy(census);
+        } else {
+            riscvlint_state_destroy(state);
+        }
     }
     munmap((void *)base, map_len);
     return rc;
@@ -424,12 +449,14 @@ static int cmp_tally(const void *a, const void *b)
 int main(int argc, char **argv)
 {
     static const char usage[] =
-        "usage: %s [-q] [-m zba|zbb|zbs|zcb|c|rva20|rva22|rva23]... "
+        "usage: %s [-q] [-i] [-m zba|zbb|zbs|zcb|c|rva20|rva22|rva23]... "
         "<binary>...\n";
     int argi = 1;
     while (argi < argc && argv[argi][0] == '-' && argv[argi][1]) {
         if (strcmp(argv[argi], "-q") == 0) {
             quiet = true;
+        } else if (strcmp(argv[argi], "-i") == 0) {
+            census_mode = true;
         } else if (strcmp(argv[argi], "-m") == 0 && argi + 1 < argc) {
             unsigned e;
             if (!riscvlint_parse_ext_name(argv[++argi], &e)) {
@@ -450,6 +477,12 @@ int main(int argc, char **argv)
         fprintf(stderr, usage, argv[0]);
         return 2;
     }
+    // -m pins what the checks may assume, and the census assumes
+    // nothing: it reports the extensions that are there. Saying so beats
+    // ignoring a flag the caller thought was doing something.
+    if (census_mode && have_forced)
+        fprintf(stderr, "%s: -m has no effect with -i; the census reports "
+                "what the binary uses\n", argv[0]);
     csh handle;
     if (cs_open(CS_ARCH_RISCV, RISCVLINT_CS_MODE, &handle) != CS_ERR_OK) {
         fprintf(stderr, "capstone: cs_open failed\n");
@@ -459,6 +492,10 @@ int main(int argc, char **argv)
     for (; argi < argc; argi++)
         scan_file(handle, argv[argi]);
     cs_close(&handle);
+
+    // The census is the whole report of a -i run; there are no findings
+    // to summarize below it.
+    if (census_mode) return 0;
 
     if (ntitles) {
         qsort(tally, ntitles, sizeof tally[0], cmp_tally);

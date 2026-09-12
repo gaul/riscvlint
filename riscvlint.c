@@ -3,6 +3,7 @@
 
 #include "riscvlint.h"
 
+#include <ctype.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -3084,4 +3085,472 @@ bool check_dead_def(riscvlint_state *state, const cs_insn *insn,
              "delete; nothing reads %s (%u bytes)", rv_reg_name(rd),
              insn->size);
     return true;
+}
+
+// ---- ISA census ----
+//
+// See riscvlint.h for what the census claims, where the profile rungs
+// come from, and why the attribution is capstone's feature groups when
+// nothing else here trusts capstone with anything but iteration.
+
+#define CENSUS_SAMPLES  4
+#define CENSUS_NAME_MAX 24
+
+// Capstone hands group ids back in a uint8_t, so 256 bounds the whole
+// space and the census can index it directly. The extension table is
+// bounded by the same space plus the four names raw decode adds.
+#define CENSUS_GROUP_MAX 256
+#define CENSUS_MAX_EXTS  128
+
+// What a level means. The positive ones are RVA U-mode profile numbers
+// and are ordered, so the profile a census implies is the largest level
+// with a nonzero tally.
+enum {
+    CENSUS_VENDOR = -2,       // not in the standard encoding space
+    CENSUS_HINT = -1,         // a base-ISA no-op on a core without it
+    CENSUS_UNPROFILED = 0,    // no RVA U-mode profile mandates it
+    CENSUS_RVA20 = 20,
+    CENSUS_RVA22 = 22,
+    CENSUS_RVA23 = 23,
+};
+
+// Every extension an RVA U-mode profile mandates, transcribed from
+// llvm/lib/Target/RISCV/RISCVProfiles.td -- RVA20U64Features,
+// RVA22U64Features, RVA23U64Features -- less the ones that define no
+// instruction a census could count: the memory-model tags (Ziccif,
+// Ziccrse, Ziccamoa, Zicclsm, Za128rs, Za64rs, Zic64b), Zkt's timing
+// guarantee, and Supm. RVA22's B is written out as the three it
+// bundles, which is how capstone's predicates spell it.
+//
+// Anything missing here is CENSUS_UNPROFILED, and that is the right
+// answer rather than an omission: Zbc, Zbkb, Zfh, Zacas, Ztso, Zcmp,
+// the scalar- and vector-crypto families and Zifencei are in no RVA
+// U-mode profile at all, and each is one `-march=` token away on any
+// target, so its presence says nothing about what the build targeted.
+static const struct {
+    const char *name;
+    int level;
+} census_levels[] = {
+    { "I", CENSUS_RVA20 },        { "M", CENSUS_RVA20 },
+    { "A", CENSUS_RVA20 },        { "F", CENSUS_RVA20 },
+    { "D", CENSUS_RVA20 },        { "C", CENSUS_RVA20 },
+    { "Zicsr", CENSUS_RVA20 },    { "Zicntr", CENSUS_RVA20 },
+
+    { "Zba", CENSUS_RVA22 },      { "Zbb", CENSUS_RVA22 },
+    { "Zbs", CENSUS_RVA22 },      { "Zfhmin", CENSUS_RVA22 },
+    { "Zicbom", CENSUS_RVA22 },   { "Zicboz", CENSUS_RVA22 },
+    { "Zihpm", CENSUS_RVA22 },
+
+    { "V", CENSUS_RVA23 },        { "Zvfhmin", CENSUS_RVA23 },
+    { "Zvbb", CENSUS_RVA23 },     { "Zicond", CENSUS_RVA23 },
+    { "Zimop", CENSUS_RVA23 },    { "Zcmop", CENSUS_RVA23 },
+    { "Zcb", CENSUS_RVA23 },      { "Zfa", CENSUS_RVA23 },
+    { "Zawrs", CENSUS_RVA23 },
+
+    // Mandatory at RVA22 (Zicbop, Zihintpause) and RVA23 (Zihintntl),
+    // but all three are hint encodings: `prefetch.r` is an `ori x0`,
+    // `pause` a `fence w`, `ntl.all` an `add x0,x0,x5`. A core without
+    // the extension executes them as those and ignores them, so they
+    // are evidence of a build flag and not of a target.
+    { "Zihintpause", CENSUS_HINT }, { "Zihintntl", CENSUS_HINT },
+    { "Zicbop", CENSUS_HINT },
+};
+
+typedef struct {
+    char name[CENSUS_NAME_MAX];
+    int level;
+    size_t count;
+    // First few sites, so a surprising tally can be checked in a
+    // disassembler: real vector code and a string pool misread as
+    // vector code both count, and only the address tells them apart.
+    uint64_t samples[CENSUS_SAMPLES];
+    unsigned nsamples;
+} census_ext;
+
+struct riscvlint_census {
+    census_ext exts[CENSUS_MAX_EXTS];
+    size_t next;
+    // Group id to slot, filled on first sight. Both the name lookup and
+    // the table search are too slow to repeat per instruction on a
+    // 35-million-instruction object, and capstone's ids do not move
+    // within a run even though they move between releases.
+    // CENSUS_UNSEEN means not yet looked up and CENSUS_NOT_EXT means
+    // looked up and not an extension.
+    short group_slot[CENSUS_GROUP_MAX];
+    size_t baseline;
+    size_t instructions;
+    size_t skipped;
+    bool overflowed;          // more distinct extensions than the table holds
+};
+
+#define CENSUS_UNSEEN   (-2)
+#define CENSUS_NOT_EXT  (-1)
+
+riscvlint_census *riscvlint_census_create(void)
+{
+    riscvlint_census *census = calloc(1, sizeof *census);
+    if (!census) return NULL;
+    for (size_t i = 0; i < CENSUS_GROUP_MAX; i++)
+        census->group_slot[i] = CENSUS_UNSEEN;
+    return census;
+}
+
+void riscvlint_census_destroy(riscvlint_census *census)
+{
+    free(census);
+}
+
+size_t riscvlint_census_instructions(const riscvlint_census *census)
+{
+    return census ? census->instructions : 0;
+}
+
+size_t riscvlint_census_skipped(const riscvlint_census *census)
+{
+    return census ? census->skipped : 0;
+}
+
+size_t riscvlint_census_baseline(const riscvlint_census *census)
+{
+    return census ? census->baseline : 0;
+}
+
+size_t riscvlint_census_extension_count(const riscvlint_census *census,
+                                        const char *name)
+{
+    if (!census || !name) return 0;
+    for (size_t i = 0; i < census->next; i++)
+        if (strcmp(census->exts[i].name, name) == 0)
+            return census->exts[i].count;
+    return 0;
+}
+
+static int census_level(const char *name, bool vendor)
+{
+    if (vendor) return CENSUS_VENDOR;
+    for (size_t i = 0; i < sizeof census_levels / sizeof census_levels[0]; i++)
+        if (strcmp(census_levels[i].name, name) == 0)
+            return census_levels[i].level;
+    return CENSUS_UNPROFILED;
+}
+
+// A capstone feature-group name reduced to the extension it names:
+// "HasStdExtZba" -> "Zba", "HasStdExtCOrZcd" -> "C",
+// "HasVInstructionsI64" -> "V". False when the group names no
+// extension -- the IsRV64/IsRV32/IsRVE target groups, and the
+// jump/call/ret/branch groups every capstone architecture carries.
+static bool census_group_name(const char *group, char *out, size_t outsz,
+                              bool *vendor)
+{
+    // Groups whose name is not the extension with a prefix on it.
+    static const struct { const char *prefix, *name; } irregular[] = {
+        // The vector groups split by what the instruction needs of the
+        // element types (I64, AnyF, F16Minimal); all of them are V, and
+        // capstone could not tell full V from the Zve* embedded subsets
+        // in any case, since those define the same encodings.
+        { "HasVInstructions", "V" },
+        // c.nop and the rest of the RVC hint encodings.
+        { "HasRVCHints", "C" },
+        // flh/fsh/fmv.h.x: what Zfhmin has without the arithmetic.
+        { "HasHalfFPLoadStoreMove", "Zfhmin" },
+    };
+
+    *vendor = false;
+    if (!group) return false;
+    if (strncmp(group, "Is", 2) == 0) return false;   // IsRV64, IsRV32, IsRVE
+
+    const char *rest = NULL;
+    if (strncmp(group, "HasVendor", 9) == 0) {
+        rest = group + 9;
+        *vendor = true;
+    } else if (strncmp(group, "HasStdExt", 9) == 0) {
+        rest = group + 9;
+    } else {
+        for (size_t i = 0; i < sizeof irregular / sizeof irregular[0]; i++)
+            if (strncmp(group, irregular[i].prefix,
+                        strlen(irregular[i].prefix)) == 0) {
+                snprintf(out, outsz, "%s", irregular[i].name);
+                return true;
+            }
+        return false;
+    }
+    if (*rest == '\0') return false;
+    snprintf(out, outsz, "%s", rest);
+
+    // "COrZcd", "ZbbOrZbkb", "ZvknhaOrZvknhb": an encoding that two
+    // extensions both define. The first alternative is the one a
+    // profile mandates -- the second is always the crypto or Zc*
+    // spelling of the same instruction -- so reporting the first keeps
+    // the ladder right. No extension name contains a capital O
+    // followed by a lowercase r, so the separator cannot be mistaken
+    // for part of one.
+    char *sep = strstr(out, "Or");
+    if (sep) *sep = '\0';
+    return out[0] != '\0';
+}
+
+// Record one use of `name`, allocating its slot on first sight. Returns
+// the slot, or -1 when the table is full.
+static int census_bump(riscvlint_census *census, const char *name,
+                       bool vendor, uint64_t addr)
+{
+    size_t i;
+    for (i = 0; i < census->next; i++)
+        if (strcmp(census->exts[i].name, name) == 0) break;
+    if (i == census->next) {
+        if (census->next == CENSUS_MAX_EXTS) {
+            census->overflowed = true;
+            return -1;
+        }
+        census->next++;
+        snprintf(census->exts[i].name, CENSUS_NAME_MAX, "%s", name);
+        census->exts[i].level = census_level(census->exts[i].name, vendor);
+    }
+    census->exts[i].count++;
+    if (census->exts[i].nsamples < CENSUS_SAMPLES)
+        census->exts[i].samples[census->exts[i].nsamples++] = addr;
+    return (int)i;
+}
+
+// The four extensions capstone marks no feature group on, picked out of
+// the encoding. Without this `csrr a0,cycle` and `fence.i` would be
+// reported as base RV64I, which is what they are not.
+static const char *census_by_encoding(uint32_t w)
+{
+    // `pause` is a FENCE with pred=W and succ=none; `ntl.*` are
+    // `add x0,x0,rs2` for rs2 in x2..x5. Both are hints: the encodings
+    // are legal base instructions that do nothing.
+    if (w == 0x0100000fu) return "Zihintpause";
+    if ((w & 0xfe0fffffu) == 0x00000033u) {
+        unsigned rs2 = (w >> 20) & 0x1fu;
+        if (rs2 >= 2 && rs2 <= 5) return "Zihintntl";
+    }
+    // SYSTEM with a funct3 of its own is a CSR access rather than
+    // ecall/ebreak/mret; MISC-MEM funct3 1 is `fence.i`.
+    if (RV_OPCODE(w) == 0x73u && ((w >> 12) & 7u) != 0) return "Zicsr";
+    if (RV_OPCODE(w) == 0x0fu && ((w >> 12) & 7u) == 1) return "Zifencei";
+    return NULL;
+}
+
+void riscvlint_census_scan(riscvlint_census *census, csh handle,
+                           const uint8_t *code, size_t len, uint64_t vaddr)
+{
+    if (!census) return;
+    cs_insn *insn = cs_malloc(handle);
+    if (!insn) return;
+
+    const uint8_t *p = code;
+    size_t remain = len;
+    uint64_t addr = vaddr;
+    while (remain >= 2) {
+        uint64_t at = addr;
+        if (!cs_disasm_iter(handle, &p, &remain, &addr, insn)) {
+            // The same resynchronisation the check driver uses, so the
+            // census and the findings are taken over one instruction
+            // stream and not two.
+            p += 2;
+            remain -= 2;
+            addr += 2;
+            census->skipped++;
+            continue;
+        }
+        census->instructions++;
+
+        bool attributed = false;
+        if (insn->detail) {
+            for (uint8_t g = 0; g < insn->detail->groups_count; g++) {
+                uint8_t id = insn->detail->groups[g];
+                short slot = census->group_slot[id];
+                if (slot == CENSUS_UNSEEN) {
+                    char name[CENSUS_NAME_MAX];
+                    bool vendor;
+                    slot = census_group_name(cs_group_name(handle, id), name,
+                                             sizeof name, &vendor)
+                        ? (short)census_bump(census, name, vendor, at)
+                        : CENSUS_NOT_EXT;
+                    census->group_slot[id] = slot;
+                    if (slot >= 0) attributed = true;
+                    continue;
+                }
+                if (slot == CENSUS_NOT_EXT) continue;
+                census->exts[slot].count++;
+                if (census->exts[slot].nsamples < CENSUS_SAMPLES)
+                    census->exts[slot].samples[
+                        census->exts[slot].nsamples++] = at;
+                attributed = true;
+            }
+        }
+
+        // Only where capstone marked nothing, and only the four-byte
+        // forms. Both restrictions matter: Zimop's `mop.r.N` sits in
+        // the SYSTEM opcode with a funct3 of its own and would read as
+        // a CSR access, and the compressed hints carry capstone's
+        // RVC-hint group and are already counted as C.
+        if (!attributed && insn->size == 4) {
+            uint32_t w = (uint32_t)insn->bytes[0] |
+                         ((uint32_t)insn->bytes[1] << 8) |
+                         ((uint32_t)insn->bytes[2] << 16) |
+                         ((uint32_t)insn->bytes[3] << 24);
+            const char *name = census_by_encoding(w);
+            if (name) {
+                census_bump(census, name, false, at);
+                attributed = true;
+            }
+        }
+
+        if (!attributed) census->baseline++;
+    }
+    cs_free(insn, 1);
+}
+
+const char *riscvlint_census_profile(const riscvlint_census *census)
+{
+    int highest = CENSUS_RVA20;
+    if (census)
+        for (size_t i = 0; i < census->next; i++)
+            if (census->exts[i].count != 0 && census->exts[i].level > highest)
+                highest = census->exts[i].level;
+    if (highest >= CENSUS_RVA23) return "RVA23U64";
+    if (highest >= CENSUS_RVA22) return "RVA22U64";
+    return "RVA20U64";
+}
+
+// Does `arch` declare extension `name`? Tag_RISCV_arch is a base token
+// and then underscore-separated extensions, each with a version suffix
+// ("rv64i2p1_m2p0_..._zba1p0"), so the comparison is against a token's
+// alphabetic prefix. A substring search would not do: "_zba" is inside
+// "_zbahalf" too, and a search for "c" matches nearly every string.
+static bool census_arch_declares(const char *arch, const char *name)
+{
+    size_t namelen = strlen(name);
+    for (const char *tok = arch; tok != NULL; ) {
+        size_t n = 0;
+        while ((tok[n] >= 'a' && tok[n] <= 'z') ||
+               (tok[n] >= 'A' && tok[n] <= 'Z'))
+            n++;
+        if (n == namelen) {
+            size_t i = 0;
+            while (i < n && tolower((unsigned char)tok[i]) ==
+                            tolower((unsigned char)name[i]))
+                i++;
+            if (i == n) return true;
+        }
+        tok = strchr(tok, '_');
+        if (tok) tok++;
+    }
+    return false;
+}
+
+// One "  <label>: Zba (12), ..." line for the extensions at `level`, by
+// descending count with ties broken by name, "none" when empty -- so
+// two censuses diff line for line.
+static void census_print_level(const riscvlint_census *census, int level,
+                               const char *label)
+{
+    size_t order[CENSUS_MAX_EXTS];
+    size_t n = 0;
+    for (size_t i = 0; i < census->next; i++)
+        if (census->exts[i].count != 0 && census->exts[i].level == level)
+            order[n++] = i;
+
+    printf("  %s: ", label);
+    if (n == 0) {
+        printf("none\n");
+        return;
+    }
+    for (size_t i = 0; i < n; i++) {
+        size_t best = i;
+        for (size_t j = i + 1; j < n; j++) {
+            const census_ext *a = &census->exts[order[j]];
+            const census_ext *b = &census->exts[order[best]];
+            if (a->count > b->count ||
+                (a->count == b->count && strcmp(a->name, b->name) < 0))
+                best = j;
+        }
+        size_t tmp = order[i];
+        order[i] = order[best];
+        order[best] = tmp;
+        printf("%s%s (%zu)", i == 0 ? "" : ", ", census->exts[order[i]].name,
+               census->exts[order[i]].count);
+    }
+    printf("\n");
+}
+
+void riscvlint_census_print(const riscvlint_census *census, const char *path,
+                            const char *arch, bool samples)
+{
+    if (!census) return;
+
+    printf("ISA census");
+    if (path) printf(" of %s", path);
+    printf(": %zu instructions, %zu undecodable halfword%s skipped\n",
+           census->instructions, census->skipped,
+           census->skipped == 1 ? "" : "s");
+    if (census->overflowed)
+        printf("  warning: more than %d extensions; the rest went "
+               "uncounted\n", CENSUS_MAX_EXTS);
+    printf("  RV64I baseline: %zu\n", census->baseline);
+    census_print_level(census, CENSUS_RVA20, "RVA20U64");
+    census_print_level(census, CENSUS_RVA22, "RVA22U64");
+    census_print_level(census, CENSUS_RVA23, "RVA23U64");
+    census_print_level(census, CENSUS_UNPROFILED, "outside the RVA profiles");
+    census_print_level(census, CENSUS_HINT, "hint space");
+    census_print_level(census, CENSUS_VENDOR, "vendor");
+
+    size_t unprofiled = 0;
+    for (size_t i = 0; i < census->next; i++)
+        if (census->exts[i].count != 0 &&
+            census->exts[i].level == CENSUS_UNPROFILED)
+            unprofiled++;
+    printf("  minimum profile implied: %s", riscvlint_census_profile(census));
+    if (unprofiled)
+        printf(", plus %zu extension%s no RVA profile mandates", unprofiled,
+               unprofiled == 1 ? "" : "s");
+    printf("\n");
+
+    printf("  declared: %s\n", arch ? arch : "nothing (no build attributes)");
+    if (arch) {
+        // Only the Z* and X* extensions are cross-checked. The
+        // single-letter ones live in the base token, which a producer
+        // may spell "rv64i2p1_m2p0_a2p1_f2p2_d2p2_c2p0" or "rv64gc" as
+        // it likes, and a census that read the second as declaring
+        // nothing would report six extensions undeclared on every
+        // object built that way.
+        size_t order[CENSUS_MAX_EXTS];
+        size_t n = 0;
+        for (size_t i = 0; i < census->next; i++) {
+            const census_ext *e = &census->exts[i];
+            if (e->count == 0 || (e->name[0] != 'Z' && e->name[0] != 'X'))
+                continue;
+            if (!census_arch_declares(arch, e->name)) order[n++] = i;
+        }
+        // By name: this is a set rather than a ranking, and sorting it
+        // keeps the line from moving when unrelated code motion changes
+        // which extension the census meets first.
+        for (size_t i = 0; i < n; i++) {
+            size_t best = i;
+            for (size_t j = i + 1; j < n; j++)
+                if (strcmp(census->exts[order[j]].name,
+                           census->exts[order[best]].name) < 0)
+                    best = j;
+            size_t tmp = order[i];
+            order[i] = order[best];
+            order[best] = tmp;
+            printf("%s%s", i == 0 ? "  used but not declared: " : ", ",
+                   census->exts[order[i]].name);
+        }
+        if (n) printf("\n");
+    }
+
+    if (!samples) return;
+    for (size_t i = 0; i < census->next; i++) {
+        const census_ext *e = &census->exts[i];
+        if (e->count == 0) continue;
+        printf("    %s at", e->name);
+        for (unsigned k = 0; k < e->nsamples; k++)
+            printf("%s 0x%" PRIx64, k == 0 ? "" : ",", e->samples[k]);
+        if (e->count > e->nsamples)
+            printf(" (+%zu more)", e->count - e->nsamples);
+        printf("\n");
+    }
 }

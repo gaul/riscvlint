@@ -800,4 +800,103 @@ bool check_c_compressible(riscvlint_state *state, const cs_insn *insn,
 bool check_dead_def(riscvlint_state *state, const cs_insn *insn,
                     riscvlint_finding *finding);
 
+// ---- ISA census ----
+//
+// A by-extension tally of every instruction decoded: armlint's census
+// with the axis RISC-V actually has. AArch64 versions its architecture,
+// so armlint reads a ladder off Armv8.x; RISC-V names its extensions
+// instead, and the ladder here is the RVA profile that made each one
+// mandatory -- Zba/Zbb/Zbs and Zfhmin at RVA22U64, V and Zicond and Zcb
+// and Zfa and Zawrs at RVA23U64. So the census answers the same
+// question, "what was this binary compiled for", by naming the profile
+// whose mandatory set covers everything it uses.
+//
+// The rungs are transcribed from llvm/lib/Target/RISCV/RISCVProfiles.td
+// rather than from memory, because the membership is not what anyone
+// guesses: Zifencei is mandated by RVA20S64 and by no RVA U-mode
+// profile at all, and Zicbop is in RVA22U64 while Zbc, Zacas and Zfh
+// are in none of them.
+//
+// The attribution is capstone's own, read from the feature groups its
+// RISC-V module generates out of LLVM's instruction predicates, and
+// matched by group NAME rather than by number. The numbers are
+// generated content with no assigned values past the first, so they
+// move whenever capstone regenerates against a newer LLVM; the names do
+// not. This is the second thing riscvlint trusts capstone for (the file
+// header says why it does not trust the operand model) and it is sound
+// where that is not: a predicate says which extension defines an
+// encoding, which is exactly what a census asks.
+//
+// An instruction can need two extensions at once -- a compressed
+// `c.mul` needs Zcb and M, `c.fld` needs C and D -- and it is counted
+// under each, so the per-extension counts sum past the instruction
+// total. The baseline line does not overlap them: it counts the
+// instructions that needed nothing beyond RV64I.
+//
+// Three groups never raise the profile level. Zihintpause's `pause`,
+// Zihintntl's `ntl.*` and Zicbop's `prefetch.*` are HINTs: their
+// encodings are a FENCE, an `add x0,...` and an `ori x0,...` that a
+// core without the extension executes as written and ignores, so a
+// binary full of them still runs on RVA20 hardware. They get their own
+// line, exactly as armlint's hint-space PAC and BTI do. Everything no
+// RVA profile mandates gets another, since a single `-march=` token
+// bolts any of them onto an older target; and vendor extensions get a
+// third, because they are not in the standard encoding space at all.
+//
+// Capstone marks no feature group on the CSR instructions or on
+// `fence.i`, and none on the two uncompressed hints, so those four are
+// picked out by raw decode -- otherwise `csrr a0,cycle` would be
+// reported as base RV64I, which it is not. (The compressed `c.ntl.*`
+// carry capstone's RVC-hint group and are left in C, which is baseline
+// and cannot mislead the ladder.)
+//
+// An undecodable halfword may be data in text OR an extension this
+// capstone cannot decode, so the skipped count bounds what the census
+// could have missed. And the census reports presence, not requirement:
+// an extension reached only through a runtime dispatch counts the same
+// as one on every path.
+//
+// Opaque; NULL is accepted everywhere.
+typedef struct riscvlint_census riscvlint_census;
+
+riscvlint_census *riscvlint_census_create(void);
+void riscvlint_census_destroy(riscvlint_census *census);
+
+// Linear-sweep decode of `len` bytes at `vaddr`, tallying each
+// instruction's extensions. An undecodable halfword resynchronises past
+// two bytes and is counted as skipped, the same rule the check driver
+// uses. Call once per executable section.
+void riscvlint_census_scan(riscvlint_census *census, csh handle,
+                           const uint8_t *code, size_t len, uint64_t vaddr);
+
+// Print the census: totals, one line per profile rung, the three lines
+// that never raise it, and the profile the tallies imply. `path` names
+// the object on the first line, or NULL for none. `arch` is the
+// object's Tag_RISCV_arch string (NULL when it has none), which is
+// reported and cross-checked against what was used. `samples` adds up
+// to four addresses per extension, to tell real use from data decoded
+// as code.
+void riscvlint_census_print(const riscvlint_census *census, const char *path,
+                            const char *arch, bool samples);
+
+size_t riscvlint_census_instructions(const riscvlint_census *census);
+size_t riscvlint_census_skipped(const riscvlint_census *census);
+
+// Instructions needing nothing beyond RV64I.
+size_t riscvlint_census_baseline(const riscvlint_census *census);
+
+// Tally for one extension by the name the census prints ("Zba", "C",
+// "V", "XTHeadBa"); 0 for an unknown name or a NULL census. The
+// spelling is capstone's feature-group name with its prefix removed, so
+// it is capitalized the way LLVM's predicates are.
+size_t riscvlint_census_extension_count(const riscvlint_census *census,
+                                        const char *name);
+
+// The lowest RVA U-mode profile whose mandatory set covers every
+// extension used: "RVA20U64", "RVA22U64" or "RVA23U64". Extensions no
+// profile mandates, the hint-space ones and the vendor ones do not
+// raise it -- see above -- so this is a floor on what the binary needs
+// rather than the whole of it.
+const char *riscvlint_census_profile(const riscvlint_census *census);
+
 #endif  // RISCVLINT_H

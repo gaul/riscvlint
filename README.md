@@ -639,6 +639,108 @@ them.
 Without `-m`, the arch string decides, and a file that carries none is
 reported as such rather than silently assumed permissive.
 
+## ISA census (`-i`)
+
+`riscvlint -i` replaces the lint scan with a census: every instruction
+in the binary's executable sections, attributed to the extensions it
+needs. AArch64 versions its architecture, so armlint reads a ladder off
+Armv8.x; RISC-V names its extensions instead, and the rung here is the
+RVA profile that made each one mandatory -- Zba/Zbb/Zbs and Zfhmin at
+RVA22U64, V and Zicond and Zcb and Zfa and Zawrs at RVA23U64. The
+question is the same one: what was this binary compiled for. `-m` pins
+what the *checks* may assume and so has nothing to say here; passing
+both says so rather than quietly ignoring the flag.
+
+```console
+$ ./riscvlint -q -i corpus/cpp/firefox-esr--libxul.so
+ISA census of corpus/cpp/firefox-esr--libxul.so: 35581433 instructions, 0 undecodable halfwords skipped
+  RV64I baseline: 15279008
+  RVA20U64: C (18752804), F (1062316), M (220322), D (176508), A (140873)
+  RVA22U64: none
+  RVA23U64: none
+  outside the RVA profiles: none
+  hint space: Zihintpause (646)
+  vendor: none
+  minimum profile implied: RVA20U64
+  declared: rv64i2p1_m2p0_a2p1_f2p2_d2p2_c2p0_ziccamoa1p0_..._zca1p0_zcd1p0
+  used but not declared: Zihintpause
+```
+
+The rungs are transcribed from `llvm/lib/Target/RISCV/RISCVProfiles.td`
+rather than from memory, because the membership is not what anyone
+guesses: Zifencei is mandated by RVA20S64 and by no RVA U-mode profile
+at all, Zicbop is in RVA22U64, and Zbc, Zacas and Zfh are in none of
+them.
+
+Three lines never raise the level. Zihintpause's `pause`, Zihintntl's
+`ntl.*` and Zicbop's `prefetch.*` are hints -- their encodings are a
+FENCE, an `add x0,x0,x5` and an `ori x0,...` that a core without the
+extension executes as written and ignores -- so they get a line of
+their own, exactly as armlint's hint-space PAC and BTI do. libxul's 646
+are a backoff spin loop in mozglue, and they are why that binary is
+reported as RVA20U64 despite using an RVA22 extension: it runs on
+rv64gc hardware. Everything no RVA profile mandates gets the other
+line, since a single `-march=` token bolts any of it onto an older
+target; vendor extensions get a third, being outside the standard
+encoding space entirely.
+
+The attribution is capstone's own, read from the feature groups its
+RISC-V module generates out of LLVM's instruction predicates, and
+matched by group *name* -- the numbers are generated content with no
+assigned values past the first, so they move whenever capstone
+regenerates against a newer LLVM. This is the second thing riscvlint
+trusts capstone for, and it is sound where the operand model is not: a
+predicate says which extension defines an encoding, which is exactly
+what a census asks. The exceptions are the CSR instructions, `fence.i`
+and the two uncompressed hints, which carry no feature group at all and
+are picked out of the encoding instead -- otherwise `csrr a0,cycle`
+would be reported as base RV64I, which is what it is not.
+
+An instruction can need two extensions at once: `c.zext.w` needs Zcb
+for the encoding and Zba for the instruction, `c.fld` needs C and D.
+Each is counted under both, so the per-extension counts sum past the
+instruction total by exactly the instructions that do. The baseline
+line does not overlap them -- it counts what needed nothing beyond
+RV64I.
+
+Since RISC-V objects say what they were built for, the census also
+reports `Tag_RISCV_arch` and names anything used that the string does
+not declare. Only the `Z*` and `X*` extensions are cross-checked: the
+single-letter ones live in the base token, which a producer may spell
+`rv64i2p1_m2p0_a2p1_f2p2_d2p2_c2p0` or `rv64gc` as it likes, and
+reading the second as declaring nothing would report six extensions
+undeclared on every object built that way.
+
+Read the census as presence, not requirement: an extension reached only
+through a runtime dispatch counts the same as one on every path. An
+undecodable halfword may be data in text or an extension this capstone
+cannot decode, so the skipped count bounds what the census could have
+missed -- and treat a small exotic tally in a binary with many skipped
+halfwords with suspicion. Without `-q` the census prints up to four
+sample addresses per extension, which is what checking one in a
+disassembler takes.
+
+Three results from the corpus. Firefox is a plain rv64gc build
+throughout -- no Zba, no Zbb, no Zbs anywhere in 35.5 million
+instructions -- which is why the extension-gated checks find so much in
+it. Debian's libLLVM, libQt6Core and all six Rust binaries are the
+opposite, every one of them RVA23U64 with Zba, Zbb, Zbs, V, Zcb and
+Zicond woven through, and all eight declare a matching arch string.
+
+The twelve Go binaries declare nothing at all, and every one of them
+still reports RVA23U64 -- off a tally of a couple of hundred
+instructions, which is where the difference between presence and
+requirement stops being abstract. Go 1.26's own toolchain binaries
+carry the same 208 vector instructions each, a compare loop the runtime
+reaches only through a byte-sized HasV flag: they run on rv64gc
+hardware and never execute it, exactly as glibc's outline-atomics LSE
+does on AArch64. `gh` and `restic` carry a different twelve, an inlined
+48-byte copy in the cgo glue beside a `getpwnam_r` call, compiled by
+Debian's GCC for a V-capable target with no guard at all -- that one
+faults. The census counts both the same way, because from the
+encodings they are the same thing; the sample addresses are what tells
+them apart.
+
 ## Building
 
 Requires Capstone 6. Capstone 5.0.x decodes RISC-V too thinly to be

@@ -1,0 +1,26 @@
+ISA census of isa_census.o: 25 instructions, 0 undecodable halfwords skipped
+  RV64I baseline: 2
+  RVA20U64: C (6), A (2), M (2), D (1), F (1), Zicsr (1)
+  RVA22U64: Zba (2), Zbb (2), Zbs (1)
+  RVA23U64: Zcb (1), Zfa (1), Zicond (1)
+  outside the RVA profiles: Zifencei (1)
+  hint space: Zihintntl (1), Zihintpause (1)
+  vendor: none
+  minimum profile implied: RVA23U64, plus 1 extension no RVA profile mandates
+  declared: rv64i2p1_m2p0_a2p1_f2p2_d2p2_c2p0_zicsr2p0_zmmul1p0_zaamo1p0_zalrsc1p0_zca1p0_zcd1p0_zba1p0
+  used but not declared: Zbb, Zbs, Zcb, Zfa, Zicond, Zifencei, Zihintntl, Zihintpause
+    C at 0x0, 0xa, 0xc, 0xe (+2 more)
+    M at 0x12, 0x16
+    A at 0x1a, 0x1e
+    F at 0x22
+    D at 0x26
+    Zicsr at 0x2a
+    Zifencei at 0x2e
+    Zba at 0x32, 0x4a
+    Zbb at 0x36, 0x3a
+    Zbs at 0x3e
+    Zicond at 0x42
+    Zfa at 0x46
+    Zcb at 0x4a
+    Zihintpause at 0x4c
+    Zihintntl at 0x50
