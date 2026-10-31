@@ -4654,6 +4654,173 @@ static void test_slli_srli_to_zexth(csh handle)
     CHECK(run_zexth(handle, over, sizeof over, 0, NULL));
 }
 
+static bool run_sext(csh handle, const uint8_t *bytes, size_t len,
+                     unsigned exts, riscvlint_finding *out)
+{
+    static uint8_t buf[256];
+    memcpy(buf, bytes, len);
+    riscvlint_state *state = riscvlint_state_create();
+    if (!state) return false;
+    bool fired = false;
+    riscvlint_state_set_extensions(state, exts);
+    if (riscvlint_state_set_section(state, handle, buf, len, 0x1000)) {
+        cs_insn *insn = cs_malloc(handle);
+        const uint8_t *p = buf;
+        size_t remain = len;
+        uint64_t addr = 0x1000;
+        if (insn && cs_disasm_iter(handle, &p, &remain, &addr, insn)) {
+            riscvlint_finding f;
+            memset(&f, 0, sizeof f);
+            fired = check_slli_srai_to_sext(state, insn, &f);
+            if (fired && out) *out = f;
+        }
+        if (insn) cs_free(insn, 1);
+    }
+    riscvlint_state_destroy(state);
+    return fired;
+}
+
+static void test_decode_srai(void)
+{
+    unsigned rd, rs1, sh;
+    // srai a5,a5,48 wide, and c.srai a5,48.
+    CHECK(rv_decode_srai(0x4307d793u, 4, &rd, &rs1, &sh));
+    CHECK(rd == 15 && rs1 == 15 && sh == 48);
+    CHECK(rv_decode_srai(0x97c1u, 2, &rd, &rs1, &sh));
+    CHECK(rd == 15 && rs1 == 15 && sh == 48);
+    // srli shares the funct3 and must not decode: funct6 000000.
+    CHECK(!rv_decode_srai(0x0307d793u, 4, &rd, &rs1, &sh));
+    CHECK(!rv_decode_srai(0x93c1u, 2, &rd, &rs1, &sh));
+    // c.andi sets the bit above c.srai's.
+    CHECK(!rv_decode_srai(0x98c1u, 2, &rd, &rs1, &sh));
+    // A shift of zero is c.srai's reserved encoding.
+    CHECK(!rv_decode_srai(0x8401u, 2, &rd, &rs1, &sh));
+}
+
+static void test_slli_srai_to_sext(csh handle)
+{
+    riscvlint_finding f;
+
+    // slli 48 then an arithmetic shift back: the low halfword with its
+    // sign broadcast, which is sext.h.
+    // slli a5,a4,48 ; srai a5,a5,48 ; ret
+    static const uint8_t sh48[] = {
+        0x93, 0x17, 0x07, 0x03,     // slli a5,a4,48 (4)
+        0xc1, 0x97,                 // srai a5,a5,48 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_sext(handle, sh48, sizeof sh48, 0, &f));
+    CHECK(strcmp(f.replacement,
+                 "sext.h a5, a4 (6 -> 4 bytes)") == 0);
+    CHECK(f.insn_count == 2 && f.address == 0x1000);
+    CHECK(strcmp(f.title,
+                 "slli + srai foldable to sext.b or sext.h") == 0);
+
+    // and 56 is the low byte.
+    // slli a5,a4,56 ; srai a5,a5,56 ; ret
+    static const uint8_t sb56[] = {
+        0x93, 0x17, 0x87, 0x03,     // slli a5,a4,56 (4)
+        0xe1, 0x97,                 // srai a5,a5,56 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_sext(handle, sb56, sizeof sb56, 0, &f));
+    CHECK(strcmp(f.replacement,
+                 "sext.b a5, a4 (6 -> 4 bytes)") == 0);
+
+    // Both wide.
+    // slli a5,a4,48 ; srai a5,a5,48 ; ret
+    static const uint8_t wide[] = {
+        0x93, 0x17, 0x07, 0x03,     // slli a5,a4,48 (4)
+        0x93, 0xd7, 0x07, 0x43,     // srai a5,a5,48 (4)
+        0x67, 0x80, 0x00, 0x00,     // ret (4)
+    };
+    CHECK(run_sext(handle, wide, sizeof wide, 0, &f));
+    CHECK(strcmp(f.replacement,
+                 "sext.h a5, a4 (8 -> 4 bytes)") == 0);
+
+    // The srai writing elsewhere, with the shifted value killed after,
+    // so the walk proves it dead -- the same arm the zext.h twin has.
+    // slli a5,a4,56 ; srai a3,a5,56 ; c.li a5,1 ; ret
+    static const uint8_t split[] = {
+        0x93, 0x17, 0x87, 0x03,     // slli a5,a4,56 (4)
+        0x93, 0xd6, 0x87, 0x43,     // srai a3,a5,56 (4)
+        0x85, 0x47,                 // c.li a5,1 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_sext(handle, split, sizeof split, 0, &f));
+    CHECK(strcmp(f.replacement,
+                 "sext.b a3, a4 (8 -> 4 bytes)") == 0);
+
+    // The same shape with the shifted value read afterwards.
+    // slli a5,a4,56 ; srai a3,a5,56 ; mv a0,a5 ; ret
+    static const uint8_t live[] = {
+        0x93, 0x17, 0x87, 0x03,     // slli a5,a4,56 (4)
+        0x93, 0xd6, 0x87, 0x43,     // srai a3,a5,56 (4)
+        0x3e, 0x85,                 // mv a0,a5 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_sext(handle, live, sizeof live, 0, NULL));
+
+    // srli in place of srai keeps the bits instead of the sign: that is
+    // check_slli_srli_to_zexth's finding, not this one.
+    // slli a5,a4,48 ; srli a5,a5,48 ; ret
+    static const uint8_t logical[] = {
+        0x93, 0x17, 0x07, 0x03,     // slli a5,a4,48 (4)
+        0xc1, 0x93,                 // srli a5,a5,48 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_sext(handle, logical, sizeof logical, 0, NULL));
+
+    // Shifting left 48 and arithmetically right 55 is a signed field
+    // extract, not a sign extension. The corpus has 6,738 of these
+    // against 3,660 real sext.h pairs, so it is the rejection that
+    // matters most here.
+    // slli a5,a4,48 ; srai a5,a5,55 ; ret
+    static const uint8_t skew[] = {
+        0x93, 0x17, 0x07, 0x03,     // slli a5,a4,48 (4)
+        0x93, 0xd7, 0x77, 0x43,     // srai a5,a5,55 (4)
+        0x67, 0x80, 0x00, 0x00,     // ret (4)
+    };
+    CHECK(!run_sext(handle, skew, sizeof skew, 0, NULL));
+
+    // 32 and 32 is sext.w, which is base-ISA `addiw rd,rs,0` and so
+    // wants no Zbb gate; it is also one dependent pair corpus-wide,
+    // both compilers emitting sext.w directly.
+    // slli a5,a4,32 ; srai a5,a5,32 ; ret
+    static const uint8_t w32[] = {
+        0x93, 0x17, 0x07, 0x02,     // slli a5,a4,32 (4)
+        0x81, 0x97,                 // srai a5,a5,32 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_sext(handle, w32, sizeof w32, 0, NULL));
+
+    // 40 and 40 keeps 24 bits, which no instruction sign-extends.
+    // slli a5,a4,40 ; srai a5,a5,40 ; ret
+    static const uint8_t forty[] = {
+        0x93, 0x17, 0x87, 0x02,     // slli a5,a4,40 (4)
+        0x93, 0xd7, 0x87, 0x42,     // srai a5,a5,40 (4)
+        0x67, 0x80, 0x00, 0x00,     // ret (4)
+    };
+    CHECK(!run_sext(handle, forty, sizeof forty, 0, NULL));
+
+    // An srai reading something the slli did not write.
+    // slli a5,a4,48 ; srai a3,a2,48 ; ret
+    static const uint8_t other[] = {
+        0x93, 0x17, 0x07, 0x03,     // slli a5,a4,48 (4)
+        0x93, 0x56, 0x06, 0x43,     // srai a3,a2,48 (4)
+        0x67, 0x80, 0x00, 0x00,     // ret (4)
+    };
+    CHECK(!run_sext(handle, other, sizeof other, 0, NULL));
+    // Gated on Zbb permissively: an arch string without it says
+    // nothing, one with it reports, and Go declaring nothing reports --
+    // which is where all 2,562 sites are.
+    CHECK(!run_sext(handle, sh48, sizeof sh48,
+                    RISCVLINT_EXT_DECLARED | RISCVLINT_EXT_ZBA, NULL));
+    CHECK(run_sext(handle, sh48, sizeof sh48,
+                   RISCVLINT_EXT_DECLARED | RISCVLINT_EXT_ZBB, NULL));
+    CHECK(run_sext(handle, sh48, sizeof sh48, 0, NULL));
+}
+
 static void test_census(csh handle)
 {
     static const uint8_t code[] = {
@@ -4830,6 +4997,8 @@ int main(void)
     test_const_eq_branch(handle);
     test_const_ord_branch(handle);
     test_slli_srli_to_zexth(handle);
+    test_decode_srai();
+    test_slli_srai_to_sext(handle);
     test_census(handle);
 
     cs_close(&handle);

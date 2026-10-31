@@ -211,6 +211,12 @@ bool rv_decode_addi(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
 bool rv_decode_srli(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
                     unsigned *shamt);
 
+// The arithmetic counterpart, which rv_decode_srli deliberately
+// refuses: one funct6 bit apart, and the difference between a mask and
+// a sign extension. check_slli_srai_to_sext is the only caller.
+bool rv_decode_srai(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
+                    unsigned *shamt);
+
 // ---- analysis state ----
 //
 // One section at a time. The state owns the side-entry map, which is
@@ -1217,6 +1223,36 @@ bool check_const_ord_branch(riscvlint_state *state, const cs_insn *insn,
 // for the 32-bit one. See TODO.md.
 bool check_slli_srli_to_zexth(riscvlint_state *state, const cs_insn *insn,
                               riscvlint_finding *finding);
+
+// `slli rd,rs,48` + `srai rd,rd,48` sign-extends the low halfword and
+// the same pair at 56 the low byte, where Zbb's `sext.h` and `sext.b`
+// do either in one. The arithmetic twin of check_slli_srli_to_zexth --
+// one funct6 bit apart in the second instruction, and the difference
+// between keeping the low bits and broadcasting their sign.
+//
+// Both amounts are Zbb, so this is one check with one title rather than
+// the pair of checks the zext family needs, where 32 is Zba's and 48 is
+// Zbb's. The two shift amounts must agree with each other: `slli 48` +
+// `srai 55` is a signed field extract, and the corpus holds 6,738 of
+// those against 3,660 real sext.h pairs.
+//
+// 32 is absent on purpose. `slli 32` + `srai 32` is `sext.w`, which is
+// base-ISA `addiw rd,rs,0` and would want no gate at all; it is also a
+// single dependent pair across the corpus, both compilers emitting
+// `sext.w` directly.
+//
+// rv_decode_extension already decodes the one-instruction forms --
+// `sext.b` is OP-IMM funct3 001 with immediate 0x604 and `sext.h` 0x605
+// -- so that check_redundant_extension can treat them as guarantees.
+// What was missing was only the two-instruction producer.
+//
+// Measured population: 2,562 sites, every one in a Go binary: 1,305
+// sext.h and 1,257 sext.b. The objects that declare Zbb have none at
+// all, their compilers emitting the instruction directly, and the ones
+// that declare an arch string without it are suppressed -- libgkcodecs
+// has 309 and 165 shapes under `-m zbb`. See TODO.md.
+bool check_slli_srai_to_sext(riscvlint_state *state, const cs_insn *insn,
+                             riscvlint_finding *finding);
 
 // ---- running every check ----
 //

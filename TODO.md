@@ -1456,9 +1456,9 @@ second instruction writes it is one dominant idiom plus nothing.
 
 # Remaining candidates
 
-None. Thirty-one checks are implemented and everything this file ever
+None. Thirty-two checks are implemented and everything this file ever
 sized is either written or recorded as rejected with the evidence that
-rejected it. The last ten did not come from a corpus probe at all: 23
+rejected it. The last eleven did not come from a corpus probe at all: 23
 came from walking armlint's check table against this one, 24 came from a
 rejection in this file being wrong, 25, 26 and 27 are the three
 addressing modes of a ratification plan for an extension that does not
@@ -1472,7 +1472,9 @@ the corpus doubled, and it was found by asking what a constant that is
 *not* multiplied by gets used for instead; 31 is the base-ISA half of
 30's shape, and records why 30's leftover 273,747 is not a candidate
 for anyone; 32 came from ranking the pair dump by dependent frequency
-and finding a shape one already-written check had left half-done.
+and finding a shape one already-written check had left half-done; 33 is
+that same shape with one funct6 bit flipped, which 32's own test
+asserted was silent.
 
 That last one is worth reading as a worked example rather than a
 number. The SWAR popcount was rejected on a bound that was not a bound
@@ -3211,6 +3213,77 @@ about **1**, and about 128 under `-m zbs`. That is the unsigned-divide
 entry's situation again -- correct, cheap, and with nothing to say about
 this corpus -- and it was left unwritten rather than shipped at one
 site.
+
+## 33. slli + srai foldable to sext.b or sext.h -- 2,562  [implemented]
+
+`slli rd,rs,48` + `srai rd,rd,48` sign-extends the low halfword and the
+same pair at 56 the low byte, where Zbb's `sext.h` and `sext.b` do
+either in one instruction.
+
+### How it was found: the entry above, one bit away
+
+Entry 32's check refuses `srai` and its test says so in as many words --
+"srai shifts the sign in: that is sext.h, a different rewrite". Writing
+that sentence was the whole of the discovery; the shift amounts needed
+measuring and nothing else did.
+
+| amounts | dependent sites | |
+|---|---:|---|
+| 48 / 55 | 6,738 | a signed field extract, no single instruction |
+| **48 / 48** | **3,660** | `sext.h` -- this entry |
+| **56 / 56** | **2,405** | `sext.b` -- this entry |
+| 63 / 63 | 440 | broadcast of bit 0, no single instruction |
+| 48 / 54 | 402 | field extract |
+| 32 / 32 | 1 | `sext.w`, base ISA, and one site |
+
+The 6,738 at 48/55 is the thing worth keeping: the near misses outnumber
+the hits nearly two to one. A check matching on the left shift alone
+would have found 10,990 pairs beginning `slli 48` and been wrong about
+two thirds of them -- 3,660 correct out of 10,990. Both amounts have to
+agree, and the test for that is the precondition this check rests on.
+
+### What the check reports -- 2,562, all of it Go
+
+| language | objects | sites |
+|---|---:|---:|
+| C++ | 13 | 0 |
+| Rust | 6 | 0 |
+| Go | 12 | 2,562 |
+| **total** | **31** | **2,562** |
+
+1,305 `sext.h` and 1,257 `sext.b`. 1,783 in `compile`, 323 in `asm`, 167
+in restic, 100 in gh, 76 in `link`, then a tail. 6,450 bytes: 783 at
+`(8 -> 4)`, 1,659 at `(6 -> 4)` and 120 at `(4 -> 4)`, where `c.slli`
+and `c.srai` had already covered it.
+
+The zeros are entry 32's division exactly. libQt6Core, libllvm20 and
+ripgrep declare Zbb and have no shapes -- their compilers emit the
+instruction -- while libgkcodecs declares no Zbb and has 309 `sext.h`
+and 165 `sext.b` shapes that only `-m zbb` reveals, 294 and 157 of them
+reportable.
+
+### One check, not two, and why 32 is not in it
+
+The zext family needs two checks because 32 is Zba's `zext.w` and 48 is
+Zbb's `zext.h`. Both sign extensions are Zbb, so one check with one
+title covers them and the replacement names which instruction it meant.
+
+32 would have been a third arm needing *no* gate -- `sext.w` is base-ISA
+`addiw rd,rs,0` -- and a check that is partly gated and partly not is
+worse than the measurement justifies: one dependent pair in 108 million
+instructions. Both compilers emit `sext.w` directly, as they emit
+`beqz` rather than loading a zero.
+
+### What this cost: a decoder the project had avoided
+
+`rv_decode_srli` has refused `srai` since it was written, with a comment
+saying why. This is the first check that wants the other funct6 value,
+so `rv_decode_srai` is new -- the four-byte form and `c.srai`, which
+sits one bit from `c.srli` and one from `c.andi`. Nothing else needed to
+change: `rv_decode_extension` already decoded `sext.b` and `sext.h`
+themselves, as OP-IMM funct3 001 with immediates 0x604 and 0x605, so
+that check_redundant_extension could recognise them as guarantees. What
+was missing was only the two-instruction producer.
 
 # Ranked for C++ and Rust specifically
 

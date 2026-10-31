@@ -203,6 +203,35 @@ bool rv_decode_srli(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
     return true;
 }
 
+bool rv_decode_srai(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
+                    unsigned *shamt)
+{
+    if (size == 4) {
+        // The same encoding as srli with funct6 010000 rather than
+        // 000000: the one bit that decides whether the sign or a zero
+        // is shifted in, and so whether the pair above it is a sign
+        // extension or a mask.
+        if (RV_OPCODE(w) != 0x13u) return false;
+        if (((w >> 12) & 0x7u) != 5u) return false;
+        if (((w >> 26) & 0x3fu) != 0x10u) return false;
+        *rd = (w >> 7) & 0x1fu;
+        *rs1 = (w >> 15) & 0x1fu;
+        *shamt = (w >> 20) & 0x3fu;
+        return true;
+    }
+    if (size != 2) return false;
+    // CB-format c.srai: bit 10 set where c.srli has it clear, bit 11
+    // clear where c.andi has it set. x8-x15 only, and a shift of zero
+    // is the reserved encoding rather than a shift of nothing.
+    if ((w & 0xec03u) != 0x8401u) return false;
+    unsigned r = 8u + ((w >> 7) & 0x7u);
+    unsigned sh = (((w >> 12) & 1u) << 5) | ((w >> 2) & 0x1fu);
+    if (sh == 0) return false;
+    *rd = *rs1 = r;
+    *shamt = sh;
+    return true;
+}
+
 bool rv_pure_def(uint32_t w, unsigned size, unsigned *rd)
 {
     if (size == 4) {
@@ -4810,6 +4839,82 @@ bool check_slli_srli_to_zexth(riscvlint_state *state, const cs_insn *insn,
     return true;
 }
 
+// `slli rd,rs,48` + `srai rd,rd,48` sign-extends the low halfword and
+// `slli 56` + `srai 56` the low byte, where Zbb's `sext.h` and `sext.b`
+// do either in one instruction. The arithmetic twin of
+// check_slli_srli_to_zexth: one funct6 bit apart in the second
+// instruction, and the difference between keeping the low bits and
+// broadcasting their sign.
+//
+// Both replacements are Zbb and rv_decode_extension already decodes
+// them -- `sext.b` is OP-IMM funct3 001 with immediate 0x604 and
+// `sext.h` 0x605 -- for check_redundant_extension to recognise as
+// guarantees. What was missing is only the two-instruction producer of
+// the same value.
+//
+// 32 is deliberately absent. `slli 32` + `srai 32` is `sext.w`, which
+// is base-ISA `addiw rd,rs,0` and needs no extension, so it would want
+// a different gate; it is also one dependent pair in the whole corpus,
+// both compilers emitting `sext.w` directly. The measurement is in
+// TODO.md rather than an arm here.
+static const char *sext_name(unsigned amount)
+{
+    return amount == 48 ? "sext.h" : "sext.b";
+}
+
+bool check_slli_srai_to_sext(riscvlint_state *state, const cs_insn *insn,
+                             riscvlint_finding *finding)
+{
+    if (!riscvlint_may_use(state, RISCVLINT_EXT_ZBB)) return false;
+    if (insn->size != 2 && insn->size != 4) return false;
+
+    uint32_t w1;
+    if (!riscvlint_word_at(state, insn->address, &w1)) return false;
+    unsigned rd1, rs1, sh1;
+    if (!rv_decode_slli(w1, insn->size, &rd1, &rs1, &sh1)) return false;
+    if ((sh1 != 48 && sh1 != 56) || rd1 == 0) return false;
+
+    uint64_t second = insn->address + insn->size;
+    uint32_t w2;
+    if (!riscvlint_word_at(state, second, &w2)) return false;
+    unsigned len2 = rv_insn_len(w2);
+    unsigned rd2, srs1, sh2;
+    if (!rv_decode_srai(w2, len2, &rd2, &srs1, &sh2)) return false;
+    // The amounts have to match each other as well as the widths: a
+    // left shift of 48 and an arithmetic right shift of 55 is a signed
+    // field extract, and the corpus has 6,738 of those against 3,660
+    // real sext.h pairs.
+    if (sh2 != sh1 || rd2 == 0) return false;
+
+    // The srai has to consume what the slli produced.
+    if (srs1 != rd1) return false;
+
+    if (riscvlint_is_branch_target(state, second)) return false;
+    if (riscvlint_is_relocated(state, insn->address) ||
+        riscvlint_is_relocated(state, second))
+        return false;
+
+    // Overwriting the shifted register leaves nothing of the
+    // intermediate to keep alive; writing elsewhere has to be proved,
+    // as in the zext.h twin.
+    if (rd2 != rd1 &&
+        riscvlint_liveness(state, second + len2, rd1) != RISCVLINT_LIVE_DEAD)
+        return false;
+
+    // Zcb spells both of these in two bytes for x8-x15, so on a target
+    // with Zcb as well some of these would save more. The figure does
+    // not assume a second extension, for the reason the zext.h twin
+    // gives.
+    unsigned before = insn->size + len2;
+    finding->title = "slli + srai foldable to sext.b or sext.h";
+    finding->address = insn->address;
+    finding->insn_count = 2;
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "%s %s, %s (%u -> 4 bytes)", sext_name(sh1), rv_reg_name(rd2),
+             rv_reg_name(rs1), before);
+    return true;
+}
+
 // ---- running every check ----
 
 static const riscvlint_check_fn riscvlint_checks[] = {
@@ -4844,6 +4949,7 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_const_eq_branch,
     check_const_ord_branch,
     check_slli_srli_to_zexth,
+    check_slli_srai_to_sext,
 };
 
 size_t riscvlint_scan(riscvlint_state *state, csh handle,

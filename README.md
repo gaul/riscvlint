@@ -3,7 +3,7 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Thirty-one checks are implemented and the ledger's candidate list is
+Thirty-two checks are implemented and the ledger's candidate list is
 empty. [TODO.md](TODO.md) is that ledger: every candidate that was
 measured, the population it came back with, and the ones rejected on
 that evidence.
@@ -12,7 +12,7 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Thirty-one of them, and the table lists twenty-five. Six report
+Thirty-two of them, and the table lists twenty-six. Six report
 nothing over this corpus -- the bit count because no baseline object
 declares Zbb; the three indexed loads and the equality branch because
 those four require their extension to be positively present rather
@@ -56,15 +56,16 @@ the row where no finding does and the arithmetic is uniform instead.
 | comparison a branch could have made | 6,880 | 42 | 0 | 6,922 | 17,422 | all |
 | transfer to the instruction that follows it | 4,299 | 831 | 20 | 5,150 | 10,354 | all |
 | dead store to a frame slot | 395 | 1 | 4,172 | 4,568 | 17,160 | all |
+| slli + srai foldable to sext.b or sext.h | 0 | 0 | 2,562 | 2,562 | 6,450 | all |
 | bit-cast routed through a frame slot | 1,149 | 0 | 10 | 1,159 | 0 | all |
 | li + mul foldable to shNadd | 0 | 0 | 416 | 416 | 1,046 | all |
 | constant loaded for a branch against zero | 79 | 0 | 202 | 281 | 1,050 | all |
 | floating-point constant fli would have built | 0 | 0 | 120 | 120 | 480 | all |
-| **total** | **498,304** | **192,611** | **3,076,963** | **3,767,878** | **8,648,954** | |
+| **total** | **498,304** | **192,611** | **3,079,525** | **3,770,440** | **8,655,404** | |
 
 Do not read the total row as a result. One row is 80% of it, and that
 row is Go's assembler declining to select RVC at all, which is a
-different kind of finding from the twenty-four around it. The second row
+different kind of finding from the twenty-five around it. The second row
 is 6% and belongs to the linker. The `assumed` in the call-pair row is
 the one byte figure that is arithmetic rather than measurement: that
 check prints no size, and every site is eight bytes in and four out
@@ -314,6 +315,36 @@ except a handful of `jalr ra,0(ra)` that were already two.
   needs no extension, so anything built by a compiler that does not do
   this -- or hand-written assembly, or a JIT -- would be reported. On
   this corpus it is a measured zero rather than an unmeasured guess.
+
+* **slli + srai foldable to sext.b or sext.h** -- the arithmetic twin of
+  the two entries below. `slli rd,rs,48` + `srai rd,rd,48` sign-extends
+  the low halfword and the same pair at 56 the low byte, where Zbb's
+  `sext.h` and `sext.b` do either in one instruction. One funct6 bit in
+  the second instruction separates this from the zext pair: whether the
+  sign or a zero is shifted back in.
+
+  Both amounts are Zbb, so this is one check rather than the two the
+  zext family needs, where 32 belongs to Zba and 48 to Zbb.
+
+  Population: **2,562** sites, every one of them Go -- 1,305 `sext.h`
+  and 1,257 `sext.b` -- worth 6,450 bytes: 783 at `(8 -> 4)`, 1,659 at
+  `(6 -> 4)` and 120 at `(4 -> 4)` where both halves were already
+  compressed. 1,783 are in `compile`, 323 in `asm`, 167 in restic, 100
+  in gh. The same division as the zext.h entry: objects declaring Zbb
+  have none, their compilers emitting the instruction directly, and
+  libgkcodecs's 309 `sext.h` and 165 `sext.b` shapes appear only under
+  `-m zbb`.
+
+  The two shift amounts have to agree with each other, which is the
+  rejection that matters: `slli 48` + `srai 55` is a signed field
+  extract, and the corpus holds **6,738** of those against 3,660 real
+  `sext.h` pairs -- nearly twice as many near misses as hits. 32 is
+  absent on purpose, being base-ISA `sext.w` and one dependent pair
+  corpus-wide.
+
+  `rv_decode_extension` already decoded the one-instruction forms, so
+  that the redundant-extension check could treat them as guarantees;
+  what was missing was the two-instruction producer of the same value.
 
 * **slli + srli foldable to zext.h** -- the same shape as the entry
   below at 48 instead of 32: `slli rd,rs,48` + `srli rd,rd,48` clears
