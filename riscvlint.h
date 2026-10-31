@@ -236,6 +236,7 @@ typedef enum {
     RISCVLINT_EXT_C   = 1u << 4,
     RISCVLINT_EXT_ZFA = 1u << 5,
     RISCVLINT_EXT_ZILX = 1u << 6,
+    RISCVLINT_EXT_ZIBI = 1u << 7,
     RISCVLINT_EXT_DECLARED = 1u << 31,
 } riscvlint_ext;
 
@@ -1124,6 +1125,47 @@ bool check_const_mul_to_shadd(riscvlint_state *state, const cs_insn *insn,
 // has the decoded site and the argument.
 bool check_udiv_pow2(riscvlint_state *state, const cs_insn *insn,
                      riscvlint_finding *finding);
+
+// A constant loaded only to be compared for equality: `li rc,K` +
+// `beq`/`bne rx,rc,L`, which Zibi's `beqi`/`bnei rx,K,L` does in one
+// instruction with K as a five-bit immediate.
+//
+// RV64I has no compare-immediate-and-branch, so every comparison
+// against a constant has to materialize it into a register first. This
+// is the shape that forces, and it is the reason Zibi is proposed.
+//
+// `imm5_zibi` is 1 through 31, or -1. Zero is absent from the range
+// deliberately: `beq rs,x0` already compares against it, so the
+// encoding spends what would have been zero on -1 instead. The range
+// test is also what keeps `lui` and `c.lui` out, their values being
+// multiples of 4096.
+//
+// Equality only. Zibi's condition predicate is isIntEqualitySetCC, so
+// it has beqi and bnei and no ordered form; the `li` + `blt`/`bge`
+// family is a larger population with nothing to fold into, and TODO.md
+// records that figure rather than this check reporting it.
+//
+// The constant must be dead on *both* successors, which is where most
+// of the shape goes -- a linear scan sees the fall-through and not the
+// taken path, and a comparand is very often still wanted on one of
+// them. check_cond_to_branch proves the same thing the same way.
+//
+// Gated on positive presence rather than un-denial, as the three Zilx
+// checks are and for the same reason, more sharply: Zibi is in no
+// profile and LLVM carries it as an experimental extension at 0.1,
+// where Zilx at least has a ratification plan. Reported when an object
+// declares `_zibi` or when `-m zibi` asks the what-if, and otherwise
+// not at all, so it contributes nothing to the generated table.
+//
+// Measured population: 177,581 sites under `-m zibi`, which would be
+// fourth in that table if it appeared there -- behind base-C
+// compression, the call pair and the stack-pointer restore. From 461,300 shapes with an
+// in-range immediate: 3,232 are branch targets, 280,487 leave the
+// constant live on a successor, and 177,581 remain. Capstone does not
+// decode Zibi, so the suggestion names an instruction the disassembler
+// cannot read back -- true of Zilx too. See TODO.md.
+bool check_const_eq_branch(riscvlint_state *state, const cs_insn *insn,
+                           riscvlint_finding *finding);
 
 // ---- running every check ----
 //

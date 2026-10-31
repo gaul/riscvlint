@@ -3975,6 +3975,236 @@ static void test_udiv_pow2(csh handle)
                    RISCVLINT_EXT_DECLARED | RISCVLINT_EXT_ZBB, NULL));
 }
 
+static bool run_zibi(csh handle, const uint8_t *bytes, size_t len,
+                     unsigned exts, riscvlint_finding *out)
+{
+    static uint8_t buf[256];
+    memcpy(buf, bytes, len);
+    riscvlint_state *state = riscvlint_state_create();
+    if (!state) return false;
+    bool fired = false;
+    riscvlint_state_set_extensions(state, exts);
+    if (riscvlint_state_set_section(state, handle, buf, len, 0x1000)) {
+        cs_insn *insn = cs_malloc(handle);
+        const uint8_t *p = buf;
+        size_t remain = len;
+        uint64_t addr = 0x1000;
+        if (insn && cs_disasm_iter(handle, &p, &remain, &addr, insn)) {
+            riscvlint_finding f;
+            memset(&f, 0, sizeof f);
+            fired = check_const_eq_branch(state, insn, &f);
+            if (fired && out) *out = f;
+        }
+        if (insn) cs_free(insn, 1);
+    }
+    riscvlint_state_destroy(state);
+    return fired;
+}
+
+static void test_const_eq_branch(csh handle)
+{
+    riscvlint_finding f;
+    const unsigned Z = RISCVLINT_EXT_ZIBI;
+
+    // c.li a5,17 then beq against it, with both successors
+    // redefining a5 -- the only way the walk proves deadness, since it
+    // declines at a `ret` rather than guess an ABI.
+    static const uint8_t eq[] = {
+        0xc5, 0x47,                 // c.li a5,17 (2)
+        0x63, 0x04, 0xf7, 0x00,     // beq a4,a5,.L (4)
+        0x85, 0x47,                 // c.li a5,1 (2)
+        0x82, 0x80,                 // ret (2)
+        0x89, 0x47,                 // c.li a5,2 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_zibi(handle, eq, sizeof eq, Z, &f));
+    CHECK(strcmp(f.replacement,
+                 "beqi a4, 17, 0x100a (6 -> 4 bytes)") == 0);
+    CHECK(f.insn_count == 2 && f.address == 0x1000);
+    CHECK(strcmp(f.title,
+                 "constant loaded for one equality branch") == 0);
+
+    // bne gives bnei.
+    static const uint8_t ne[] = {
+        0xc5, 0x47,                 // c.li a5,17 (2)
+        0x63, 0x14, 0xf7, 0x00,     // bne a4,a5,.L (4)
+        0x85, 0x47,                 // c.li a5,1 (2)
+        0x82, 0x80,                 // ret (2)
+        0x89, 0x47,                 // c.li a5,2 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_zibi(handle, ne, sizeof ne, Z, &f));
+    CHECK(strcmp(f.replacement,
+                 "bnei a4, 17, 0x100a (6 -> 4 bytes)") == 0);
+
+    // beq commutes, so the constant may be the first operand; the
+    // rewrite names the other one either way.
+    static const uint8_t swap[] = {
+        0xc5, 0x47,                 // c.li a5,17 (2)
+        0x63, 0x84, 0xe7, 0x00,     // beq a5,a4,.L (4)
+        0x85, 0x47,                 // c.li a5,1 (2)
+        0x82, 0x80,                 // ret (2)
+        0x89, 0x47,                 // c.li a5,2 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_zibi(handle, swap, sizeof swap, Z, &f));
+    CHECK(strcmp(f.replacement,
+                 "beqi a4, 17, 0x100a (6 -> 4 bytes)") == 0);
+
+    // -1 is in imm5_zibi's range though it is not a five-bit unsigned
+    // value: the encoding spends the otherwise unused zero on it.
+    static const uint8_t negone[] = {
+        0xfd, 0x57,                 // c.li a5,-1 (2)
+        0x63, 0x04, 0xf7, 0x00,     // beq a4,a5,.L (4)
+        0x85, 0x47,                 // c.li a5,1 (2)
+        0x82, 0x80,                 // ret (2)
+        0x89, 0x47,                 // c.li a5,2 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_zibi(handle, negone, sizeof negone, Z, &f));
+    CHECK(strcmp(f.replacement,
+                 "beqi a4, -1, 0x100a (6 -> 4 bytes)") == 0);
+
+    // A wide `li` for 31, the top of the range: eight bytes to four.
+    static const uint8_t wide[] = {
+        0x93, 0x07, 0xf0, 0x01,     // li a5,31 (4)
+        0x63, 0x06, 0xf7, 0x00,     // beq a4,a5,.L (4)
+        0x93, 0x07, 0x10, 0x00,     // li a5,1 (4)
+        0x67, 0x80, 0x00, 0x00,     // ret (4)
+        0x93, 0x07, 0x20, 0x00,     // li a5,2 (4)
+        0x67, 0x80, 0x00, 0x00,     // ret (4)
+    };
+    CHECK(run_zibi(handle, wide, sizeof wide, Z, &f));
+    CHECK(strcmp(f.replacement,
+                 "beqi a4, 31, 0x1010 (8 -> 4 bytes)") == 0);
+
+    // 32 is one past the top.
+    static const uint8_t big[] = {
+        0x93, 0x07, 0x00, 0x02,     // li a5,32 (4)
+        0x63, 0x06, 0xf7, 0x00,     // beq a4,a5,.L (4)
+        0x93, 0x07, 0x10, 0x00,     // li a5,1 (4)
+        0x67, 0x80, 0x00, 0x00,     // ret (4)
+        0x93, 0x07, 0x20, 0x00,     // li a5,2 (4)
+        0x67, 0x80, 0x00, 0x00,     // ret (4)
+    };
+    CHECK(!run_zibi(handle, big, sizeof big, Z, NULL));
+
+    // -2 is outside it on the other side -- only -1 is there.
+    static const uint8_t negtwo[] = {
+        0xf9, 0x57,                 // c.li a5,-2 (2)
+        0x63, 0x04, 0xf7, 0x00,     // beq a4,a5,.L (4)
+        0x85, 0x47,                 // c.li a5,1 (2)
+        0x82, 0x80,                 // ret (2)
+        0x89, 0x47,                 // c.li a5,2 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_zibi(handle, negtwo, sizeof negtwo, Z, NULL));
+
+    // Zero is outside it too, and for a reason: `beqz` already
+    // compares against x0, which is why Zibi has -1 instead.
+    static const uint8_t zero[] = {
+        0x81, 0x47,                 // c.li a5,0 (2)
+        0x63, 0x04, 0xf7, 0x00,     // beq a4,a5,.L (4)
+        0x85, 0x47,                 // c.li a5,1 (2)
+        0x82, 0x80,                 // ret (2)
+        0x89, 0x47,                 // c.li a5,2 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_zibi(handle, zero, sizeof zero, Z, NULL));
+
+    // Equality only. Zibi's condition predicate is
+    // isIntEqualitySetCC, so an ordered comparison has no form.
+    static const uint8_t lt[] = {
+        0xc5, 0x47,                 // c.li a5,17 (2)
+        0x63, 0x44, 0xf7, 0x00,     // blt a4,a5,.L (4)
+        0x85, 0x47,                 // c.li a5,1 (2)
+        0x82, 0x80,                 // ret (2)
+        0x89, 0x47,                 // c.li a5,2 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_zibi(handle, lt, sizeof lt, Z, NULL));
+
+    // The branch naming the constant in both operands is a condition
+    // that reads nothing else.
+    static const uint8_t both[] = {
+        0xc5, 0x47,                 // c.li a5,17 (2)
+        0x63, 0x84, 0xf7, 0x00,     // beq a5,a5,.L (4)
+        0x85, 0x47,                 // c.li a5,1 (2)
+        0x82, 0x80,                 // ret (2)
+        0x89, 0x47,                 // c.li a5,2 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_zibi(handle, both, sizeof both, Z, NULL));
+
+    // ...and in neither, which makes the two adjacent by accident.
+    static const uint8_t unrel[] = {
+        0xc5, 0x47,                 // c.li a5,17 (2)
+        0x63, 0x04, 0xd7, 0x00,     // beq a4,a3,.L (4)
+        0x85, 0x47,                 // c.li a5,1 (2)
+        0x82, 0x80,                 // ret (2)
+        0x89, 0x47,                 // c.li a5,2 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_zibi(handle, unrel, sizeof unrel, Z, NULL));
+
+    // `beq x0,a5`, which the assembler writes as c.beqz: zero against
+    // a constant is settled before run time.
+    static const uint8_t zeroop[] = {
+        0xc5, 0x47,                 // c.li a5,17 (2)
+        0x99, 0xc3,                 // beq zero,a5,.L (2)
+        0x85, 0x47,                 // c.li a5,1 (2)
+        0x82, 0x80,                 // ret (2)
+        0x89, 0x47,                 // c.li a5,2 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_zibi(handle, zeroop, sizeof zeroop, Z, NULL));
+
+    // The constant read again on the fall-through path.
+    static const uint8_t live[] = {
+        0xc5, 0x47,                 // c.li a5,17 (2)
+        0x63, 0x04, 0xf7, 0x00,     // beq a4,a5,.L (4)
+        0x3e, 0x85,                 // mv a0,a5 (2)
+        0x82, 0x80,                 // ret (2)
+        0x89, 0x47,                 // c.li a5,2 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_zibi(handle, live, sizeof live, Z, NULL));
+
+    // ...and the case a fall-through-only proof would miss: dead where
+    // a linear scan walks, live where the branch goes. This is the
+    // reason the proof is made twice.
+    static const uint8_t livetk[] = {
+        0xc5, 0x47,                 // c.li a5,17 (2)
+        0x63, 0x04, 0xf7, 0x00,     // beq a4,a5,.L (4)
+        0x85, 0x47,                 // c.li a5,1 (2)
+        0x82, 0x80,                 // ret (2)
+        0x3e, 0x85,                 // mv a0,a5 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_zibi(handle, livetk, sizeof livetk, Z, NULL));
+
+    // A branch into the branch: arriving that way, the register
+    // compared against need not hold 17.
+    static const uint8_t target[] = {
+        0xc5, 0x47,                 // c.li a5,17 (2)
+        0x63, 0x04, 0xf7, 0x00,     // beq a4,a5,.L (4)
+        0x85, 0x47,                 // c.li a5,1 (2)
+        0xed, 0xfe,                 // bnez a3,.T (2)
+        0x89, 0x47,                 // c.li a5,2 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_zibi(handle, target, sizeof target, Z, NULL));
+    // The gate is positive presence, not un-denial: unlike every
+    // riscvlint_may_use check, an object declaring nothing at all is
+    // still not told about an instruction no target has. The three Zilx
+    // checks read the set the same way.
+    CHECK(!run_zibi(handle, eq, sizeof eq, 0, NULL));
+    CHECK(!run_zibi(handle, eq, sizeof eq, RISCVLINT_EXT_DECLARED, NULL));
+    CHECK(!run_zibi(handle, eq, sizeof eq,
+                    RISCVLINT_EXT_DECLARED | RISCVLINT_EXT_ZBA, NULL));
+    CHECK(run_zibi(handle, eq, sizeof eq, RISCVLINT_EXT_DECLARED | Z, NULL));
+}
+
 static void test_census(csh handle)
 {
     static const uint8_t code[] = {
@@ -4148,6 +4378,7 @@ int main(void)
     test_fp_pool_to_fli(handle);
     test_const_mul_to_shadd(handle);
     test_udiv_pow2(handle);
+    test_const_eq_branch(handle);
     test_census(handle);
 
     cs_close(&handle);

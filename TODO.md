@@ -1456,18 +1456,20 @@ second instruction writes it is one dominant idiom plus nothing.
 
 # Remaining candidates
 
-None. Twenty-eight checks are implemented and everything this file ever
+None. Twenty-nine checks are implemented and everything this file ever
 sized is either written or recorded as rejected with the evidence that
-rejected it. The last seven did not come from a corpus probe at all: 23
+rejected it. The last eight did not come from a corpus probe at all: 23
 came from walking armlint's check table against this one, 24 came from a
 rejection in this file being wrong, 25, 26 and 27 are the three
 addressing modes of a ratification plan for an extension that does not
-exist in hardware yet, and 28 and 29 both fell out of a pair dump being
-re-counted for an unrelated question. 28's own entry records the columns
-of that count which were sized and rejected, the largest of them 16,313
-sites with no instruction to fold them into; 29 is the one entry here
-whose check was written and then measured at 0, and it says why it was
-kept anyway.
+exist in hardware yet, and 28, 29 and 30 all came out of one pair dump
+being re-counted for an unrelated question. 28's own entry records the
+columns of that count which were sized and rejected, the largest of
+them 16,313 sites with no instruction to fold them into; 29 is the one
+entry here whose check was written and then measured at 0, and says why
+it was kept anyway; 30 is the largest thing this file has added since
+the corpus doubled, and it was found by asking what a constant that is
+*not* multiplied by gets used for instead.
 
 That last one is worth reading as a worked example rather than a
 number. The SWAR popcount was rejected on a bound that was not a bound
@@ -2858,6 +2860,147 @@ planned JIT corpus is the obvious place for it to come back non-zero.
 Shipping it on those grounds is a judgement rather than a measurement,
 and this paragraph is here so that the judgement is on the record with
 its number next to it: 0 of 108,165,211 instructions.
+
+## 30. A constant loaded for one equality branch -- 177,581  [implemented]
+
+`li rc,K` + `beq`/`bne rx,rc,L`, which Zibi's `beqi`/`bnei rx,K,L` does
+in one instruction with K as a five-bit immediate. RV64I has no
+compare-immediate-and-branch, so a comparison against a constant has to
+materialize it into a register first. This is that shape, and it is the
+reason the extension is proposed.
+
+### How it was found
+
+Entry 28 ended with a question it did not need to answer. It found the
+constants 3, 5 and 9 being loaded by the hundred thousand and almost
+never multiplied by -- so what are they for? The successor distribution
+answered it: of 82,825 dependent pairs corpus-wide where such a
+constant feeds the instruction after it, **69% feed a conditional
+branch** and 21% a store, against 1% feeding a multiply.
+
+Those branches were most of what the distribution found and none of
+what entry 28's check reports. Asking what a one-instruction form for
+*them* would look like turned up `RISCVInstrInfoZibi.td`.
+
+### What Zibi is, from the tablegen
+
+| | |
+|---|---|
+| instructions | `beqi`, `bnei`, and nothing else |
+| condition | equality only -- `ZibiCond` is `isIntEqualitySetCC` |
+| immediate | `imm5_zibi`: 1..31, **or -1** |
+| encoding | funct3 010 and 011 in OPC_BRANCH, four bytes, B-type |
+| status | `RISCVExperimentalExtension` at **0.1** |
+| profiles | none |
+| capstone | does not decode it |
+
+Zero is absent from the immediate range deliberately, and the evidence
+is `imm5_zibi`'s own predicate rather than a specification, there being
+none to read: `(Imm != 0 && isUInt<5>(Imm)) || Imm == -1`. `beq rs,x0`
+already compares against zero, so the encoding spends that slot on -1.
+The detail is worth having -- a check that assumed a plain five-bit
+unsigned field would miss every -1 and would wrongly offer a fold for
+every comparison against zero, which is a population of its own that
+`beqz` already covers. 18 of libmozsqlite3's 726 sites are -1.
+
+Zibi is a stage earlier than Zilx: 0.1 and experimental against a
+ratification plan. Both are in no profile, so this check reads the
+extension set the same way the three Zilx checks do -- positively
+present, not merely un-denied -- and reports nothing under any object's
+own declaration.
+
+One difference from Zilx is worth recording. The *instruction* does
+exist in shipping silicon, as a vendor extension: CORE-V has
+`cv.beqimm` and `cv.bneimm`, which capstone does decode even though it
+does not decode Zibi. So unlike the indexed loads, this fold is one
+some real hardware can execute today, under another name and with its
+own immediate range, which has not been checked against this one.
+
+### What the check reports -- 177,581 under `-m zibi`
+
+| language | objects | sites |
+|---|---:|---:|
+| C++ | 13 | 166,378 |
+| Rust | 6 | 5,766 |
+| Go | 12 | 5,437 |
+| **total** | **31** | **177,581** |
+
+Largest objects: 47,115 in libxul, 39,641 in debian-libllvm22, 38,997 in
+ubuntu-libllvm22, 36,710 in libllvm20, 1,869 in uutils, 1,683 in
+libgkcodecs, 1,360 in go `compile`, 1,307 in ripgrep.
+
+This is the first entry in the file whose population is C++'s rather
+than Go's -- 94% of it, with the four largest contributors being three
+LLVM builds and libxul. The two shift-add families and the base-C row
+are Go's assembler, and the contrast is worth noting, but what these
+comparisons are in the source the check cannot see: it reads `li` and
+`beq` and not the switch arm or enum test they may have come from. The
+measured fact is the concentration in the largest C++ objects.
+
+It would be fourth in the table of reported checks if it appeared there,
+behind base-C compression (2,996,620), the call pair (292,301) and the
+stack-pointer restore (216,226).
+
+358,328 bytes. 175,998 sites are `c.li` + `beq` at `(6 -> 4)` and 1,583
+are a wide `li` at `(8 -> 4)`, so 99% save exactly the two bytes the
+compressed `li` took. Nothing saves more: the branch keeps its own
+displacement and so its reach, `beqi` is four bytes with no compressed
+form, and the branch being replaced was never compressed either --
+`c.beqz` and `c.bnez` compare against x0 and these compare two
+registers.
+
+### What it costs: one proof made twice
+
+| | sites |
+|---|---:|
+| shapes with an in-range immediate | 461,300 |
+| -- constant live on a successor | 280,487 |
+| -- branch reachable from elsewhere | 3,232 |
+| reported | **177,581** |
+
+61% of the raw shape goes, nearly all of it to liveness. The constant
+has to be dead on **both** successors and a linear scan sees only the
+fall-through, so the proof is made twice -- at the fall-through and at
+the branch target -- exactly as `check_cond_to_branch` makes it, whose
+own comment says the taken path is where half of its raw population
+turns out to be live. Relocations and the sp/gp/tp test cost nothing
+here.
+
+### What Zibi does not cover, measured
+
+Two populations sit next to this one and have no Zibi form:
+
+| shape | dependent sites |
+|---|---:|
+| `li` + `beq`/`bne`, immediate outside 1..31 and -1 | 238,018 |
+| `li` + `blt`/`bltu`/`bge`/`bgeu`, any immediate | 273,747 |
+
+The second is the larger and is the extension's own design decision:
+equality only. An ordered comparison against a small constant is at
+least as common as an equality one and gets nothing. Both figures are
+recorded here because they are the obvious next question about the
+extension, and because they bound what a later version of it could add.
+
+### What else the same pass turned up and did not become a check
+
+`li rc,K` + `mv rd,rc` folds to `li rd,K`, and no existing check reports
+it -- verified directly rather than assumed. The pair dump sized it at
+50,044 dependent pairs, which looked like a fourth-ranking check.
+
+Written as a throwaway with the real preconditions it reports almost
+nothing: 0 of go `compile`'s 10,175 shapes, 0 of ripgrep's 424, 5 of
+libQt6Core's 306. 91% to 94% is lost to liveness, and the reason is the
+shape itself -- a compiler emits `li` then `mv` precisely when it needs
+the constant in two registers, which is exactly when the `li` cannot be
+deleted. Rematerializing instead of copying would break the dependency
+without changing the size, and this project reports size and instruction
+count rather than latency.
+
+One oddity fell out of the same count and is recorded for its own sake:
+53 dependent pairs of `li rc,0` + `bnez rc,L`, a branch on a register
+just proved zero. That is a never-taken branch rather than a missed
+peephole, and at 53 sites across 108 million instructions it is not
+worth a rule.
 
 # Ranked for C++ and Rust specifically
 

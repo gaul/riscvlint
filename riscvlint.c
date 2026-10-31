@@ -279,6 +279,7 @@ unsigned riscvlint_parse_arch(const char *arch)
     if (strstr(arch, "_zcb")) exts |= RISCVLINT_EXT_ZCB;
     if (strstr(arch, "_zfa")) exts |= RISCVLINT_EXT_ZFA;
     if (strstr(arch, "_zilx")) exts |= RISCVLINT_EXT_ZILX;
+    if (strstr(arch, "_zibi")) exts |= RISCVLINT_EXT_ZIBI;
     // C is spelled `_c2p0` in the base run and `_zca1p0` once the
     // Zc* split gave it a name of its own; a conforming string carries
     // whichever the assembler wrote, and some carry both.
@@ -1447,6 +1448,10 @@ bool riscvlint_parse_ext_name(const char *name, unsigned *exts)
         // Zilx is in no profile -- not RVA20, RVA22, RVA23 or RVB23 --
         // so it is named on its own and never arrives with one.
         { "zilx",  RISCVLINT_EXT_ZILX },
+        // Zibi is in no profile either, and is a stage earlier than
+        // Zilx: LLVM has it as an RISCVExperimentalExtension at 0.1,
+        // where Zilx at least has a ratification plan behind it.
+        { "zibi",  RISCVLINT_EXT_ZIBI },
         // Every profile from RVA20 up mandates C.
         { "rva20", RISCVLINT_EXT_C },
         { "rva22", RISCVLINT_EXT_ZBA | RISCVLINT_EXT_ZBB | RISCVLINT_EXT_ZBS |
@@ -3334,15 +3339,18 @@ static const char *zilx_name(rv_mem_kind kind)
 bool check_indexed_load(riscvlint_state *state, const cs_insn *insn,
                         riscvlint_finding *finding)
 {
-    // Positively present, not merely un-denied -- which is this check
-    // alone among the gated ones. riscvlint_may_use answers true when
-    // an object declares no attributes, because "absent" must not
-    // silence a check on the code it exists for; that rule assumes the
-    // extension is one some target plausibly has. Zilx is in no profile
-    // and in no shipping core, so defaulting to permissive would put
-    // 3,528 findings on the Go objects suggesting an instruction nobody
-    // can execute. It fires when the object declares `_zilx` or when
-    // `-m zilx` asks the what-if, and otherwise not at all.
+    // Positively present, not merely un-denied. riscvlint_may_use
+    // answers true when an object declares no attributes, because
+    // "absent" must not silence a check on the code it exists for; that
+    // rule assumes the extension is one some target plausibly has. Zilx
+    // is in no profile and in no shipping core, so defaulting to
+    // permissive would put 3,528 findings on the Go objects suggesting
+    // an instruction nobody can execute. It fires when the object
+    // declares `_zilx` or when `-m zilx` asks the what-if, and
+    // otherwise not at all.
+    //
+    // The three Zilx checks and check_const_eq_branch are the only ones
+    // that read the set this way; every other gate is riscvlint_may_use.
     if (!(riscvlint_state_extensions(state) & RISCVLINT_EXT_ZILX))
         return false;
     // An `add` a deeper fold has already turned into one `lxs*`. Both
@@ -4468,6 +4476,105 @@ bool check_udiv_pow2(riscvlint_state *state, const cs_insn *insn,
     return true;
 }
 
+// A constant loaded only to be compared for equality, where Zibi's
+// `beqi`/`bnei` takes the constant as a five-bit immediate and the `li`
+// disappears. RV64I has no compare-immediate-and-branch, so every
+// comparison against a constant has to materialize it first; this is
+// the shape that forces.
+//
+// imm5_zibi is 1 through 31, or -1. Zero is absent from the range
+// because `beq rs,x0` already compares against it, which is also why
+// decode_const's `lui` spellings never reach here: a lui's value is a
+// multiple of 4096 and a c.lui's the same, so the range test excludes
+// them without a second look at the encoding.
+static bool zibi_immediate(int64_t v)
+{
+    return v == -1 || (v >= 1 && v <= 31);
+}
+
+bool check_const_eq_branch(riscvlint_state *state, const cs_insn *insn,
+                           riscvlint_finding *finding)
+{
+    // Positively present, not merely un-denied, for the reason
+    // check_indexed_load states at length -- and more so here. Zibi is
+    // in no profile and LLVM carries it as an experimental extension at
+    // 0.1, where Zilx at least has a ratification plan; the permissive
+    // reading would put 177,581 findings across the corpus, 47,115 of
+    // them in libxul alone, for an instruction no target can execute.
+    if (!(riscvlint_state_extensions(state) & RISCVLINT_EXT_ZIBI))
+        return false;
+    if (insn->size != 2 && insn->size != 4) return false;
+
+    uint32_t w1;
+    if (!riscvlint_word_at(state, insn->address, &w1)) return false;
+    unsigned rc;
+    int64_t val;
+    if (!decode_const(w1, insn->size, &rc, &val)) return false;
+    if (!zibi_immediate(val)) return false;
+    // sp, gp and tp hold what the ABI says they hold rather than a
+    // comparand, as in check_const_mul_to_shadd and check_const_remat.
+    if (rc == 2 || rc == 3 || rc == 4) return false;
+
+    uint64_t second = insn->address + insn->size;
+    uint32_t w2;
+    if (!riscvlint_word_at(state, second, &w2)) return false;
+    unsigned len2 = rv_insn_len(w2);
+    unsigned brs1, brs2, bf3;
+    int64_t off;
+    if (!rv_decode_cond_branch(w2, len2, &brs1, &brs2, &bf3, &off))
+        return false;
+    // Equality only: Zibi has beqi and bnei and nothing else, its
+    // condition predicate being isIntEqualitySetCC. The ordered
+    // comparisons are a larger population and have no Zibi form -- see
+    // TODO.md, where that number is recorded rather than reported.
+    if (bf3 != 0u && bf3 != 1u) return false;
+    // beq and bne commute, so the constant may be either operand, but
+    // it has to be exactly one of them: `beq rc,rc` is a condition that
+    // does not read anything else, and a branch naming it in neither
+    // operand is unrelated to the `li`.
+    unsigned rx;
+    if (brs2 == rc && brs1 != rc) rx = brs1;
+    else if (brs1 == rc && brs2 != rc) rx = brs2;
+    else return false;
+    // x0 as the other operand compares zero against a constant, which
+    // is a condition decided at assembly time rather than a comparison.
+    if (rx == 0) return false;
+
+    // Folding deletes the `li`, so the branch must not be reachable from
+    // anywhere that did not run it.
+    if (riscvlint_is_branch_target(state, second)) return false;
+    if (riscvlint_is_relocated(state, insn->address) ||
+        riscvlint_is_relocated(state, second))
+        return false;
+
+    // The constant has to be dead on *both* successors, which is where
+    // most of this shape's population goes: a scan sees the fall-through
+    // and not the taken path, and the comparand is very often still
+    // wanted on one of them. check_cond_to_branch proves the same thing
+    // the same way.
+    uint64_t fallthrough = second + len2;
+    uint64_t taken = second + (uint64_t)off;
+    if (riscvlint_liveness(state, fallthrough, rc) != RISCVLINT_LIVE_DEAD)
+        return false;
+    if (riscvlint_liveness(state, taken, rc) != RISCVLINT_LIVE_DEAD)
+        return false;
+
+    // The branch keeps its own displacement and so its reach, and beqi
+    // is a B-type four bytes with no compressed form. The branch being
+    // replaced cannot have been compressed either -- c.beqz and c.bnez
+    // compare against x0 and this one compares two registers -- so the
+    // saving is exactly what the `li` took.
+    unsigned before = insn->size + len2;
+    finding->title = "constant loaded for one equality branch";
+    finding->address = insn->address;
+    finding->insn_count = 2;
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "%s %s, %lld, 0x%" PRIx64 " (%u -> 4 bytes)",
+             bf3 == 0u ? "beqi" : "bnei", rv_reg_name(rx), (long long)val,
+             taken, before);
+    return true;
+}
+
 // ---- running every check ----
 
 static const riscvlint_check_fn riscvlint_checks[] = {
@@ -4499,6 +4606,7 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_zext_indexed_load,
     check_const_mul_to_shadd,
     check_udiv_pow2,
+    check_const_eq_branch,
 };
 
 size_t riscvlint_scan(riscvlint_state *state, csh handle,

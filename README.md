@@ -3,7 +3,7 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Twenty-eight checks are implemented and the ledger's candidate list
+Twenty-nine checks are implemented and the ledger's candidate list
 is empty. [TODO.md](TODO.md) is that ledger: every candidate that was
 measured, the population it came back with, and the ones rejected on
 that evidence.
@@ -12,12 +12,13 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Twenty-eight of them, and the table lists twenty-three. Five report
+Twenty-nine of them, and the table lists twenty-three. Six report
 nothing over this corpus -- the bit count because no baseline object
-declares Zbb, the three indexed loads because they are the ones
-requiring their extension to be positively present rather than merely
-un-denied, and the unsigned divide by a power of two because all three
-toolchains already do that fold themselves. Those entries below say why. Every figure is
+declares Zbb; the three indexed loads and the equality branch because
+those four require their extension to be positively present rather
+than merely un-denied, and no object declares Zilx or Zibi; and the
+unsigned divide by a power of two because all three toolchains already
+do that fold themselves. Those entries below say why. Every figure is
 what the check itself reports over the [corpus](#corpus) --
 108,165,211 instructions of three toolchains across 31 objects --
 rather than what a mining tool estimated for it. The two have differed
@@ -162,6 +163,58 @@ except a handful of `jalr ra,0(ra)` that were already two.
   Go site is lost to a relocation, to an sp/gp/tp destination, or to a
   multiply that does not read the constant exactly once, and the only
   branch-target rejections anywhere in the corpus are libxul's two.
+
+* **constant loaded for one equality branch** -- `li rc,K` +
+  `beq`/`bne rx,rc,L`, which Zibi's `beqi`/`bnei rx,K,L` does in one
+  instruction. RV64I has no compare-immediate-and-branch, so every
+  comparison against a constant must materialize it into a register
+  first; this is the shape that forces, and the reason the extension is
+  proposed.
+
+  `imm5_zibi` is 1 through 31, or **-1**. Zero is absent deliberately --
+  `beq rs,x0` already compares against it, so the encoding spends what
+  would have been zero on -1 instead. Equality only: Zibi's condition
+  predicate is `isIntEqualitySetCC`, so it has `beqi` and `bnei` and no
+  ordered form.
+
+  Population: **177,581** sites under `-m zibi` -- 166,378 C++, 5,766
+  Rust, 5,437 Go -- worth 358,328 bytes. 47,115 are in libxul, 39,641 in
+  debian-libllvm22, 38,997 in ubuntu-libllvm22 and 36,710 in libllvm20.
+  Unlike the two shift-add families, which are Go's almost entirely,
+  this one is 94% C++, and the four largest contributors are three
+  LLVM builds and libxul. What those comparisons are in the source the
+  check cannot see; that they are concentrated in the largest C++
+  objects is as far as the evidence goes. It would be fourth in the
+  table above if it appeared there, behind base-C compression, the call
+  pair and the stack-pointer restore.
+
+  175,998 of the sites are `c.li` + `beq`, six bytes down to four, and
+  1,583 are a wide `li`, eight down to four -- so 99% of them save
+  exactly the two bytes the compressed `li` took. The branch keeps its
+  own displacement and so its reach, and the branch being replaced was
+  never compressed in the first place: `c.beqz` and `c.bnez` compare
+  against x0 and these compare two registers.
+
+  The cost is one liveness proof made twice. The constant has to be dead
+  on **both** successors, and a linear scan sees the fall-through and not
+  the taken path: of 461,300 shapes with an in-range immediate, 280,487
+  leave it live on one side or the other and 3,232 more have something
+  branching into the comparison. That is 61% of the raw shape gone, and
+  the same proof `check_cond_to_branch` makes for the same reason.
+
+  Gated on positive presence, as the three indexed loads are and for a
+  sharper version of the same reason: Zibi is in no profile and LLVM
+  carries it as an *experimental* extension at version 0.1, where Zilx at
+  least has a ratification plan. Capstone cannot decode it either, so
+  like the Zilx entries this check suggests an instruction the
+  disassembler alongside it could not read back. Every figure here is an
+  `-m zibi` figure.
+
+  Unlike the indexed loads, though, the instruction itself does run on
+  real hardware today: CORE-V ships `cv.beqimm` and `cv.bneimm` as a
+  vendor extension, and capstone decodes *those*. Their immediate range
+  has not been checked against Zibi's, so the figures above are Zibi's
+  alone.
 
 * **unsigned divide or remainder by a power of two** -- `li rc,2^k` +
   `divu rd,rx,rc` is a shift: `srli rd,rx,k`. `divuw` divides the low
@@ -1000,9 +1053,11 @@ except a handful of `jalr ra,0(ra)` that were already two.
 
 `-m <name>` pins the extensions the checks may assume, and may be
 repeated. Names are either extensions (`zba`, `zbb`, `zbs`, `zcb`,
-`zfa`, `zilx`, `c`) or profiles that bundle them (`rva20`, `rva22`,
-`rva23`). `zilx` is the one no profile contains, so it only ever
-arrives by being named.
+`zfa`, `zilx`, `zibi`, `c`) or profiles that bundle them (`rva20`,
+`rva22`, `rva23`). `zilx` and `zibi` are the two no profile contains,
+so they only ever arrive by being named -- and the checks behind them
+are the four that want the extension positively present rather than
+merely un-denied.
 
 `-m` replaces what the object declares, in both directions, because both
 are useful and neither is expressible if the flag merely adds to the
