@@ -5849,6 +5849,86 @@ bool check_push_run(riscvlint_state *state, const cs_insn *insn,
     return true;
 }
 
+// ---- zero loaded for a store ----
+
+#define ZSTORE_WALK 16      // instructions the stores may span
+
+bool check_zero_for_store(riscvlint_state *state, const cs_insn *insn,
+                          riscvlint_finding *finding)
+{
+    if (insn->size != 2 && insn->size != 4) return false;
+    uint32_t w;
+    if (!riscvlint_word_at(state, insn->address, &w)) return false;
+    unsigned rt;
+    int64_t val;
+    if (!decode_const(w, insn->size, &rt, &val) || val != 0) return false;
+    // sp, gp and tp hold what the ABI says they hold rather than a
+    // value to store, as in check_const_remat.
+    if (rt == 2 || rt == 3 || rt == 4) return false;
+    if (riscvlint_is_relocated(state, insn->address)) return false;
+
+    // Every integer store of rt that follows before anything else might
+    // touch it becomes a store of x0. The walk stops at the first
+    // instruction that might, at a transfer, and at a side entry, where
+    // a path that never ran the `li` would arrive at a store expecting
+    // whatever rt held there.
+    bool zcb = riscvlint_may_use(state, RISCVLINT_EXT_ZCB);
+    unsigned nst = 0, before = insn->size, after = 0, seen = 1, span = 1;
+    rv_mem_kind kind1 = RV_MEM_NONE;
+    unsigned base1 = 0;
+    int64_t off1 = 0;
+    uint64_t at = insn->address + insn->size, end = at;
+    for (int budget = ZSTORE_WALK; budget > 0; budget--) {
+        if (riscvlint_is_branch_target(state, at)) break;
+        uint32_t w2;
+        if (!riscvlint_word_at(state, at, &w2)) break;
+        unsigned len = rv_insn_len(w2);
+        seen++;
+        rv_mem_kind kind;
+        unsigned data, base;
+        int64_t off;
+        if (rv_decode_mem(w2, len, &kind, &data, &base, &off) &&
+            rv_mem_is_store(kind) && !rv_mem_is_fp(kind) && data == rt &&
+            base != rt) {
+            if (riscvlint_is_relocated(state, at)) break;
+            if (nst++ == 0) {
+                kind1 = kind;
+                base1 = base;
+                off1 = off;
+            }
+            before += len;
+            // c.sdsp and c.swsp name x0 as freely as any register; the
+            // quadrant-0 forms cannot, so a compressed store through any
+            // other base grows back to four bytes.
+            after += len == 2 ? rv_mem_encoded_size(kind, 0, base, off, zcb)
+                              : 4;
+            end = at + len;
+            span = seen;
+        } else if (rv_may_name(w2, len, rt) || rv_stops_walk(w2, len)) {
+            break;
+        }
+        at += len;
+    }
+    if (nst == 0 || after >= before) return false;
+    // After the fold rt no longer holds zero, so nothing past the last
+    // store may read it.
+    if (riscvlint_liveness(state, end, rt) != RISCVLINT_LIVE_DEAD)
+        return false;
+
+    finding->title = "zero loaded for a store";
+    finding->address = insn->address;
+    finding->insn_count = span;
+    if (nst == 1)
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "%s zero, %" PRId64 "(%s) (%u -> %u bytes)",
+                 rv_mem_name(kind1), off1, rv_reg_name(base1), before, after);
+    else
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "zero for %s in %u stores (%u -> %u bytes)", rv_reg_name(rt),
+                 nst, before, after);
+    return true;
+}
+
 // ---- running every check ----
 
 static const riscvlint_check_fn riscvlint_checks[] = {
@@ -5890,6 +5970,7 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_long_li,
     check_no_effect,
     check_push_run,
+    check_zero_for_store,
 };
 
 size_t riscvlint_scan(riscvlint_state *state, csh handle,

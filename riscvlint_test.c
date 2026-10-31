@@ -5604,6 +5604,65 @@ static void test_push_run(csh handle)
     CHECK(run_window(handle, check_push_run, odd, sizeof odd, 0x1000, NULL) == 0);
 }
 
+// check_zero_for_store: a register zeroed only to be stored.
+static void test_zero_for_store(csh handle)
+{
+    riscvlint_finding f;
+    const uint32_t li_a0_0 = 0x00000513u;        // li a0,0
+    const uint32_t sd_a0_8sp = 0x00a13423u;      // sd a0,8(sp)
+    const uint32_t ret = 0x00008067u;
+
+    // Baseline: li a0,0; sd a0,-128(s0); li a0,15. The li redefining a0
+    // is what proves it dead.
+    uint32_t one[] = { li_a0_0, 0xf8a43023u /* sd a0,-128(s0) */,
+                       0x00f00513u /* li a0,15 */, ret };
+    CHECK(run_words(handle, check_zero_for_store, one, 4, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "sd zero, -128(s0) (8 -> 4 bytes)") == 0);
+    CHECK(f.insn_count == 2 && f.address == 0x1000);
+    CHECK(strcmp(f.title, "zero loaded for a store") == 0);
+
+    // Three stores of the same zero, one with an unrelated instruction
+    // before it: the li goes once.
+    uint32_t three[] = { 0x00000793u /* li a5,0 */,
+                         0x00f4b7a3u /* sd a5,15(s1) */,
+                         0x00f4bba3u /* sd a5,23(s1) */,
+                         0x02870813u /* addi a6,a4,40 */,
+                         0x00f4bfa3u /* sd a5,31(s1) */,
+                         0x00100793u /* li a5,1 */, ret };
+    CHECK(run_words(handle, check_zero_for_store, three, 7, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "zero for a5 in 3 stores (16 -> 12 bytes)") == 0);
+    CHECK(f.insn_count == 5);
+
+    // Not reported: a0 read after the store; a0 reaching `ret`, which the
+    // walk will not judge; a `j` back to the second store, which a0 then
+    // reaches from somewhere else; a constant that is not zero; and a
+    // store through a0 rather than of it.
+    uint32_t read[] = { li_a0_0, sd_a0_8sp, 0x00050593u /* mv a1,a0 */, ret };
+    CHECK(run_words(handle, check_zero_for_store, read, 4, 0x1000, NULL) == 0);
+    uint32_t live[] = { li_a0_0, sd_a0_8sp, ret };
+    CHECK(run_words(handle, check_zero_for_store, live, 3, 0x1000, NULL) == 0);
+    uint32_t entry[] = { li_a0_0, sd_a0_8sp, 0x00a13823u /* sd a0,16(sp) */,
+                         0x00100513u /* li a0,1 */, 0xff9ff06fu /* j -8 */ };
+    CHECK(run_words(handle, check_zero_for_store, entry, 5, 0x1000, NULL) == 0);
+    uint32_t nonzero[] = { 0x00100513u /* li a0,1 */, sd_a0_8sp,
+                           0x00200513u /* li a0,2 */, ret };
+    CHECK(run_words(handle, check_zero_for_store, nonzero, 4, 0x1000, NULL) == 0);
+    uint32_t base[] = { li_a0_0, 0x00b53023u /* sd a1,0(a0) */,
+                        0x00100513u /* li a0,1 */, ret };
+    CHECK(run_words(handle, check_zero_for_store, base, 4, 0x1000, NULL) == 0);
+
+    // Compressed: c.sdsp names x0, so c.li a5,0; c.sdsp a5,8(sp) is one
+    // c.sdsp zero. c.sd cannot, and c.li a5,0; c.sd a5,8(a0) would grow
+    // to a four-byte sd zero, saving nothing.
+    uint8_t sdsp[] = { 0x81, 0x47, 0x3e, 0xe4, 0x85, 0x47, 0x82, 0x80 };
+    CHECK(run_window(handle, check_zero_for_store, sdsp, sizeof sdsp, 0x1000,
+                     &f) == 1);
+    CHECK(strcmp(f.replacement, "sd zero, 8(sp) (4 -> 2 bytes)") == 0);
+    uint8_t csd[] = { 0x81, 0x47, 0x1c, 0xe5, 0x85, 0x47, 0x82, 0x80 };
+    CHECK(run_window(handle, check_zero_for_store, csd, sizeof csd, 0x1000,
+                     NULL) == 0);
+}
+
 int main(void)
 {
     csh handle;
@@ -5643,6 +5702,7 @@ int main(void)
     test_long_li(handle);
     test_no_effect(handle);
     test_push_run(handle);
+    test_zero_for_store(handle);
     test_zero_store_run(handle);
     test_bitcast_through_frame(handle);
     test_cchain(handle);

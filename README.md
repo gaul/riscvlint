@@ -3,8 +3,8 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Thirty-eight checks are implemented and the ledger's candidate list
-holds seven, all from a JIT corpus. [TODO.md](TODO.md) is that ledger:
+Thirty-nine checks are implemented and the ledger's candidate list
+holds six, all from a JIT corpus. [TODO.md](TODO.md) is that ledger:
 every candidate that was measured, the population it came back with,
 and the ones rejected on that evidence.
 What got written was decided by the corpus rather than by intuition,
@@ -12,20 +12,20 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Thirty-eight of them, and the table lists twenty-seven. The jump pair,
-the constant chain, the no-op and the push run have so far been measured
-over the JetStream corpus of TODO.md, which the table does not cover.
-Seven report nothing over this corpus -- the bit count because no
-baseline object declares Zbb; the three indexed loads, the equality
-branch and the compare-exchange loop because those five require their
-extension to be positively present rather than merely un-denied, and no
-object declares Zilx, Zibi or Zacas; and the unsigned divide by a power
-of two because all three toolchains already do that fold themselves.
-Those entries below say why. Every figure is what the check itself
-reports over the [corpus](#corpus) -- 108,165,211 instructions of three
-toolchains across 31 objects -- rather than what a mining tool estimated
-for it. The two have differed by an order of magnitude every time both
-were measured.
+Thirty-nine of them, and the table lists twenty-seven. The jump pair,
+the constant chain, the no-op, the push run and the zero store have so
+far been measured over the JetStream corpus of TODO.md, which the table
+does not cover. Seven report nothing over this corpus -- the bit count
+because no baseline object declares Zbb; the three indexed loads, the
+equality branch and the compare-exchange loop because those five require
+their extension to be positively present rather than merely un-denied,
+and no object declares Zilx, Zibi or Zacas; and the unsigned divide by a
+power of two because all three toolchains already do that fold
+themselves. Those entries below say why. Every figure is what the check
+itself reports over the [corpus](#corpus) -- 108,165,211 instructions of
+three toolchains across 31 objects -- rather than what a mining tool
+estimated for it. The two have differed by an order of magnitude every
+time both were measured.
 
 The table is generated, not maintained: `scripts/check_table.py` scans
 the corpus and prints it, which is how adding two objects stopped
@@ -819,6 +819,28 @@ except a handful of `jalr ra,0(ra)` that were already two.
   `sb zero` and `sh zero` have no compressed spelling at all -- the two
   figures are the same and the finding matches the disassembly byte for
   byte.
+
+* **zero loaded for a store** -- `li rt,0` and then stores of rt, where
+  each could store x0 and the `li` go:
+
+  ```
+   12e7ab4: li a0, 0
+   12e7ab8: sd a0, -0x80(s0)        -> sd zero, -128(s0) (8 -> 4 bytes)
+   12e7abc: li a0, 1
+  ```
+
+  Every integer store of rt that follows before anything else might
+  name it counts, up to sixteen instructions with no side entry or
+  transfer among them, so a zero stored four times is one finding; rt
+  must be dead after the last store. `c.sdsp` and `c.swsp` name x0 as
+  freely as any register, but the quadrant-0 compressed stores cannot,
+  and a site whose store would grow back to four bytes is not reported.
+
+  The JetStream corpus (TODO.md, entry 41) has 31,052 sites rewriting
+  40,979 stores, worth 124,208 bytes: 18,695 in baseline, whose
+  accumulator is a0, so that a bytecode loading zero and one storing it
+  to a register are exactly this pair; 6,584 in regexp code, 4,743 in
+  Maglev and 969 in TurboFan.
 
 * **constant built in more instructions than li needs** -- a chain of
   `lui` or `li` followed by `addi`, `addiw`, `slli`, `ori` or `xori`

@@ -1486,7 +1486,7 @@ which is to the digit what check 3 reports over this corpus.
 | 38 | an instruction with no architectural effect | 812,586 | ML 764K | **implemented**, 812,586 |
 | 39 | a conditional branch whose target is an unconditional jump | 177,202 | ML 137K, TF 17K, RE 14K | candidate |
 | 40 | pushes one stack adjustment would do | 81,103 runs | ML 78K | **implemented**, 259,684 |
-| 41 | `li rt,0` + a store of rt | 43,002 | BL 20K, ML 13K, RE 7K | candidate |
+| 41 | `li rt,0` + a store of rt | 43,002 | BL 20K, ML 13K, RE 7K | **implemented**, 31,052 |
 | 42 | a branch over a constant move that Zbb `max`/`min` does | 31,906 | ML | candidate |
 | 43 | `li rc,0` + `beq`/`bne rx,rc` | 29,089 | TF 25K | candidate |
 | 44 | an immediate operand materialized into a register | 20,743 | ML | candidate |
@@ -1629,15 +1629,37 @@ baseline's and part of Maglev's -- fell outside its 81,103, and a
 prologue ending in the untagged-slot `Sub64` counted one adjustment
 short. Regexp code agrees with it: 3,020 against 3,016.
 
-## 39 and 41 to 46. Seven more shapes from the JetStream corpus
+## 41. Zero loaded for a store -- 31,052  [implemented]
+
+`li rt,0` and then a store of rt, where `sd zero` stores the same bytes
+and the `li` goes. In baseline code the accumulator is a0, so a bytecode
+that loads zero followed by one that stores the accumulator to a
+register is `li a0,0` + `sd a0,slot(s0)`, and the next bytecode's load
+into a0 is what proves it dead.
+
+The check collects every integer store of rt that follows before
+anything else might name it, up to sixteen instructions with no side
+entry or transfer among them, so a zero stored four times is one finding
+and one `li`. rt must be dead after the last store, by the liveness
+walk.
+
+What check_zero_for_store reports: 31,052 sites rewriting 40,979 stores,
+worth 124,208 bytes -- exactly the `li`s, since no store here is
+compressed and none grows -- 18,695 baseline, 6,584 regexp, 4,743
+Maglev, 969 TurboFan, 61 wrappers. 27,324 have one store and 3,014 store
+the same zero four times. Against the miner's 43,002 stores the check
+comes in under, and the shortfall is Maglev's and TurboFan's: there the
+zero is usually stored or pushed as a call's argument, and the call
+comes before anything redefines the register, which the liveness walk
+treats as a possible read.
+
+## 39 and 42 to 46. Six more shapes from the JetStream corpus
 
 * **39**, a branch whose target is a `j`: jump threading. 177,202, and
   38,002 more `j` whose target is another `j`. Check 19 reads
   `bcc L1; j X; L1:`; this is `bcc L; ...; L: j X`, where the branch can
   be retargeted when X is inside its reach. Many sites are both at once
   (`bnez a0,L1; j A; L1: j B`).
-* **41**, a register loaded with zero and then stored: 43,002, `sd x0`
-  being free. 19,930 in baseline, 12,635 in Maglev.
 * **42**, `li t2,K; blt t2,a5,+8; li a5,K`, Maglev's argument-count
   clamp in the epilogue: 31,906 sites that are Zbb's `max`. 4,162 more
   branch over a `mv` (a select, Zicond's `czero` pair) and 892 over an
@@ -1684,9 +1706,9 @@ not tracked (about 75K, every one a dispatch handle that a later
 
 # Remaining candidates
 
-Seven, 39 and 41 to 46, all from the JetStream corpus above; over the
-package corpus there are none. Thirty-eight checks are implemented, 36
-to 38 and 40 being the four from that corpus so far, and everything
+Six, 39 and 42 to 46, all from the JetStream corpus above; over the
+package corpus there are none. Thirty-nine checks are implemented, 36
+to 38, 40 and 41 being the five from that corpus so far, and everything
 this file sized over the package corpus is either written or recorded
 as rejected with the evidence that rejected it. Thirteen of the package
 entries, 23 to 35, did not come from a corpus probe at all: 23 came

@@ -1434,6 +1434,24 @@ bool check_no_effect(riscvlint_state *state, const cs_insn *insn,
 bool check_push_run(riscvlint_state *state, const cs_insn *insn,
                     riscvlint_finding *finding);
 
+// A register loaded with zero only to be stored: `li rt,0` and then
+// integer stores of rt, each of which could store x0 instead, and the
+// `li` go. The stores are every one of rt that follows before anything
+// else might read or write it, within sixteen instructions and with no
+// side entry or transfer among them; a store whose base is rt reads it
+// as an address and ends the walk. rt must be dead after the last
+// store, by the liveness walk.
+//
+// Priced at each store's own encoding class: `c.sdsp` and `c.swsp` name
+// x0 as freely as any register, but the quadrant-0 forms cannot, so a
+// compressed store through another base grows to four bytes, and a site
+// where that eats the saving is not reported.
+//
+// Measured population: 31,052 sites in the JetStream corpus (TODO.md,
+// entry 41), rewriting 40,979 stores. Compilers store x0 directly.
+bool check_zero_for_store(riscvlint_state *state, const cs_insn *insn,
+                          riscvlint_finding *finding);
+
 // ---- running every check ----
 //
 // Called once per finding, with `ctx` as given. The finding is valid
