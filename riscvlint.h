@@ -1050,6 +1050,44 @@ const char *rv_fli_spell(int entry, char *out, size_t outsz);
 bool check_fp_pool_to_fli(riscvlint_state *state, const cs_insn *insn,
                           riscvlint_finding *finding);
 
+// `li rd,3` (or 5, or 9) followed by a multiply by it: Zba's
+// `sh1add`/`sh2add`/`sh3add` computes the same product in one
+// instruction, with both operands naming the multiplicand --
+// `sh1add rd,rx,rx` is rx + (rx << 1).
+//
+// The factor has to be one of exactly those three. A power of two is a
+// shift and no compiler in the corpus emits a multiply for one: four
+// dependent `li` + `mul` pairs across 108 million instructions load a
+// power of two, against 712 that load a 3, 5 or 9. Every other small factor needs two shifts and
+// an add at best, which is no better than the two instructions already
+// there.
+//
+// Only `mul`. `mulw` sign-extends its 32-bit product and shNadd does
+// not, so folding one needs a following `sext.w` and trades two
+// instructions for two; the corpus has 387 of those, which is why the
+// decoder's reach -- a different major opcode for mulw, a different
+// funct3 for the mulh family -- is the test rather than a mnemonic
+// list.
+//
+// The constant must be dead after the pair, since the rewrite stops
+// loading it. Usually the multiply overwrites it and that is free.
+//
+// Gated on Zba: suppressed when the object declares an arch string
+// without it, reported when it declares one with it or declares none.
+//
+// Measured population: 416 sites, every one of them in a Go binary.
+// GCC and LLVM reduce a multiply by a small constant themselves,
+// with or without Zba, so nothing reaches their encoders in this form.
+// See TODO.md.
+//
+// Where the `li` is wide it is also check_c_compressible's finding,
+// which says the same two instructions could be six bytes rather than
+// eight -- all 107 such sites carry both. Both stand: C and Zba are
+// separate answers to separate questions, and the Zba one makes the C
+// one moot by removing the instruction rather than shrinking it.
+bool check_const_mul_to_shadd(riscvlint_state *state, const cs_insn *insn,
+                              riscvlint_finding *finding);
+
 // ---- running every check ----
 //
 // Called once per finding, with `ctx` as given. The finding is valid

@@ -3594,6 +3594,179 @@ static void test_fp_pool_to_fli(csh handle)
 // for rv64gc plus the extensions named, so what capstone's feature
 // groups say about them is being checked against what an assembler
 // required to emit them.
+static bool run_cmul(csh handle, const uint8_t *bytes, size_t len,
+                     unsigned exts, riscvlint_finding *out)
+{
+    static uint8_t buf[256];
+    memcpy(buf, bytes, len);
+    riscvlint_state *state = riscvlint_state_create();
+    if (!state) return false;
+    bool fired = false;
+    riscvlint_state_set_extensions(state, exts);
+    if (riscvlint_state_set_section(state, handle, buf, len, 0x1000)) {
+        cs_insn *insn = cs_malloc(handle);
+        const uint8_t *p = buf;
+        size_t remain = len;
+        uint64_t addr = 0x1000;
+        if (insn && cs_disasm_iter(handle, &p, &remain, &addr, insn)) {
+            riscvlint_finding f;
+            memset(&f, 0, sizeof f);
+            fired = check_const_mul_to_shadd(state, insn, &f);
+            if (fired && out) *out = f;
+        }
+        if (insn) cs_free(insn, 1);
+    }
+    riscvlint_state_destroy(state);
+    return fired;
+}
+
+static void test_const_mul_to_shadd(csh handle)
+{
+    riscvlint_finding f;
+
+    // c.li a5,3 ; mul a5,a4,a5 -- the commonest spelling, and the one
+    // that needs no liveness query: the multiply overwrites the
+    // constant it reads.
+    static const uint8_t self[] = {
+        0x8d, 0x47,                    // c.li a5,3
+        0xb3, 0x07, 0xf7, 0x02,        // mul a5,a4,a5
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(run_cmul(handle, self, sizeof self, 0, &f));
+    CHECK(strcmp(f.replacement, "sh1add a5, a4, a4 (6 -> 4 bytes)") == 0);
+    CHECK(f.insn_count == 2 && f.address == 0x1000);
+    CHECK(strcmp(f.title, "li + mul foldable to shNadd") == 0);
+
+    // A wide `li` for the 5: eight bytes down to four.
+    static const uint8_t wide[] = {
+        0x93, 0x07, 0x50, 0x00,        // li a5,5
+        0xb3, 0x07, 0xf7, 0x02,        // mul a5,a4,a5
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_cmul(handle, wide, sizeof wide, 0, &f));
+    CHECK(strcmp(f.replacement, "sh2add a5, a4, a4 (8 -> 4 bytes)") == 0);
+
+    // Nine is the third factor, and the one Go's compiler emits most.
+    static const uint8_t nine[] = {
+        0xa5, 0x47,                    // c.li a5,9
+        0xb3, 0x07, 0xf7, 0x02,        // mul a5,a4,a5
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(run_cmul(handle, nine, sizeof nine, 0, &f));
+    CHECK(strcmp(f.replacement, "sh3add a5, a4, a4 (6 -> 4 bytes)") == 0);
+
+    // Both halves compressed: Zcb's `c.mul`, where the rewrite buys an
+    // instruction and no space. The corpus has none -- no object that
+    // multiplies by a small constant also uses Zcb -- but the shape is
+    // the one a target with both extensions would present.
+    static const uint8_t compressed[] = {
+        0x8d, 0x47,                    // c.li a5,3
+        0xd9, 0x9f,                    // c.mul a5,a4
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(run_cmul(handle, compressed, sizeof compressed, 0, &f));
+    CHECK(strcmp(f.replacement, "sh1add a5, a4, a4 (4 -> 4 bytes)") == 0);
+
+    // Seven needs two shifts and a subtract: no shNadd, so nothing to
+    // say.
+    static const uint8_t seven[] = {
+        0x9d, 0x47,                    // c.li a5,7
+        0xb3, 0x07, 0xf7, 0x02,        // mul a5,a4,a5
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(!run_cmul(handle, seven, sizeof seven, 0, NULL));
+
+    // Four is a shift, which is the rewrite a compiler already made.
+    static const uint8_t four[] = {
+        0x91, 0x47,                    // c.li a5,4
+        0xb3, 0x07, 0xf7, 0x02,        // mul a5,a4,a5
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(!run_cmul(handle, four, sizeof four, 0, NULL));
+
+    // mulw sign-extends its 32-bit product; sh1add does not, so this
+    // pair is not two instructions for one.
+    static const uint8_t wordop[] = {
+        0x8d, 0x47,                    // c.li a5,3
+        0xbb, 0x07, 0xf7, 0x02,        // mulw a5,a4,a5
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(!run_cmul(handle, wordop, sizeof wordop, 0, NULL));
+
+    // mulh returns the other half of the product.
+    static const uint8_t high[] = {
+        0x8d, 0x47,                    // c.li a5,3
+        0xb3, 0x17, 0xf7, 0x02,        // mulh a5,a4,a5
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(!run_cmul(handle, high, sizeof high, 0, NULL));
+
+    // The multiply reads the constant twice: that is nine, a constant of
+    // its own, not three times something.
+    static const uint8_t square[] = {
+        0x8d, 0x47,                    // c.li a5,3
+        0xb3, 0x87, 0xf7, 0x02,        // mul a5,a5,a5
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(!run_cmul(handle, square, sizeof square, 0, NULL));
+
+    // A multiply that does not read the constant at all: the `li` is for
+    // something later and the two are adjacent by accident.
+    static const uint8_t unrelated[] = {
+        0x8d, 0x47,                    // c.li a5,3
+        0x33, 0x87, 0xc6, 0x02,        // mul a4,a3,a2
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(!run_cmul(handle, unrelated, sizeof unrelated, 0, NULL));
+
+    // x0 as the multiplicand makes the product zero.
+    static const uint8_t zeroarg[] = {
+        0x8d, 0x47,                    // c.li a5,3
+        0x33, 0x07, 0xf0, 0x02,        // mul a4,zero,a5
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(!run_cmul(handle, zeroarg, sizeof zeroarg, 0, NULL));
+
+    // The multiply writes elsewhere and the constant is read after it:
+    // the rewrite would drop a value something still wants.
+    static const uint8_t live[] = {
+        0x8d, 0x47,                    // c.li a5,3
+        0x33, 0x87, 0xf6, 0x02,        // mul a4,a3,a5
+        0x3e, 0x85,                    // c.mv a0,a5
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(!run_cmul(handle, live, sizeof live, 0, NULL));
+
+    // The same shape with the constant overwritten instead of read, so
+    // the walk proves it dead and the fold stands.
+    static const uint8_t walked[] = {
+        0x8d, 0x47,                    // c.li a5,3
+        0x33, 0x87, 0xf6, 0x02,        // mul a4,a3,a5
+        0x85, 0x47,                    // c.li a5,1
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(run_cmul(handle, walked, sizeof walked, 0, &f));
+    CHECK(strcmp(f.replacement, "sh1add a4, a3, a3 (6 -> 4 bytes)") == 0);
+
+    // A branch into the multiply: arriving that way, the register it
+    // reads need not hold a 3.
+    static const uint8_t target[] = {
+        0x8d, 0x47,                    // c.li a5,3
+        0xb3, 0x07, 0xf7, 0x02,        // mul a5,a4,a5
+        0x75, 0xff,                    // c.bnez a4,-4
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(!run_cmul(handle, target, sizeof target, 0, NULL));
+
+    // Declared without Zba: the instruction does not exist on that
+    // target. Declared with it, and the Go case of declaring nothing,
+    // both report.
+    CHECK(!run_cmul(handle, self, sizeof self,
+                    RISCVLINT_EXT_DECLARED | RISCVLINT_EXT_ZBB, NULL));
+    CHECK(run_cmul(handle, self, sizeof self,
+                   RISCVLINT_EXT_DECLARED | RISCVLINT_EXT_ZBA, NULL));
+}
+
 static void test_census(csh handle)
 {
     static const uint8_t code[] = {
@@ -3765,6 +3938,7 @@ int main(void)
     test_sweep();
     test_fli_table();
     test_fp_pool_to_fli(handle);
+    test_const_mul_to_shadd(handle);
     test_census(handle);
 
     cs_close(&handle);

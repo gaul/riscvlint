@@ -1456,13 +1456,16 @@ second instruction writes it is one dominant idiom plus nothing.
 
 # Remaining candidates
 
-None. Twenty-six checks are implemented and everything this file ever
+None. Twenty-seven checks are implemented and everything this file ever
 sized is either written or recorded as rejected with the evidence that
-rejected it. The last five did not come from a corpus probe at all: 23
+rejected it. The last six did not come from a corpus probe at all: 23
 came from walking armlint's check table against this one, 24 came from a
-rejection in this file being wrong, and 25, 26 and 27 are the three
+rejection in this file being wrong, 25, 26 and 27 are the three
 addressing modes of a ratification plan for an extension that does not
-exist in hardware yet.
+exist in hardware yet, and 28 fell out of a pair dump being re-counted
+for an unrelated question. 28's own entry records the three columns of
+that count which were sized and rejected, the largest of them 16,313
+sites with no instruction to fold them into.
 
 That last one is worth reading as a worked example rather than a
 number. The SWAR popcount was rejected on a bound that was not a bound
@@ -2619,6 +2622,145 @@ nothing on the table (384 of 4,629,930 `mv`, 0 of 3,065,349 in-range
 `li`), so a check here is worth writing only for Go-built binaries, and
 sizing it means an encodability pass over the whole C extension rather
 than the handful of forms Zcb needed.
+
+## 28. A multiply by 3, 5 or 9 -- 416  [implemented]
+
+`li rc,{3,5,9}` + `mul rd,rx,rc`, which one Zba instruction does:
+`sh1add rd,rx,rx` is rx + (rx << 1), and `sh2add`/`sh3add` give five
+and nine the same way. Both operands name the multiplicand -- the shift
+supplies the even part of the factor and the addend the odd one.
+
+The entry exists because a pair dump was being re-counted for something
+else and this fell out of it. The question asked was which constants a
+`li` feeds into a multiply or divide, in the hope that strength
+reduction had been left undone somewhere; the answer was mostly that it
+had not, and the one column with anything in it was 3, 5 and 9.
+
+### What the check reports -- 416, all of it Go
+
+| language | objects | sites |
+|---|---:|---:|
+| C++ | 13 | 0 |
+| Rust | 6 | 0 |
+| Go | 12 | 416 |
+| **total** | **31** | **416** |
+
+Per object: 66 in `compile`, 58 in restic, 55 in `go`, 49 in gh, 37 in
+`fix` and `vet`, 31 in `link`, 24 in `cover`, 20 in `asm`, 17 in `cgo`,
+12 in `gofmt`, 10 in `preprofile`.
+
+1,046 bytes: 309 sites at `(6 -> 4)` where the `li` was compressed and
+107 at `(8 -> 4)` where it was not. 416 instructions. By factor, 385
+threes, 19 fives and 12 nines -- nine tenths of the population is one
+factor. What that 3 is doing in the source the check cannot see: a
+three-word stride and a `* 3` written out are the same two instructions
+here.
+
+The two byte figures are two builds rather than a mixture. Every one of
+gh's 49 and restic's 58 has a wide `li`, and every one of the ten
+`golang-1.26-go` tools' 309 has a `c.li`; nothing is mixed within an
+object, which puts the difference in the build rather than in the code.
+It is the same assembler behaviour the base-C row of the table is about,
+visible here at 107 sites instead of 2.9 million. All 107 are also
+reported as compressible to a base C form -- the only overlap with
+another check found at any of these sites.
+
+### The zeros are real, not the gate
+
+The C++ objects mostly declare an arch string without Zba, so the gate
+alone would explain a zero. It is not the gate. With the gate forced
+open by `-m zba`:
+
+| object | `li` of 3/5/9 | no `mul` next | reads it once | folds |
+|---|---:|---:|---:|---:|
+| libxul | 105,450 | 105,431 | 2 | 0 |
+| debian-libllvm22 | 75,090 | 75,080 | 0 | 0 |
+| ubuntu-libllvm22 | 72,533 | 72,530 | 0 | 0 |
+| libllvm20 | 66,201 | 66,193 | 0 | 0 |
+| uutils coreutils | 7,644 | 7,635 | 0 | 0 |
+| ripgrep | 3,065 | 3,065 | 0 | 0 |
+| **all 19 C++/Rust** | **343,378** | **343,323** | **2** | **0** |
+
+libxul's two are both branch targets, which is why its `folds` column is
+0 rather than 2. 53 more across the 19 objects have a multiply adjacent
+to the `li` that does not read it exactly once -- an unrelated multiply
+standing next to a loaded constant, not a near miss.
+
+The middle column is the result. These toolchains load 3, 5 and 9 by the
+hundred thousand and almost never to multiply by one. Of the 82,825
+pairs corpus-wide where such a constant feeds the next instruction, 69%
+feed a conditional branch and 21% a store -- a comparison against a
+small number, or writing one into a field -- against 1,099 that feed a
+multiply and 25 a divide. GCC and LLVM reduce a multiply by a small
+constant to shifts and adds in the compiler, with or without Zba, so
+nothing reaches the encoder in this form.
+
+This is the same division as the two shift-add families above it, and
+for the same reason: 13,180 of 13,418 shNadd sites and 18,071 of 18,125
+zext.w sites are Go's too.
+
+### What it costs: one liveness query, and nothing else
+
+712 pairs across the Go objects have the shape and 416 are reported. The
+entire difference is the constant still being live after the multiply:
+296 sites, 42%. Per object the proof costs 50 of `compile`'s 116, 37 of
+restic's 95, 31 of gh's 80, 25 of `asm`'s 45.
+
+Every other precondition costs nothing measurable. No Go site is lost to
+a relocation, to an sp/gp/tp destination, or to a multiply adjacent to
+the `li` that does not read it exactly once -- that last test rejects 53
+sites corpus-wide and every one of them is in a C++ or Rust object. The
+only branch-target rejections anywhere are libxul's two. That is unusual
+for this file, where the indexed-load entries spend most of their
+population on their preconditions, and it follows from the shape being
+two adjacent instructions with one register between them rather than
+three or four.
+
+The 712 also reconciles exactly with the probe, which is rarer in this
+file than the check itself. The pair dump counted 712 dependent
+`li {3,5,9}` + `mul` pairs, and the check counts 712 shapes reaching its
+liveness query across the Go objects. The two extra shapes in the corpus
+-- libxul's -- are absent from the probe for the same reason the check
+rejects them: `pairscan` does not emit a pair whose second instruction
+is a branch target, so both sides apply that rule and agree to the
+instruction. Every other entry here has a gap between what a shape scan
+sees and what a check with preconditions reports; there is none here
+because the probe's `dep` column already encodes this check's only other
+structural precondition.
+
+### What the same probe turned up and did not become a check
+
+The probe classified every `li` feeding a multiply, divide or remainder.
+Four columns were worth sizing and three were rejected:
+
+| shape | dependent sites | verdict |
+|---|---:|---|
+| `li` 3/5/9 + `mul` | 712 | this entry |
+| `li` 2^k + `mul` | 4 | compilers already shift |
+| `li` 2^k + `divu`/`remu` | 134 | too small, below |
+| `li` other + `mul` | 16,313 | no fold exists |
+
+The 4 is the headline rejection. A multiply by a power of two is a
+shift, and in 108 million instructions four dependent pairs load one --
+so the classic strength reduction is one a check has nothing to say
+about, which was the opposite of what the probe was looking for.
+
+The 134 are a real fold and were left unwritten on size. The probe found
+165 dependent pairs loading a power of two into a divide or remainder:
+122 unsigned divides, which become one `srli`, and 12 unsigned
+remainders, which become one `andi` of the mask. The other 31 are signed
+-- 22 `div`, 8 `divw`, 1 `remw` -- where a bare shift is wrong without
+the bias correction `div` performs and the fold would have to add it
+back. 134 sites against the 416 here, with a signed/unsigned split to
+get right and no extension to gate on, is a worse trade than it looks.
+
+The 16,313 is not arithmetic at all. Its constants are 24 (2,933 sites),
+40 (2,029), 88 (1,396), 10 (1,215), 104 (919), 48 (757) and a long tail
+-- record sizes, `i * sizeof(T)`. Most are 2^k +/- 2^j, which is already
+two shifts and an add, and the rest a power of two times a small odd
+(88 = 8*11, 104 = 8*13, 152 = 8*19, 100 = 4*25). There is no
+one-instruction form to fold them into, Zba or otherwise, so the column
+is large and empty.
 
 # Ranked for C++ and Rust specifically
 

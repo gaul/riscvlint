@@ -3680,7 +3680,9 @@ enum {
 #define PC_M0F_D ((int64_t)0x0f0f0f0f0f0f0f0full)
 #define PC_M01_D ((int64_t)0x0101010101010101ull)
 
-// Register-register ALU forms the sequence uses, in both spellings.
+// Register-register ALU forms these checks use, in both spellings:
+// the popcount sequence needs all four, check_const_mul_to_shadd only
+// the multiply.
 typedef enum { RRR_NONE = 0, RRR_ADD, RRR_SUB, RRR_AND, RRR_MUL } rrr_op;
 
 static rrr_op decode_rrr(uint32_t w, unsigned size, unsigned *rd,
@@ -4245,6 +4247,98 @@ bool check_fp_pool_to_fli(riscvlint_state *state, const cs_insn *insn,
     return true;
 }
 
+// The shift amount whose shNadd multiplies by `v`, or 0 for a factor no
+// shNadd reaches. `sh1add rd,rs1,rs2` computes rs2 + (rs1 << 1), which
+// is three times one register when both operands name it; sh2add and
+// sh3add give five and nine the same way. 2, 4 and 8 are absent because
+// a multiply by a power of two is a shift, which the compilers emit
+// directly: four dependent `li` + `mul` pairs in the corpus load a
+// power of two, against 712 that load a 3, 5 or 9.
+static unsigned rv_shadd_shift(int64_t v)
+{
+    switch (v) {
+    case 3: return 1;
+    case 5: return 2;
+    case 9: return 3;
+    default: return 0;
+    }
+}
+
+bool check_const_mul_to_shadd(riscvlint_state *state, const cs_insn *insn,
+                              riscvlint_finding *finding)
+{
+    if (!riscvlint_may_use(state, RISCVLINT_EXT_ZBA)) return false;
+    if (insn->size != 2 && insn->size != 4) return false;
+
+    uint32_t w1;
+    if (!riscvlint_word_at(state, insn->address, &w1)) return false;
+    unsigned rc;
+    int64_t val;
+    if (!decode_const(w1, insn->size, &rc, &val)) return false;
+    unsigned shamt = rv_shadd_shift(val);
+    if (!shamt) return false;
+    // decode_const also spells lui and c.lui, whose values are multiples
+    // of 4096 and so never 3, 5 or 9; the multiplier test is what
+    // excludes them, rather than a second look at the encoding.
+    //
+    // sp, gp and tp hold what the ABI says they hold rather than a
+    // constant some region loaded, and nothing here would make one of
+    // them dead. check_const_remat declines the same three.
+    if (rc == 2 || rc == 3 || rc == 4) return false;
+
+    uint64_t second = insn->address + insn->size;
+    uint32_t w2;
+    if (!riscvlint_word_at(state, second, &w2)) return false;
+    unsigned len2 = rv_insn_len(w2);
+    unsigned rd, mrs1, mrs2;
+    // `mul` and `c.mul` only. decode_rrr reaches neither `mulw` nor
+    // `mulh`: the first is a different major opcode and the rest a
+    // different funct3, which is the exclusion this rewrite needs rather
+    // than an accident. mulw sign-extends its 32-bit product and shNadd
+    // does not, so that pair needs a following `sext.w` and trades two
+    // instructions for two; mulh returns the other half of the product
+    // and is not a scaled value at all.
+    if (decode_rrr(w2, len2, &rd, &mrs1, &mrs2) != RRR_MUL) return false;
+
+    // The multiply has to read the constant exactly once. Twice is
+    // `rc * rc`, a constant of its own and a different rewrite; not at
+    // all means these two instructions are unrelated and the `li` was
+    // loaded for something further on.
+    bool a_is_const = mrs1 == rc, b_is_const = mrs2 == rc;
+    if (a_is_const == b_is_const) return false;
+    unsigned rx = a_is_const ? mrs2 : mrs1;
+    // x0 as the multiplicand makes the product zero rather than a scaled
+    // value, and the rewrite would have to be `li rd,0`.
+    if (rx == 0) return false;
+
+    // Reaching the multiply from somewhere else means the register it
+    // reads need not hold 3, 5 or 9 when it executes.
+    if (riscvlint_is_branch_target(state, second)) return false;
+    if (riscvlint_is_relocated(state, insn->address) ||
+        riscvlint_is_relocated(state, second))
+        return false;
+
+    // The constant stops existing, so it has to be dead after the pair.
+    // When the multiply overwrites it that is free. This is the only
+    // precondition here that costs anything: 296 of the corpus's 712
+    // shapes are lost to it, and nothing is lost to the branch,
+    // relocation or register tests above.
+    if (rd != rc &&
+        riscvlint_liveness(state, second + len2, rc) != RISCVLINT_LIVE_DEAD)
+        return false;
+
+    unsigned before = insn->size + len2;
+    finding->title = "li + mul foldable to shNadd";
+    finding->address = insn->address;
+    finding->insn_count = 2;
+    // Both operands are the multiplicand: the shift supplies the even
+    // part of the factor and the addend the odd one.
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "sh%uadd %s, %s, %s (%u -> 4 bytes)", shamt, rv_reg_name(rd),
+             rv_reg_name(rx), rv_reg_name(rx), before);
+    return true;
+}
+
 // ---- running every check ----
 
 static const riscvlint_check_fn riscvlint_checks[] = {
@@ -4274,6 +4368,7 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_indexed_load,
     check_scaled_indexed_load,
     check_zext_indexed_load,
+    check_const_mul_to_shadd,
 };
 
 size_t riscvlint_scan(riscvlint_state *state, csh handle,

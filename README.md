@@ -3,8 +3,8 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Twenty-six checks are implemented and the ledger's candidate list is
-empty. [TODO.md](TODO.md) is that ledger: every candidate that was
+Twenty-seven checks are implemented and the ledger's candidate list
+is empty. [TODO.md](TODO.md) is that ledger: every candidate that was
 measured, the population it came back with, and the ones rejected on
 that evidence.
 What got written was decided by the corpus rather than by intuition,
@@ -12,7 +12,7 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Twenty-six of them, and the table lists twenty-two. Four report
+Twenty-seven of them, and the table lists twenty-three. Four report
 nothing under any object's own declaration -- the bit count because no
 baseline object declares Zbb, and the three indexed loads because they
 are the ones requiring their extension to be positively present rather
@@ -54,12 +54,13 @@ the row where no finding does and the arithmetic is uniform instead.
 | transfer to the instruction that follows it | 4,299 | 831 | 20 | 5,150 | 10,354 | all |
 | dead store to a frame slot | 395 | 1 | 4,172 | 4,568 | 17,160 | all |
 | bit-cast routed through a frame slot | 1,149 | 0 | 10 | 1,159 | 0 | all |
+| li + mul foldable to shNadd | 0 | 0 | 416 | 416 | 1,046 | all |
 | floating-point constant fli would have built | 0 | 0 | 120 | 120 | 480 | all |
-| **total** | **498,225** | **192,611** | **3,066,823** | **3,757,659** | **8,617,224** | |
+| **total** | **498,225** | **192,611** | **3,067,239** | **3,758,075** | **8,618,270** | |
 
 Do not read the total row as a result. One row is 80% of it, and that
 row is Go's assembler declining to select RVC at all, which is a
-different kind of finding from the twenty-one around it. The second row
+different kind of finding from the twenty-two around it. The second row
 is 6% and belongs to the linker. The `assumed` in the call-pair row is
 the one byte figure that is arithmetic rather than measurement: that
 check prints no size, and every site is eight bytes in and four out
@@ -109,6 +110,57 @@ except a handful of `jalr ra,0(ra)` that were already two.
   suppresses itself only on positive evidence of absence -- an arch
   string that is present and does not name the extension. When the set
   had to be assumed rather than read, the run says so.
+
+* **li + mul foldable to shNadd** -- `li rc,{3,5,9}` + `mul rd,rx,rc`
+  multiplies by a small constant in two instructions, one of which exists
+  only to hold the constant. Zba's `sh1add`/`sh2add`/`sh3add` does it in
+  one with both operands naming the multiplicand: `sh1add rd,rx,rx` is
+  rx + (rx << 1), and sh2add and sh3add give five and nine the same way.
+  Reported only when the constant is dead after the multiply, which it
+  usually is because the multiply overwrites it.
+
+  Population: 416 sites, **every one of them Go**, worth 1,046 bytes --
+  309 at six bytes down to four and 107 at eight. By factor it is 385
+  threes, 19 fives and 12 nines.
+
+  The six-or-eight split is not a mixture within a binary but a split
+  between builds. All 107 wide ones are gh's 49 and restic's 58, where
+  every site has a four-byte `li`; the ten `golang-1.26-go` tools have
+  none, and every site in them is a `c.li`. Those 107 are also
+  check_c_compressible's findings -- all of them, since a `li` of 3, 5
+  or 9 always fits `c.li` -- which is two checks saying the same two
+  instructions are too long for different reasons. Both stand, and the
+  Zba one subsumes the other by removing the instruction rather than
+  shrinking it.
+
+  The C++ and Rust zeros are not the gate suppressing anything. Forced
+  open with `-m zba`, the nineteen GCC- and LLVM-built objects hold
+  343,378 `li` of a 3, 5 or 9 and exactly **two** are followed by a
+  multiply that reads the constant once -- both in libxul, both branch
+  targets, so neither folds. Those toolchains do load 3, 5 and 9 by the
+  hundred thousand, and almost never to multiply by one: of the 82,825
+  pairs corpus-wide where such a constant feeds the instruction after
+  it, 69% feed a conditional branch and 21% a store, against 1% -- 1,099
+  -- that feed a multiply. GCC and LLVM reduce a multiply by a small
+  constant in the compiler whether or not the target has Zba, so the
+  population belongs to one toolchain rather than to the extension,
+  which is also true of the two shift-add families above.
+
+  Only `mul` is matched. `mulw` sign-extends its 32-bit product where
+  shNadd does not, so folding one needs a following `sext.w` and trades
+  two instructions for two; the corpus holds 387 of that shape. Powers
+  of two are absent for the opposite reason: four dependent pairs load
+  one in 108 million instructions, because a multiply by a power of two
+  is a shift every compiler already emits. Every other factor needs two
+  shifts and an add, which is no better than the two instructions
+  already there.
+
+  The liveness proof is what this check costs. 712 pairs have the shape
+  and 416 survive: in 296 the constant is read again after the multiply,
+  so the `li` cannot go away. Nothing else rejects a reported site -- no
+  Go site is lost to a relocation, to an sp/gp/tp destination, or to a
+  multiply that does not read the constant exactly once, and the only
+  branch-target rejections anywhere in the corpus are libxul's two.
 
 * **slli + srli foldable to zext.w** -- `slli rd,rs,32` +
   `srli rd,rd,32` clears the upper word in two dependent instructions
