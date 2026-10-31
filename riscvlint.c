@@ -203,6 +203,26 @@ bool rv_decode_srli(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
     return true;
 }
 
+bool rv_decode_not(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1)
+{
+    if (size == 4) {
+        // `not rd,rs` is `xori rd,rs,-1`, which is the only xori this
+        // project has ever needed to name.
+        if (RV_OPCODE(w) != 0x13u) return false;
+        if (((w >> 12) & 0x7u) != 4u) return false;
+        if (sign_extend((uint64_t)(w >> 20) & 0xfffu, 12) != -1) return false;
+        *rd = (w >> 7) & 0x1fu;
+        *rs1 = (w >> 15) & 0x1fu;
+        return *rd != 0;
+    }
+    if (size != 2) return false;
+    // Zcb's `c.not`, in the unary group that shares c.andi's funct3. It
+    // is in-place, so it only ever spells `not rd,rd`.
+    if ((w & 0xfc7fu) != 0x9c75u) return false;
+    *rd = *rs1 = 8u + ((w >> 7) & 0x7u);
+    return true;
+}
+
 bool rv_decode_srai(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
                     unsigned *shamt)
 {
@@ -5115,6 +5135,130 @@ bool check_cas_loop_to_amocas(riscvlint_state *state, const cs_insn *insn,
     return true;
 }
 
+// `and`, `or` and `xor` in both spellings, which is the set Zbb has a
+// complement-taking form of. The funct3 comes back so the caller can
+// say which, and `c.and`/`c.or`/`c.xor` are in-place, so rd and rs1
+// coincide there -- which costs nothing, the operation commuting.
+static bool decode_logic(uint32_t w, unsigned size, unsigned *f3,
+                         unsigned *rd, unsigned *rs1, unsigned *rs2)
+{
+    if (size == 4) {
+        if (RV_OPCODE(w) != 0x33u || ((w >> 25) & 0x7fu) != 0u) return false;
+        unsigned k = (w >> 12) & 7u;
+        if (k != 7u && k != 6u && k != 4u) return false;   // and, or, xor
+        *f3 = k;
+        *rd = (w >> 7) & 0x1fu;
+        *rs1 = (w >> 15) & 0x1fu;
+        *rs2 = (w >> 20) & 0x1fu;
+        return *rd != 0;
+    }
+    if (size != 2) return false;
+    // The C1 misc-ALU register group with bit 12 clear: bits 6:5 pick
+    // c.sub, c.xor, c.or and c.and, and only the last three are here.
+    if ((w & 0xfc03u) != 0x8c01u) return false;
+    unsigned sel = (w >> 5) & 3u;
+    if (sel == 0u) return false;                           // c.sub
+    *f3 = sel == 1u ? 4u : (sel == 2u ? 6u : 7u);
+    *rd = *rs1 = 8u + ((w >> 7) & 0x7u);
+    *rs2 = 8u + ((w >> 2) & 0x7u);
+    return true;
+}
+
+// Zbb's complement-taking logical forms: `andn rd,rs1,rs2` is
+// rs1 & ~rs2, `orn` the same with or, and `xnor` is ~(rs1 ^ rs2). So a
+// `not` feeding any of the three folds into one instruction, and so
+// does an `xor` feeding a `not`:
+//
+//     not  rt, rb          and  rd, ra, rt   ->  andn rd, ra, rb
+//     not  rt, rb          or   rd, ra, rt   ->  orn  rd, ra, rb
+//     not  rt, rb          xor  rd, ra, rt   ->  xnor rd, ra, rb
+//     xor  rt, ra, rb      not  rd, rt       ->  xnor rd, ra, rb
+//
+// The last two are the same instruction because ~a ^ b and ~(a ^ b) are
+// the same value, which is also why `xor` is the only operation whose
+// two orders both fold.
+//
+// The two orders that do not fold are worth naming: `or` then `not` is
+// NOR and `and` then `not` is NAND, and Zbb has neither. That is 5,477
+// dependent pairs in the corpus against 12,474 that do fold, so the
+// direction test is doing real work rather than tidying.
+static const char *zbb_logic_name(unsigned f3)
+{
+    if (f3 == 7u) return "andn";
+    if (f3 == 6u) return "orn";
+    return "xnor";
+}
+
+bool check_not_logic_fold(riscvlint_state *state, const cs_insn *insn,
+                          riscvlint_finding *finding)
+{
+    if (!riscvlint_may_use(state, RISCVLINT_EXT_ZBB)) return false;
+    if (insn->size != 2 && insn->size != 4) return false;
+
+    uint32_t w1;
+    if (!riscvlint_word_at(state, insn->address, &w1)) return false;
+    uint64_t second = insn->address + insn->size;
+    uint32_t w2;
+    if (!riscvlint_word_at(state, second, &w2)) return false;
+    unsigned len2 = rv_insn_len(w2);
+
+    unsigned f3, rd, ra, rb, inter;
+    unsigned nrd, nrs;
+    if (rv_decode_not(w1, insn->size, &nrd, &nrs)) {
+        // The complement first, consumed by the logical operation.
+        unsigned s1, s2;
+        if (!decode_logic(w2, len2, &f3, &rd, &s1, &s2)) return false;
+        // Read exactly once: twice is `rt & rt`, which is a move of the
+        // complement and not a fold, and never means the two are
+        // unrelated.
+        bool a = s1 == nrd, b = s2 == nrd;
+        if (a == b) return false;
+        ra = a ? s2 : s1;
+        rb = nrs;
+        inter = nrd;
+    } else if (decode_logic(w1, insn->size, &f3, &inter, &ra, &rb)) {
+        // The logical operation first, complemented after -- which only
+        // xor folds, `or` then `not` being NOR and `and` then `not`
+        // NAND, neither of which Zbb has.
+        if (f3 != 4u) return false;
+        if (!rv_decode_not(w2, len2, &rd, &nrs)) return false;
+        if (nrs != inter) return false;
+    } else {
+        return false;
+    }
+    // x0 as the surviving operand makes the result a constant or a
+    // plain complement, either of which is a different rewrite.
+    if (ra == 0 || rb == 0) return false;
+
+    if (riscvlint_is_branch_target(state, second)) return false;
+    if (riscvlint_is_relocated(state, insn->address) ||
+        riscvlint_is_relocated(state, second))
+        return false;
+
+    // The intermediate goes, so it has to be dead unless the second
+    // instruction overwrote it. 575 of the corpus's 3,093 shapes lose
+    // here and nothing else rejects any of them.
+    if (rd != inter &&
+        riscvlint_liveness(state, second + len2, inter) != RISCVLINT_LIVE_DEAD)
+        return false;
+
+    // None of the three has a compressed form, so the fold is always
+    // four bytes. Where both halves were already compressed it buys an
+    // instruction and a dependency rather than space, as the shift-add
+    // family does. In the `xor`-then-`not` order the `not` is also
+    // check_zcb_compressible's finding -- c.not, two bytes rather than
+    // four -- and both stand: Zcb shrinks the instruction and Zbb
+    // removes it.
+    unsigned before = insn->size + len2;
+    finding->title = "not + and/or/xor foldable to andn/orn/xnor";
+    finding->address = insn->address;
+    finding->insn_count = 2;
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "%s %s, %s, %s (%u -> 4 bytes)", zbb_logic_name(f3),
+             rv_reg_name(rd), rv_reg_name(ra), rv_reg_name(rb), before);
+    return true;
+}
+
 // ---- running every check ----
 
 static const riscvlint_check_fn riscvlint_checks[] = {
@@ -5151,6 +5295,7 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_slli_srli_to_zexth,
     check_slli_srai_to_sext,
     check_cas_loop_to_amocas,
+    check_not_logic_fold,
 };
 
 size_t riscvlint_scan(riscvlint_state *state, csh handle,

@@ -214,6 +214,10 @@ bool rv_decode_srli(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
 // The arithmetic counterpart, which rv_decode_srli deliberately
 // refuses: one funct6 bit apart, and the difference between a mask and
 // a sign extension. check_slli_srai_to_sext is the only caller.
+// `not rd,rs`, which is `xori rd,rs,-1` four bytes wide and Zcb's
+// in-place `c.not` in two.
+bool rv_decode_not(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1);
+
 bool rv_decode_srai(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
                     unsigned *shamt);
 
@@ -1310,6 +1314,42 @@ bool check_slli_srai_to_sext(riscvlint_state *state, const cs_insn *insn,
 // AMO arm nor a Zabha one would have anything to report. See TODO.md.
 bool check_cas_loop_to_amocas(riscvlint_state *state, const cs_insn *insn,
                               riscvlint_finding *finding);
+
+// A complement folded into the logical operation that consumes it, by
+// Zbb's `andn`, `orn` and `xnor`:
+//
+//     not rt,rb     and rd,ra,rt   ->  andn rd,ra,rb
+//     not rt,rb     or  rd,ra,rt   ->  orn  rd,ra,rb
+//     not rt,rb     xor rd,ra,rt   ->  xnor rd,ra,rb
+//     xor rt,ra,rb  not rd,rt      ->  xnor rd,ra,rb
+//
+// `andn rd,rs1,rs2` is rs1 & ~rs2 and `xnor` is ~(rs1 ^ rs2), which is
+// why the last two are the same instruction: ~a ^ b and ~(a ^ b) are
+// the same value, and xor is the only one of the three whose two orders
+// both fold.
+//
+// The orders that do not fold are the point of the direction test.
+// `or` then `not` is NOR and `and` then `not` is NAND, and Zbb has
+// neither; those are 5,477 dependent pairs in the corpus against 12,474
+// that do fold.
+//
+// `not` is `xori rd,rs,-1`, which is why this shape appears in no
+// probe that looks for `li`. rv_decode_not reads it and Zcb's in-place
+// `c.not`.
+//
+// Measured population: 2,518 sites, every one in a Go binary, from
+// 3,093 shapes -- the highest survival rate of any check here, 81%,
+// with the only losses to the liveness proof on the intermediate and
+// none at all to branch targets or relocations. The objects that
+// declare Zbb have no shapes, their compilers emitting `andn`
+// directly; libgkcodecs declares none and has 63 that `-m zbb` shows.
+// By form it is 2,724 andn shapes, 319 xnor and 50 orn.
+//
+// In the xor-then-not order the `not` is also check_zcb_compressible's
+// finding, `c.not` being two bytes where the wide form is four. Both
+// stand: Zcb shrinks the instruction and Zbb removes it.
+bool check_not_logic_fold(riscvlint_state *state, const cs_insn *insn,
+                          riscvlint_finding *finding);
 
 // ---- running every check ----
 //

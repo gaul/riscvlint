@@ -1456,9 +1456,9 @@ second instruction writes it is one dominant idiom plus nothing.
 
 # Remaining candidates
 
-None. Thirty-three checks are implemented and everything this file ever
+None. Thirty-four checks are implemented and everything this file ever
 sized is either written or recorded as rejected with the evidence that
-rejected it. The last twelve did not come from a corpus probe at all: 23
+rejected it. The last thirteen did not come from a corpus probe at all: 23
 came from walking armlint's check table against this one, 24 came from a
 rejection in this file being wrong, 25, 26 and 27 are the three
 addressing modes of a ratification plan for an extension that does not
@@ -1475,7 +1475,9 @@ for anyone; 32 came from ranking the pair dump by dependent frequency
 and finding a shape one already-written check had left half-done; 33 is
 that same shape with one funct6 bit flipped, which 32's own test
 asserted was silent; and 34 came from walking armlint's check table
-against this one a second time, which is where 23 came from too.
+against this one a second time, which is where 23 came from too; and 35
+came from finishing that walk, the second half of armlint's table having
+gone unread when 34 turned up in the first.
 
 That last one is worth reading as a worked example rather than a
 number. The SWAR popcount was rejected on a bound that was not a bound
@@ -3392,6 +3394,105 @@ The ordering bits are the union of the pair's, so `lr.aq` with `sc.rl`
 becomes `amocas.aqrl`. That is at least as strong as the two
 instructions it replaces and never weaker, which is the direction a
 suggestion may err in. All four variants occur in the corpus.
+
+## 35. A complement folded into its logical operation -- 2,518  [implemented]
+
+Zbb's `andn rd,rs1,rs2` is rs1 & ~rs2, `orn` the same with or, and
+`xnor` is ~(rs1 ^ rs2). So a `not` feeding any of the three logical
+operations folds away, and so does an `xor` feeding a `not`:
+
+```
+not rt,rb     and rd,ra,rt   ->  andn rd,ra,rb
+not rt,rb     or  rd,ra,rt   ->  orn  rd,ra,rb
+not rt,rb     xor rd,ra,rt   ->  xnor rd,ra,rb
+xor rt,ra,rb  not rd,rt      ->  xnor rd,ra,rb
+```
+
+The last two are the same instruction because `~a ^ b` and `~(a ^ b)`
+are the same value, which is also why `xor` is the only one of the three
+whose two orders both fold.
+
+### How it was found, and why it took three attempts
+
+Entry 34 came from walking armlint's check table against this one. That
+walk stopped at the first hit -- `check_lse_rmw` -- and the second half
+of the table went unread. Reading it through turned up
+`check_mvn_logic_fold`, the AArch64 `bic` equivalent, and nothing in
+riscvlint answered it.
+
+It had also survived three earlier probes without showing up, for one
+reason: **`not` is `xori rd,rs,-1`**. Every probe in entries 28 through
+33 looked for a `li` or an `slli` as the first instruction, and a
+complement is neither. It took asking what armlint folds rather than
+what the pair dump ranks highest.
+
+| shape | dependent pairs | |
+|---|---:|---|
+| `not` + `and` | 8,870 | `andn` |
+| `xor` + `not` | 3,182 | `xnor` |
+| `not` + `or` | 422 | `orn` |
+| `not` + `xor` | 2 | `xnor`, the other order |
+| `or` + `not` | 5,369 | NOR -- Zbb has none |
+| `and` + `not` | 108 | NAND -- Zbb has none |
+
+12,474 fold and 5,477 do not, which is why the check tests the direction
+rather than just the pair of mnemonics.
+
+### What the check reports -- 2,518, all of it Go
+
+| language | objects | sites |
+|---|---:|---:|
+| C++ | 13 | 2 |
+| Rust | 6 | 1 |
+| Go | 12 | 2,518 |
+| **total** | **31** | **2,521** |
+
+Of the Go sites, 2,151 are `andn`, 319 `xnor` and 48 `orn`: 345 in gh,
+337 in restic, 333 in `go`, 273 in `compile`, 201 in `link`, 191 in
+`asm`, 178 in `cover`, 174 in `cgo`, `fix` and `vet`, 69 in `gofmt` and
+`preprofile`.
+
+The three non-Go sites matter more than their number. Every other Zb
+entry in this file reports exactly zero outside Go, because an object
+that declares the extension has a compiler that already uses it. Three
+here do not, which makes this the only Zbb check with a C++ or Rust site
+at all: two in ubuntu-libllvm22, `c.xor a0,a1` + `c.not a0` and
+`c.not a1` + `c.and a0,a1`, and one in uutils, `not a4,a5` +
+`c.and a4,a1`. All three are the in-place compressed spellings, which is
+what clang's own `andn` selection leaves behind rather than catches.
+
+9,152 bytes: 2,057 sites at `(8 -> 4)`, 462 at `(6 -> 4)` and **2** at
+`(4 -> 4)`, where `c.not` and `c.and` had already covered it and the
+rewrite buys an instruction and a dependency rather than space. Those
+two are among the three non-Go sites; all 2,518 Go ones are six or eight
+bytes. This entry first said 9,150 bytes over 2,518 sites, counted from
+the Go objects alone, and the generated table disagreed by two bytes and
+three sites -- which is the argument for the table being generated.
+
+### The best survival rate in the file
+
+2,518 of the Go objects' 3,093 shapes, 81%. The only losses are 575 to the liveness
+proof on the complement; branch targets and relocations reject nothing
+at all, and neither does the x0 test or the read-exactly-once test.
+
+That is worth noting against the rest of this file, where the usual
+figure is a third to a twentieth. The reason is the shape: a complement
+exists to be consumed, so the register holding it is normally dead
+immediately, and in two thirds of these the consuming instruction
+overwrites it outright and no query is needed.
+
+### The usual Zbb division, and one overlap
+
+ripgrep and libQt6Core declare Zbb and have **no shapes at all** --
+their compilers emit `andn` directly. libgkcodecs declares an arch
+string without Zbb and has 63 shapes that only `-m zbb` reveals. Go
+declares nothing and holds the whole reported population.
+
+In the `xor`-then-`not` order the `not` is also
+check_zcb_compressible's finding: `c.not` is two bytes where the wide
+form is four. Both stand, as the shNadd and base-C overlap does -- Zcb
+shrinks the instruction and Zbb removes it, and the second subsumes the
+first.
 
 # Ranked for C++ and Rust specifically
 

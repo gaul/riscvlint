@@ -5044,6 +5044,208 @@ static void test_cas_loop_to_amocas(csh handle)
                   RISCVLINT_EXT_DECLARED | RISCVLINT_EXT_ZACAS, NULL));
 }
 
+static bool run_logic(csh handle, const uint8_t *bytes, size_t len,
+                      unsigned exts, riscvlint_finding *out)
+{
+    static uint8_t buf[256];
+    memcpy(buf, bytes, len);
+    riscvlint_state *state = riscvlint_state_create();
+    if (!state) return false;
+    bool fired = false;
+    riscvlint_state_set_extensions(state, exts);
+    if (riscvlint_state_set_section(state, handle, buf, len, 0x1000)) {
+        cs_insn *insn = cs_malloc(handle);
+        const uint8_t *p = buf;
+        size_t remain = len;
+        uint64_t addr = 0x1000;
+        if (insn && cs_disasm_iter(handle, &p, &remain, &addr, insn)) {
+            riscvlint_finding f;
+            memset(&f, 0, sizeof f);
+            fired = check_not_logic_fold(state, insn, &f);
+            if (fired && out) *out = f;
+        }
+        if (insn) cs_free(insn, 1);
+    }
+    riscvlint_state_destroy(state);
+    return fired;
+}
+
+static void test_decode_not(void)
+{
+    unsigned rd, rs1;
+    // not a5,a4 wide, and Zcb's in-place c.not a5.
+    CHECK(rv_decode_not(0xfff74793u, 4, &rd, &rs1));
+    CHECK(rd == 15 && rs1 == 14);
+    CHECK(rv_decode_not(0x9ff5u, 2, &rd, &rs1));
+    CHECK(rd == 15 && rs1 == 15);
+    CHECK(rv_decode_not(0x9f75u, 2, &rd, &rs1));
+    CHECK(rd == 14 && rs1 == 14);
+    // Any other xori immediate is not a complement.
+    CHECK(!rv_decode_not(0xffe74793u, 4, &rd, &rs1));
+    CHECK(!rv_decode_not(0x00174793u, 4, &rd, &rs1));
+    // andi and ori share the opcode; c.andi shares c.not's funct3.
+    CHECK(!rv_decode_not(0xfff77793u, 4, &rd, &rs1));
+    CHECK(!rv_decode_not(0x9bfdu, 2, &rd, &rs1));
+}
+
+static void test_not_logic_fold(csh handle)
+{
+    riscvlint_finding f;
+
+    // `not a5,a4` then `c.and a5,a3`: a3 & ~a4, which is andn. The
+    // second instruction overwrites the complement, so the intermediate
+    // is dead by construction.
+    // not a5,a4 ; and a5,a3,a5 ; ret
+    static const uint8_t andn[] = {
+        0x93, 0x47, 0xf7, 0xff,     // not a5,a4 (4)
+        0xf5, 0x8f,                 // and a5,a3,a5 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_logic(handle, andn, sizeof andn, 0, &f));
+    CHECK(strcmp(f.replacement,
+                 "andn a5, a3, a4 (6 -> 4 bytes)") == 0);
+    CHECK(f.insn_count == 2 && f.address == 0x1000);
+    CHECK(strcmp(f.title,
+                 "not + and/or/xor foldable to andn/orn/xnor") == 0);
+
+    // a3 | ~a4 is orn.
+    // not a5,a4 ; or a5,a3,a5 ; ret
+    static const uint8_t orn[] = {
+        0x93, 0x47, 0xf7, 0xff,     // not a5,a4 (4)
+        0xd5, 0x8f,                 // or a5,a3,a5 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_logic(handle, orn, sizeof orn, 0, &f));
+    CHECK(strcmp(f.replacement,
+                 "orn a5, a3, a4 (6 -> 4 bytes)") == 0);
+
+    // a3 ^ ~a4 is ~(a3 ^ a4), so the complement-first order folds to
+    // xnor as well.
+    // not a5,a4 ; xor a5,a3,a5 ; ret
+    static const uint8_t xnorA[] = {
+        0x93, 0x47, 0xf7, 0xff,     // not a5,a4 (4)
+        0xb5, 0x8f,                 // xor a5,a3,a5 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_logic(handle, xnorA, sizeof xnorA, 0, &f));
+    CHECK(strcmp(f.replacement,
+                 "xnor a5, a3, a4 (6 -> 4 bytes)") == 0);
+
+    // ...and so does the other order, which only xor allows. The `not`
+    // here is also check_zcb_compressible's c.not finding; both stand.
+    // xor a5,a3,a4 ; not a5,a5 ; ret
+    static const uint8_t xnorB[] = {
+        0xb3, 0xc7, 0xe6, 0x00,     // xor a5,a3,a4 (4)
+        0x93, 0xc7, 0xf7, 0xff,     // not a5,a5 (4)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_logic(handle, xnorB, sizeof xnorB, 0, &f));
+    CHECK(strcmp(f.replacement,
+                 "xnor a5, a3, a4 (8 -> 4 bytes)") == 0);
+
+    // The complement as the first operand instead: `and` commutes, so
+    // the fold is the same and names the other register.
+    // not a5,a4 ; and a5,a5,a3 ; ret
+    static const uint8_t swapped[] = {
+        0x93, 0x47, 0xf7, 0xff,     // not a5,a4 (4)
+        0xf5, 0x8f,                 // and a5,a5,a3 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_logic(handle, swapped, sizeof swapped, 0, &f));
+    CHECK(strcmp(f.replacement,
+                 "andn a5, a3, a4 (6 -> 4 bytes)") == 0);
+
+    // Both halves wide.
+    // not a5,a4 ; and a5,a3,a5 ; ret
+    static const uint8_t wide[] = {
+        0x93, 0x47, 0xf7, 0xff,     // not a5,a4 (4)
+        0xb3, 0xf7, 0xf6, 0x00,     // and a5,a3,a5 (4)
+        0x67, 0x80, 0x00, 0x00,     // ret (4)
+    };
+    CHECK(run_logic(handle, wide, sizeof wide, 0, &f));
+    CHECK(strcmp(f.replacement,
+                 "andn a5, a3, a4 (8 -> 4 bytes)") == 0);
+
+    // The result written elsewhere, with the complement killed after,
+    // so the walk proves it dead.
+    // not a5,a4 ; and a2,a3,a5 ; li a5,1 ; ret
+    static const uint8_t split[] = {
+        0x93, 0x47, 0xf7, 0xff,     // not a5,a4 (4)
+        0x33, 0xf6, 0xf6, 0x00,     // and a2,a3,a5 (4)
+        0x85, 0x47,                 // li a5,1 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_logic(handle, split, sizeof split, 0, &f));
+    CHECK(strcmp(f.replacement,
+                 "andn a2, a3, a4 (8 -> 4 bytes)") == 0);
+
+    // The same shape with the complement read afterwards -- 575 of the
+    // corpus's 3,093 shapes, and the only thing that rejects any of them.
+    // not a5,a4 ; and a2,a3,a5 ; mv a0,a5 ; ret
+    static const uint8_t live[] = {
+        0x93, 0x47, 0xf7, 0xff,     // not a5,a4 (4)
+        0x33, 0xf6, 0xf6, 0x00,     // and a2,a3,a5 (4)
+        0x3e, 0x85,                 // mv a0,a5 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_logic(handle, live, sizeof live, 0, NULL));
+
+    // Both operands the complement: `rt & rt` is a move of it, not a
+    // fold.
+    // not a5,a4 ; and a3,a5,a5 ; ret
+    static const uint8_t both[] = {
+        0x93, 0x47, 0xf7, 0xff,     // not a5,a4 (4)
+        0xb3, 0xf6, 0xf7, 0x00,     // and a3,a5,a5 (4)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_logic(handle, both, sizeof both, 0, NULL));
+
+    // x0 as the surviving operand makes the result a constant.
+    // not a5,a4 ; and a3,zero,a5 ; ret
+    static const uint8_t zeroop[] = {
+        0x93, 0x47, 0xf7, 0xff,     // not a5,a4 (4)
+        0xb3, 0x76, 0xf0, 0x00,     // and a3,zero,a5 (4)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_logic(handle, zeroop, sizeof zeroop, 0, NULL));
+
+    // A logical op that does not read the complement at all.
+    // not a5,a4 ; and a3,a2,a1 ; ret
+    static const uint8_t unrel[] = {
+        0x93, 0x47, 0xf7, 0xff,     // not a5,a4 (4)
+        0xb3, 0x76, 0xb6, 0x00,     // and a3,a2,a1 (4)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_logic(handle, unrel, sizeof unrel, 0, NULL));
+
+    // `add` then `not` has no Zbb form; only the three logical
+    // operations do.
+    // add a5,a3,a4 ; not a5,a5 ; ret
+    static const uint8_t addnot[] = {
+        0xb3, 0x87, 0xe6, 0x00,     // add a5,a3,a4 (4)
+        0x93, 0xc7, 0xf7, 0xff,     // not a5,a5 (4)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_logic(handle, addnot, sizeof addnot, 0, NULL));
+
+    // `or` then `not` is NOR, which Zbb does not have -- nor NAND for
+    // `and` then `not`. Those two orders are 5,477 dependent pairs in
+    // the corpus against 12,474 that fold, so the direction matters.
+    // or a5,a3,a4 ; not a5,a5 ; ret
+    static const uint8_t ornot[] = {
+        0xb3, 0xe7, 0xe6, 0x00,     // or a5,a3,a4 (4)
+        0x93, 0xc7, 0xf7, 0xff,     // not a5,a5 (4)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_logic(handle, ornot, sizeof ornot, 0, NULL));
+    // Gated on Zbb permissively, like the other Zb checks.
+    CHECK(!run_logic(handle, andn, sizeof andn,
+                     RISCVLINT_EXT_DECLARED | RISCVLINT_EXT_ZBA, NULL));
+    CHECK(run_logic(handle, andn, sizeof andn,
+                    RISCVLINT_EXT_DECLARED | RISCVLINT_EXT_ZBB, NULL));
+    CHECK(run_logic(handle, andn, sizeof andn, 0, NULL));
+}
+
 static void test_census(csh handle)
 {
     static const uint8_t code[] = {
@@ -5224,6 +5426,8 @@ int main(void)
     test_slli_srai_to_sext(handle);
     test_decode_lr_sc();
     test_cas_loop_to_amocas(handle);
+    test_decode_not();
+    test_not_logic_fold(handle);
     test_census(handle);
 
     cs_close(&handle);

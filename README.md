@@ -3,8 +3,8 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Thirty-three checks are implemented and the ledger's candidate list
-is empty. [TODO.md](TODO.md) is that ledger: every candidate that was
+Thirty-four checks are implemented and the ledger's candidate list is
+empty. [TODO.md](TODO.md) is that ledger: every candidate that was
 measured, the population it came back with, and the ones rejected on
 that evidence.
 What got written was decided by the corpus rather than by intuition,
@@ -12,7 +12,7 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Thirty-three of them, and the table lists twenty-six. Seven report
+Thirty-four of them, and the table lists twenty-seven. Seven report
 nothing over this corpus -- the bit count because no baseline object
 declares Zbb; the three indexed loads, the equality branch and the
 compare-exchange loop because those five require their extension to be
@@ -57,15 +57,16 @@ the row where no finding does and the arithmetic is uniform instead.
 | transfer to the instruction that follows it | 4,299 | 831 | 20 | 5,150 | 10,354 | all |
 | dead store to a frame slot | 395 | 1 | 4,172 | 4,568 | 17,160 | all |
 | slli + srai foldable to sext.b or sext.h | 0 | 0 | 2,562 | 2,562 | 6,450 | all |
+| not + and/or/xor foldable to andn/orn/xnor | 2 | 1 | 2,518 | 2,521 | 9,152 | all |
 | bit-cast routed through a frame slot | 1,149 | 0 | 10 | 1,159 | 0 | all |
 | li + mul foldable to shNadd | 0 | 0 | 416 | 416 | 1,046 | all |
 | constant loaded for a branch against zero | 79 | 0 | 202 | 281 | 1,050 | all |
 | floating-point constant fli would have built | 0 | 0 | 120 | 120 | 480 | all |
-| **total** | **498,304** | **192,611** | **3,079,525** | **3,770,440** | **8,655,404** | |
+| **total** | **498,306** | **192,612** | **3,082,043** | **3,772,961** | **8,664,556** | |
 
 Do not read the total row as a result. One row is 80% of it, and that
 row is Go's assembler declining to select RVC at all, which is a
-different kind of finding from the twenty-five around it. The second row
+different kind of finding from the twenty-six around it. The second row
 is 6% and belongs to the linker. The `assumed` in the call-pair row is
 the one byte figure that is arithmetic rather than measurement: that
 check prints no size, and every site is eight bytes in and four out
@@ -361,6 +362,49 @@ except a handful of `jalr ra,0(ra)` that were already two.
   needs no extension, so anything built by a compiler that does not do
   this -- or hand-written assembly, or a JIT -- would be reported. On
   this corpus it is a measured zero rather than an unmeasured guess.
+
+* **not + and/or/xor foldable to andn/orn/xnor** -- a complement folded
+  into the logical operation that consumes it. `andn rd,rs1,rs2` is
+  rs1 & ~rs2, `orn` the same with or, and `xnor` is ~(rs1 ^ rs2), so
+  four shapes collapse:
+
+  ```
+  not rt,rb     and rd,ra,rt   ->  andn rd,ra,rb
+  not rt,rb     or  rd,ra,rt   ->  orn  rd,ra,rb
+  not rt,rb     xor rd,ra,rt   ->  xnor rd,ra,rb
+  xor rt,ra,rb  not rd,rt      ->  xnor rd,ra,rb
+  ```
+
+  The last two are one instruction because `~a ^ b` and `~(a ^ b)` are
+  the same value -- which is also why `xor` is the only one of the three
+  whose two orders both fold.
+
+  Population: **2,521** sites -- 2,518 Go, 2 C++, 1 Rust -- worth 9,152
+  bytes: 2,057 at `(8 -> 4)`, 462 at `(6 -> 4)` and 2 at `(4 -> 4)`,
+  where both halves were already compressed and the rewrite buys an
+  instruction rather than space. Of the Go sites, 2,151 are `andn`, 319
+  `xnor` and 48 `orn`; 345 are in gh, 337 in restic, 333 in `go`, 273 in
+  `compile`, 201 in `link`, 191 in `asm`.
+
+  It survives its preconditions better than anything else here -- 2,518
+  of the Go objects' 3,093 shapes, 81% -- and the only losses are to the
+  liveness proof on the complement. Nothing at all is lost to a branch
+  target or a relocation.
+
+  The orders that **don't** fold are what the direction test is for:
+  `or` then `not` is NOR and `and` then `not` is NAND, and Zbb has
+  neither. Those are 5,477 dependent pairs against 12,474 that fold.
+
+  `not` is `xori rd,rs,-1`, which is why this shape appears in no probe
+  that looks for a `li`. The Zbb division is the usual one but not
+  absolute: ripgrep and libQt6Core declare Zbb and have no shapes at
+  all, their compilers emitting `andn` directly, and libgkcodecs
+  declares none and has 63 that only `-m zbb` reveals -- but three sites
+  do survive in the Zbb-declaring C++ and Rust objects, which is three
+  more than the zext.h and sext entries manage. In the `xor`-then-`not` order the `not` is
+  also check_zcb_compressible's finding -- `c.not`, two bytes rather
+  than four -- and both stand: Zcb shrinks the instruction and Zbb
+  removes it.
 
 * **slli + srai foldable to sext.b or sext.h** -- the arithmetic twin of
   the two entries below. `slli rd,rs,48` + `srai rd,rd,48` sign-extends
