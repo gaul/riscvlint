@@ -59,6 +59,12 @@ driver-test: riscvlint
 json-test: riscvlint
 	./scripts/json_test.sh
 
+# Go's pclntab: that a finding is named after the function holding it,
+# and that a table that does not hold together costs the names rather
+# than producing wrong ones.
+gopclntab-test: riscvlint
+	./scripts/gopclntab_test.sh
+
 # Corpus-mining research utilities (see "Mining tools" in README.md);
 # not part of the default build or test targets.
 tools: tools/pairscan tools/defuse tools/candscan
@@ -82,4 +88,4 @@ clean:
 		tools/pairscan tools/defuse tools/candscan *.o
 
 .PHONY: all build clean lib test integration-test integration-test-regen \
-	driver-test json-test tools
+	driver-test json-test gopclntab-test tools

@@ -838,9 +838,10 @@ call pair foldable to jal at offset: 0x6e382: -> jal ra, 0xf2e72 (2 instructions
 ...
 ```
 
-The `<...>` that would name the containing function appears only when
-the object kept a symbol table to attribute against, which a Debian
-binary has not.
+The `<...>` names the containing function, from the ELF symbol table
+where there is one and from Go's own function table otherwise -- see
+[Attribution](#attribution). A Debian C++ or Rust binary has neither and
+prints the unannotated form.
 
 This is armlint's and x86lint's polarity, and riscvlint had the
 opposite one until it was flipped: every finding printed unless `-q`
@@ -932,6 +933,70 @@ return value is zero over a function it just emitted; `*skipped`
 reports the bytes stepped over without linting, so an incomplete sweep
 is not mistaken for a clean one.
 
+## Attribution
+
+A finding is worth more with a function name on it than without, and
+which name is available depends entirely on what the toolchain left
+behind. riscvlint tries two sources, in this order:
+
+* the ELF symbol table's `STT_FUNC` entries, bounded by `st_size` where
+  the symbol carries one. This is what a locally built object has, and
+  it is the case that matters for a compiler test suite;
+* **Go's `.gopclntab`**, the runtime's own function table. It survives
+  `strip`, because traceback needs it, and it is the only thing a Go
+  binary offers: `golang-1.26-go--compile` has zero `STT_FUNC` symbols
+  and no corpus object has a `.symtab` at all. With it, every one of
+  the Go cohort's 3,066,703 findings is named -- 12 of the corpus's 29
+  objects, and its largest population by a wide margin.
+
+The layout parsed is `runtime.pcHeader` (`runtime/symtab.go`) plus two
+of the regions its offsets name: the functab, an array of `nfunc+1`
+`{uint32 entryoff, uint32 funcoff}` pairs sorted by `entryoff`, and
+`funcnametab`, which the `_func` record at each `funcoff` indexes with
+its second field. Magic `0xfffffff0` (Go 1.18, 1.19) and `0xfffffff1`
+(Go 1.20 and later) share that layout; an older binary is refused
+rather than misread.
+
+Two things it has to get right that reading the struct does not give
+you.
+
+**The text base is not in the header.** `pcHeader.textStart` is what
+`entryoff` is nominally relative to, and in this corpus it is zero in
+`gofmt` and `compile` and correct in `gh` -- so trusting it would put
+every function in two thirds of the Go objects at the bottom of the
+address space. The base is instead tried from the header and then from
+the `.text` section address, and whichever the whole table validates
+against is the one used. `entryoff` 0 is the first function either way.
+
+**Validation is all-or-nothing.** Every entry is walked once before the
+table is believed: the `entryoff`s must be sorted, since the runtime
+binary-searches them; every `funcoff` must address a record inside the
+region; every name must be NUL-terminated inside `funcnametab`; and the
+whole covered text range must fall inside one executable section, which
+is what catches a wrong base. A table that fails any of these is
+dropped whole and the findings print unannotated, because a wrong
+function name on every finding in a file is worse than no name -- being
+trusted is the entire value of the annotation. `make gopclntab-test`
+covers a mutant per field, each of which must cost the names and leave
+the scan untouched.
+
+One RISC-V-specific wrinkle. Go's riscv64 linker emits a
+`$x<arch string>` functab entry beside each cgo function -- the ISA
+mapping symbol, sharing the function's address and sorting after it:
+12 of `gh`'s 32,233 entries and 12 of `restic`'s, none in a pure-Go
+binary. A lookup that takes the last entry at an address would name
+findings after those, so it steps back off them to the function they
+mark.
+
+Not done: finding the header by scanning the data sections, which is
+what a binary whose section names were stripped would need. Every Go
+object here names `.gopclntab`, so that is a measurement away rather
+than written on spec. Nor is `.dynsym` consulted as a fallback for the
+C++ and Rust half -- Debian keeps only exports there, 43,176 of them in
+libLLVM covering 16.9 MB of a 51.9 MB `.text`, so it would name about a
+third of the findings and leave the rest looking like they belong to
+whichever export preceded them.
+
 ## Exit status
 
 The grep convention, so riscvlint can gate a test suite and CI can tell
@@ -975,7 +1040,8 @@ time and reports subtly wrong output rather than failing.
 `make test` runs the unit suite, `make integration-test` the snapshot
 fixtures under `fixtures/`, `make driver-test` the driver's exit
 statuses and verbosity default, `make json-test` the `--json` document,
-and `make tools` the mining utilities. Every shell suite exits 2 rather
+`make gopclntab-test` the Go function-table parser, and `make tools`
+the mining utilities. Every shell suite exits 2 rather
 than 0 when it cannot find a clang that targets riscv64 -- and, for the
 linked fixtures, an lld that can link it -- so a missing toolchain
 cannot pass by testing nothing.

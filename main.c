@@ -224,10 +224,237 @@ static void tally_add(const char *title)
     ntitles++;
 }
 
-// Nearest preceding function symbol, for the "<name+0x..>" in a finding.
+// ---- Go's pclntab ----
+//
+// A Go binary carries nothing this driver could attribute a finding
+// against: `golang-1.26-go--compile` has zero STT_FUNC symbols, and no
+// corpus object has a `.symtab` at all. Its runtime's own function
+// table does survive the strip, because traceback needs it, and it is
+// what names the Go half of the corpus -- 12 of 29 objects, the largest
+// cohort here.
+//
+// The layout is runtime.pcHeader (runtime/symtab.go) followed by the
+// regions its offsets name. Only two of them are needed for a name: the
+// functab, an array of nfunc+1 {uint32 entryoff, uint32 funcoff} pairs
+// sorted by entryoff, and funcnametab, which the `_func` record at each
+// funcoff indexes with its second field.
+
+#define GO_PCLN_MAGIC_118 0xfffffff0u   // Go 1.18 and 1.19
+#define GO_PCLN_MAGIC_120 0xfffffff1u   // Go 1.20 and later
+
+typedef struct {
+    const uint8_t *functab;     // nfunc+1 entries, 8 bytes each
+    const uint8_t *funcdata;    // the _func records funcoff indexes
+    size_t funcdata_len;
+    const char *funcname;       // funcnametab
+    size_t funcname_len;
+    uint64_t nfunc;
+    uint64_t text;              // what entryoff is relative to
+    bool valid;
+} go_functab;
+
+static uint32_t go_u32(const uint8_t *p)
+{
+    uint32_t v;
+    memcpy(&v, p, 4);
+    return v;
+}
+
+// entryoff and funcoff of functab entry `i`, which may be the sentinel
+// at index nfunc.
+static void go_entry(const go_functab *g, uint64_t i, uint32_t *entryoff,
+                     uint32_t *funcoff)
+{
+    *entryoff = go_u32(g->functab + i * 8);
+    *funcoff = go_u32(g->functab + i * 8 + 4);
+}
+
+// The name at a functab index, or NULL where the record or the string
+// is out of bounds. The `_func` record's first two fields are entryOff
+// (uint32) and nameOff (int32 into funcnametab); they have been the
+// first two since Go 1.18 and are all a name needs.
+static const char *go_name(const go_functab *g, uint64_t i)
+{
+    uint32_t entryoff, funcoff;
+    go_entry(g, i, &entryoff, &funcoff);
+    if (funcoff > g->funcdata_len || g->funcdata_len - funcoff < 8)
+        return NULL;
+    uint32_t nameoff = go_u32(g->funcdata + funcoff + 4);
+    if (nameoff >= g->funcname_len) return NULL;
+    // The region must hold a terminator, or the name runs off the end.
+    if (!memchr(g->funcname + nameoff, '\0', g->funcname_len - nameoff))
+        return NULL;
+    return g->funcname + nameoff;
+}
+
+// Walk every entry once and refuse the table unless all of it holds
+// together. A header field this driver cannot sanity-check is a wrong
+// function name on every finding in the file, which is worse than no
+// name: the whole point of the annotation is to be trusted.
+static bool go_validate(const go_functab *g, const uint8_t *base,
+                        const Elf64_Ehdr *eh)
+{
+    uint32_t prev = 0;
+    for (uint64_t i = 0; i <= g->nfunc; i++) {
+        uint32_t entryoff, funcoff;
+        go_entry(g, i, &entryoff, &funcoff);
+        if (i && entryoff < prev) return false;      // the runtime binary
+        prev = entryoff;                             // searches it sorted
+        if (i == g->nfunc) break;                    // sentinel: no record
+        if (!go_name(g, i)) return false;
+    }
+    // Every function has to land in an executable section, which is
+    // what catches a wrong text base: the offsets are small and a base
+    // that is off by the load address puts all of them nowhere.
+    const Elf64_Shdr *sh = (const Elf64_Shdr *)(base + eh->e_shoff);
+    uint64_t lo = g->text, hi = g->text + prev;
+    if (hi < lo) return false;
+    for (unsigned i = 0; i < eh->e_shnum; i++) {
+        if ((sh[i].sh_flags & SHF_EXECINSTR) == 0) continue;
+        if (sh[i].sh_type != SHT_PROGBITS) continue;
+        if (lo >= sh[i].sh_addr && hi <= sh[i].sh_addr + sh[i].sh_size)
+            return true;
+    }
+    return false;
+}
+
+static go_functab go_read(const uint8_t *base, size_t map_len,
+                          const Elf64_Ehdr *eh)
+{
+    go_functab g;
+    memset(&g, 0, sizeof g);
+
+    const Elf64_Shdr *sh = (const Elf64_Shdr *)(base + eh->e_shoff);
+    const Elf64_Shdr *pcln = NULL, *text = NULL;
+    const char *shstr = NULL;
+    size_t shstr_len = 0;
+    if (eh->e_shstrndx < eh->e_shnum) {
+        const Elf64_Shdr *s = &sh[eh->e_shstrndx];
+        if (s->sh_offset < map_len && s->sh_size &&
+            s->sh_size <= map_len - s->sh_offset &&
+            base[s->sh_offset + s->sh_size - 1] == '\0') {
+            shstr = (const char *)(base + s->sh_offset);
+            shstr_len = s->sh_size;
+        }
+    }
+    if (!shstr) return g;
+    for (unsigned i = 0; i < eh->e_shnum; i++) {
+        if (sh[i].sh_name >= shstr_len) continue;
+        const char *name = shstr + sh[i].sh_name;
+        if (sh[i].sh_offset > map_len ||
+            sh[i].sh_size > map_len - sh[i].sh_offset)
+            continue;
+        if (strcmp(name, ".gopclntab") == 0) pcln = &sh[i];
+        else if (strcmp(name, ".text") == 0) text = &sh[i];
+    }
+    // Found by section name only. x86lint also scans the data sections
+    // for the header, which is what a binary whose section names were
+    // stripped needs; every Go object in this corpus names it, so that
+    // is a measurement away rather than written on spec.
+    if (!pcln || pcln->sh_size < 72) return g;
+
+    const uint8_t *h = base + pcln->sh_offset;
+    uint32_t magic = go_u32(h);
+    if (magic != GO_PCLN_MAGIC_118 && magic != GO_PCLN_MAGIC_120) return g;
+    if (h[4] || h[5]) return g;                     // pad1, pad2
+    unsigned min_lc = h[6], ptr_size = h[7];
+    // riscv64 is 8-byte pointers, and minLC is 2 with the C extension
+    // and 4 without -- both appear in this corpus.
+    if (ptr_size != 8 || (min_lc != 2 && min_lc != 4)) return g;
+
+    uint64_t f[8];
+    for (unsigned i = 0; i < 8; i++) memcpy(&f[i], h + 8 + i * 8, 8);
+    // f[] is nfunc, nfiles, textStart, funcnameOffset, cuOffset,
+    // filetabOffset, pctabOffset, pclnOffset.
+    uint64_t nfunc = f[0], text_start = f[2], funcname_off = f[3];
+    uint64_t cu_off = f[4], pcln_off = f[7];
+    if (!nfunc || nfunc > (1u << 24)) return g;
+    if (funcname_off >= cu_off || cu_off > pcln->sh_size) return g;
+    if (pcln_off >= pcln->sh_size) return g;
+    // nfunc+1 entries: the last is a sentinel carrying the end of the
+    // text the table covers.
+    if ((pcln->sh_size - pcln_off) / 8 < nfunc + 1) return g;
+
+    g.functab = h + pcln_off;
+    g.funcdata = h + pcln_off;
+    g.funcdata_len = pcln->sh_size - pcln_off;
+    g.funcname = (const char *)(h + funcname_off);
+    g.funcname_len = cu_off - funcname_off;
+    g.nfunc = nfunc;
+
+    // The header's textStart is not to be trusted: of this corpus's Go
+    // objects it is 0 in `gofmt` and `compile` and right in `gh`, so
+    // two thirds of them would place every function at the bottom of
+    // the address space. Try it when it is set, then the section
+    // layout, and take whichever the whole table validates against --
+    // entryoff 0 is the first function either way.
+    uint64_t candidates[2];
+    unsigned ncand = 0;
+    if (text_start) candidates[ncand++] = text_start;
+    if (text && text->sh_addr) candidates[ncand++] = text->sh_addr;
+    for (unsigned i = 0; i < ncand; i++) {
+        g.text = candidates[i];
+        if (go_validate(&g, base, eh)) {
+            g.valid = true;
+            return g;
+        }
+    }
+    memset(&g, 0, sizeof g);
+    return g;
+}
+
+// Nearest preceding Go function, bounded by where the next one starts.
+static const char *go_symbolize(const go_functab *g, uint64_t addr,
+                                uint64_t *delta)
+{
+    if (!g->valid || addr < g->text) return NULL;
+    uint64_t off = addr - g->text;
+    if (off > 0xffffffffu) return NULL;
+
+    // The last entry whose entryoff does not pass `off`. The sentinel
+    // at nfunc is the end of the covered text, so an address at or past
+    // it belongs to no function.
+    uint64_t lo = 0, hi = g->nfunc;             // invariant: answer < hi
+    while (hi - lo > 1) {
+        uint64_t mid = lo + (hi - lo) / 2;
+        uint32_t entryoff, funcoff;
+        go_entry(g, mid, &entryoff, &funcoff);
+        if (entryoff <= off) lo = mid;
+        else hi = mid;
+    }
+    uint32_t entryoff, funcoff;
+    go_entry(g, lo, &entryoff, &funcoff);
+    if (entryoff > off) return NULL;
+    uint32_t sentinel, unused;
+    go_entry(g, g->nfunc, &sentinel, &unused);
+    if (off >= sentinel) return NULL;
+
+    // Go's riscv64 linker emits a `$x<arch string>` entry beside each
+    // cgo function -- the ISA mapping symbol, sharing its address and
+    // sorting after it. 12 of gh's 32,233 entries and 12 of restic's,
+    // and naming a finding after one would be absurd, so step back off
+    // them to the function they mark.
+    while (lo > 0) {
+        const char *name = go_name(g, lo);
+        if (name && name[0] != '$') break;
+        uint32_t prev_entry, prev_func;
+        go_entry(g, lo - 1, &prev_entry, &prev_func);
+        if (prev_entry != entryoff) break;      // a different function
+        lo--;
+    }
+    const char *name = go_name(g, lo);
+    if (!name || !name[0] || name[0] == '$') return NULL;
+    go_entry(g, lo, &entryoff, &funcoff);
+    *delta = off - entryoff;
+    return name;
+}
+
+// Nearest preceding function symbol, for the "<name+0x..>" in a
+// finding. The ELF symbol table first, since it is what a locally built
+// object carries, then Go's own table.
 static const char *symbolize(const uint8_t *base, size_t map_len,
-                             const Elf64_Ehdr *eh, uint64_t addr,
-                             uint64_t *delta)
+                             const Elf64_Ehdr *eh, const go_functab *go,
+                             uint64_t addr, uint64_t *delta)
 {
     const Elf64_Shdr *sh = (const Elf64_Shdr *)(base + eh->e_shoff);
     const char *best = NULL;
@@ -252,7 +479,7 @@ static const char *symbolize(const uint8_t *base, size_t map_len,
             best_val = sym[j].st_value;
         }
     }
-    if (!best) return NULL;
+    if (!best) return go ? go_symbolize(go, addr, delta) : NULL;
     *delta = addr - best_val;
     return best;
 }
@@ -266,6 +493,7 @@ typedef struct {
     const uint8_t *base;
     size_t map_len;
     const Elf64_Ehdr *eh;
+    const go_functab *go;
     const char *section;    // name of the section being scanned
 } report_ctx;
 
@@ -322,8 +550,8 @@ static void report(void *ctx, const riscvlint_finding *f)
     if (!verbose) return;
 
     uint64_t delta = 0;
-    const char *sym = symbolize(c->base, c->map_len, c->eh, f->address,
-                                &delta);
+    const char *sym = symbolize(c->base, c->map_len, c->eh, c->go,
+                                f->address, &delta);
     printf("%s at offset: 0x%" PRIx64, f->title, f->address);
     if (sym) {
         if (delta) printf(" <%s+0x%" PRIx64 ">", sym, delta);
@@ -411,8 +639,8 @@ static void json_finding(void *ctx, const riscvlint_finding *f)
     putchar('"');
 
     uint64_t delta = 0;
-    const char *sym = symbolize(c->base, c->map_len, c->eh, f->address,
-                                &delta);
+    const char *sym = symbolize(c->base, c->map_len, c->eh, c->go,
+                                f->address, &delta);
     if (sym) {
         fputs(", \"function\": \"", stdout);
         json_puts(sym);
@@ -482,7 +710,8 @@ static bool image_read(void *ctx, uint64_t vaddr, void *out, size_t n)
 static void scan_section(csh handle, riscvlint_state *state,
                          const uint8_t *code, size_t size, uint64_t vaddr,
                          const uint8_t *base, size_t map_len,
-                         const Elf64_Ehdr *eh, const char *name)
+                         const Elf64_Ehdr *eh, const go_functab *go,
+                         const char *name)
 {
     if (!riscvlint_state_set_section(state, handle, code, size, vaddr))
         return;
@@ -507,7 +736,7 @@ static void scan_section(csh handle, riscvlint_state *state,
         free(offs);
     }
 
-    report_ctx ctx = { handle, state, base, map_len, eh, name };
+    report_ctx ctx = { handle, state, base, map_len, eh, go, name };
     riscvlint_scan(state, handle, code, size, vaddr,
                    json_mode ? json_finding : report, &ctx,
                    &total_insns, &total_skipped);
@@ -542,6 +771,9 @@ static int scan_file(csh handle, const char *path)
     } else {
         const char *arch = find_arch_string(base, map_len, eh);
         image im = { base, map_len, eh };
+        // Read once per file rather than per finding: validating it is
+        // a walk of every entry.
+        go_functab go = go_read(base, map_len, eh);
         // The census reads the arch string for its own report and gates
         // nothing on it, so it needs no state and no extension mask.
         riscvlint_state *state = NULL;
@@ -625,6 +857,7 @@ static int scan_file(csh handle, const char *path)
             else
                 scan_section(handle, state, base + sh[i].sh_offset,
                              sh[i].sh_size, sh[i].sh_addr, base, map_len, eh,
+                             &go,
                              shstr && sh[i].sh_name < shstr_len
                                  ? shstr + sh[i].sh_name : NULL);
         }
