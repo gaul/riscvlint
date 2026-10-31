@@ -961,10 +961,26 @@ size_t riscvlint_scan(riscvlint_state *state, csh handle,
 // census can be held to. Over libxul and both libllvm22 builds the two
 // agree to within 1.3% on each of those four masks.
 //
-// Still not followed: composition through a register-register `add` or
-// `or`, which is how RISCVMatInt joins the halves of a 64-bit value. A
-// chain stops at the last `addi`/`slli`, so the sequence above reports
-// `0x5555555500000000` rather than `0x5555555555555555`.
+// Composition through a register-register `add` or `or` is followed
+// too, which is how RISCVMatInt joins the halves of a 64-bit value.
+// Unlike a step there is no ambiguity about what it does -- the sum or
+// union of two known constants is a constant whatever else is true --
+// so both sources are closed without being counted and their
+// instructions are charged to the value they were built for. Where the
+// two halves grew from the same root instruction, which is what a
+// cross-register step leaves behind, their counts overlap and the
+// larger is taken rather than the sum.
+//
+// That is what makes a 64-bit constant visible as itself: libxul's
+// 2,867 `0x5555555555555555` chains used to report as
+// `0x5555555500000000`, the shifted half, and the 64-bit popcount is
+// the expensive one.
+//
+// Still not followed: anything else that combines two known values --
+// `sub`, `xor`, `and`, a shift by a register. Those appear in
+// RISCVMatInt's output rarely or not at all, and every one added is a
+// chance to absorb an instruction that was using a constant rather
+// than building one.
 //
 // Two things the report says that a by-value tally alone would not.// Two things the report says that a by-value tally alone would not.
 //

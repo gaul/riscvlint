@@ -3608,6 +3608,54 @@ static bool cchain_step_of(uint32_t w, unsigned size, cchain_step *st)
     return true;
 }
 
+// A composition: `add` or `or` of two registers that both hold chains
+// in flight. Unlike a step there is no ambiguity about what this does
+// -- the sum or union of two known constants is a constant whatever
+// else is true -- which is why it may close both sources where the
+// cross-register step has to leave its one open.
+//
+// This is how RISCVMatInt joins the halves of a 64-bit value, and
+// without it a 64-bit constant surfaces as its shifted high half:
+// `0x5555555500000000` appeared 2,867 times in libxul where the value
+// being built was `0x5555555555555555`.
+typedef struct {
+    unsigned dst, a, b;
+    bool is_or;
+} cchain_merge;
+
+static bool cchain_merge_of(uint32_t w, unsigned size, cchain_merge *m)
+{
+    if (size == 4) {
+        if (RV_OPCODE(w) != 0x33u) return false;
+        if (((w >> 25) & 0x7fu) != 0u) return false;    // funct7 0: not M
+        unsigned f3 = (w >> 12) & 0x7u;
+        if (f3 != 0u && f3 != 6u) return false;         // add, or
+        m->is_or = f3 == 6u;
+        m->dst = (w >> 7) & 0x1fu;
+        m->a = (w >> 15) & 0x1fu;
+        m->b = (w >> 20) & 0x1fu;
+        return m->dst != 0 && m->a != 0 && m->b != 0;
+    }
+    if (size != 2) return false;
+    // c.add rd,rs2 -- op 10, funct3 100, bit 12 set.
+    if ((w & 0xf003u) == 0x9002u) {
+        m->dst = m->a = (w >> 7) & 0x1fu;
+        m->b = (w >> 2) & 0x1fu;
+        m->is_or = false;
+        return m->dst != 0 && m->b != 0;
+    }
+    // c.or rd',rs2' -- op 01, funct3 100, bit 12 clear, bits 11:10 set,
+    // bits 6:5 == 10. c.and, c.xor and c.sub share the shape and are
+    // separated by those two bits.
+    if ((w & 0xfc63u) == 0x8c41u) {
+        m->dst = m->a = 8u + ((w >> 7) & 7u);
+        m->b = 8u + ((w >> 2) & 7u);
+        m->is_or = true;
+        return true;
+    }
+    return false;
+}
+
 static void cchain_apply(const cchain_step *st, int64_t *val)
 {
     if (st->shift) {
@@ -3739,6 +3787,38 @@ void riscvlint_cchain_scan(riscvlint_cchain *c, csh handle,
                 cchain_close(c, &live[st.dst]);
             }
             live[st.dst] = moved;
+            continue;
+        }
+
+        // Then a composition, which likewise reads the registers whose
+        // chains it consumes.
+        cchain_merge mg;
+        if (cchain_merge_of(w, insn->size, &mg) && live[mg.a].open &&
+            live[mg.b].open) {
+            cchain_live out;
+            out.open = true;
+            out.val = mg.is_or ? (live[mg.a].val | live[mg.b].val)
+                               : (int64_t)((uint64_t)live[mg.a].val +
+                                           (uint64_t)live[mg.b].val);
+            // Where both halves grew from the same root instruction --
+            // which is what a cross-register step leaves behind, since
+            // it copies the chain rather than moving it -- their
+            // instruction counts overlap and adding them would charge
+            // the shared prefix twice.
+            out.ninsn = live[mg.a].start == live[mg.b].start
+                            ? (live[mg.a].ninsn > live[mg.b].ninsn
+                                   ? live[mg.a].ninsn : live[mg.b].ninsn) + 1
+                            : live[mg.a].ninsn + live[mg.b].ninsn + 1;
+            out.start = live[mg.a].start < live[mg.b].start
+                            ? live[mg.a].start : live[mg.b].start;
+            // Both sources are consumed here, so they are closed
+            // without being counted: their instructions belong to the
+            // value they were built for. A half that was also used
+            // elsewhere is lost, which is the safe direction.
+            live[mg.a].open = false;
+            live[mg.b].open = false;
+            cchain_close(c, &live[mg.dst]);
+            live[mg.dst] = out;
             continue;
         }
 

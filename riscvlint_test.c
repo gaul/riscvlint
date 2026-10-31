@@ -2800,6 +2800,46 @@ static void test_cchain(csh handle)
     CHECK(riscvlint_cchain_values(c) == 2);
     riscvlint_cchain_destroy(c);
 
+    // Composition through a register-register `add`, which is how
+    // RISCVMatInt joins the halves of a 64-bit value. Without it the
+    // chain stops at the shifted high half and a 64-bit constant is
+    // reported as something that was never built.
+    static const uint8_t comp[] = {
+        0xb7, 0x55, 0x55, 0x55,        // lui a1,0x55555
+        0x93, 0x84, 0x55, 0x55,        // addi s1,a1,1365 -> 0x55555555
+        0x13, 0x99, 0x04, 0x02,        // slli s2,s1,0x20 -> 0x5555555500000000
+        0xb3, 0x09, 0x99, 0x00,        // add s3,s2,s1    -> 0x5555555555555555
+    };
+    c = riscvlint_cchain_create();
+    if (!c) { CHECK(false); return; }
+    riscvlint_cchain_scan(c, handle, NULL, comp, sizeof comp, 0x1000);
+    CHECK(riscvlint_cchain_lookup(c, (int64_t)0x5555555555555555ull, &chains,
+                                  &insns, NULL, NULL));
+    // Four instructions, not five: s1 and s2 grew from the same `lui`,
+    // so their counts overlap and adding them would charge it twice.
+    CHECK(chains == 1 && insns == 4);
+    // The halves are consumed by the composition and not counted on
+    // their own, so neither appears.
+    CHECK(!riscvlint_cchain_lookup(c, 0x55555555, NULL, NULL, NULL, NULL));
+    CHECK(!riscvlint_cchain_lookup(c, (int64_t)0x5555555500000000ull, NULL,
+                                   NULL, NULL, NULL));
+    riscvlint_cchain_destroy(c);
+
+    // `or` composes too, and two halves with *different* roots add
+    // their counts rather than taking the larger.
+    static const uint8_t comp_or[] = {
+        0x93, 0x04, 0x10, 0x00,        // addi s1,zero,1   -> 1, one insn
+        0x37, 0x39, 0x33, 0x33,        // lui s2,0x33333
+        0x13, 0x09, 0x39, 0x33,        // addi s2,s2,819   -> 0x33333333, two
+        0x33, 0x6a, 0x99, 0x00,        // or s4,s2,s1      -> 0x33333333 | 1
+    };
+    c = riscvlint_cchain_create();
+    if (!c) { CHECK(false); return; }
+    riscvlint_cchain_scan(c, handle, NULL, comp_or, sizeof comp_or, 0x1000);
+    CHECK(riscvlint_cchain_lookup(c, 0x33333333, &chains, &insns, NULL, NULL));
+    CHECK(chains == 1 && insns == 4);   // 1 + 2 + the `or` itself
+    riscvlint_cchain_destroy(c);
+
     // Everything tolerates NULL, as the census does.
     riscvlint_cchain_destroy(NULL);
     riscvlint_cchain_set_hooks(NULL, NULL, NULL, NULL, NULL);

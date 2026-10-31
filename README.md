@@ -1070,29 +1070,38 @@ addi s1,a1,1365      a1's chain completes into *s1*, not a1
 addi a2,a2,819       this one completes in place
 ```
 
-Not followed: composition through a register-register `add` or `or`,
-which is how `RISCVMatInt` joins the halves of a 64-bit value. A chain
-stops at the last `addi`/`slli`, so the sequence above reports
-`0x5555555500000000` rather than `0x5555555555555555` -- the 64-bit
-masks appear as their shifted high halves, 2,867 of them in libxul.
+Composition through a register-register `add` or `or` is followed too,
+which is how `RISCVMatInt` joins the halves of a 64-bit value. There is
+no ambiguity about what that does -- the sum or union of two known
+constants is a constant whatever else is true -- so both sources are
+closed without being counted and their instructions are charged to the
+value they were built for, taking the larger rather than the sum where
+the two halves grew from the same root. That is what makes a 64-bit
+constant visible as itself: libxul's 2,867 `0x5555555555555555` chains
+used to report as `0x5555555500000000`, the shifted half.
+
+Still not followed: anything else that combines two known values --
+`sub`, `xor`, `and`, a shift by a register. Those barely appear in
+`RISCVMatInt`'s output, and each one added is another chance to absorb
+an instruction that was *using* a constant rather than building one.
 
 ```console
 $ ./riscvlint -c -q corpus/cpp/firefox-esr--libxul.so
-Constant chains in corpus/cpp/firefox-esr--libxul.so: 2716710 materializations, 3189846 instructions
-  one instruction: 2319245
-  two or more: 397465 chains, 870601 instructions, 29026 distinct values
-    of which addresses: 18871 chains, 37756 instructions
-    of which constants: 378594 chains, 832845 instructions
+Constant chains in corpus/cpp/firefox-esr--libxul.so: 2697870 materializations, 3171535 instructions
+  one instruction: 2318741
+  two or more: 379129 chains, 852794 instructions, 29031 distinct values
+    of which addresses: 13611 chains, 27236 instructions
+    of which constants: 365518 chains, 825558 instructions
   costliest values:
-       56390 insns  0x8000000000000000 (-9223372036854775808) 27954 chains
+       56386 insns  0x8000000000000000 (-9223372036854775808) 27952 chains
        37256 insns  0xfff9800000000000 (-1829587348619264) 18628 chains
        27476 insns  0xfffe000000000000 (-562949953421312) 13738 chains
        24970 insns  0x2000100000000 (562954248388608) 12485 chains
-       23949 insns  0x8000000000000001 (-9223372036854775807) 7974 chains
+       23946 insns  0x8000000000000001 (-9223372036854775807) 7973 chains
+       20796 insns  0x101010101010101 (72340172838076673) 5199 chains
        ...
   rebuilt inside one function: not counted, nothing named the functions
-```
-Read off that one run: the sign bit 18,757 times, then four values of
+```Read off that one run: the sign bit 18,757 times, then four values of
 the form `0xfff?800000000000`, which are SpiderMonkey's NaN-boxed JSVal
 tags -- 30,000 materializations of a handful of type tags -- and
 further down `0xffffffff80004005`, which is `NS_ERROR_FAILURE`, 2,569
@@ -1104,14 +1113,14 @@ Three things the report does that a by-value tally alone would not.
 
 **Single-instruction values are counted and not tallied.** `li a0,0`
 has no cheaper spelling, and libxul materializes something in one
-instruction 2,319,245 times, so ranking those by cost would make the
+instruction 2,318,741 times, so ranking those by cost would make the
 report a list of "build zero". The totals keep them; the ranked list
 starts at two.
 
 **Addresses are told from literals.** In a linked object `lui`+`addi`
 of a symbol's `%hi`/`%lo` is indistinguishable from arithmetic on a
 literal, and conflating them buries the constants: libxul reports
-18,871 address chains against 378,594 constant ones, where the naive
+13,611 address chains against 365,518 constant ones, where the naive
 test -- any allocated section -- put a large part of the second column
 in the first. Two
 conditions, both principled. The value must land in a section holding

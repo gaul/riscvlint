@@ -1179,24 +1179,38 @@ word per rd, so the encoding can be counted directly:
 The residual is the right sign: a `lui` whose completion never arrives
 is counted as a one-instruction value rather than guessed at.
 
-**Still not followed:** composition through a register-register `add`
-or `or`, which is how RISCVMatInt joins the halves of a 64-bit value. A
-chain stops at the last `addi`/`slli`, so a 64-bit mask surfaces as its
-shifted high half -- `0x5555555500000000`, 2,867 times in libxul. That
-is the next thing to extend, and unlike the `addi` case it is
-unambiguous: an `add` of two registers both holding open chains is a
-constant whatever else is true.
+**Composition is followed too.** A register-register `add` or `or` of
+two registers both holding chains in flight joins them, which is how
+RISCVMatInt builds a 64-bit value out of halves. Unlike the `addi`
+case there is nothing to guess -- the sum or union of two known
+constants is a constant -- so both sources close without being counted
+and their instructions are charged to the value they were built for.
+Where both halves grew from the same root instruction, which is what a
+cross-register step leaves behind, the larger count is taken rather
+than the sum: adding them would charge the shared `lui` twice.
+
+That is what makes a 64-bit constant visible as itself. libxul's
+`0x5555555555555555` reported as `0x5555555500000000` before it, and
+the split is now 2,867 chains reaching the full 64-bit mask against
+1,109 that stop at `0x55555555` -- 3,976 against the 4,007 `lui`
+encodings, so the accounting still reconciles after the change. The
+64-bit popcount is the expensive one and it was the invisible one.
+
+Still not followed: anything else combining two known values -- `sub`,
+`xor`, `and`, a shift by a register. They barely appear in
+RISCVMatInt's output, and each one added is another chance to absorb an
+instruction that was *using* a constant rather than building one.
 
 ### What the corpus builds
 
 | object | materializations | chains of 2+ | insns | distinct values |
 |---|---:|---:|---:|---:|
-| libxul | 2,716,710 | 397,465 | 870,601 | 29,026 |
-| debian-libllvm22 | 1,475,654 | 137,548 | 301,617 | 21,109 |
-| ubuntu-libllvm22 | 1,380,418 | 72,481 | 153,382 | 19,588 |
+| libxul | 2,697,870 | 379,129 | 852,794 | 29,031 |
+| debian-libllvm22 | 1,465,226 | 127,162 | 291,274 | 21,142 |
+| ubuntu-libllvm22 | 1,376,978 | 69,045 | 149,950 | 19,581 |
 
 The last two rows are the same source at the same release, so the
-difference between them is mostly what RVA23 removes: 65,067 fewer
+difference between them is mostly what RVA23 removes: 58,117 fewer
 multi-instruction chains, because `cpop` replaces a dozen instructions
 and four masks, `zext.w` replaces a shift pair, and the Zb families
 replace idioms that needed a mask built first.
@@ -1205,8 +1219,9 @@ The costliest values are diagnostic on sight, which is the argument for
 the report existing. libxul: the sign bit 27,954 times, then values
 shaped `0xfff?800000000000` -- SpiderMonkey's NaN-boxed JSVal tags --
 and `0xffffffff80004005`, `NS_ERROR_FAILURE`, 6,434 times.
-`0x5555555500000000` 2,867 times is the 64-bit popcount mask described
-above.
+`0x101010101010101` 5,199 times is the 64-bit popcount's sum
+multiplier, which only became visible as itself once composition was
+followed.
 
 ### Why none of this became a check
 
@@ -1388,9 +1403,12 @@ instruction, two, or a short run.
 One thing the old entry got wrong in the same breath: the 64-bit masks
 are not absent, they were invisible for a second reason. RISCVMatInt
 joins a 64-bit value's halves with a register-register `add`, which the
-census still does not follow, so `0x5555555555555555` surfaces as
-`0x5555555500000000` -- 2,867 times in libxul. The 64-bit popcount is
-there, and it is the expensive one.
+census did not follow until it was taught to, so
+`0x5555555555555555` surfaced as `0x5555555500000000`. It is now
+2,867 chains in libxul against 1,109 that stop at 32 bits, so most of
+this candidate is the 64-bit sequence -- a dozen instructions and four
+64-bit masks to one `cpop`, which is the expensive case and was the
+hidden one.
 
 ### Redundant mask after a zero-extending load -- 1,354
 
