@@ -1657,9 +1657,11 @@ not tracked (about 75K, every one a dispatch handle that a later
 # Remaining candidates
 
 Eight, 39 to 46, all from the JetStream corpus above; over the package
-corpus there are none. Thirty-four checks are implemented and everything
-this file sized over that corpus is either written or recorded as
-rejected with the evidence that rejected it. The last thirteen did not come from a corpus probe at all: 23
+corpus there are none. Thirty-seven checks are implemented, 36 to 38
+being the first three from that corpus, and everything this file sized
+over the package corpus is either written or recorded as rejected with
+the evidence that rejected it. Thirteen of the package entries, 23 to
+35, did not come from a corpus probe at all: 23
 came from walking armlint's check table against this one, 24 came from a
 rejection in this file being wrong, 25, 26 and 27 are the three
 addressing modes of a ratification plan for an extension that does not

@@ -4,9 +4,9 @@ A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
 Thirty-seven checks are implemented and the ledger's candidate list
-holds eight, all from a JIT corpus. [TODO.md](TODO.md) is that ledger: every candidate that was
-measured, the population it came back with, and the ones rejected on
-that evidence.
+holds eight, all from a JIT corpus. [TODO.md](TODO.md) is that ledger:
+every candidate that was measured, the population it came back with,
+and the ones rejected on that evidence.
 What got written was decided by the corpus rather than by intuition,
 and what did not get written was rejected the same way.
 
@@ -14,8 +14,9 @@ and what did not get written was rejected the same way.
 
 Thirty-seven of them, and the table lists twenty-seven. The jump pair,
 the constant chain and the no-op have so far been measured over the
-JetStream corpus of TODO.md, which the table does not cover. Seven report nothing over this corpus -- the bit count because no baseline object
-declares Zbb; the three indexed loads, the equality branch and the
+JetStream corpus of TODO.md, which the table does not cover. Seven
+report nothing over this corpus -- the bit count because no baseline
+object declares Zbb; the three indexed loads, the equality branch and the
 compare-exchange loop because those five require their extension to be
 positively present rather than merely un-denied, and no object declares
 Zilx, Zibi or Zacas; and the unsigned divide by a power of two because
