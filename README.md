@@ -3,7 +3,7 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Twenty-one checks are implemented and the ledger's candidate list is
+Twenty-two checks are implemented and the ledger's candidate list is
 empty. [TODO.md](TODO.md) is that ledger: every candidate that was
 measured, the population it came back with, and the ones rejected on
 that evidence.
@@ -12,7 +12,7 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Twenty-one of them. Every figure below is what the check itself reports
+Twenty-two of them. Every figure below is what the check itself reports
 over the [corpus](#corpus) -- 73,139,165 instructions of three
 toolchains -- rather than what a mining tool estimated for it. The two
 have differed by an order of magnitude every time both were measured.
@@ -40,7 +40,8 @@ have differed by an order of magnitude every time both were measured.
 | instruction compressible to a Zcb form | 705 | 181 | 29,762 | 30,648 | 61,296 |
 | redundant sign or zero extension | 6,589 | 333 | 1,593 | 8,515 | 20,864 |
 | dead register definition | 11,741 | 248 | 7,876 | 19,865 | 54,570 |
-| **total** | **328,987** | **192,611** | **3,066,703** | **3,588,301** | **8,060,142** |
+| floating-point constant fli would have built | 0 | 0 | 120 | 120 | 480 |
+| **total** | **328,987** | **192,611** | **3,066,823** | **3,588,421** | **8,060,622** |
 
 Do not read the total row as a result. One row is 84% of it, and that
 row is Go's assembler declining to select RVC at all, which is a
@@ -610,11 +611,70 @@ handful of `jalr ra,0(ra)` that were already two.
   C and Go conventions, and riscvlint cannot tell which it is looking at,
   so both answer "unknown" rather than guessing.
 
+* **floating-point constant `fli` would have built** --
+  `auipc rd,%pcrel_hi(L)` + `fld frd,%pcrel_lo(L)(rd)` where the eight
+  bytes at L hold a value Zfa's `fli.d` materializes in one
+  instruction. The pair, the load and the pool slot all go. Also the
+  `flw`/`fli.s` spelling; the absolute `lui %hi` one measures **zero**,
+  because the one place it appears its `lui` fits `c.lui`, which pairs
+  with a two-byte `c.fld` and so is a different pair.
+
+  This is armlint's "`ldr` literal of an encodable constant" with the
+  two architectures the other way round, and it is the clearest case in
+  either tool of a check whose worth is a property of the ISA rather
+  than of the compiler. AArch64 has `fmov #imm8` and `movi` at
+  baseline, so LLVM materializes every encodable FP constant and
+  armlint's version of this check measured 35 sites in 42,324 pool
+  loads -- 0.08%, and closed. RISC-V has no floating-point immediate at
+  all without Zfa, so on a baseline target the pool is where *every*
+  constant goes.
+
+  Population: 3,428 sites, which splits on the declaration rather than
+  on the compiler. 3,308 are the nine baseline Firefox objects under
+  `-m rva23` (libxul 2,966, libgkcodecs 210, the rest two figures), 120
+  are Go, whose assembler selects no Zfa, and **0** are the eight
+  objects that declare `zfa1p0` -- where the compiler was allowed to use
+  `fli` it already had, 798 times across the corpus. So this is an
+  `-m rva23` finding in the same sense the Zcb check is: an answer to
+  "what would rebuilding for RVA23 buy me", not a peephole anyone
+  missed.
+
+  Whether an entry exists is decided by a port of LLVM's
+  `RISCVLoadFPImm::getLoadFPImm`, in integer arithmetic rather than
+  through a float, so the answer does not turn on the host's rounding
+  mode or on what a double-to-float conversion does with a NaN payload.
+  The assembler is the oracle that matters -- a finding is only advice
+  if the immediate it names exists -- so the table is transcribed from
+  `RISCVBaseInfo.cpp` rather than from the spec, for the same reason the
+  census's profile rungs came from `RISCVProfiles.td`. What libxul's
+  pool actually holds, in order: 1.0 x909, nan x787, 0.5 x664, inf
+  x468, -1.0 x207, then a tail.
+
+  It is the first check that reads anything outside the section being
+  scanned, which the library exposes as `riscvlint_state_set_image`. Its
+  contract is that only allocated, **non-writable** contents are served:
+  a constant the program can overwrite is not a constant, and
+  `.data.rel.ro` is writable at load time precisely so the dynamic
+  linker can relocate into it. A relocatable object is refused outright,
+  since all its sections sit at address 0 and "the section holding this
+  address" names nothing there. Without a provider the check stands
+  down, so a library caller with no image to offer loses findings rather
+  than correctness.
+
+  What the preconditions cost: 3,459 of libxul's 14,992 adjacent pool
+  loads hold an encodable value, 3,441 survive the branch-target and
+  relocation tests, and 2,966 survive the liveness one. That last proof
+  is the expensive one and it is not optional -- the rewrite stops
+  writing the address register, and a pool address is often used again
+  for the slot next door. In Go it costs far more: 84 encodable, 14
+  reported, because the gc assembler routes pool addresses through `t6`
+  and reuses it.
+
 ## Selecting the target
 
 `-m <name>` pins the extensions the checks may assume, and may be
-repeated. Names are either extensions (`zba`, `zbb`, `zbs`, `zcb`, `c`)
-or profiles that bundle them (`rva20`, `rva22`, `rva23`).
+repeated. Names are either extensions (`zba`, `zbb`, `zbs`, `zcb`,
+`zfa`, `c`) or profiles that bundle them (`rva20`, `rva22`, `rva23`).
 
 `-m` replaces what the object declares, in both directions, because both
 are useful and neither is expressible if the flag merely adds to the
@@ -634,7 +694,7 @@ bytes on it still could be.
 ratification window and is mandatory in RVA23U64, so it is the first
 extension gated here that tells the two profiles apart -- and on the
 corpus's one baseline build it is by far the largest difference between
-them.
+them. Zfa is mandatory there too, and is the second.
 
 Without `-m`, the arch string decides, and a file that carries none is
 reported as such rather than silently assumed permissive.

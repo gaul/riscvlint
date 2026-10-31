@@ -6,6 +6,7 @@
 
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int failures;
@@ -167,10 +168,12 @@ static void test_arch_gate(void)
     // The two profiles used to expand alike. Zcb missed RVA22's
     // ratification window and is mandatory in RVA23U64, so it is the
     // first extension gated here that separates them; test_zcb_gate
-    // covers the difference from the other side.
+    // covers the difference from the other side. Zfa is mandatory
+    // there too, and is the second.
     CHECK(riscvlint_parse_ext_name("rva23", &m) &&
           m == (RISCVLINT_EXT_ZBA | RISCVLINT_EXT_ZBB | RISCVLINT_EXT_ZBS |
-                RISCVLINT_EXT_ZCB | RISCVLINT_EXT_C));
+                RISCVLINT_EXT_ZCB | RISCVLINT_EXT_C | RISCVLINT_EXT_ZFA));
+    CHECK(riscvlint_parse_ext_name("zfa", &m) && m == RISCVLINT_EXT_ZFA);
     CHECK(!riscvlint_parse_ext_name("zbq", &m));
     CHECK(!riscvlint_parse_ext_name("", &m));
 
@@ -2401,6 +2404,219 @@ static void test_c_form(void)
     CHECK(!rv_c_form(0x6588u, 2, f, sizeof f));       // already two bytes
 }
 
+// Zfa's fli table, against LLVM's RISCVLoadFPImm::getLoadFPImm. The
+// entry numbers are the ones LLVM's own table yields, so a wrong
+// transcription shows up here rather than as a suggestion the assembler
+// rejects.
+static void test_fli_table(void)
+{
+    // binary64.
+    CHECK(rv_fli_entry(0x3ff0000000000000ull, 8) == 16);   // 1.0
+    CHECK(rv_fli_entry(0xbff0000000000000ull, 8) == 0);    // -1.0
+    CHECK(rv_fli_entry(0x3fe0000000000000ull, 8) == 12);   // 0.5
+    CHECK(rv_fli_entry(0x3fe8000000000000ull, 8) == 14);   // 0.75
+    CHECK(rv_fli_entry(0x4000000000000000ull, 8) == 20);   // 2.0
+    CHECK(rv_fli_entry(0x40f0000000000000ull, 8) == 29);   // 65536.0
+    CHECK(rv_fli_entry(0x3ef0000000000000ull, 8) == 2);    // 2^-16
+    CHECK(rv_fli_entry(0x7ff0000000000000ull, 8) == 30);   // inf
+    CHECK(rv_fli_entry(0x7ff8000000000000ull, 8) == 31);   // canonical NaN
+    CHECK(rv_fli_entry(0x0010000000000000ull, 8) == 1);    // DBL_MIN
+    // Everything the table does not hold. Zero is not an entry (x0
+    // through fmv.d.x is how that one is built), the only negative
+    // entry is -1.0, and a mantissa needing more than two bits is out
+    // whether or not the value looks round.
+    CHECK(rv_fli_entry(0x0000000000000000ull, 8) == -1);   // 0.0
+    CHECK(rv_fli_entry(0x8000000000000000ull, 8) == -1);   // -0.0
+    CHECK(rv_fli_entry(0xbfe0000000000000ull, 8) == -1);   // -0.5
+    CHECK(rv_fli_entry(0x40091eb851eb851full, 8) == -1);   // 3.14
+    CHECK(rv_fli_entry(0x3fb999999999999aull, 8) == -1);   // 0.1
+    CHECK(rv_fli_entry(0xfff8000000000000ull, 8) == -1);   // -NaN
+    CHECK(rv_fli_entry(0x7ff8000000000001ull, 8) == -1);   // NaN, payload
+    CHECK(rv_fli_entry(0xfff0000000000000ull, 8) == -1);   // -inf
+    CHECK(rv_fli_entry(0x0000000000000001ull, 8) == -1);   // subnormal
+    // 2^-127 is representable as a double and not as a normal float, so
+    // the exponent range test is what rejects it rather than the
+    // mantissa one.
+    CHECK(rv_fli_entry(0x3800000000000000ull, 8) == -1);
+
+    // binary32.
+    CHECK(rv_fli_entry(0x3f800000ull, 4) == 16);           // 1.0f
+    CHECK(rv_fli_entry(0xbf800000ull, 4) == 0);            // -1.0f
+    CHECK(rv_fli_entry(0x00800000ull, 4) == 1);            // FLT_MIN
+    CHECK(rv_fli_entry(0x7f800000ull, 4) == 30);           // inf
+    CHECK(rv_fli_entry(0x7fc00000ull, 4) == 31);           // NaN
+    CHECK(rv_fli_entry(0x4048f5c3ull, 4) == -1);           // 3.14f
+    CHECK(rv_fli_entry(0x00000000ull, 4) == -1);           // 0.0f
+    CHECK(rv_fli_entry(0x1ff800000ull, 4) == -1);          // not 32 bits
+    CHECK(rv_fli_entry(0x3f800000ull, 2) == -1);           // no such width
+
+    // The spelling, which is LLVM's printer: three by name and the rest
+    // by value, integral ones with one fraction digit.
+    char buf[32];
+    CHECK(strcmp(rv_fli_spell(16, buf, sizeof buf), "1.0") == 0);
+    CHECK(strcmp(rv_fli_spell(0, buf, sizeof buf), "-1.0") == 0);
+    CHECK(strcmp(rv_fli_spell(12, buf, sizeof buf), "0.5") == 0);
+    CHECK(strcmp(rv_fli_spell(14, buf, sizeof buf), "0.75") == 0);
+    CHECK(strcmp(rv_fli_spell(20, buf, sizeof buf), "2.0") == 0);
+    CHECK(strcmp(rv_fli_spell(1, buf, sizeof buf), "min") == 0);
+    CHECK(strcmp(rv_fli_spell(30, buf, sizeof buf), "inf") == 0);
+    CHECK(strcmp(rv_fli_spell(31, buf, sizeof buf), "nan") == 0);
+    CHECK(strcmp(rv_fli_spell(2, buf, sizeof buf),
+                 "1.52587890625e-05") == 0);
+    // Every entry round-trips: the value its spelling names is the
+    // value whose bits map back to it. Entries 1, 30 and 31 are spelled
+    // by name and have no value to parse, so they sit out.
+    for (int e = 0; e < 32; e++) {
+        if (e == 1 || e == 30 || e == 31) continue;
+        rv_fli_spell(e, buf, sizeof buf);
+        double d = strtod(buf, NULL);
+        uint64_t bits;
+        memcpy(&bits, &d, sizeof bits);
+        CHECK(rv_fli_entry(bits, 8) == e);
+    }
+}
+
+// A pool of one value at one address, standing in for the image.
+typedef struct {
+    uint64_t addr;
+    uint64_t bits;
+    unsigned width;
+} fake_pool;
+
+static bool fake_read(void *ctx, uint64_t vaddr, void *out, size_t n)
+{
+    const fake_pool *p = ctx;
+    if (vaddr != p->addr || n != p->width) return false;
+    uint8_t b[8];
+    for (size_t i = 0; i < n; i++) b[i] = (uint8_t)(p->bits >> (8 * i));
+    memcpy(out, b, n);
+    return true;
+}
+
+// run_window_exts with an image installed. A NULL pool is the "caller
+// offered none" case, where the check must stand down rather than guess.
+static int run_fli(csh handle, const uint8_t *code, size_t len,
+                   uint64_t vaddr, unsigned exts, fake_pool *pool,
+                   riscvlint_finding *out)
+{
+    static uint8_t buf[256];
+    memcpy(buf, code, len);
+    riscvlint_state *state = riscvlint_state_create();
+    if (!state) return -1;
+    riscvlint_state_set_extensions(state, exts);
+    if (pool) riscvlint_state_set_image(state, fake_read, pool);
+    int fired = 0;
+    if (riscvlint_state_set_section(state, handle, buf, len, vaddr)) {
+        cs_insn *insn = cs_malloc(handle);
+        const uint8_t *p = buf;
+        size_t remain = len;
+        uint64_t addr = vaddr;
+        while (insn && remain >= 2 &&
+               cs_disasm_iter(handle, &p, &remain, &addr, insn)) {
+            riscvlint_finding f;
+            memset(&f, 0, sizeof f);
+            if (check_fp_pool_to_fli(state, insn, &f)) {
+                if (out && !fired) *out = f;
+                fired++;
+            }
+            riscvlint_state_observe(state, insn);
+        }
+        if (insn) cs_free(insn, 1);
+    }
+    riscvlint_state_destroy(state);
+    return fired;
+}
+
+// A floating-point constant fli would have built. The encodings are
+// clang's for rv64gc; the code sits at 0x1000, so `auipc rd,0` plus an
+// offset of 256 resolves to 0x1100, which is where the fake pool is.
+static void test_fp_pool_to_fli(csh handle)
+{
+    riscvlint_finding f;
+    // The commonest shape in libxul: a double pool load of 1.0, with
+    // the address register overwritten straight after.
+    static const uint8_t dbl[] = {
+        0x17, 0x05, 0x00, 0x00,        // auipc a0,0
+        0x07, 0x35, 0x05, 0x10,        // fld fa0,256(a0)
+        0x05, 0x45,                    // c.li a0,1
+        0x82, 0x80,                    // c.ret
+    };
+    fake_pool one = { 0x1100, 0x3ff0000000000000ull, 8 };
+    CHECK(run_fli(handle, dbl, sizeof dbl, 0x1000, 0, &one, &f) == 1);
+    CHECK(f.address == 0x1000 && f.insn_count == 2);
+    CHECK(strstr(f.replacement, "fli.d fa0, 1.0") != NULL);
+    CHECK(strstr(f.replacement, "8 -> 4 bytes") != NULL);
+    CHECK(strstr(f.replacement, "pool 0x1100") != NULL);
+
+    // The four other values libxul's pool holds most of.
+    static const struct { uint64_t bits; const char *text; } values[] = {
+        { 0x7ff8000000000000ull, "fli.d fa0, nan" },
+        { 0x3fe0000000000000ull, "fli.d fa0, 0.5" },
+        { 0x7ff0000000000000ull, "fli.d fa0, inf" },
+        { 0xbff0000000000000ull, "fli.d fa0, -1.0" },
+        { 0x0010000000000000ull, "fli.d fa0, min" },
+    };
+    for (size_t i = 0; i < sizeof values / sizeof values[0]; i++) {
+        fake_pool p = { 0x1100, values[i].bits, 8 };
+        CHECK(run_fli(handle, dbl, sizeof dbl, 0x1000, 0, &p, &f) == 1);
+        CHECK(strstr(f.replacement, values[i].text) != NULL);
+    }
+
+    // A value no entry holds is the common case and not a finding.
+    static const uint64_t absent[] = {
+        0x40091eb851eb851full,         // 3.14
+        0x0000000000000000ull,         // 0.0
+        0xbfe0000000000000ull,         // -0.5
+    };
+    for (size_t i = 0; i < sizeof absent / sizeof absent[0]; i++) {
+        fake_pool p = { 0x1100, absent[i], 8 };
+        CHECK(run_fli(handle, dbl, sizeof dbl, 0x1000, 0, &p, NULL) == 0);
+    }
+
+    // The single, which is `flw` and `fli.s`.
+    static const uint8_t sgl[] = {
+        0x97, 0x05, 0x00, 0x00,        // auipc a1,0
+        0x87, 0xa5, 0x05, 0x10,        // flw fa1,256(a1)
+        0x85, 0x45,                    // c.li a1,1
+        0x82, 0x80,                    // c.ret
+    };
+    fake_pool onef = { 0x1100, 0x3f800000ull, 4 };
+    CHECK(run_fli(handle, sgl, sizeof sgl, 0x1000, 0, &onef, &f) == 1);
+    CHECK(strstr(f.replacement, "fli.s fa1, 1.0") != NULL);
+
+    // The rewrite stops writing the address register, so a site that
+    // reads it afterwards is not one. This is what the liveness proof
+    // is for, and on libxul it is what 475 of 3,441 sites fail.
+    static const uint8_t live[] = {
+        0x97, 0x06, 0x00, 0x00,        // auipc a3,0
+        0x87, 0xb6, 0x06, 0x10,        // fld fa3,256(a3)
+        0x36, 0xe0,                    // c.sdsp a3,0(sp)
+        0x82, 0x80,                    // c.ret
+    };
+    fake_pool lp = { 0x1100, 0x3ff0000000000000ull, 8 };
+    CHECK(run_fli(handle, live, sizeof live, 0x1000, 0, &lp, NULL) == 0);
+
+    // No image: the caller offered nothing to resolve against, so the
+    // check loses a finding rather than inventing one.
+    CHECK(run_fli(handle, dbl, sizeof dbl, 0x1000, 0, NULL, NULL) == 0);
+
+    // The pool address must resolve. A reader that declines -- which is
+    // what the driver's does for a writable section -- is the same
+    // answer as having none.
+    fake_pool elsewhere = { 0x2200, 0x3ff0000000000000ull, 8 };
+    CHECK(run_fli(handle, dbl, sizeof dbl, 0x1000, 0, &elsewhere, NULL) == 0);
+
+    // The gate. An object that declares an arch without Zfa positively
+    // says the instruction is unavailable; one that declares an arch
+    // with it, or declares nothing at all, leaves the check on.
+    CHECK(run_fli(handle, dbl, sizeof dbl, 0x1000,
+                  RISCVLINT_EXT_DECLARED, &one, NULL) == 0);
+    CHECK(run_fli(handle, dbl, sizeof dbl, 0x1000,
+                  RISCVLINT_EXT_DECLARED | RISCVLINT_EXT_ZFA, &one,
+                  NULL) == 1);
+    CHECK(run_fli(handle, dbl, sizeof dbl, 0x1000, 0, &one, NULL) == 1);
+}
+
 // The ISA census. The encodings are the fixture's, assembled by clang
 // for rv64gc plus the extensions named, so what capstone's feature
 // groups say about them is being checked against what an assembler
@@ -2568,6 +2784,8 @@ int main(void)
     test_transfer_to_next(handle);
     test_zero_store_run(handle);
     test_bitcast_through_frame(handle);
+    test_fli_table();
+    test_fp_pool_to_fli(handle);
     test_census(handle);
 
     cs_close(&handle);

@@ -265,6 +265,7 @@ unsigned riscvlint_parse_arch(const char *arch)
     if (strstr(arch, "_zbb")) exts |= RISCVLINT_EXT_ZBB;
     if (strstr(arch, "_zbs")) exts |= RISCVLINT_EXT_ZBS;
     if (strstr(arch, "_zcb")) exts |= RISCVLINT_EXT_ZCB;
+    if (strstr(arch, "_zfa")) exts |= RISCVLINT_EXT_ZFA;
     // C is spelled `_c2p0` in the base run and `_zca1p0` once the
     // Zc* split gave it a name of its own; a conforming string carries
     // whichever the assembler wrote, and some carry both.
@@ -1128,6 +1129,12 @@ struct riscvlint_state {
                         // ahead of the caller's own cursor
     cs_insn *probe;
 
+    // Reads data outside the scanned section, for the one check that
+    // resolves a pool address. NULL unless a caller offered one; see
+    // riscvlint_state_set_image for what it is allowed to serve.
+    riscvlint_read_fn read;
+    void *read_ctx;
+
     // The prologue check_redundant_sp_restore is waiting to match, and
     // whether anything has moved sp since. Every other check reads only
     // the instruction under the cursor and what follows it; this one
@@ -1267,6 +1274,13 @@ void riscvlint_state_set_extensions(riscvlint_state *state, unsigned exts)
     state->exts = exts;
 }
 
+void riscvlint_state_set_image(riscvlint_state *state, riscvlint_read_fn read,
+                               void *ctx)
+{
+    state->read = read;
+    state->read_ctx = ctx;
+}
+
 unsigned riscvlint_state_extensions(const riscvlint_state *state)
 {
     return state->exts;
@@ -1366,14 +1380,17 @@ bool riscvlint_parse_ext_name(const char *name, unsigned *exts)
         { "zbs",   RISCVLINT_EXT_ZBS },
         { "zcb",   RISCVLINT_EXT_ZCB },
         { "c",     RISCVLINT_EXT_C },
+        { "zfa",   RISCVLINT_EXT_ZFA },
         // Every profile from RVA20 up mandates C.
         { "rva20", RISCVLINT_EXT_C },
         { "rva22", RISCVLINT_EXT_ZBA | RISCVLINT_EXT_ZBB | RISCVLINT_EXT_ZBS |
                    RISCVLINT_EXT_C },
         // Zcb missed RVA22's ratification window and is mandatory in
-        // RVA23U64, so this is where the two profiles part.
+        // RVA23U64, so this is where the two profiles part. Zfa is
+        // mandatory there too (RISCVProfiles.td's RVA23U64Features).
         { "rva23", RISCVLINT_EXT_ZBA | RISCVLINT_EXT_ZBB | RISCVLINT_EXT_ZBS |
-                   RISCVLINT_EXT_ZCB | RISCVLINT_EXT_C },
+                   RISCVLINT_EXT_ZCB | RISCVLINT_EXT_C |
+                   RISCVLINT_EXT_ZFA },
     };
     for (size_t i = 0; i < sizeof table / sizeof table[0]; i++) {
         if (strcmp(name, table[i].name) == 0) {
@@ -3087,6 +3104,187 @@ bool check_dead_def(riscvlint_state *state, const cs_insn *insn,
     return true;
 }
 
+// ---- a floating-point constant `fli` would have materialized ----
+
+// Entries 2..31 of Zfa's `fli` table, as the (exponent, 2-bit mantissa)
+// pair each one has in binary32. Transcribed from LLVM's
+// LoadFP32ImmArr (RISCVBaseInfo.cpp) rather than from the spec table,
+// for the same reason the census's profile rungs came from
+// RISCVProfiles.td: the assembler is what has to accept the suggestion,
+// so the assembler's own table is the one to agree with. Entry 0
+// (-1.0) and entry 1 (the smallest positive normal, which differs per
+// type) are not in it and are handled separately, exactly as LLVM does.
+static const struct { uint8_t exp, mant; } fli_table[30] = {
+    { 0x6f, 0 }, { 0x70, 0 }, { 0x77, 0 }, { 0x78, 0 }, { 0x7b, 0 },
+    { 0x7c, 0 }, { 0x7d, 0 }, { 0x7d, 1 }, { 0x7d, 2 }, { 0x7d, 3 },
+    { 0x7e, 0 }, { 0x7e, 1 }, { 0x7e, 2 }, { 0x7e, 3 }, { 0x7f, 0 },
+    { 0x7f, 1 }, { 0x7f, 2 }, { 0x7f, 3 }, { 0x80, 0 }, { 0x80, 1 },
+    { 0x80, 2 }, { 0x81, 0 }, { 0x82, 0 }, { 0x83, 0 }, { 0x86, 0 },
+    { 0x87, 0 }, { 0x8e, 0 }, { 0x8f, 0 }, { 0xff, 0 }, { 0xff, 2 },
+};
+
+int rv_fli_entry(uint64_t bits, unsigned width)
+{
+    unsigned sign, exp;
+    unsigned mant;      // the two mantissa bits the table indexes on
+
+    if (width == 8) {
+        // The smallest positive normal is entry 1 and is type-specific:
+        // 2^-1022 here, 2^-126 for a single.
+        if (bits == 0x0010000000000000ull) return 1;
+        sign = (unsigned)(bits >> 63);
+        unsigned e64 = (unsigned)((bits >> 52) & 0x7ff);
+        uint64_t frac = bits & 0xfffffffffffffull;
+        // A binary64 pattern is a binary32 one exactly when its
+        // mantissa fits 23 bits and its exponent is in range. The
+        // table's test then clears the low 21 of those 23, so all told
+        // the low 50 mantissa bits have to be zero -- which is the same
+        // condition, reached without converting anything.
+        if (frac & 0x3ffffffffffffull) return -1;
+        mant = (unsigned)(frac >> 50);
+        if (e64 == 0x7ff) {
+            exp = 0xff;                 // inf and the canonical NaN
+        } else if (e64 == 0) {
+            return -1;                  // zero and the subnormals
+        } else {
+            int e32 = (int)e64 - 1023 + 127;
+            if (e32 < 1 || e32 > 254) return -1;
+            exp = (unsigned)e32;
+        }
+    } else if (width == 4) {
+        if (bits > 0xffffffffull) return -1;
+        if (bits == 0x00800000ull) return 1;
+        sign = (unsigned)((bits >> 31) & 1);
+        exp = (unsigned)((bits >> 23) & 0xff);
+        if (bits & 0x1fffffull) return -1;
+        mant = (unsigned)((bits >> 21) & 3);
+        if (exp == 0) return -1;
+    } else {
+        return -1;
+    }
+
+    int entry = -1;
+    for (int i = 0; i < 30; i++)
+        if (fli_table[i].exp == exp && fli_table[i].mant == mant) {
+            entry = i + 2;
+            break;
+        }
+    if (entry < 0) return -1;
+    // The only negative value the table holds is -1.0, which is 1.0's
+    // entry with the sign set.
+    if (sign) return entry == 16 ? 0 : -1;
+    return entry;
+}
+
+const char *rv_fli_spell(int entry, char *out, size_t outsz)
+{
+    // The three LLVM's printer spells by name rather than by value.
+    if (entry == 1) { snprintf(out, outsz, "min"); return out; }
+    if (entry == 30) { snprintf(out, outsz, "inf"); return out; }
+    if (entry == 31) { snprintf(out, outsz, "nan"); return out; }
+    if (entry < 0 || entry > 31) { snprintf(out, outsz, "?"); return out; }
+    // Entry 0 is -1.0; everything else is the table's pattern with a
+    // clear sign.
+    unsigned idx = entry == 0 ? 16 : (unsigned)entry;
+    uint32_t pat = (uint32_t)(entry == 0 ? 1u << 31 : 0u) |
+                   (uint32_t)fli_table[idx - 2].exp << 23 |
+                   (uint32_t)fli_table[idx - 2].mant << 21;
+    float f;
+    memcpy(&f, &pat, sizeof f);
+    // LLVM prints an integral value with one fraction digit and
+    // everything else with %.12g, which is the precision the smallest
+    // entry needs. Matched so the text is what the assembler reads
+    // back.
+    if (f == (float)(int)f) snprintf(out, outsz, "%.1f", (double)f);
+    else snprintf(out, outsz, "%.12g", (double)f);
+    return out;
+}
+
+// fld/flw frd, imm12(rs1): the FP loads, which rv_decode_mem reports as
+// memory records but not in the form this needs.
+static bool rv_decode_fp_load(uint32_t w, unsigned *frd, unsigned *rs1,
+                              int64_t *imm, unsigned *width)
+{
+    if (RV_OPCODE(w) != 0x07u) return false;
+    unsigned f3 = (w >> 12) & 7u;
+    if (f3 == 2) *width = 4;            // flw
+    else if (f3 == 3) *width = 8;       // fld
+    else return false;                  // flh, and the vector loads
+    *frd = (w >> 7) & 0x1fu;
+    *rs1 = (w >> 15) & 0x1fu;
+    *imm = sign_extend((uint64_t)(w >> 20) & 0xfffu, 12);
+    return true;
+}
+
+bool check_fp_pool_to_fli(riscvlint_state *state, const cs_insn *insn,
+                          riscvlint_finding *finding)
+{
+    if (insn->size != 4) return false;
+    if (!state->read) return false;     // no image to resolve against
+    if (!riscvlint_may_use(state, RISCVLINT_EXT_ZFA)) return false;
+
+    uint32_t w1;
+    if (!riscvlint_word_at(state, insn->address, &w1)) return false;
+    unsigned rd1;
+    int64_t hi;
+    // The `auipc` spelling only. `lui %hi` + `fld %lo` is the same fold
+    // and measures **zero** in the corpus: the absolute form appears
+    // only where its `lui` fits `c.lui`, which pairs with a two-byte
+    // `c.fld` and so is a different pair entirely. Recorded so the
+    // omission is a measurement rather than an oversight.
+    if (!rv_decode_auipc(w1, &rd1, &hi)) return false;
+    if (rd1 == 0) return false;         // computes nothing
+
+    uint64_t second = insn->address + 4;
+    uint32_t w2;
+    if (!riscvlint_word_at(state, second, &w2)) return false;
+    unsigned frd, rs1, width;
+    int64_t lo;
+    if (!rv_decode_fp_load(w2, &frd, &rs1, &lo, &width)) return false;
+    if (rs1 != rd1) return false;       // not this address
+
+    // Something branching onto the load would lose its address.
+    if (riscvlint_is_branch_target(state, second)) return false;
+    // In an unlinked object both immediates wait on R_RISCV_PCREL_HI20
+    // and its LO12, so the address computed from them is fiction.
+    if (riscvlint_is_relocated(state, insn->address) ||
+        riscvlint_is_relocated(state, second))
+        return false;
+
+    int64_t target = (int64_t)insn->address + hi + lo;
+    if (target < 0) return false;
+
+    uint8_t pool[8];
+    if (!state->read(state->read_ctx, (uint64_t)target, pool, width))
+        return false;
+    uint64_t bits = 0;
+    for (unsigned i = 0; i < width; i++)
+        bits |= (uint64_t)pool[i] << (8 * i);
+
+    // Tested before the liveness walk, which is much the more expensive
+    // of the two: most of the population fails here -- 3,459 of
+    // libxul's 14,992 pool loads hold a value any entry holds.
+    int entry = rv_fli_entry(bits, width);
+    if (entry < 0) return false;
+
+    // The rewrite stops writing rd1. A pool address is sometimes reused
+    // for the slot next door, so this has to be proved rather than
+    // assumed.
+    if (riscvlint_liveness(state, second + 4, rd1) != RISCVLINT_LIVE_DEAD)
+        return false;
+
+    char value[32];
+    rv_fli_spell(entry, value, sizeof value);
+    finding->title = "floating-point constant fli would have built";
+    finding->address = insn->address;
+    finding->insn_count = 2;
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "fli.%c %s, %s (8 -> 4 bytes, pool 0x%" PRIx64 ")",
+             width == 8 ? 'd' : 's', rv_freg_name(frd), value,
+             (uint64_t)target);
+    return true;
+}
+
 // ---- running every check ----
 
 static const riscvlint_check_fn riscvlint_checks[] = {
@@ -3111,6 +3309,7 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_transfer_to_next,
     check_zero_store_run,
     check_bitcast_through_frame,
+    check_fp_pool_to_fli,
 };
 
 size_t riscvlint_scan(riscvlint_state *state, csh handle,

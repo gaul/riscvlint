@@ -1,0 +1,17 @@
+note: fp_pool_to_fli.o: -m overrides the arch declared in the object
+floating-point constant fli would have built at offset: 0x111d4: -> fli.d fa0, 1.0 (8 -> 4 bytes, pool 0x101b8) (2 instructions)
+  auipc a0, 0xfffff
+  fld fa0, -0x1c(a0)
+
+floating-point constant fli would have built at offset: 0x111de: -> fli.s fa1, 1.0 (8 -> 4 bytes, pool 0x101d0) (2 instructions)
+  auipc a1, 0xfffff
+  flw fa1, -0xe(a1)
+
+floating-point constant fli would have built at offset: 0x111e8: -> fli.d fa2, nan (8 -> 4 bytes, pool 0x101c0) (2 instructions)
+  auipc a2, 0xfffff
+  fld fa2, -0x28(a2)
+
+Optimization opportunities by type:
+       3  floating-point constant fli would have built
+
+3 optimization opportunities in 16 instructions

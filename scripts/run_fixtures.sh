@@ -38,6 +38,20 @@ if ! probe_err=$($CC $CC_FLAGS -c -o "$PROBE/probe.o" "$PROBE/probe.s" 2>&1); th
     exit 2
 fi
 
+# Some fixtures have to be linked rather than left relocatable; see the
+# .link sidecar below. Probed here and refused up front like the
+# assembler, since a suite that quietly dropped those fixtures would
+# report a pass it had not earned.
+LINK_FLAGS="-nostdlib -static -fuse-ld=lld"
+printf '\t.text\n\t.globl _start\n_start:\n\tret\n' > "$PROBE/link.s"
+if ! probe_err=$($CC $CC_FLAGS $LINK_FLAGS -o "$PROBE/link.elf" \
+                     "$PROBE/link.s" 2>&1); then
+    echo "run_fixtures: $CC $CC_FLAGS $LINK_FLAGS cannot link RISC-V" >&2
+    echo "run_fixtures: the linked fixtures require it; install lld" >&2
+    echo "$probe_err" >&2
+    exit 2
+fi
+
 for src in "$ROOT"/fixtures/*.s; do
     name=$(basename "$src" .s)
     obj="$PROBE/$name.o"
@@ -49,7 +63,16 @@ for src in "$ROOT"/fixtures/*.s; do
     if [ -f "$ROOT/fixtures/$name.flags" ]; then
         extra=$(cat "$ROOT/fixtures/$name.flags")
     fi
-    if ! err=$($CC $CC_FLAGS $extra -c -o "$obj" "$src" 2>&1); then
+    # And a fixtures/<name>.link sidecar asks for a linked executable
+    # rather than a relocatable object. The checks that resolve an
+    # address into data need real section addresses, and in a .o every
+    # section sits at 0.
+    if [ -f "$ROOT/fixtures/$name.link" ]; then
+        mode="$LINK_FLAGS -o $obj"
+    else
+        mode="-c -o $obj"
+    fi
+    if ! err=$($CC $CC_FLAGS $extra $mode "$src" 2>&1); then
         printf "  ERROR   %s  (assembly failed)\n" "$name"
         echo "$err" | sed 's/^/          /'
         FAIL=$((FAIL + 1))

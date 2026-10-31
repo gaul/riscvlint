@@ -1264,9 +1264,11 @@ second instruction writes it is one dominant idiom plus nothing.
 
 # Remaining candidates
 
-None. Twenty-one checks are implemented and every candidate this file
+None. Twenty-two checks are implemented and every candidate this file
 ever sized is either written or recorded as rejected with the evidence
-that rejected it.
+that rejected it. The twenty-second came from somewhere else -- a walk
+of armlint's check table against this one rather than from a corpus
+probe -- and has its own section below.
 
 Six left this list by being written, and each cost something different.
 18 needed nothing new -- the window already held base, displacement,
@@ -1289,6 +1291,119 @@ rules a shape token could decide; the full encodability pass found
 22,596 in the same cohort, and the difference is entirely instructions
 whose immediates were relocations when the assembler saw them. A census
 that can only ask about `mv` and `li` cannot see a `%pcrel_lo` addi.
+
+## 23. A floating-point constant `fli` would have built -- 3,428  [implemented]
+
+Not sized from a `pairscan` family. It came out of walking armlint's
+hundred-row check table against riscvlint's twenty-one, where almost
+everything either had no RISC-V analogue (the flag folds), or was
+already written, or had already been rejected here with a number -- the
+Zbb/Zbs/Zcb idiom table below, `li`+immediate-form at 942, equal-shift
+`andi` at 2. One row was none of those: armlint's "`ldr` literal of an
+encodable constant".
+
+**The interesting part is that armlint closed that check and this one
+ships.** armlint measured 35 encodable of 42,324 FP pool loads -- 0.08%
+-- and the premise turned out to be wrong as well as the count:
+librustc_driver's `ldr d` loads from `__TEXT,__const` are mostly 8-byte
+struct blobs moved through the FP file, not doubles, and of the real FP
+constants LLVM had already taken every encodable one through FMOV/MOVI.
+AArch64 has `fmov #imm8` and `movi` at baseline, so the pool holds only
+what does not encode.
+
+RV64GC has no floating-point immediate at all. `fli.s`/`fli.d` arrive
+with Zfa, which is mandatory in RVA23U64 and in nothing below it. So on
+a baseline target every FP constant is a pool load, and the question is
+only how many of them Zfa's 32 entries cover.
+
+### Sizing it
+
+A python probe over the whole corpus: find every adjacent 4-byte
+`auipc` + `fld`/`flw` whose load reads the auipc's register, resolve
+the target, read the pooled bytes out of the file, and run them through
+a transcription of LLVM's `RISCVLoadFPImm::getLoadFPImm`.
+
+| cohort | objects | adjacent pool loads | `fli`-encodable |
+|---|---:|---:|---:|
+| Firefox, baseline rv64gc | 9 | 16,653 | 3,907 |
+| declares `zfa1p0` | 8 | 598 | **0** |
+| Go, no attributes | 12 | 1,288 | 421 |
+| total | 29 | 18,539 | 4,328 |
+
+Zero on every object that declares Zfa, against 798 `fli` instructions
+the corpus already contains (688 `fli.d`, 110 `fli.s`). That is the same
+shape as the Zb table below and reads the same way: the rejection "the
+compilers already do this" only holds where the compiler was allowed
+to, and here it holds exactly.
+
+What libxul's pool holds, in order: 1.0 x909, nan x787, 0.5 x664, inf
+x468, -1.0 x207, 1.5 x61, 3.0 x54, 2.0 x45, then a tail. These are the
+constants an FP-heavy C++ codebase actually writes down.
+
+### What the check reports -- 3,428 and 13,712 bytes
+
+Three preconditions beyond the shape, measured on libxul: of 3,459
+encodable loads, 3,441 survive the branch-target and relocation tests
+and 2,966 survive the liveness one. The liveness proof is the
+expensive precondition and it is not optional -- the rewrite stops
+writing the `auipc`'s register, and a pool address is routinely used
+again for the slot next door.
+
+In Go that proof costs most of the population: 84 encodable, 14
+reported. The gc assembler routes pool addresses through `t6`, its
+REGTMP, and reuses it; this is the same register that made armlint's
+split-pair candidate worthless, from the other direction.
+
+The corpus split, by what the object declares rather than by which
+compiler built it:
+
+| cohort | default | `-m rva23` |
+|---|---:|---:|
+| Firefox (9) | 0 | 3,308 |
+| declares `zfa1p0` (8) | 0 | 0 |
+| Go (12) | 120 | 120 |
+
+So the honest reading is the Zcb one: an `-m rva23` answer to "what
+would rebuilding buy me", plus a small real population in Go.
+
+### The two things it needed that no other check has
+
+**Reading outside the section.** Every other check decides from the
+instruction stream. This one has to resolve an address into data, which
+the library takes as a caller-supplied reader
+(`riscvlint_state_set_image`) so that ELF stays the driver's business.
+Its contract is the soundness argument: only allocated, non-writable
+contents may be served. `.data` is out because the program can
+overwrite it, and `.data.rel.ro` is out because it is writable at load
+time precisely so the dynamic linker can relocate into it -- in both
+cases the bytes in the file are not the bytes the load would see. A
+relocatable object is refused whole, since every section there sits at
+address 0 and "the section holding this address" names nothing; that is
+also why `fixtures/fp_pool_to_fli` is the first fixture to be linked
+rather than left as a `.o`.
+
+**An encodability test against the assembler.** A finding is only
+advice if the immediate it names exists, so `rv_fli_entry` is a port of
+LLVM's own function rather than a reading of the spec table -- the same
+rule the census followed in taking its profile rungs from
+`RISCVProfiles.td`. It is integer arithmetic rather than a float
+conversion, so the answer does not depend on the host's rounding mode
+or on what a double-to-float conversion does with a NaN payload: a
+binary64 pattern is a binary32 one with at most two mantissa bits
+exactly when its low 50 mantissa bits are clear and its exponent is in
+range, which is the whole test.
+
+### What it does not claim
+
+The absolute `lui %hi` + `fld %lo` spelling, which is the same fold,
+measures **zero** across the corpus in its four-byte form: where that
+shape appears at all its `lui` fits `c.lui`, which pairs with a
+two-byte `c.fld`. The arm was written, measured at 0, and removed
+rather than shipped unmeasured.
+
+Non-adjacent pairs are not matched, by the project's standing adjacency
+rule. Neither is the compressed `c.fld` pair, for the same reason as
+the `lui` arm -- it is a different population and has not been sized.
 
 ### 16 and 20. A computation a live register already holds -- 29,595 of 39,274  [implemented]
 

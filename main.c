@@ -26,10 +26,14 @@
 #define ELFMAG        "\x7f""ELF"
 #define SELFMAG       4
 #define ELFCLASS64    2
+#define ET_REL        1
 #define EM_RISCV      243
 #define SHT_PROGBITS  1
 #define SHT_SYMTAB    2
 #define SHT_RELA      4
+#define SHT_NOBITS    8
+#define SHF_WRITE     0x1
+#define SHF_ALLOC     0x2
 #define SHF_EXECINSTR 0x4
 #define STT_FUNC      2
 #define SHT_RISCV_ATTRIBUTES 0x70000003
@@ -426,6 +430,47 @@ static void json_finding(void *ctx, const riscvlint_finding *f)
     putchar('}');
 }
 
+// ---- the image, for the checks that resolve an address into data ----
+
+typedef struct {
+    const uint8_t *base;
+    size_t map_len;
+    const Elf64_Ehdr *eh;
+} image;
+
+// riscvlint_read_fn over the mapped file. Only allocated, non-writable
+// sections with contents are served, which is the contract
+// riscvlint_state_set_image states and the reason
+// check_fp_pool_to_fli's rewrite is sound: a constant the program can
+// overwrite is not a constant, and a section the dynamic linker
+// relocates into is writable at load time precisely so that it can be.
+// `.rodata` qualifies; `.data` and `.data.rel.ro` do not.
+static bool image_read(void *ctx, uint64_t vaddr, void *out, size_t n)
+{
+    const image *im = ctx;
+    // A relocatable object's sections all sit at address 0, so "the
+    // section containing this address" names nothing. Serving reads
+    // there would hand back whichever section matched first, which for
+    // a .o is usually .text -- the code, read as data.
+    if (im->eh->e_type == ET_REL) return false;
+    const Elf64_Shdr *sh = (const Elf64_Shdr *)(im->base + im->eh->e_shoff);
+    for (unsigned i = 0; i < im->eh->e_shnum; i++) {
+        if ((sh[i].sh_flags & SHF_ALLOC) == 0) continue;
+        if (sh[i].sh_flags & SHF_WRITE) continue;
+        if (sh[i].sh_type == SHT_NOBITS) continue;   // .bss has no contents
+        if (!sh[i].sh_addr || !sh[i].sh_size) continue;
+        if (vaddr < sh[i].sh_addr) continue;
+        uint64_t off = vaddr - sh[i].sh_addr;
+        if (off >= sh[i].sh_size || sh[i].sh_size - off < n) continue;
+        if (sh[i].sh_offset > im->map_len ||
+            sh[i].sh_size > im->map_len - sh[i].sh_offset)
+            continue;
+        memcpy(out, im->base + sh[i].sh_offset + off, n);
+        return true;
+    }
+    return false;
+}
+
 // ---- scanning ----
 
 static void scan_section(csh handle, riscvlint_state *state,
@@ -490,6 +535,7 @@ static int scan_file(csh handle, const char *path)
         rc = -1;
     } else {
         const char *arch = find_arch_string(base, map_len, eh);
+        image im = { base, map_len, eh };
         // The census reads the arch string for its own report and gates
         // nothing on it, so it needs no state and no extension mask.
         riscvlint_state *state = NULL;
@@ -524,6 +570,7 @@ static int scan_file(csh handle, const char *path)
                            "(pass -m to pin)\n", path);
             }
             riscvlint_state_set_extensions(state, effective);
+            riscvlint_state_set_image(state, image_read, &im);
             // The two notes above as fields: a reader of the document
             // needs them for the same reason a reader of the report
             // does, and stdout is the document's now.
@@ -612,7 +659,7 @@ int main(int argc, char **argv)
 {
     static const char usage[] =
         "usage: %s [-q] [-i] [--json] "
-        "[-m zba|zbb|zbs|zcb|c|rva20|rva22|rva23]... <binary>...\n";
+        "[-m zba|zbb|zbs|zcb|zfa|c|rva20|rva22|rva23]... <binary>...\n";
     int argi = 1;
     while (argi < argc && argv[argi][0] == '-' && argv[argi][1]) {
         if (strcmp(argv[argi], "-q") == 0) {

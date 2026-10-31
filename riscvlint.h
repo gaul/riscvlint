@@ -234,6 +234,7 @@ typedef enum {
     RISCVLINT_EXT_ZBS = 1u << 2,
     RISCVLINT_EXT_ZCB = 1u << 3,
     RISCVLINT_EXT_C   = 1u << 4,
+    RISCVLINT_EXT_ZFA = 1u << 5,
     RISCVLINT_EXT_DECLARED = 1u << 31,
 } riscvlint_ext;
 
@@ -264,6 +265,26 @@ void riscvlint_state_set_relocs(riscvlint_state *state,
 
 void riscvlint_state_set_extensions(riscvlint_state *state, unsigned exts);
 unsigned riscvlint_state_extensions(const riscvlint_state *state);
+
+// Reads `n` bytes at `vaddr` out of the image the code came from, for
+// the one check that has to resolve an address into data. Returns false
+// where it cannot, which is the common answer and not an error.
+//
+// The provider must serve only bytes that cannot change between the
+// file and the running program: allocated, **non-writable** sections
+// with contents. That rules out `.data`, which a program may overwrite,
+// and `.data.rel.ro`, which is writable at load time precisely so the
+// dynamic linker can relocate into it -- in both cases the bytes in the
+// file are not the bytes the load would see. A provider that is laxer
+// than this makes check_fp_pool_to_fli unsound, which is why the rule
+// is stated here rather than left to the driver.
+typedef bool (*riscvlint_read_fn)(void *ctx, uint64_t vaddr, void *out,
+                                  size_t n);
+// Installs it. Without one -- the default -- the checks that need it
+// stand down, so a caller that has no image to offer loses findings
+// rather than correctness.
+void riscvlint_state_set_image(riscvlint_state *state, riscvlint_read_fn read,
+                               void *ctx);
 
 // True unless the object positively declares an arch without `ext`.
 bool riscvlint_may_use(const riscvlint_state *state, unsigned ext);
@@ -799,6 +820,63 @@ bool check_c_compressible(riscvlint_state *state, const cs_insn *insn,
 
 bool check_dead_def(riscvlint_state *state, const cs_insn *insn,
                     riscvlint_finding *finding);
+
+// ---- a floating-point constant `fli` would have materialized ----
+
+// Which of Zfa's 32 `fli` entries holds the value whose bit pattern is
+// `bits`, or -1 for a value no entry holds. `width` is 4 for a binary32
+// pattern (`fli.s`) and 8 for a binary64 one (`fli.d`).
+//
+// A port of LLVM's RISCVLoadFPImm::getLoadFPImm (RISCVBaseInfo.cpp),
+// which is the oracle that matters: a finding is only advice if the
+// assembler agrees the immediate exists. Done in integer arithmetic
+// rather than through a float, so the answer does not depend on the
+// host's rounding mode or on what a double-to-float conversion does
+// with a NaN payload -- the test is simply that the pattern's low bits
+// are clear and its (exponent, 2-bit mantissa) pair is in the table.
+int rv_fli_entry(uint64_t bits, unsigned width);
+
+// How the assembler spells that entry: `min`, `inf` and `nan` for
+// entries 1, 30 and 31, and otherwise the value, matching LLVM's
+// RISCVInstPrinter::printFPImmOperand so the suggested instruction is
+// one that assembles. Writes to `out` and returns it.
+const char *rv_fli_spell(int entry, char *out, size_t outsz);
+
+// `auipc rd,%pcrel_hi(L)` + `fld frd,%pcrel_lo(L)(rd)` where the eight
+// bytes at L are a value Zfa's `fli.d` builds in one instruction: the
+// pair, the load and the pool slot all go. Also the `flw`/`fli.s`
+// spelling; the absolute `lui %hi` one measures zero, for the reason
+// the implementation records.
+//
+// This is armlint's "`ldr` literal of an encodable constant" with the
+// architectures the other way round. AArch64 has `fmov #imm8` at
+// baseline, so LLVM materializes every encodable FP constant and that
+// check measured 35 sites in 42,324 pool loads -- 0.08%, and closed.
+// RISC-V has no floating-point immediate at all without Zfa, so the
+// pool is where *every* constant goes on a baseline target, and the
+// check armlint rejected is the largest one left here.
+//
+// Measured population: 18,539 adjacent pool loads across the corpus, of
+// which 4,328 hold a value `fli` encodes -- 3,907 in the nine baseline
+// Firefox objects (libxul alone has 3,459: 1.0 x909, nan x787, 0.5
+// x664, inf x468, -1.0 x207) and 421 in Go, whose assembler selects no
+// Zfa. **Zero** in the eight objects that declare `zfa1p0`: where the
+// compiler was allowed to use `fli` it already did, 798 times. So this
+// is an `-m rva23` finding in the same sense as the Zcb check -- "what
+// would rebuilding for RVA23 buy me" -- rather than a peephole anyone
+// missed. See TODO.md.
+//
+// Four things it requires beyond the shape. The pool address must
+// resolve through riscvlint_state_set_image, whose contract is that
+// only non-writable contents are served: a constant a program can
+// overwrite is not a constant. Neither instruction may carry a
+// relocation, since in an unlinked object both immediates are
+// placeholders. Nothing may branch between them. And the `auipc`'s own
+// register must be provably dead afterwards -- the rewrite stops
+// writing it, and a pool address is sometimes used again for the slot
+// next door.
+bool check_fp_pool_to_fli(riscvlint_state *state, const cs_insn *insn,
+                          riscvlint_finding *finding);
 
 // ---- running every check ----
 //
