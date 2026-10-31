@@ -4534,6 +4534,126 @@ static void test_const_ord_branch(csh handle)
     CHECK(!run_ord(handle, target, sizeof target, NULL));
 }
 
+static bool run_zexth(csh handle, const uint8_t *bytes, size_t len,
+                      unsigned exts, riscvlint_finding *out)
+{
+    static uint8_t buf[256];
+    memcpy(buf, bytes, len);
+    riscvlint_state *state = riscvlint_state_create();
+    if (!state) return false;
+    bool fired = false;
+    riscvlint_state_set_extensions(state, exts);
+    if (riscvlint_state_set_section(state, handle, buf, len, 0x1000)) {
+        cs_insn *insn = cs_malloc(handle);
+        const uint8_t *p = buf;
+        size_t remain = len;
+        uint64_t addr = 0x1000;
+        if (insn && cs_disasm_iter(handle, &p, &remain, &addr, insn)) {
+            riscvlint_finding f;
+            memset(&f, 0, sizeof f);
+            fired = check_slli_srli_to_zexth(state, insn, &f);
+            if (fired && out) *out = f;
+        }
+        if (insn) cs_free(insn, 1);
+    }
+    riscvlint_state_destroy(state);
+    return fired;
+}
+
+static void test_slli_srli_to_zexth(csh handle)
+{
+    riscvlint_finding f;
+
+    // slli a5,a4,48 ; c.srli a5,48 -- the spelling all 9,522 corpus
+    // sites use, where the srli overwrites what the slli wrote and the
+    // intermediate is dead by construction.
+    static const uint8_t over[] = {
+        0x93, 0x17, 0x07, 0x03,        // slli a5,a4,48
+        0xc1, 0x93,                    // c.srli a5,48
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(run_zexth(handle, over, sizeof over, 0, &f));
+    CHECK(strcmp(f.replacement, "zext.h a5, a4 (6 -> 4 bytes)") == 0);
+    CHECK(f.insn_count == 2 && f.address == 0x1000);
+    CHECK(strcmp(f.title, "slli + srli foldable to zext.h") == 0);
+
+    // Both wide: eight bytes down to four.
+    static const uint8_t wide[] = {
+        0x93, 0x17, 0x07, 0x03,        // slli a5,a4,48
+        0x93, 0xd7, 0x07, 0x03,        // srli a5,a5,48
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_zexth(handle, wide, sizeof wide, 0, &f));
+    CHECK(strcmp(f.replacement, "zext.h a5, a4 (8 -> 4 bytes)") == 0);
+
+    // The srli writing elsewhere, with the shifted value overwritten
+    // afterwards so the walk proves it dead. This is the arm the
+    // zext.w sibling does not have, and 43 of libgkcodecs's 151 shapes
+    // are this -- none of the Go ones.
+    static const uint8_t split[] = {
+        0x93, 0x17, 0x07, 0x03,        // slli a5,a4,48
+        0x93, 0xd6, 0x07, 0x03,        // srli a3,a5,48
+        0x85, 0x47,                    // c.li a5,1
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(run_zexth(handle, split, sizeof split, 0, &f));
+    CHECK(strcmp(f.replacement, "zext.h a3, a4 (8 -> 4 bytes)") == 0);
+
+    // The same shape with the shifted value read afterwards instead.
+    static const uint8_t live[] = {
+        0x93, 0x17, 0x07, 0x03,        // slli a5,a4,48
+        0x93, 0xd6, 0x07, 0x03,        // srli a3,a5,48
+        0x3e, 0x85,                    // c.mv a0,a5
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(!run_zexth(handle, live, sizeof live, 0, NULL));
+
+    // srai shifts the sign in: that is sext.h, a different rewrite,
+    // and rv_decode_srli refuses it.
+    static const uint8_t arith[] = {
+        0x93, 0x17, 0x07, 0x03,        // slli a5,a4,48
+        0xc1, 0x97,                    // c.srai a5,48
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(!run_zexth(handle, arith, sizeof arith, 0, NULL));
+
+    // 32 and 32 is zext.w, which is check_slli_srli_to_zext's and needs
+    // Zba rather than Zbb.
+    static const uint8_t w32[] = {
+        0x93, 0x17, 0x07, 0x02,        // slli a5,a4,32
+        0x81, 0x93,                    // c.srli a5,32
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(!run_zexth(handle, w32, sizeof w32, 0, NULL));
+
+    // Shifting left 48 and right 32 keeps sixteen bits and moves them,
+    // which is no single instruction at all.
+    static const uint8_t mixed[] = {
+        0x93, 0x17, 0x07, 0x03,        // slli a5,a4,48
+        0x81, 0x93,                    // c.srli a5,32
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(!run_zexth(handle, mixed, sizeof mixed, 0, NULL));
+
+    // An srli that reads something the slli did not write: two
+    // instructions that happen to be adjacent.
+    static const uint8_t other[] = {
+        0x93, 0x17, 0x07, 0x03,        // slli a5,a4,48
+        0x93, 0x56, 0x06, 0x03,        // srli a3,a2,48
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(!run_zexth(handle, other, sizeof other, 0, NULL));
+
+    // Gated on Zbb, permissively: an object declaring an arch string
+    // without it is told nothing, one declaring it is, and Go declaring
+    // nothing at all is -- which is where the whole population is.
+    CHECK(!run_zexth(handle, over, sizeof over,
+                     RISCVLINT_EXT_DECLARED | RISCVLINT_EXT_ZBA, NULL));
+    CHECK(run_zexth(handle, over, sizeof over,
+                    RISCVLINT_EXT_DECLARED | RISCVLINT_EXT_ZBB, NULL));
+    CHECK(run_zexth(handle, over, sizeof over, 0, NULL));
+}
+
 static void test_census(csh handle)
 {
     static const uint8_t code[] = {
@@ -4709,6 +4829,7 @@ int main(void)
     test_udiv_pow2(handle);
     test_const_eq_branch(handle);
     test_const_ord_branch(handle);
+    test_slli_srli_to_zexth(handle);
     test_census(handle);
 
     cs_close(&handle);

@@ -1456,9 +1456,9 @@ second instruction writes it is one dominant idiom plus nothing.
 
 # Remaining candidates
 
-None. Thirty checks are implemented and everything this file ever
+None. Thirty-one checks are implemented and everything this file ever
 sized is either written or recorded as rejected with the evidence that
-rejected it. The last nine did not come from a corpus probe at all: 23
+rejected it. The last ten did not come from a corpus probe at all: 23
 came from walking armlint's check table against this one, 24 came from a
 rejection in this file being wrong, 25, 26 and 27 are the three
 addressing modes of a ratification plan for an extension that does not
@@ -1471,7 +1471,8 @@ it was kept anyway; 30 is the largest thing this file has added since
 the corpus doubled, and it was found by asking what a constant that is
 *not* multiplied by gets used for instead; 31 is the base-ISA half of
 30's shape, and records why 30's leftover 273,747 is not a candidate
-for anyone.
+for anyone; 32 came from ranking the pair dump by dependent frequency
+and finding a shape one already-written check had left half-done.
 
 That last one is worth reading as a worked example rather than a
 number. The SWAR popcount was rejected on a bound that was not a bound
@@ -3124,6 +3125,92 @@ whether a value is at most one or more than one. Neither is a zero test
 and neither has a one-instruction form on any riscv64 target: the best
 either gets is `srli rt,rx,1` + a zero test, which is two instructions
 for two.
+
+## 32. slli + srli foldable to zext.h -- 9,522  [implemented]
+
+`slli rd,rs,48` + `srli rd,rd,48` clears all but the low halfword in two
+dependent instructions where Zbb's `zext.h` does it in one.
+`(rs << 48) >> 48` logical is `rs & 0xffff`; LLVM spells the instruction
+`ZEXT_H_RV64` under `[HasStdExtZbbOrZbkb, IsRV64]`, encoded as
+`packw rd,rs,x0` and marked `IsSignExtendingOpW`, which changes nothing
+here because a value below 0x10000 is its own sign extension.
+
+### How it was found: a check that was written half-way
+
+Entry 3 is the same shape at 32, folding to Zba's `zext.w`, and it has
+been in the tool since early on. Nobody asked what the *other* shift
+amounts did until the pair dump was ranked by dependent frequency and
+`slli -> srli` came up fourteenth at 188,828. Split by the two amounts:
+
+| amounts | dependent sites | |
+|---|---:|---|
+| 32 / 32 | 75,900 | entry 3's check, already |
+| 48 / 48 | **14,808** | this entry -- nothing was looking at it |
+| a == b, mask wider than `andi`'s 11 bits | 25,365 | no single instruction |
+| a == b, mask fits `andi` (a >= 53) | 2 | base ISA, and two sites |
+| b == 63 (single bit -> Zbs `bexti`) | 3,893 | sized below, not written |
+| b > a (field extract) | 39,917 | no single instruction |
+| b < a (field insert) | 28,943 | no single instruction |
+
+The lesson is narrower than entry 29's and worth its own line: a check
+written for one immediate is not a check written for the family. Nothing
+in entry 3 was wrong, and nothing in this file recorded that its
+sibling existed.
+
+### What the check reports -- 9,522, all of it Go
+
+| language | objects | sites |
+|---|---:|---:|
+| C++ | 13 | 0 |
+| Rust | 6 | 0 |
+| Go | 12 | 9,522 |
+| **total** | **31** | **9,522** |
+
+3,746 in `compile`, 3,262 in `asm`, 863 in `link`, 560 in gh, 362 in
+restic, 290 in `go`, then a tail.
+
+29,634 bytes: 5,907 sites at `(8 -> 4)`, 3,003 at `(6 -> 4)` and 612 at
+`(4 -> 4)`, where `c.slli` and `c.srli` had already covered it and the
+rewrite buys an instruction and a dependency rather than space. That 6%
+compares with the 8% entry 3 measures for the 32-bit shape, and the
+reason is the same: `c.srli` is CB-format and can only name x8-x15.
+
+### The zeros are the usual division, and both kinds of zero appear
+
+Three LLVM builds and libQt6Core declare Zbb, so the gate is open, and
+they have **no shapes at all** -- their compilers emit `zext.h`
+directly. The firefox objects and debian-libllvm22 declare an arch
+string without Zbb, so `riscvlint_may_use` suppresses the check there;
+forced open with `-m zbb` they do have the shape, 151 in libgkcodecs and
+63 in libmozsqlite3. Both kinds of zero in one check, which is the
+clearest illustration in this file of why the three-valued gate exists.
+
+### One arm the sibling does not have
+
+Entry 3 requires the `srli` to overwrite the register the `slli` wrote,
+which makes the intermediate dead by construction and needs no liveness
+query; its doc says every site in its corpus is written that way. For
+this shape that is true of all 9,522 Go sites and false of 43 of
+libgkcodecs's 151, so the arm is here and costs one query. The check
+sits at the end of riscvlint.c only because that is where new checks go;
+`riscvlint_liveness` is declared in the header and would have been
+callable beside the sibling just as well.
+
+Whether entry 3 would gain sites from the same arm has not been
+measured. It is the obvious next question and is recorded here rather
+than answered.
+
+### Also sized, not written: bexti
+
+`slli rd,rs,63-k` + `srli rd,rd,63` extracts bit k, which Zbs does as
+`bexti rd,rs,k`. 3,893 dependent pairs in the dump, and with a
+throwaway check: 100 shapes in libgkcodecs, 41 in libmozsqlite3, 5 in
+uutils, 1 in go `compile`. All but the uutils and Go ones are in objects
+whose own arch string has no Zbs, so under own declarations it reports
+about **1**, and about 128 under `-m zbs`. That is the unsigned-divide
+entry's situation again -- correct, cheap, and with nothing to say about
+this corpus -- and it was left unwritten rather than shipped at one
+site.
 
 # Ranked for C++ and Rust specifically
 

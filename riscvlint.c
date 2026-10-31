@@ -4741,6 +4741,75 @@ bool check_const_ord_branch(riscvlint_state *state, const cs_insn *insn,
     return true;
 }
 
+// `slli rd,rs,48` + `srli rd,rd,48` clears all but the low halfword in
+// two dependent instructions, where Zbb's `zext.h` does it in one. The
+// sibling of check_slli_srli_to_zext, which is the same shape at 32 and
+// Zba's `zext.w`; this is the half that check was never written for.
+//
+// `(rs << 48) >> 48` logical is `rs & 0xffff`, and `zext.h` is exactly
+// that. LLVM spells it ZEXT_H_RV64 under [HasStdExtZbbOrZbkb, IsRV64],
+// encoded as `packw rd,rs,x0`, and marks it IsSignExtendingOpW -- which
+// changes nothing here, a value below 0x10000 being its own sign
+// extension.
+//
+// Unlike the sibling this one accepts an srli that writes a register
+// other than the one the slli wrote, on a liveness proof. The arm is
+// worth having: the sibling's doc can say every site in its corpus
+// overwrites, and for this shape that is true of all 9,522 Go sites and
+// false of 43 of libgkcodecs's 151, which are reachable only under
+// `-m zbb` but are not nothing. Whether the sibling would gain sites
+// from the same arm has not been measured.
+bool check_slli_srli_to_zexth(riscvlint_state *state, const cs_insn *insn,
+                              riscvlint_finding *finding)
+{
+    if (!riscvlint_may_use(state, RISCVLINT_EXT_ZBB)) return false;
+    if (insn->size != 2 && insn->size != 4) return false;
+
+    uint32_t w1;
+    if (!riscvlint_word_at(state, insn->address, &w1)) return false;
+    unsigned rd1, rs1, sh1;
+    if (!rv_decode_slli(w1, insn->size, &rd1, &rs1, &sh1)) return false;
+    if (sh1 != 48 || rd1 == 0) return false;
+
+    uint64_t second = insn->address + insn->size;
+    uint32_t w2;
+    if (!riscvlint_word_at(state, second, &w2)) return false;
+    unsigned len2 = rv_insn_len(w2);
+    unsigned rd2, srs1, sh2;
+    if (!rv_decode_srli(w2, len2, &rd2, &srs1, &sh2)) return false;
+    if (sh2 != 48 || rd2 == 0) return false;
+
+    // The srli has to consume what the slli produced. `srai` in its
+    // place is a sign extension and a different rewrite, which
+    // rv_decode_srli already refuses.
+    if (srs1 != rd1) return false;
+
+    if (riscvlint_is_branch_target(state, second)) return false;
+    if (riscvlint_is_relocated(state, insn->address) ||
+        riscvlint_is_relocated(state, second))
+        return false;
+
+    // Overwriting the shifted register leaves nothing of the
+    // intermediate to keep alive; writing elsewhere has to be proved.
+    if (rd2 != rd1 &&
+        riscvlint_liveness(state, second + len2, rd1) != RISCVLINT_LIVE_DEAD)
+        return false;
+
+    // Zcb has a two-byte `c.zext.h` for x8-x15, so on a target with both
+    // extensions some of these would save six bytes rather than four.
+    // The figure stays at four for the same reason the sibling's does:
+    // the rewrite is named for one extension and sized without assuming
+    // a second, and the byte column is a lower bound by construction.
+    unsigned before = insn->size + len2;
+    finding->title = "slli + srli foldable to zext.h";
+    finding->address = insn->address;
+    finding->insn_count = 2;
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "zext.h %s, %s (%u -> 4 bytes)", rv_reg_name(rd2),
+             rv_reg_name(rs1), before);
+    return true;
+}
+
 // ---- running every check ----
 
 static const riscvlint_check_fn riscvlint_checks[] = {
@@ -4774,6 +4843,7 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_udiv_pow2,
     check_const_eq_branch,
     check_const_ord_branch,
+    check_slli_srli_to_zexth,
 };
 
 size_t riscvlint_scan(riscvlint_state *state, csh handle,

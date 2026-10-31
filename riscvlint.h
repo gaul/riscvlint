@@ -1193,6 +1193,31 @@ bool check_const_eq_branch(riscvlint_state *state, const cs_insn *insn,
 bool check_const_ord_branch(riscvlint_state *state, const cs_insn *insn,
                             riscvlint_finding *finding);
 
+// `slli rd,rs,48` + `srli rd,rd,48` clears all but the low halfword
+// where Zbb's `zext.h` does it in one instruction -- the sibling of
+// check_slli_srli_to_zext at 48 instead of 32, and the half that check
+// was never written for. `(rs << 48) >> 48` logical is `rs & 0xffff`,
+// which is what zext.h computes; LLVM has it as ZEXT_H_RV64 under
+// [HasStdExtZbbOrZbkb, IsRV64].
+//
+// Gated on Zbb permissively, like the other Zb checks: suppressed when
+// the object declares an arch string without it, reported when it
+// declares one with it or declares none.
+//
+// Unlike the sibling, an srli writing a register other than the one the
+// slli wrote is accepted on a liveness proof, which 43 of libgkcodecs's
+// 151 shapes need and none of the Go ones do.
+//
+// Measured population: 9,522 sites, every one of them in a Go binary.
+// The three LLVM builds and libQt6Core declare Zbb and have none --
+// their compilers already emit zext.h -- and the firefox objects and
+// debian-libllvm22 declare no Zbb, so their shapes appear only under
+// `-m zbb`: 143 of libgkcodecs's 151 and 57 of libmozsqlite3's 63.
+// In the pair dump this shape is 14,808 dependent pairs against 75,900
+// for the 32-bit one. See TODO.md.
+bool check_slli_srli_to_zexth(riscvlint_state *state, const cs_insn *insn,
+                              riscvlint_finding *finding);
+
 // ---- running every check ----
 //
 // Called once per finding, with `ctx` as given. The finding is valid

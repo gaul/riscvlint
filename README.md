@@ -3,7 +3,7 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Thirty checks are implemented and the ledger's candidate list is
+Thirty-one checks are implemented and the ledger's candidate list is
 empty. [TODO.md](TODO.md) is that ledger: every candidate that was
 measured, the population it came back with, and the ones rejected on
 that evidence.
@@ -12,7 +12,7 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Thirty of them, and the table lists twenty-four. Six report
+Thirty-one of them, and the table lists twenty-five. Six report
 nothing over this corpus -- the bit count because no baseline object
 declares Zbb; the three indexed loads and the equality branch because
 those four require their extension to be positively present rather
@@ -48,6 +48,7 @@ the row where no finding does and the arithmetic is uniform instead.
 | redundant sign or zero extension | 8,285 | 333 | 1,593 | 10,211 | 25,078 | all |
 | conditional branch over an unconditional jump | 9,031 | 340 | 331 | 9,702 | 28,072 | all |
 | load of a just-stored value | 5,244 | 267 | 4,041 | 9,552 | 8,200 | all |
+| slli + srli foldable to zext.h | 0 | 0 | 9,522 | 9,522 | 29,634 | all |
 | base add foldable into memory offset | 5,768 | 429 | 2,993 | 9,190 | 26,216 | all |
 | redundant reload | 3,631 | 231 | 4,408 | 8,270 | 10,878 | all |
 | run of zero stores one wider store would do | 5,942 | 143 | 1,292 | 7,377 | 37,928 | all |
@@ -59,11 +60,11 @@ the row where no finding does and the arithmetic is uniform instead.
 | li + mul foldable to shNadd | 0 | 0 | 416 | 416 | 1,046 | all |
 | constant loaded for a branch against zero | 79 | 0 | 202 | 281 | 1,050 | all |
 | floating-point constant fli would have built | 0 | 0 | 120 | 120 | 480 | all |
-| **total** | **498,304** | **192,611** | **3,067,441** | **3,758,356** | **8,619,320** | |
+| **total** | **498,304** | **192,611** | **3,076,963** | **3,767,878** | **8,648,954** | |
 
 Do not read the total row as a result. One row is 80% of it, and that
 row is Go's assembler declining to select RVC at all, which is a
-different kind of finding from the twenty-three around it. The second row
+different kind of finding from the twenty-four around it. The second row
 is 6% and belongs to the linker. The `assumed` in the call-pair row is
 the one byte figure that is arithmetic rather than measurement: that
 check prints no size, and every site is eight bytes in and four out
@@ -313,6 +314,33 @@ except a handful of `jalr ra,0(ra)` that were already two.
   needs no extension, so anything built by a compiler that does not do
   this -- or hand-written assembly, or a JIT -- would be reported. On
   this corpus it is a measured zero rather than an unmeasured guess.
+
+* **slli + srli foldable to zext.h** -- the same shape as the entry
+  below at 48 instead of 32: `slli rd,rs,48` + `srli rd,rd,48` clears
+  all but the low halfword, where Zbb's `zext.h` does it in one.
+  `(rs << 48) >> 48` logical is `rs & 0xffff`, which is what the
+  instruction computes; LLVM has it as `ZEXT_H_RV64` under
+  `[HasStdExtZbbOrZbkb, IsRV64]`.
+
+  Population: **9,522** sites, every one of them Go, worth 29,634 bytes
+  -- 5,907 at `(8 -> 4)`, 3,003 at `(6 -> 4)` and 612 at `(4 -> 4)`
+  where both halves were already compressed and the rewrite buys an
+  instruction rather than space. 3,746 are in `compile`, 3,262 in `asm`,
+  863 in `link`, 560 in gh, 362 in restic.
+
+  The division is the same as every other Zb check here. The three LLVM
+  builds and libQt6Core declare Zbb and have **no** sites at all -- their
+  compilers already emit `zext.h` -- while the firefox objects and
+  debian-libllvm22 declare no Zbb, so their shapes are suppressed by
+  their own arch string and appear only under `-m zbb`: 143 of
+  libgkcodecs's 151 and 57 of libmozsqlite3's 63.
+
+  Unlike the 32-bit sibling, an `srli` writing a register other than the
+  one the `slli` wrote is accepted on a liveness proof. The sibling can
+  say every site in its corpus overwrites; that is true of all 9,522
+  here and false of 43 of libgkcodecs's 151, so the arm earns its one
+  query. Zcb's two-byte `c.zext.h` would make some of these save six
+  bytes rather than four, which the figure does not assume.
 
 * **slli + srli foldable to zext.w** -- `slli rd,rs,32` +
   `srli rd,rd,32` clears the upper word in two dependent instructions
