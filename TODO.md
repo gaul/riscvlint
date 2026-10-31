@@ -1199,6 +1199,135 @@ liveness over the whole function, which no check here has.
 
 Worth recording so nobody re-derives them from intuition.
 
+### LR/SC compare-and-swap loop -> Zacas `amocas` -- 9,459, and in no profile
+
+armlint's `-m lse` row asked to the ISA RISC-V has. The A extension
+carries `amoadd`/`amoand`/`amoor`/`amoxor`/`amomin`/`amomax` and **no
+compare-and-swap**, so every CAS in a riscv64 binary is an `lr`/`sc`
+retry loop. Zacas adds `amocas.w`/`.d`.
+
+The shape, from ripgrep 0x70a5a and repeated almost verbatim thousands
+of times:
+
+```
+1: lr.d.aq  a3,(a0)
+   bnez     a3,2f        # expected zero: someone else holds it
+   sc.d.rl  a4,a1,(a0)
+   bnez     a4,1b        # spurious failure: retry
+2:
+```
+
+`compare_exchange(p, 0, a1)`, which `amocas.d a3,a1,(a0)` does with no
+retry and no backward branch. Four instructions and a loop become two
+and a branch.
+
+Sized by classifying every `lr` site's forward window out to the `sc`:
+a compare-and-branch-out before the store is a CAS, an ALU op with no
+compare is a fetch-op, and the branch after the `sc` is the retry. Four
+objects, one per toolchain plus the baseline C++ one, which is as far as
+this needed to go -- the shape turns out to be uniform.
+
+| object | lr sites | CAS-shaped | fetch-op | no `sc` nearby |
+|---|---:|---:|---:|---:|
+| libxul | 8,656 | 8,625 | 31 | 0 |
+| go compile | 6,161 | 381 | 1 | 5,779 |
+| libQt6Core | 283 | 283 | 0 | 0 |
+| ripgrep | 170 | 170 | 0 | 0 |
+
+In the C++ and Rust objects every single `lr` is one shape or the
+other, with nothing unclassified: these are compiler-emitted atomics
+and there is no hand-written variety to account for.
+
+**Go's column is the one worth keeping.** 5,779 of its 6,161 `lr`
+instructions have no `sc` within thirteen instructions, because they
+are not retry loops at all:
+
+```
+142f0: lr.w.aq a0,(a0)
+142f4: ret
+```
+
+That is `runtime/internal/atomic.Load` -- a load-reserved used as an
+acquire load, taking a reservation it never uses. It explains the
+corpus-wide asymmetry that made this candidate look bigger than it is:
+37,248 `lr` against 14,234 `sc`, which reads as "thousands of loops
+with no store" until you look. Whether `lr.w.aq` is a worse acquire
+load than `lw`+`fence r,rw` on real hardware is a microarchitectural
+question this tool cannot answer and has no business guessing at, so it
+is recorded rather than sized. Note it would be a Go-toolchain finding,
+not a compiler-peephole one.
+
+**It is not written, and the gate is the first reason.** Zacas is in no
+RVA profile: zero occurrences in `RISCVProfiles.td`, and `RVB23U64`
+does not carry it either. No corpus object declares it. Every other
+gated check here names an extension some profile mandates, which is
+what makes `-m rva23` a question worth asking -- "what would rebuilding
+for RVA23 buy me". `-m zacas` would answer a question no profile asks,
+which is armlint's `-m cssc` position, except that cssc at least has
+cores that implement it.
+
+The second reason is the shape. Every check that ships is a pair, a
+window lookup, or one instruction plus a liveness walk. This is a
+*region*: four instructions spanning a backward branch, needing the
+retry branch verified to target the `lr` and no side entry into the
+middle. And the rewrite is a judgement rather than a transcription --
+it moves which register holds the expected value, and `lr.aq`+`sc.rl`
+-> `amocas.aqrl` is a decision about ordering rather than a
+substitution.
+
+**The 31 are the more interesting number.** Those are fetch-op loops
+whose body is a single `add`/`and`/`or`/`xor`/`sub` -- exactly what the
+A extension's AMOs already do, at RVA20 baseline, with no `-m` needed.
+That is armlint's fetch-op row, and against libxul's own 123,561 AMO
+instructions it is 0.025%: the compilers emit the atomic directly, and
+what is left is the handful of places they could not. Sized, and too
+small to write.
+
+### SWAR popcount -> Zbb `cpop` -- at most 27, and the one baseline object does not count bits
+
+Bounded rather than counted, which is the only honest form: without
+Zbb, `llvm.ctpop` expands to the Hacker's Delight sequence, and its
+four masks are what a detector would key on. The `-c` census counts the
+chains that build each, which sizes the candidate without writing it.
+
+| constant | libxul | libLLVM | go compile | ripgrep | corpus |
+|---|---:|---:|---:|---:|---:|
+| `0x55555555` | 53 | 2 | 1 | 0 | 107 |
+| `0x33333333` | 706 | 1 | 1 | 0 | 842 |
+| `0x0f0f0f0f` | 27 | 1 | 1 | 0 | 41 |
+| `0x01010101` | 1,475 | 26 | 0 | 17 | 1,943 |
+| any 64-bit form | 0 | 0 | 0 | 0 | **0** |
+
+A sequence needs all four, so the smallest column bounds the number
+that can be co-located: **at most 27 in libxul, at most 1 anywhere
+else.** And the counts are wildly unbalanced, which says most of these
+constants are something else entirely -- `0x01010101` is the byte
+broadcast every `memchr` and `strlen` uses, and at 1,475 against 27 it
+cannot be popcount.
+
+The zero row is the stronger signal. The 64-bit popcount is where the
+sequence costs most -- a dozen instructions and four 64-bit constants
+-- and not one of those constants is built anywhere in 73 million
+instructions.
+
+What the corpus does instead settles it:
+
+| object | declares Zbb | `cpop`/`cpopw` |
+|---|---|---:|
+| libxul | no | **0** |
+| libLLVM | yes | 1,291 |
+| go compile | no attributes | 41 |
+| ripgrep | yes | 1 |
+
+libLLVM counts bits 1,291 times and spells it `cpop` because it was
+allowed to. libxul is the one baseline-rv64gc object in the corpus and
+it does not count bits at all. So the population this check would
+report exists only on a target without Zbb, and the only such target
+here has nothing to report -- which makes the figure a property of
+which binaries are in the corpus rather than of the compilers. A third
+baseline C++ object that happened to use `__builtin_popcountll` could
+change the answer; nothing in this corpus can.
+
 ### Redundant mask after a zero-extending load -- 1,354
 
 `lbu` already zero-extends, so `andi rd,rd,255` after it is dead. The
