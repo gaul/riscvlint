@@ -3,8 +3,8 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Twenty-two checks are implemented and the ledger's candidate list is
-empty. [TODO.md](TODO.md) is that ledger: every candidate that was
+Twenty-two checks are implemented and the ledger's candidate list has
+one entry on it. [TODO.md](TODO.md) is that ledger: every candidate that was
 measured, the population it came back with, and the ones rejected on
 that evidence.
 What got written was decided by the corpus rather than by intuition,
@@ -13,42 +13,53 @@ and what did not get written was rejected the same way.
 ## Checks
 
 Twenty-two of them. Every figure below is what the check itself reports
-over the [corpus](#corpus) -- 73,139,165 instructions of three
-toolchains -- rather than what a mining tool estimated for it. The two
-have differed by an order of magnitude every time both were measured.
+over the [corpus](#corpus) -- 108,165,211 instructions of three
+toolchains across 31 objects -- rather than what a mining tool
+estimated for it. The two have differed by an order of magnitude every
+time both were measured.
 
-| check | C++ | Rust | Go | sites | bytes |
-|---|---:|---:|---:|---:|---:|
-| call pair foldable to jal | 120,578 | 171,665 | 56 | 292,299 | 1,169,196 |
-| slli + add foldable to shNadd | 67 | 165 | 13,180 | 13,412 | 23,840 |
-| slli + srli foldable to zext.w | 2 | 52 | 18,071 | 18,125 | 50,178 |
-| redundant stack-pointer restore | 100,718 | 11,683 | 0 | 112,401 | 449,604 |
-| comparison a branch could have made | 2,895 | 42 | 0 | 2,937 | 7,578 |
-| conditional branch over an unconditional jump | 4,691 | 340 | 331 | 5,362 | 15,514 |
-| transfer to the instruction that follows it | 2,851 | 831 | 20 | 3,702 | 7,458 |
-| redundant reload | 2,086 | 231 | 4,408 | 6,725 | 9,918 |
-| load of a just-stored value | 3,676 | 267 | 4,041 | 7,984 | 6,866 |
-| load of a value the register still holds | 10,445 | 519 | 5,592 | 16,556 | 41,232 |
-| dead store to a frame slot | 203 | 1 | 4,172 | 4,376 | 16,714 |
-| run of zero stores one wider store would do | 4,913 | 143 | 1,292 | 6,348 | 32,960 |
-| bit-cast routed through a frame slot | 1,145 | 0 | 10 | 1,155 | 0 |
-| store of a value the slot already holds | 1,199 | 225 | 5,341 | 6,765 | 20,194 |
-| constant re-materialization | 8,970 | 571 | 1,457 | 10,998 | 21,996 |
-| computation a live register already holds | 21,230 | 3,450 | 4,915 | 29,595 | 62,212 |
-| base add foldable into memory offset | 2,922 | 429 | 2,993 | 6,344 | 19,574 |
-| instruction compressible to a base C form | 21,361 | 1,235 | 2,961,593 | 2,984,189 | 5,968,378 |
-| instruction compressible to a Zcb form | 705 | 181 | 29,762 | 30,648 | 61,296 |
-| redundant sign or zero extension | 6,589 | 333 | 1,593 | 8,515 | 20,864 |
-| dead register definition | 11,741 | 248 | 7,876 | 19,865 | 54,570 |
-| floating-point constant fli would have built | 0 | 0 | 120 | 120 | 480 |
-| **total** | **328,987** | **192,611** | **3,066,823** | **3,588,421** | **8,060,622** |
+The table is generated, not maintained: `scripts/check_table.py` scans
+the corpus and prints it, which is how adding two objects stopped
+silently leaving every figure describing the other 29. Each object is
+read under its **own** declared extensions, no `-m`, so a Zcb figure is
+what riscvlint would tell that object's owner rather than what
+rebuilding it would buy. `bytes` comes from each finding's own stated
+saving and `sized` says how many findings stated one -- `assumed` marks
+the row where no finding does and the arithmetic is uniform instead.
 
-Do not read the total row as a result. One row is 84% of it, and that
+| check | C++ | Rust | Go | sites | bytes | sized |
+|---|---:|---:|---:|---:|---:|---:|
+| instruction compressible to a base C form | 33,792 | 1,235 | 2,961,593 | 2,996,620 | 5,993,240 | all |
+| call pair foldable to jal | 120,580 | 171,665 | 56 | 292,301 | 1,169,204 | assumed |
+| redundant stack-pointer restore | 204,543 | 11,683 | 0 | 216,226 | 864,904 | all |
+| computation a live register already holds | 42,573 | 3,450 | 4,915 | 50,938 | 106,004 | all |
+| instruction compressible to a Zcb form | 706 | 181 | 29,762 | 30,649 | 61,298 | all |
+| dead register definition | 13,413 | 248 | 7,876 | 21,537 | 58,266 | all |
+| load of a value the register still holds | 13,957 | 519 | 5,592 | 20,068 | 50,496 | all |
+| constant re-materialization | 16,410 | 571 | 1,457 | 18,438 | 36,876 | all |
+| slli + srli foldable to zext.w | 2 | 52 | 18,071 | 18,125 | 50,178 | all |
+| slli + add foldable to shNadd | 73 | 165 | 13,180 | 13,418 | 23,842 | all |
+| redundant sign or zero extension | 8,285 | 333 | 1,593 | 10,211 | 25,078 | all |
+| conditional branch over an unconditional jump | 9,031 | 340 | 331 | 9,702 | 28,072 | all |
+| load of a just-stored value | 5,244 | 267 | 4,041 | 9,552 | 8,200 | all |
+| base add foldable into memory offset | 5,768 | 429 | 2,993 | 9,190 | 26,216 | all |
+| redundant reload | 3,631 | 231 | 4,408 | 8,270 | 10,878 | all |
+| run of zero stores one wider store would do | 5,942 | 143 | 1,292 | 7,377 | 37,928 | all |
+| store of a value the slot already holds | 1,552 | 225 | 5,341 | 7,118 | 21,128 | all |
+| comparison a branch could have made | 6,880 | 42 | 0 | 6,922 | 17,422 | all |
+| transfer to the instruction that follows it | 4,299 | 831 | 20 | 5,150 | 10,354 | all |
+| dead store to a frame slot | 395 | 1 | 4,172 | 4,568 | 17,160 | all |
+| bit-cast routed through a frame slot | 1,149 | 0 | 10 | 1,159 | 0 | all |
+| floating-point constant fli would have built | 0 | 0 | 120 | 120 | 480 | all |
+| **total** | **498,225** | **192,611** | **3,066,823** | **3,757,659** | **8,617,224** | |
+
+Do not read the total row as a result. One row is 80% of it, and that
 row is Go's assembler declining to select RVC at all, which is a
-different kind of finding from the fifteen around it. The byte column for
-the call-pair row is arithmetic rather than measurement: that check does
-not print a size, and every site is eight bytes in and four out except a
-handful of `jalr ra,0(ra)` that were already two.
+different kind of finding from the twenty-one around it. The second row
+is 6% and belongs to the linker. The `assumed` in the call-pair row is
+the one byte figure that is arithmetic rather than measurement: that
+check prints no size, and every site is eight bytes in and four out
+except a handful of `jalr ra,0(ra)` that were already two.
 
 * **call pair foldable to jal** -- `auipc rd,X` + `jalr rd,Y(rd)` builds a
   call with +/-2GB of reach out of eight bytes and a register dependency.
@@ -58,7 +69,7 @@ handful of `jalr ra,0(ra)` that were already two.
   spelling `jalr x0,Y(rd)` would stop writing that register and needs a
   liveness proof this check does not have.
 
-  Population: 292,299 sites -- 171,665 Rust, 120,578 C++, 56 Go. It is a
+  Population: 292,301 sites -- 171,665 Rust, 120,580 C++, 56 Go. It is a
   linker-relaxation finding rather than a compiler one.
 
   The C++ figure used to be 0, and the explanation given for it was
@@ -81,7 +92,7 @@ handful of `jalr ra,0(ra)` that were already two.
   only when the add writes back the register the slli wrote and reads it
   exactly once, which makes the shifted value dead by construction.
 
-  Population: 13,412 sites, 13,180 of them in Go binaries -- GCC and LLVM
+  Population: 13,418 sites, 13,180 of them in Go binaries -- GCC and LLVM
   already use the extension. Of the 232 that are not, 163 are uutils and
   67 libLLVM. Both halves have compressed spellings, and 41% of the sites
   are `c.slli` + `c.add`, which is four bytes either way: there the
@@ -116,7 +127,8 @@ handful of `jalr ra,0(ra)` that were already two.
   the instruction's whole effect is already in force, which is what
   separates it from a dead definition.
 
-  Population: 112,401 sites -- 100,716 libLLVM, 11,683 Rust, 2 in
+  Population: 216,226 sites -- 103,825 of them in ubuntu-libllvm22 and
+  100,716 in libllvm20, both clang-built, 11,683 Rust, 2 in
   libgkcodecs.so, and **0 in both libQt6Core and libxul**, which is the
   finding.
 
@@ -474,7 +486,7 @@ handful of `jalr ra,0(ra)` that were already two.
   whenever the sum fits the 12-bit field and nothing goes on to read
   `rd`. The direct analogue of armlint's `add` + `ldr` check.
 
-  Population: 6,344 sites -- C++ 2,922, Go 2,993, Rust 429.
+  Population: 9,190 sites -- C++ 5,768, Go 2,993, Rust 429.
 
   This is the check the corpus warned about. Sampling the *shapes* --
   pairs where the access's base really is the addi's destination and the
@@ -507,7 +519,7 @@ handful of `jalr ra,0(ra)` that were already two.
   the same kind of finding: RVC selection is an assembler pass, so a
   finding means the instruction was legal to compress and was not.
 
-  Population: 22,596 in C++ and Rust -- 21,361 of it C++ -- and
+  Population: 35,027 in C++ and Rust -- 33,792 of it C++ -- and
   **2,961,593 in Go**, 21% of its instructions. Those are two different
   results wearing one name.
 
@@ -543,15 +555,20 @@ handful of `jalr ra,0(ra)` that were already two.
   assembly time, so a finding means the instruction was legal to compress
   and was not.
 
-  Population: 30,648 with the gate in force -- 29,762 Go, 705 libQt6Core,
-  181 uutils, and 0 everywhere else. libxul contributes nothing because
-  it declares no Zcb and the gate is right to stay shut; `-m zcb` over it
-  reports 320,550, which is 626 KB and the largest thing `-m` has to say
-  about any binary in the corpus.
+  Population: 30,649 with the gate in force -- 29,762 Go, 705 libQt6Core,
+  181 uutils, and 1 everywhere else. The baseline objects contribute
+  nothing because they declare no Zcb and the gate is right to stay
+  shut; forcing it reports 320,550 over libxul and 174,980 over
+  `debian-libllvm22`, which are the two largest things `-m` has to say
+  about any binary here.
 
   The two figures answer different questions and should not be added.
-  30,648 is what the assemblers left on targets that have the extension;
-  320,550 is what enabling it on a baseline build would buy.
+  30,649 is what the assemblers left on targets that have the extension;
+  the other is what enabling it on a baseline build would buy -- and
+  since the corpus now holds the same libLLVM release built both ways,
+  that second figure has been checked rather than only predicted: 174,980
+  against the 166,673 Zcb instructions the RVA23 build actually
+  contains, within 5%. See [the libllvm22 pair](#the-libllvm22-pair).
 
   Every Zcb form names its registers with a three-bit field, so x8-x15
   only, and the memory forms carry an unsigned two-bit byte offset or a
@@ -572,7 +589,7 @@ handful of `jalr ra,0(ra)` that were already two.
   check and unlike everything else here it needs no liveness query at
   all; where it writes elsewhere it becomes a `mv`.
 
-  Population: 8,515 sites -- 6,589 C++, 1,593 Go, 333 Rust. Within C++
+  Population: 10,211 sites -- 8,285 C++, 1,593 Go, 333 Rust. Within C++
   it is 3,433 libQt6Core, 2,253 libxul and 817 libLLVM, and libQt6Core
   against libLLVM is the contrast worth keeping: this is GCC's residue
   where the stack-restore check is clang's -- the same corpus, the other
@@ -604,7 +621,7 @@ handful of `jalr ra,0(ra)` that were already two.
   what that proves dead. The commonest shape is a frame pointer
   established and never used.
 
-  Population: 19,865 sites -- C++ 11,741, Go 7,876, Rust 248 -- and the
+  Population: 21,537 sites -- C++ 13,413, Go 7,876, Rust 248 -- and the
   first check here that fires meaningfully on C++, where libxul's 5,239
   and libQt6Core's 5,203 nearly tie. The walk makes no ABI assumptions:
   what a call may read and what a return exposes both differ between the
@@ -1195,7 +1212,9 @@ time and reports subtly wrong output rather than failing.
 fixtures under `fixtures/`, `make driver-test` the driver's exit
 statuses and verbosity default, `make json-test` the `--json` document,
 `make gopclntab-test` the Go function-table parser, and `make tools`
-the mining utilities. Every shell suite exits 2 rather than 0 when it
+the mining utilities. `scripts/check_table.py` regenerates the
+per-check table above from a corpus scan, and `--check` makes it say
+whether the committed one is stale. Every shell suite exits 2 rather than 0 when it
 cannot find a clang that targets riscv64 -- and, for the linked
 fixtures, an lld that can link it -- so a missing toolchain cannot pass
 by testing nothing.
