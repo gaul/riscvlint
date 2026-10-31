@@ -1456,16 +1456,18 @@ second instruction writes it is one dominant idiom plus nothing.
 
 # Remaining candidates
 
-None. Twenty-seven checks are implemented and everything this file ever
+None. Twenty-eight checks are implemented and everything this file ever
 sized is either written or recorded as rejected with the evidence that
-rejected it. The last six did not come from a corpus probe at all: 23
+rejected it. The last seven did not come from a corpus probe at all: 23
 came from walking armlint's check table against this one, 24 came from a
 rejection in this file being wrong, 25, 26 and 27 are the three
 addressing modes of a ratification plan for an extension that does not
-exist in hardware yet, and 28 fell out of a pair dump being re-counted
-for an unrelated question. 28's own entry records the three columns of
-that count which were sized and rejected, the largest of them 16,313
-sites with no instruction to fold them into.
+exist in hardware yet, and 28 and 29 both fell out of a pair dump being
+re-counted for an unrelated question. 28's own entry records the columns
+of that count which were sized and rejected, the largest of them 16,313
+sites with no instruction to fold them into; 29 is the one entry here
+whose check was written and then measured at 0, and it says why it was
+kept anyway.
 
 That last one is worth reading as a worked example rather than a
 number. The SWAR popcount was rejected on a bound that was not a bound
@@ -2731,13 +2733,14 @@ structural precondition.
 ### What the same probe turned up and did not become a check
 
 The probe classified every `li` feeding a multiply, divide or remainder.
-Four columns were worth sizing and three were rejected:
+Four columns were worth sizing: one is this entry, one became entry 29,
+and two were rejected here.
 
 | shape | dependent sites | verdict |
 |---|---:|---|
 | `li` 3/5/9 + `mul` | 712 | this entry |
 | `li` 2^k + `mul` | 4 | compilers already shift |
-| `li` 2^k + `divu`/`remu` | 134 | too small, below |
+| `li` 2^k + `divu`/`remu` | 134 | written: entry 29, and **0** |
 | `li` other + `mul` | 16,313 | no fold exists |
 
 The 4 is the headline rejection. A multiply by a power of two is a
@@ -2745,14 +2748,15 @@ shift, and in 108 million instructions four dependent pairs load one --
 so the classic strength reduction is one a check has nothing to say
 about, which was the opposite of what the probe was looking for.
 
-The 134 are a real fold and were left unwritten on size. The probe found
-165 dependent pairs loading a power of two into a divide or remainder:
-122 unsigned divides, which become one `srli`, and 12 unsigned
-remainders, which become one `andi` of the mask. The other 31 are signed
--- 22 `div`, 8 `divw`, 1 `remw` -- where a bare shift is wrong without
-the bias correction `div` performs and the fold would have to add it
-back. 134 sites against the 416 here, with a signed/unsigned split to
-get right and no extension to gate on, is a worse trade than it looks.
+The 134 looked like a real fold and is entry 29, where it was written
+and measured at 0. The probe found 165 dependent pairs loading a power
+of two into a divide or remainder: 122 unsigned divides, which become
+one `srli`, 12 unsigned remainders, which become one `andi` of the mask,
+and 31 signed -- 22 `div`, 8 `divw`, 1 `remw` -- where a bare shift is
+wrong without the bias correction `div` performs. What that count could
+not see is which operand the dependency runs through, which for a
+non-commutative operation is the whole question; entry 29 says what
+happened to it.
 
 The 16,313 is not arithmetic at all. Its constants are 24 (2,933 sites),
 40 (2,029), 88 (1,396), 10 (1,215), 104 (919), 48 (757) and a long tail
@@ -2761,6 +2765,99 @@ two shifts and an add, and the rest a power of two times a small odd
 (88 = 8*11, 104 = 8*13, 152 = 8*19, 100 = 4*25). There is no
 one-instruction form to fold them into, Zba or otherwise, so the column
 is large and empty.
+
+## 29. An unsigned divide or remainder by a power of two -- 0  [implemented]
+
+`li rc,2^k` + `divu rd,rx,rc` is `srli rd,rx,k`. `divuw` divides the low
+words and sign-extends its 32-bit quotient, which is exactly what
+`srliw` does with its shift; `remu` and `remuw` by 2^k are the low k
+bits, which is `andi rd,rx,2^k-1`. All three replacements are RV64I, so
+there is no extension gate -- the finding stands whatever an object's
+arch string says, as it does for the dozen other checks here whose
+rewrite is a base-ISA instruction or a deletion.
+
+It is also the only check here whose population is zero with no gate to
+blame for it. The bit count and the three indexed loads report nothing
+under the corpus's own declarations and plenty under `-m`; this one has
+nothing to force on, so zero is the whole answer. The measurement is
+the entry.
+
+### Why the probe's 134 was not a population
+
+Entry 28's probe counted 134 dependent pairs where a `li` of a power of
+two is followed by an unsigned divide or remainder. `pairscan`'s `dep`
+column says the second instruction reads a register the first wrote. It
+does not say *which* operand, and for a non-commutative operation that
+is the entire question: `divu rd,rx,rc` is a shift and `divu rd,rc,rx`
+is a constant divided by a variable, and both are `dep`.
+
+What the check finds, counting both `li` and `lui` and every immediate
+rather than the probe's small-immediate `li` tokens. The first row is a
+ceiling rather than a count of constants: a `lui` whose immediate is a
+power of two is often the high half of something else, and only its
+being adjacent to a divide makes it interesting.
+
+| | sites |
+|---|---:|
+| `li`/`lui` whose immediate alone is a power of two | 1,593,373 |
+| followed by an unsigned divide or remainder on it | 618 |
+| -- the constant as the **dividend** | 603 |
+| -- neither operand the constant | 31 |
+| -- the constant as the divisor: the real shape | 15 |
+| reported | **0** |
+
+603 of 618. The remaining 15 all fail a precondition: 13 are branch
+targets and 2 leave the divisor live afterwards. The two bounds that
+come from the replacement rather than the shape -- `andi`'s 12-bit
+signed immediate capping a mask at 2047, `srliw`'s five-bit shift
+amount -- reject nothing, and neither does the relocation or sp/gp/tp
+test.
+
+This is the lesson of the entry and it generalises past this check: for
+any non-commutative operation, a `dep` count is an upper bound with no
+stated error, because the direction of the dependency is exactly what
+decides whether a fold exists. `sub`, the shifts and the stores are all
+in the same position.
+
+### The 13 are not near misses
+
+One of them, in `golang-1.26-go--go` inside `debug/elf.(*File).DynString`:
+
+```
+0x3fa172:  j 0x3fa178          <- jumps over the li
+0x3fa176:  c.li t1, 8
+0x3fa178:  remu t1, a1, t1
+```
+
+A path reaches the `remu` without executing the `li`, so on that path t1
+is not 8 and `andi t1,a1,7` computes something else. The branch-target
+rule is doing correctness work here rather than being conservative --
+decoded by hand, by scanning the enclosing function for branches whose
+target is the `remu`, which found exactly that one `j`.
+
+All 13 are branch targets by construction, and the one decoded above is
+what that means in practice: two instructions adjacent across a
+control-flow merge rather than a missed peephole. The other twelve were
+not decoded individually. Read with the 603, the conclusion is that all
+three toolchains in this corpus reduce an unsigned divide by a power of
+two in the compiler, and what the shape scan saw afterwards was noise.
+
+### Why it is kept rather than removed
+
+Entry 23 has the opposite precedent: its absolute `lui %hi` + `fld %lo`
+arm was written, measured at 0, and removed rather than shipped
+unmeasured. The difference is what a zero means in each case. That arm
+was zero because the *spelling* it looked for does not occur here --
+where the shape appears at all its `lui` is compressed, so there was no
+four-byte form to find. This check is zero because the three toolchains
+in this corpus already do the fold. The rewrite needs no extension, so
+anything built by a compiler that does not do it -- older toolchains,
+`-O0` output, hand-written assembly, a JIT -- would be reported, and the
+planned JIT corpus is the obvious place for it to come back non-zero.
+
+Shipping it on those grounds is a judgement rather than a measurement,
+and this paragraph is here so that the judgement is on the record with
+its number next to it: 0 of 108,165,211 instructions.
 
 # Ranked for C++ and Rust specifically
 

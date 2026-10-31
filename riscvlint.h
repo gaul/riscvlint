@@ -1088,6 +1088,43 @@ bool check_fp_pool_to_fli(riscvlint_state *state, const cs_insn *insn,
 bool check_const_mul_to_shadd(riscvlint_state *state, const cs_insn *insn,
                               riscvlint_finding *finding);
 
+// `li rc,2^k` followed by an unsigned divide or remainder by it, which
+// one RV64I instruction does: `srli rd,rx,k` for `divu`, `srliw` for
+// `divuw` -- which divides the low words and sign-extends, exactly what
+// srliw's shift does -- and `andi rd,rx,2^k-1` for `remu` and `remuw`,
+// the remainder by a power of two being its low bits.
+//
+// There is no extension gate: all three replacements are RV64I, so the
+// finding stands whatever the object's arch string says.
+//
+// Unsigned only. `div rd,rx,2^k` rounds toward zero and `srai` rounds
+// toward minus infinity, which disagree for every negative dividend not
+// a multiple of the divisor, so folding a signed divide needs the bias
+// added back first and is three instructions rather than one. The
+// signed funct3 values are refused in the decoder rather than filtered
+// later, so there is one place to look.
+//
+// Two bounds come from the replacement rather than the shape. andi's
+// immediate is twelve bits signed, so a remainder folds only up to a
+// mask of 2047 -- k of 11 -- above which the mask would need its own
+// `li` and the pair would not shrink. srliw's shift amount is five
+// bits, so a `divuw` folds only to k of 31, above which the divisor's
+// low word is not a power of two in the first place. Neither bound
+// rejects anything in the corpus.
+//
+// Measured population: 0. Of 1,593,373 `li` and `lui` whose immediate
+// alone is a power of two, 618 are followed by an unsigned divide or
+// remainder reading that register, and 603 of those read it as the
+// dividend, which no shift replaces;
+// 13 of the remaining 15 are branch targets and 2 leave the divisor
+// live. All three toolchains in the corpus already do this fold, so
+// what is left is adjacency across a control-flow merge. The check is
+// cheap and needs no extension, so it is kept for the compilers and
+// the hand-written code this corpus does not contain. TODO.md entry 29
+// has the decoded site and the argument.
+bool check_udiv_pow2(riscvlint_state *state, const cs_insn *insn,
+                     riscvlint_finding *finding);
+
 // ---- running every check ----
 //
 // Called once per finding, with `ctx` as given. The finding is valid

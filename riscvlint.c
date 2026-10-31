@@ -4339,6 +4339,135 @@ bool check_const_mul_to_shadd(riscvlint_state *state, const cs_insn *insn,
     return true;
 }
 
+// Which unsigned divide or remainder an encoding spells. The signed
+// forms -- funct3 4 and 6 -- are deliberately absent: `div rd,rx,2^k`
+// rounds toward zero and a bare `srai` rounds toward minus infinity, so
+// folding one needs a bias added back and is three instructions rather
+// than one.
+typedef enum {
+    RV_UDIV_NONE = 0,
+    RV_UDIV_D,          // divu
+    RV_UDIV_W,          // divuw
+    RV_UREM_D,          // remu
+    RV_UREM_W,          // remuw
+} rv_udiv_op;
+
+static rv_udiv_op decode_udiv(uint32_t w, unsigned size, unsigned *rd,
+                              unsigned *rs1, unsigned *rs2)
+{
+    // Four bytes only. Zcb's `c.mul` is the whole of the M extension's
+    // compressed surface, so no divide has a two-byte spelling to miss.
+    if (size != 4) return RV_UDIV_NONE;
+    unsigned op = RV_OPCODE(w);
+    if (op != 0x33u && op != 0x3bu) return RV_UDIV_NONE;
+    if (((w >> 25) & 0x7fu) != 0x01u) return RV_UDIV_NONE;      // not M
+    unsigned f3 = (w >> 12) & 7u;
+    if (f3 != 5u && f3 != 7u) return RV_UDIV_NONE;    // 4 and 6 are signed
+    *rd = (w >> 7) & 0x1fu;
+    *rs1 = (w >> 15) & 0x1fu;
+    *rs2 = (w >> 20) & 0x1fu;
+    if (*rd == 0) return RV_UDIV_NONE;
+    if (op == 0x33u) return f3 == 5u ? RV_UDIV_D : RV_UREM_D;
+    return f3 == 5u ? RV_UDIV_W : RV_UREM_W;
+}
+
+bool check_udiv_pow2(riscvlint_state *state, const cs_insn *insn,
+                     riscvlint_finding *finding)
+{
+    // No extension gate: srli, srliw and andi are all RV64I, so the
+    // finding stands whatever the object's arch string says.
+    if (insn->size != 2 && insn->size != 4) return false;
+
+    uint32_t w1;
+    if (!riscvlint_word_at(state, insn->address, &w1)) return false;
+    unsigned rc;
+    int64_t val;
+    if (!decode_const(w1, insn->size, &rc, &val)) return false;
+    // A power of two, and at least 2. `val & (val - 1)` is the
+    // power-of-two test; the `val < 2` beside it does the rest of the
+    // work, excluding 1, where dividing is a move and the remainder is
+    // zero, and excluding 0, which no shift amount describes and which
+    // would not terminate the loop below.
+    if (val < 2 || (val & (val - 1)) != 0) return false;
+    unsigned k = 0;
+    while (((int64_t)1 << (k + 1)) <= val) k++;
+    // sp, gp and tp hold what the ABI says they hold rather than a
+    // divisor, as in check_const_mul_to_shadd and check_const_remat.
+    if (rc == 2 || rc == 3 || rc == 4) return false;
+
+    uint64_t second = insn->address + insn->size;
+    uint32_t w2;
+    if (!riscvlint_word_at(state, second, &w2)) return false;
+    unsigned len2 = rv_insn_len(w2);
+    unsigned rd, rx, drs2;
+    rv_udiv_op op = decode_udiv(w2, len2, &rd, &rx, &drs2);
+    if (op == RV_UDIV_NONE) return false;
+    // Division does not commute, so the constant has to be the divisor
+    // and nothing else. Both operands naming it is `rc / rc`, which is
+    // 1 or 0 and a constant of its own.
+    if (drs2 != rc || rx == rc) return false;
+    // x0 as the dividend makes the result zero rather than a shift of
+    // anything.
+    if (rx == 0) return false;
+
+    char rewrite[48];
+    switch (op) {
+    case RV_UDIV_D:
+        // Unsigned, so the quotient is the dividend shifted down, with
+        // no case distinction and no bias. srli's shift amount is six
+        // bits and k cannot exceed 30 here, `li` and `lui` between them
+        // reaching no higher.
+        snprintf(rewrite, sizeof rewrite, "srli %s, %s, %u",
+                 rv_reg_name(rd), rv_reg_name(rx), k);
+        break;
+    case RV_UDIV_W:
+        // divuw divides the low words and sign-extends the 32-bit
+        // quotient, which is exactly what srliw does with its shift.
+        // srliw's shift amount is five bits, and above 31 the divisor's
+        // low word is not a power of two at all.
+        if (k > 31) return false;
+        snprintf(rewrite, sizeof rewrite, "srliw %s, %s, %u",
+                 rv_reg_name(rd), rv_reg_name(rx), k);
+        break;
+    case RV_UREM_D:
+    case RV_UREM_W:
+        // The remainder is the low k bits, so the fold is a mask of
+        // 2^k - 1. andi's immediate is twelve bits signed: 2047 is the
+        // largest mask it holds, so k of 12 or more would need the mask
+        // materialized and the pair would not shrink. The `w` form
+        // needs no separate case -- the mask clears everything above
+        // bit 10, where the low word and the register agree.
+        if (k > 11) return false;
+        snprintf(rewrite, sizeof rewrite, "andi %s, %s, %lld",
+                 rv_reg_name(rd), rv_reg_name(rx),
+                 (long long)(((int64_t)1 << k) - 1));
+        break;
+    default:
+        return false;
+    }
+
+    // Arriving at the divide from elsewhere means the divisor need not
+    // be a power of two when it executes.
+    if (riscvlint_is_branch_target(state, second)) return false;
+    if (riscvlint_is_relocated(state, insn->address) ||
+        riscvlint_is_relocated(state, second))
+        return false;
+
+    // The divisor stops being loaded, so it has to be dead after the
+    // pair. The divide overwriting it is the free case.
+    if (rd != rc &&
+        riscvlint_liveness(state, second + len2, rc) != RISCVLINT_LIVE_DEAD)
+        return false;
+
+    unsigned before = insn->size + len2;
+    finding->title = "unsigned divide or remainder by a power of two";
+    finding->address = insn->address;
+    finding->insn_count = 2;
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "%s (%u -> 4 bytes)", rewrite, before);
+    return true;
+}
+
 // ---- running every check ----
 
 static const riscvlint_check_fn riscvlint_checks[] = {
@@ -4369,6 +4498,7 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_scaled_indexed_load,
     check_zext_indexed_load,
     check_const_mul_to_shadd,
+    check_udiv_pow2,
 };
 
 size_t riscvlint_scan(riscvlint_state *state, csh handle,

@@ -3,7 +3,7 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Twenty-seven checks are implemented and the ledger's candidate list
+Twenty-eight checks are implemented and the ledger's candidate list
 is empty. [TODO.md](TODO.md) is that ledger: every candidate that was
 measured, the population it came back with, and the ones rejected on
 that evidence.
@@ -12,11 +12,12 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Twenty-seven of them, and the table lists twenty-three. Four report
-nothing under any object's own declaration -- the bit count because no
-baseline object declares Zbb, and the three indexed loads because they
-are the ones requiring their extension to be positively present rather
-than merely un-denied. Those entries below say why. Every figure is
+Twenty-eight of them, and the table lists twenty-three. Five report
+nothing over this corpus -- the bit count because no baseline object
+declares Zbb, the three indexed loads because they are the ones
+requiring their extension to be positively present rather than merely
+un-denied, and the unsigned divide by a power of two because all three
+toolchains already do that fold themselves. Those entries below say why. Every figure is
 what the check itself reports over the [corpus](#corpus) --
 108,165,211 instructions of three toolchains across 31 objects --
 rather than what a mining tool estimated for it. The two have differed
@@ -161,6 +162,57 @@ except a handful of `jalr ra,0(ra)` that were already two.
   Go site is lost to a relocation, to an sp/gp/tp destination, or to a
   multiply that does not read the constant exactly once, and the only
   branch-target rejections anywhere in the corpus are libxul's two.
+
+* **unsigned divide or remainder by a power of two** -- `li rc,2^k` +
+  `divu rd,rx,rc` is a shift: `srli rd,rx,k`. `divuw` divides the low
+  words and sign-extends its 32-bit quotient, which is what `srliw`
+  does, and `remu`/`remuw` by 2^k is the low k bits, which is
+  `andi rd,rx,2^k-1`. All three replacements are RV64I, so there is no
+  extension gate and the finding stands whatever an object's arch string
+  says. It is also the only check here whose population is zero with no
+  gate to blame: the four others that report nothing under the corpus's
+  own declarations all report plenty under `-m`, and this one has
+  nothing to force on.
+
+  Unsigned only. `div rd,rx,2^k` rounds toward zero where `srai` rounds
+  toward minus infinity, and they disagree for every negative dividend
+  that is not a multiple of the divisor, so folding a signed divide
+  means adding the bias back and is three instructions rather than one.
+  Two further bounds come from the replacement and not the shape:
+  `andi`'s immediate is twelve bits signed, so a remainder folds only up
+  to a mask of 2047, and `srliw`'s shift amount is five bits.
+
+  Population: **0**. The corpus holds 1,593,373 `li` or `lui` whose
+  immediate alone is a power of two -- a ceiling, since a `lui` can be
+  the high half of a larger constant -- and 618 of those are immediately
+  followed by an unsigned divide or remainder that depends on the
+  register. 603 of those 618 have the
+  constant as the **dividend** -- `li a0,1024` + `divu a0,a0,a4` is 1024
+  over a variable, which no shift replaces -- leaving 15 real shapes,
+  and all 15 fail a precondition: 13 are branch targets and 2 leave the
+  divisor live.
+
+  The branch-target rejections are correctness, not caution. One of the
+  13, in `golang-1.26-go--go`, is
+
+  ```
+  0x3fa172:  j 0x3fa178          <- jumps over the li
+  0x3fa176:  c.li t1, 8
+  0x3fa178:  remu t1, a1, t1
+  ```
+
+  where a path reaches the `remu` without executing the `li`, so
+  `andi t1,a1,7` would compute something else on that path: two
+  instructions adjacent across a control-flow merge rather than a missed
+  peephole. That one was decoded by hand; the other twelve were not.
+  Read with the 603, the conclusion is that all three toolchains in this
+  corpus reduce an unsigned divide by a power of two in the compiler,
+  and what the shape scan saw afterwards is noise.
+
+  The check is kept because it costs nothing to run and the rewrite
+  needs no extension, so anything built by a compiler that does not do
+  this -- or hand-written assembly, or a JIT -- would be reported. On
+  this corpus it is a measured zero rather than an unmeasured guess.
 
 * **slli + srli foldable to zext.w** -- `slli rd,rs,32` +
   `srli rd,rd,32` clears the upper word in two dependent instructions

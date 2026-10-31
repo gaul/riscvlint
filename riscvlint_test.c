@@ -3767,6 +3767,214 @@ static void test_const_mul_to_shadd(csh handle)
                    RISCVLINT_EXT_DECLARED | RISCVLINT_EXT_ZBA, NULL));
 }
 
+static bool run_udiv(csh handle, const uint8_t *bytes, size_t len,
+                     unsigned exts, riscvlint_finding *out)
+{
+    static uint8_t buf[256];
+    memcpy(buf, bytes, len);
+    riscvlint_state *state = riscvlint_state_create();
+    if (!state) return false;
+    bool fired = false;
+    riscvlint_state_set_extensions(state, exts);
+    if (riscvlint_state_set_section(state, handle, buf, len, 0x1000)) {
+        cs_insn *insn = cs_malloc(handle);
+        const uint8_t *p = buf;
+        size_t remain = len;
+        uint64_t addr = 0x1000;
+        if (insn && cs_disasm_iter(handle, &p, &remain, &addr, insn)) {
+            riscvlint_finding f;
+            memset(&f, 0, sizeof f);
+            fired = check_udiv_pow2(state, insn, &f);
+            if (fired && out) *out = f;
+        }
+        if (insn) cs_free(insn, 1);
+    }
+    riscvlint_state_destroy(state);
+    return fired;
+}
+
+static void test_udiv_pow2(csh handle)
+{
+    riscvlint_finding f;
+
+    // c.li a5,8 ; divu a5,a4,a5 -- the quotient is the dividend shifted
+    // down three, with no bias and no case distinction.
+    static const uint8_t divd[] = {
+        0xa1, 0x47,                    // c.li a5,8
+        0xb3, 0x57, 0xf7, 0x02,        // divu a5,a4,a5
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(run_udiv(handle, divd, sizeof divd, 0, &f));
+    CHECK(strcmp(f.replacement, "srli a5, a4, 3 (6 -> 4 bytes)") == 0);
+    CHECK(f.insn_count == 2 && f.address == 0x1000);
+    CHECK(strcmp(f.title,
+                 "unsigned divide or remainder by a power of two") == 0);
+
+    // A wide `li` for 64: eight bytes down to four.
+    static const uint8_t wide[] = {
+        0x93, 0x07, 0x00, 0x04,        // li a5,64
+        0xb3, 0x57, 0xf7, 0x02,        // divu a5,a4,a5
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_udiv(handle, wide, sizeof wide, 0, &f));
+    CHECK(strcmp(f.replacement, "srli a5, a4, 6 (8 -> 4 bytes)") == 0);
+
+    // divuw divides the low words and sign-extends: srliw, not srli.
+    static const uint8_t divw[] = {
+        0xa1, 0x47,                    // c.li a5,8
+        0xbb, 0x57, 0xf7, 0x02,        // divuw a5,a4,a5
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(run_udiv(handle, divw, sizeof divw, 0, &f));
+    CHECK(strcmp(f.replacement, "srliw a5, a4, 3 (6 -> 4 bytes)") == 0);
+
+    // The remainder is the low three bits, which is a mask of 7. The
+    // `w` form masks to the same value.
+    static const uint8_t remd[] = {
+        0xa1, 0x47,                    // c.li a5,8
+        0xb3, 0x77, 0xf7, 0x02,        // remu a5,a4,a5
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(run_udiv(handle, remd, sizeof remd, 0, &f));
+    CHECK(strcmp(f.replacement, "andi a5, a4, 7 (6 -> 4 bytes)") == 0);
+
+    static const uint8_t remw[] = {
+        0xa1, 0x47,                    // c.li a5,8
+        0xbb, 0x77, 0xf7, 0x02,        // remuw a5,a4,a5
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(run_udiv(handle, remw, sizeof remw, 0, &f));
+    CHECK(strcmp(f.replacement, "andi a5, a4, 7 (6 -> 4 bytes)") == 0);
+
+    // c.lui a5,1 is 4096: a shift of twelve, which srli holds.
+    static const uint8_t big[] = {
+        0x85, 0x67,                    // c.lui a5,1
+        0xb3, 0x57, 0xf7, 0x02,        // divu a5,a4,a5
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(run_udiv(handle, big, sizeof big, 0, &f));
+    CHECK(strcmp(f.replacement, "srli a5, a4, 12 (6 -> 4 bytes)") == 0);
+
+    // The same divisor for a remainder needs a mask of 4095, which does
+    // not fit andi's twelve signed bits, so the pair would not shrink.
+    static const uint8_t bigrem[] = {
+        0x85, 0x67,                    // c.lui a5,1
+        0xb3, 0x77, 0xf7, 0x02,        // remu a5,a4,a5
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(!run_udiv(handle, bigrem, sizeof bigrem, 0, NULL));
+
+    // The signed forms round toward zero where a shift rounds down, so
+    // neither folds to one instruction.
+    static const uint8_t signd[] = {
+        0xa1, 0x47,                    // c.li a5,8
+        0xb3, 0x47, 0xf7, 0x02,        // div a5,a4,a5
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(!run_udiv(handle, signd, sizeof signd, 0, NULL));
+
+    static const uint8_t signr[] = {
+        0xa1, 0x47,                    // c.li a5,8
+        0xb3, 0x67, 0xf7, 0x02,        // rem a5,a4,a5
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(!run_udiv(handle, signr, sizeof signr, 0, NULL));
+
+    // mulhu shares the funct7 and is not a divide.
+    static const uint8_t high[] = {
+        0xa1, 0x47,                    // c.li a5,8
+        0xb3, 0x37, 0xf7, 0x02,        // mulhu a5,a4,a5
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(!run_udiv(handle, high, sizeof high, 0, NULL));
+
+    // Three is not a power of two.
+    static const uint8_t three[] = {
+        0x8d, 0x47,                    // c.li a5,3
+        0xb3, 0x57, 0xf7, 0x02,        // divu a5,a4,a5
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(!run_udiv(handle, three, sizeof three, 0, NULL));
+
+    // One is a move and the remainder by it is zero; zero is a divide
+    // by zero, which on riscv64 returns all ones rather than trapping.
+    // Neither is a shift, and neither reaches the shift-amount loop.
+    static const uint8_t one[] = {
+        0x85, 0x47,                    // c.li a5,1
+        0xb3, 0x57, 0xf7, 0x02,        // divu a5,a4,a5
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(!run_udiv(handle, one, sizeof one, 0, NULL));
+
+    static const uint8_t zero[] = {
+        0x81, 0x47,                    // c.li a5,0
+        0xb3, 0x57, 0xf7, 0x02,        // divu a5,a4,a5
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(!run_udiv(handle, zero, sizeof zero, 0, NULL));
+
+    // The constant as the dividend rather than the divisor: division
+    // does not commute, so this is 8/a4 and not a shift.
+    static const uint8_t swapped[] = {
+        0xa1, 0x47,                    // c.li a5,8
+        0xb3, 0xd7, 0xe7, 0x02,        // divu a5,a5,a4
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(!run_udiv(handle, swapped, sizeof swapped, 0, NULL));
+
+    // Both operands the constant: that is 1, a constant of its own.
+    static const uint8_t both[] = {
+        0xa1, 0x47,                    // c.li a5,8
+        0xb3, 0xd7, 0xf7, 0x02,        // divu a5,a5,a5
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(!run_udiv(handle, both, sizeof both, 0, NULL));
+
+    // x0 as the dividend makes the quotient zero.
+    static const uint8_t zeronum[] = {
+        0xa1, 0x47,                    // c.li a5,8
+        0x33, 0x57, 0xf0, 0x02,        // divu a4,zero,a5
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(!run_udiv(handle, zeronum, sizeof zeronum, 0, NULL));
+
+    // The divide writes elsewhere and the divisor is read after it.
+    static const uint8_t live[] = {
+        0xa1, 0x47,                    // c.li a5,8
+        0x33, 0xd7, 0xf6, 0x02,        // divu a4,a3,a5
+        0x3e, 0x85,                    // c.mv a0,a5
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(!run_udiv(handle, live, sizeof live, 0, NULL));
+
+    // The same shape with the divisor overwritten, so the walk proves
+    // it dead.
+    static const uint8_t walked[] = {
+        0xa1, 0x47,                    // c.li a5,8
+        0x33, 0xd7, 0xf6, 0x02,        // divu a4,a3,a5
+        0x85, 0x47,                    // c.li a5,1
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(run_udiv(handle, walked, sizeof walked, 0, &f));
+    CHECK(strcmp(f.replacement, "srli a4, a3, 3 (6 -> 4 bytes)") == 0);
+
+    // A branch into the divide: the divisor need not be 8 on that path.
+    static const uint8_t target[] = {
+        0xa1, 0x47,                    // c.li a5,8
+        0xb3, 0x57, 0xf7, 0x02,        // divu a5,a4,a5
+        0x75, 0xff,                    // c.bnez a4,-4
+        0x82, 0x80,                    // c.ret
+    };
+    CHECK(!run_udiv(handle, target, sizeof target, 0, NULL));
+
+    // No extension gate: srli, srliw and andi are RV64I, so an object
+    // declaring a bare rv64gc still gets the finding, and one declaring
+    // Zbb and nothing else gets it too.
+    CHECK(run_udiv(handle, divd, sizeof divd, RISCVLINT_EXT_DECLARED, &f));
+    CHECK(run_udiv(handle, divd, sizeof divd,
+                   RISCVLINT_EXT_DECLARED | RISCVLINT_EXT_ZBB, NULL));
+}
+
 static void test_census(csh handle)
 {
     static const uint8_t code[] = {
@@ -3939,6 +4147,7 @@ int main(void)
     test_fli_table();
     test_fp_pool_to_fli(handle);
     test_const_mul_to_shadd(handle);
+    test_udiv_pow2(handle);
     test_census(handle);
 
     cs_close(&handle);
