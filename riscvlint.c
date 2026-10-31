@@ -52,6 +52,18 @@ static int64_t ci_imm6(uint32_t w)
     return sign_extend((((w >> 12) & 1u) << 5) | ((w >> 2) & 0x1fu), 6);
 }
 
+// The immediate of `c.lui`, whose 6-bit field is the value's bits
+// 17:12 rather than its low six. Shifted while still an unsigned field
+// and sign-extended afterwards, which is the order the encoding
+// describes -- and the only defined one, since a left shift of a
+// negative value is undefined behaviour. `ci_imm6(w) << 12` reads the
+// same and agrees on every input, but UBSan is right about it.
+static int64_t ci_imm6_lui(uint32_t w)
+{
+    uint64_t field = (((w >> 12) & 1u) << 5) | ((w >> 2) & 0x1fu);
+    return sign_extend(field << 12, 18);
+}
+
 bool rv_decode_auipc(uint32_t w, unsigned *rd, int64_t *imm)
 {
     if (RV_OPCODE(w) != RV_OP_AUIPC) return false;
@@ -828,7 +840,7 @@ unsigned rv_result_guarantees(uint32_t w, unsigned size, unsigned *rd)
             return guarantees_for_range(v, v);
         }
         if (f3 == 3 && *rd != 0 && *rd != 2) {        // c.lui (not addi16sp)
-            int64_t v = ci_imm6(w) << 12;
+            int64_t v = ci_imm6_lui(w);
             return guarantees_for_range(v, v);
         }
         if (f3 == 4) {
@@ -1883,7 +1895,7 @@ static bool decode_const(uint32_t w, unsigned size, unsigned *rd, int64_t *val)
     }
     if ((w & 0xe003u) == 0x6001u) {                     // c.lui (not addi16sp)
         *rd = (w >> 7) & 0x1fu;
-        *val = ci_imm6(w) << 12;
+        *val = ci_imm6_lui(w);
         return *rd != 0 && *rd != 2 && ci_imm6(w) != 0;
     }
     return false;
