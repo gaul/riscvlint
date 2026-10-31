@@ -1456,12 +1456,13 @@ second instruction writes it is one dominant idiom plus nothing.
 
 # Remaining candidates
 
-None. Twenty-four checks are implemented and everything this file ever
+None. Twenty-five checks are implemented and everything this file ever
 sized is either written or recorded as rejected with the evidence that
-rejected it. The last three did not come from a corpus probe at all: 23
+rejected it. The last four did not come from a corpus probe at all: 23
 came from walking armlint's check table against this one, 24 came from a
-rejection in this file being wrong, and 25 came from a ratification
-plan for an extension that does not exist in hardware yet.
+rejection in this file being wrong, and 25 and 26 came from a
+ratification plan for an extension that does not exist in hardware
+yet.
 
 That last one is worth reading as a worked example rather than a
 number. The SWAR popcount was rejected on a bound that was not a bound
@@ -1763,7 +1764,7 @@ Measured, so nobody has to re-derive it: of the three tests at the
 final shift, the shift-width test costs 5 sites, the branch-target test
 0, and the liveness proof 1,717.
 
-## 25. An address computed for one indexed load -- 118,569  [implemented]
+## 25. An address computed for one indexed load -- 162,792  [implemented]
 
 Not sized from a probe either. It came from the Zilx ratification plan:
 the extension that gives RV64 the addressing mode it has never had, and
@@ -1782,42 +1783,46 @@ in rs1 with the base in rs2, the reverse of a normal load. Worth noting
 for the census: capstone does not decode them, so a binary that
 actually contained Zilx would have those words read as atomics.
 
-### What the check reports -- 118,569, and half of it free
+### What the check reports -- 162,792, and nearly half of it free
 
-| object | sites |
-|---|---:|
-| libxul | 62,620 |
-| debian-libllvm22 | 51,494 |
-| Go (12 objects, `-m zilx`) | 3,528 |
-| ripgrep | 927 |
+Corpus-wide under `-m zilx`, by language and with the scaled column
+beside it for the reason entry 26 gives:
 
-**Half saves no space.** In libxul 31,114 of the 62,620 are a
+| language | objects | unscaled | scaled |
+|---|---:|---:|---:|
+| C++ | 13 | 138,924 | 20,002 |
+| Rust | 6 | 3,850 | 50 |
+| Go | 12 | 20,018 | 5,170 |
+| **total** | **31** | **162,792** | **25,222** |
+
+The largest individual objects: 54,170 in libxul, 40,929 in
+debian-libllvm22, 18,860 in ubuntu-libllvm22, 18,697 in libllvm20.
+
+**Nearly half saves no space.** In libxul 24,888 of the 54,170 are a
 compressed `c.add` and a compressed load folding to a four-byte `lxd`
 -- four bytes for four. The finding prints `(4 -> 4 bytes)` so a reader
 can tell, and the rewrite still removes an instruction and an address
-dependency; 23,882 save two bytes and 7,624 save four, for 78,260 in
+dependency; 21,661 save two bytes and 7,621 save four, for 73,806 in
 all. This is the branch-over-jump situation again, where the byte
 column understates what the fold does and is the honest number anyway.
 
-ripgrep's 927 against libxul's 62,620 is not a compiler difference. It
+ripgrep's 927 against libxul's 54,170 is not a compiler difference. It
 declares Zba, so its `slli`+`add` pairs are already single `sh*add`
-instructions and the `add`+load shape mostly does not arise.
+instructions and the shapes mostly do not arise.
 
-### The scaled shape, sized and not written -- 30,297
+**A correction to what this entry first said.** It was written as
+"118,569 sites -- 62,620 libxul, 51,494 debian-libllvm22, 3,528 Go,
+927 ripgrep", and three of those four figures were right about the
+wrong thing. 118,569 is the sum over *four objects*, not the corpus,
+and the 3,528 was one Go object (`compile`) read as all twelve. Every
+other headline in this file is a corpus figure, so that one did not
+mean what its position implied. The four-object sum was also measured
+before entry 26 existed and so counts the scaled triples as unscaled
+finds; 62,620 and 51,494 are now 54,170 + 8,450 and 40,929 + 10,565.
 
-`slli rt,ri,3` + `add rd,rb,rt` + `ld rt2,0(rd)` is what one `lxsd`
-would do, and it is three instructions with an intervening register
-rather than two adjacent ones -- a different match, and not written.
-Sized with the shift required to agree with the access width: 12,984 in
-libxul, 17,313 in debian-libllvm22, 1,796 in go compile, and **0** in
-ripgrep for the reason above.
-
-The shift/width mismatches are worth keeping separately, because they
-are not candidates: 2,468 in libxul and 13,561 in debian-libllvm22
-shift by an amount the load's width does not match, which is a
-`slli`+`add` that is not an array index at all. Reading the triple
-without that condition would overstate the population by 78% on
-libLLVM.
+The scaled shape is entry 26 below, and the two checks never both fire
+at one site: a scaled finding replaces the unscaled one at the same
+`add` rather than standing beside it.
 
 ### The gate, and the one place the standing rule does not hold
 
@@ -1827,18 +1832,139 @@ RISCVProfiles.td. So unlike Zcb, Zfa or the bit count there is no "what
 would rebuilding for RVA23 buy me" reading -- it asserts a specific
 target, which is armlint's `-m cssc` position.
 
-It is also the only check that requires its extension to be
-**positively present** rather than merely un-denied, and that is a
-deliberate departure. The standing rule, written down when the Zba
-checks were first gated, is that an object declaring no attributes
-leaves a check unrestricted, because Go emits no `.riscv.attributes`
-and treating "absent" as "no" would silence a check on the code it
-exists for. That rule assumes the extension is one some target
-plausibly has. Zilx is in no profile and no shipping core, so the
-permissive reading put 3,528 findings on the Go objects suggesting an
-instruction nobody can execute -- which is advice, not a finding. The
-check fires on a declared `_zilx` or on `-m zilx`, and otherwise not at
-all, so nothing from it reaches the generated table.
+This check and entry 26 are also the only two that require their
+extension to be **positively present** rather than merely un-denied,
+and that is a deliberate departure. The standing rule, written down
+when the Zba checks were first gated, is that an object declaring no
+attributes leaves a check unrestricted, because Go emits no
+`.riscv.attributes` and treating "absent" as "no" would silence a check
+on the code it exists for. That rule assumes the extension is one some
+target plausibly has. Zilx is in no profile and no shipping core, so
+the permissive reading put 25,188 findings on the Go objects alone,
+suggesting an instruction nobody can execute -- which is advice, not a
+finding. They fire on a declared `_zilx` or on `-m zilx`, and otherwise
+not at all, so nothing from either reaches the generated table.
+
+## 26. An address scaled for one indexed load -- 25,222  [implemented]
+
+`slli rt,ri,3` + `add rd,rb,rt` + `ld rt2,0(rd)`, which Zilx's scaled
+form does in one: `lxsd rt2,(rb),ri`. Entry 25 is the two-instruction
+shape; this is the three-instruction one, and it is the shape the base
+ISA actually pays for `a[i]` with.
+
+### What the check reports -- 25,222, and all of it saves space
+
+| language | objects | sites |
+|---|---:|---:|
+| C++ | 13 | 20,002 |
+| Rust | 6 | 50 |
+| Go | 12 | 5,170 |
+| **total** | **31** | **25,222** |
+
+Largest objects: 10,565 in debian-libllvm22, 8,450 in libxul, 969 in
+go `compile`, 811 in `gh`.
+
+Every site saves at least two bytes, which entry 25 cannot say: three
+instructions is six bytes at the very least and the fold is four, so
+there is no `(4 -> 4 bytes)` row to apologise for. libxul's 8,450 are
+4,664 at `(6 -> 4)`, 2,837 at `(8 -> 4)`, 946 at `(10 -> 4)` and 3 at
+`(12 -> 4)` -- 26,376 bytes.
+
+### These are not new sites, and that is the point
+
+Each scaled triple's `add` was already an unscaled finding, so this
+check reclassifies rather than discovers. The arithmetic is exact: per
+object, scaled + unscaled equals what entry 25 reported before this one
+existed. libxul 8,450 + 54,170 = 62,620; debian-libllvm22
+10,565 + 40,929 = 51,494; go `compile` 969 + 2,559 = 3,528; ripgrep
+0 + 927 = 927.
+
+Which is why the two checks do not both fire. `check_scaled_indexed_load`
+records the `add` it covered and `check_indexed_load` declines there,
+because with Zilx present the site is one `lxsd` and not an `lxd`
+beside a surviving `slli`. Counting both would double the site and
+credit the worse fold.
+
+What the deeper fold buys is bytes, not sites. At libxul's same 62,620
+sites the saving goes from 78,260 bytes to 100,182, a 28% increase, and
+it reconciles down to the instruction: of the 8,450 that moved, 6,226
+were `(4 -> 4)` and saved nothing, 2,221 saved two and 3 saved four, so
+they contributed 4,454 bytes before and 26,376 after.
+
+The state field is `zilx_scaled`, a watermark in the same spirit as
+`zrun_end`: the driver walks a section in address order and the `slli`
+precedes the `add`, so one address is enough.
+
+### The shift must agree with the width, and that is the whole number
+
+The scale factor is log2 of the access size and nothing else, so a
+`slli` by an amount the load's width does not match is a different
+computation and folding it would change the address. Measured on the
+shapes that reach the test:
+
+| object | right shape | shift/width or byte | reported |
+|---|---:|---:|---:|
+| libxul | 20,881 | 7,897 | 8,450 |
+| debian-libllvm22 | 33,789 | 16,476 | 10,565 |
+| go `compile` | 3,018 | 1,222 | 969 |
+
+Subtracting those leaves the probe's own figures exactly -- 12,984,
+17,313 and 1,796 -- which is how the check was checked against the
+sizing that preceded it. Of the rejected column, 2,468 in libxul and
+13,561 in debian-libllvm22 are genuine shift/width disagreements and
+the rest are byte loads, whose scale factor is 1 and whose shift is
+therefore zero; those sites belong to entry 25. Reading the triple
+without the width test would overstate libLLVM by 78%.
+
+### What soundness costs here
+
+Two writes disappear rather than one, so both have to be gone, and the
+liveness walk is asked twice. Against the 12,984 width-matching
+triples in libxul:
+
+| declined by | sites |
+|---|---:|
+| the address still read after | 3,092 |
+| the shifted index still read after | 1,345 |
+| a branch into the middle of the triple | 97 |
+| **reported** | **8,450** |
+
+Both writes die by construction in the common case -- the `add` over
+the shift and the load over either, which is what `slli a5,a5,3` +
+`add a5,a0,a5` + `ld a5,0(a5)` is -- and 7,338 of the 8,450 have the
+`add` overwriting the shifted register, which is also
+`check_slli_add_to_shadd`'s precondition. The relocation test and the
+sp/gp/tp test cost 0 on each of the three objects instrumented; they
+are there because the shape allows them rather than because the corpus
+exercises them.
+
+### The clearest extension result in the corpus
+
+Of the 25,222 sites, **77** are in the nine objects that declare Zba
+and 25,145 are in the twenty-two that do not:
+
+| | objects | scaled sites |
+|---|---:|---:|
+| declares `zba1p0` | 9 | 77 |
+| does not | 22 | 25,145 |
+
+Where Zba is available the `slli`+`add` is already one `sh3add` and
+this triple never forms. ripgrep, libQt6Core and Ubuntu's libLLVM 22
+have none of it at all, against 10,565 in Debian's build of that same
+LLVM release -- and those two builds are *not* a controlled pair, since
+the toolchains differ too (see the frame-pointer figures above), but
+the other eight Zba objects say the same thing without needing to be.
+
+So the sequence has two answers at two prices, which is the argument
+this project started from: Zba halves it, and Zilx removes it.
+
+### Not written: the zero-extended index
+
+LLVM's `RISCVInstrInfoZilx.td` has a third addressing mode at funct5
+`0b11110`, `lxsuw*`, which zero-extends a 32-bit index before scaling
+it. Its shape is `slli rt,ri,32` + `srli rt,rt,32-N` + `add` + load,
+four instructions rather than three, and it overlaps
+`check_slli_srli_to_zext`'s pair. Not sized and not written.
 
 ### 16 and 20. A computation a live register already holds -- 29,595 of 39,274  [implemented]
 

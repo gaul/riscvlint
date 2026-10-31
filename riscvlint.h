@@ -839,11 +839,12 @@ bool check_dead_def(riscvlint_state *state, const cs_insn *insn,
 // ratification plan's prose, for the reason the `fli` check gives --
 // the assembler is what has to accept the suggestion.
 //
-// This reports the unscaled shape only: two adjacent instructions, an
-// `add` of two registers feeding a zero-offset integer load of the
-// register it wrote. The scaled shape is `slli` + `add` + load and is
-// three instructions with an intervening register, which is a
-// different match; it is sized in TODO.md and not written.
+// This reports the unscaled shape: two adjacent instructions, an `add`
+// of two registers feeding a zero-offset integer load of the register
+// it wrote. The scaled shape is three instructions with an intervening
+// register and is a different match, in check_scaled_indexed_load
+// below -- which also tells this check to stay quiet at an `add` that
+// fold has already claimed, since one site is one rewrite.
 //
 // Loads only, and integer loads only. Zilx has no indexed store and no
 // indexed floating-point load, so a store or an `flw` through a
@@ -860,6 +861,43 @@ bool check_dead_def(riscvlint_state *state, const cs_insn *insn,
 // position.
 bool check_indexed_load(riscvlint_state *state, const cs_insn *insn,
                         riscvlint_finding *finding);
+
+// `slli rt,ri,3` + `add rd,rb,rt` + `ld rt2,0(rd)`, which Zilx's
+// scaled indexed loads do in one: `lxsd rt2,(rb),ri`. This is the
+// shape the base ISA actually pays for `a[i]` with, and the one
+// AArch64 has had since the beginning.
+//
+// The scale factor is log2 of the access size and nothing else, so the
+// shift the code already performs has to agree with the width the load
+// reads. That condition is the whole difference between a population
+// and a coincidence: `slli rt,ri,3` + an `lw` is some other
+// computation, and folding it would change the address. Without it the
+// triple reads 78% higher on libLLVM -- 13,561 of its matches shift by
+// the wrong amount. Byte loads scale by 1, so their shift amount is
+// zero, there is no `slli`, and that site belongs to the unscaled
+// check above.
+//
+// Two writes disappear here rather than one, the shifted index and the
+// address, so both have to be gone. Each is killed by construction
+// wherever a later instruction of the triple overwrites it -- the
+// `add` over the shift, the load over either -- which is what the
+// common `slli a5,a5,3` + `add a5,a0,a5` + `ld a5,0(a5)` is; anything
+// else is proved by the liveness walk or declined.
+//
+// The `add` in the middle is also the unscaled check's match, and the
+// two are not independent findings: with Zilx present a compiler emits
+// one `lxsd`, not an `lxd` and a surviving `slli`. So this check
+// records the `add` it covered and the unscaled one declines there,
+// which keeps a site counted once and counted as the better rewrite.
+//
+// Measured population under `-m zilx`: see TODO.md. ripgrep has 0 of
+// it, and that is Zba rather than a compiler difference -- where Zba is
+// declared the `slli`+`add` is already one `sh3add` and this triple
+// never forms. Which makes the check's own reading of the corpus an
+// argument about extensions rather than about compilers: Zba halves the
+// sequence and Zilx removes it.
+bool check_scaled_indexed_load(riscvlint_state *state, const cs_insn *insn,
+                               riscvlint_finding *finding);
 
 // ---- a bit count spelled out longhand ----
 

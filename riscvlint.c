@@ -1167,6 +1167,14 @@ struct riscvlint_state {
     // which is what makes a single watermark enough.
     uint64_t zrun_end;
 
+    // The address of an `add` that check_scaled_indexed_load has
+    // already folded into one scaled indexed load. The unscaled check
+    // matches that same `add` and must not report it a second time:
+    // with Zilx present the site is one `lxsd`, not an `lxd` beside a
+    // surviving `slli`. UINT64_MAX is "none", since a section can
+    // legitimately begin at address 0.
+    uint64_t zilx_scaled;
+
     // What each register's current value is known to guarantee about its
     // own high bits, for check_redundant_extension. Cleared at every
     // region boundary, so a guarantee is only read on the straight-line
@@ -1263,6 +1271,7 @@ bool riscvlint_state_set_section(riscvlint_state *state, csh handle,
     state->handle = handle;
     memset(&state->fp, 0, sizeof state->fp);
     state->zrun_end = 0;
+    state->zilx_scaled = UINT64_MAX;
     memset(state->guarantees, 0, sizeof state->guarantees);
     memset(&state->win, 0, sizeof state->win);
     if (!state->probe) state->probe = cs_malloc(handle);
@@ -3328,6 +3337,10 @@ bool check_indexed_load(riscvlint_state *state, const cs_insn *insn,
     // `-m zilx` asks the what-if, and otherwise not at all.
     if (!(riscvlint_state_extensions(state) & RISCVLINT_EXT_ZILX))
         return false;
+    // An `add` the scaled fold has already folded into one `lxs*`. The
+    // scaled shape starts an instruction earlier, so it has been judged
+    // by the time the cursor arrives here. See `zilx_scaled`.
+    if (insn->address == state->zilx_scaled) return false;
     if (insn->size != 2 && insn->size != 4) return false;
     uint32_t w1;
     if (!riscvlint_word_at(state, insn->address, &w1)) return false;
@@ -3376,6 +3389,119 @@ bool check_indexed_load(riscvlint_state *state, const cs_insn *insn,
     snprintf(finding->replacement, sizeof finding->replacement,
              "%s %s, (%s), %s (%u -> 4 bytes)", name, rv_reg_name(data),
              rv_reg_name(rb), rv_reg_name(ri), before);
+    return true;
+}
+
+// ---- an address scaled for one indexed load ----
+//
+// See riscvlint.h for the shape, why the shift must agree with the
+// access width, and why this one tells the unscaled check to be quiet.
+
+// The scaled indexed mnemonic for a load kind, and the shift amount the
+// scaled form implies -- log2 of the access size and nothing else.
+// Byte loads scale by 1, so their shift is zero, there is no `slli` to
+// fold, and that site is the unscaled check's.
+static const char *zilx_scaled_name(rv_mem_kind kind, unsigned *shamt)
+{
+    switch (kind) {
+    case RV_MEM_LH:  *shamt = 1; return "lxsh";
+    case RV_MEM_LHU: *shamt = 1; return "lxshu";
+    case RV_MEM_LW:  *shamt = 2; return "lxsw";
+    case RV_MEM_LWU: *shamt = 2; return "lxswu";
+    case RV_MEM_LD:  *shamt = 3; return "lxsd";
+    default:         return NULL;   // bytes, stores, and the FP loads
+    }
+}
+
+bool check_scaled_indexed_load(riscvlint_state *state, const cs_insn *insn,
+                               riscvlint_finding *finding)
+{
+    // Positively present, not merely un-denied, for the reason
+    // check_indexed_load states at length.
+    if (!(riscvlint_state_extensions(state) & RISCVLINT_EXT_ZILX))
+        return false;
+    if (insn->size != 2 && insn->size != 4) return false;
+
+    uint32_t w1;
+    if (!riscvlint_word_at(state, insn->address, &w1)) return false;
+    unsigned rt, ri, shamt;
+    if (!rv_decode_slli(w1, insn->size, &rt, &ri, &shamt)) return false;
+    // x0 is not a shift destination, a shift by nothing is a hint
+    // rather than a scale, and x0 indexes nothing.
+    if (rt == 0 || ri == 0 || shamt == 0) return false;
+
+    uint64_t second = insn->address + insn->size;
+    uint32_t w2;
+    if (!riscvlint_word_at(state, second, &w2)) return false;
+    unsigned len2 = rv_insn_len(w2);
+    unsigned rd, ars1, ars2;
+    if (!rv_decode_add(w2, len2, &rd, &ars1, &ars2)) return false;
+    if (rd == 0) return false;
+    // The add must read the shifted register exactly once. `add rd,rt,rt`
+    // doubles the shifted value, which is a wider shift and not this
+    // rewrite, and it leaves no second operand to call the base.
+    bool a_is_shift = ars1 == rt, b_is_shift = ars2 == rt;
+    if (a_is_shift == b_is_shift) return false;
+    unsigned rb = a_is_shift ? ars2 : ars1;
+    if (rb == 0) return false;
+
+    uint64_t third = second + len2;
+    uint32_t w3;
+    if (!riscvlint_word_at(state, third, &w3)) return false;
+    unsigned len3 = rv_insn_len(w3);
+    rv_mem_kind kind;
+    unsigned data, base;
+    int64_t off;
+    if (!rv_decode_mem(w3, len3, &kind, &data, &base, &off)) return false;
+    if (base != rd || off != 0) return false;
+    unsigned want;
+    const char *name = zilx_scaled_name(kind, &want);
+    // The scale is the access width, so a shift that disagrees with it
+    // is some other computation and folding it would change the
+    // address. This is the condition the population depends on.
+    if (!name || shamt != want) return false;
+
+    // sp, gp and tp hold what the ABI says they hold and are never
+    // dead, so folding either write away is not on offer. Both of this
+    // fold's writes are subject to it, unlike the unscaled shape's one.
+    if (rd == 2 || rd == 3 || rd == 4) return false;
+    if (rt == 2 || rt == 3 || rt == 4) return false;
+
+    // Three instructions means two interior addresses something could
+    // branch to, and either one makes the triple not a straight line.
+    if (riscvlint_is_branch_target(state, second) ||
+        riscvlint_is_branch_target(state, third))
+        return false;
+    if (riscvlint_is_relocated(state, insn->address) ||
+        riscvlint_is_relocated(state, second) ||
+        riscvlint_is_relocated(state, third))
+        return false;
+
+    // The fold stops writing both the shifted index and the address.
+    // Each is killed by construction where a later instruction of the
+    // triple overwrites it -- the add over the shift, the load over
+    // either -- and everything else is proved or declined.
+    uint64_t after = third + len3;
+    if (data != rd &&
+        riscvlint_liveness(state, after, rd) != RISCVLINT_LIVE_DEAD)
+        return false;
+    if (rt != rd && data != rt &&
+        riscvlint_liveness(state, after, rt) != RISCVLINT_LIVE_DEAD)
+        return false;
+
+    unsigned before = insn->size + len2 + len3;
+    finding->title = "address scaled for one indexed load";
+    finding->address = insn->address;
+    finding->insn_count = 3;
+    // Unlike the unscaled form this is not symmetric: the scale applies
+    // to the index and not to the base, so which register goes in the
+    // parentheses is decided by which one the slli shifted.
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "%s %s, (%s), %s (%u -> 4 bytes)", name, rv_reg_name(data),
+             rv_reg_name(rb), rv_reg_name(ri), before);
+    // The add is the unscaled check's match too, and one site is one
+    // rewrite rather than two.
+    state->zilx_scaled = second;
     return true;
 }
 
@@ -4006,6 +4132,7 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_fp_pool_to_fli,
     check_swar_popcount,
     check_indexed_load,
+    check_scaled_indexed_load,
 };
 
 size_t riscvlint_scan(riscvlint_state *state, csh handle,

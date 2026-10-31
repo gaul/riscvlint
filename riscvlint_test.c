@@ -2939,6 +2939,216 @@ static void test_indexed_load(csh handle)
                           0x1000, zilx, NULL) == 0);
 }
 
+// Counts findings by title over the whole registry. The scaled fold's
+// suppression of the unscaled one cannot be seen through
+// run_window_exts: the two fire at different instructions and reach
+// each other through the state, so the scan is the only harness that
+// watches both at once.
+typedef struct {
+    const char *a, *b;
+    int na, nb;
+} title_tally;
+
+static void tally_titles(void *ctx, const riscvlint_finding *f)
+{
+    title_tally *t = ctx;
+    if (t->a && strcmp(f->title, t->a) == 0) t->na++;
+    if (t->b && strcmp(f->title, t->b) == 0) t->nb++;
+}
+
+static void scan_titles(csh handle, const uint8_t *code, size_t len,
+                        uint64_t vaddr, unsigned exts, title_tally *t)
+{
+    static uint8_t buf[256];
+    memcpy(buf, code, len);
+    riscvlint_state *state = riscvlint_state_create();
+    if (!state) { failures++; return; }
+    riscvlint_state_set_extensions(state, exts);
+    if (riscvlint_state_set_section(state, handle, buf, len, vaddr))
+        riscvlint_scan(state, handle, buf, len, vaddr, tally_titles, t,
+                       NULL, NULL);
+    riscvlint_state_destroy(state);
+}
+
+// An address scaled for one indexed load. Every buffer here is clang's
+// own assembly of the shape, since hand-encoding three instructions and
+// a shift amount is how a test comes to agree with a wrong check.
+static void test_scaled_indexed_load(csh handle)
+{
+    riscvlint_finding f;
+    const unsigned zilx = RISCVLINT_EXT_DECLARED | RISCVLINT_EXT_ZILX;
+
+    // The commonest shape: the add overwrites the shifted index and the
+    // load overwrites the address, so both writes the fold removes die
+    // by construction and no walk is needed.
+    static const uint8_t self[] = {
+        0x93, 0x96, 0x37, 0x00,     // slli a3, a5, 3
+        0xb3, 0x86, 0x66, 0x01,     // add  a3, a3, s6
+        0x83, 0xb6, 0x06, 0x00,     // ld   a3, 0(a3)
+        0x67, 0x80, 0x00, 0x00,     // ret
+    };
+    CHECK(run_window_exts(handle, check_scaled_indexed_load, self,
+                          sizeof self, 0x1000, zilx, &f) == 1);
+    CHECK(f.address == 0x1000 && f.insn_count == 3);
+    CHECK(strstr(f.replacement, "lxsd a3, (s6), a5") != NULL);
+    CHECK(strstr(f.replacement, "(12 -> 4 bytes)") != NULL);
+
+    // All three compressed, which is the cheapest the base ISA can
+    // spell this and still twice the size of the fold. c.slli implies
+    // rd == rs1, so here the index register is the shifted register and
+    // the suggestion names it unshifted.
+    static const uint8_t packed[] = {
+        0x8e, 0x06,                 // c.slli a3, 3
+        0xda, 0x96,                 // c.add  a3, s6
+        0x94, 0x62,                 // c.ld   a3, 0(a3)
+        0x82, 0x80,                 // c.jr   ra
+    };
+    CHECK(run_window_exts(handle, check_scaled_indexed_load, packed,
+                          sizeof packed, 0x1000, zilx, &f) == 1);
+    CHECK(strstr(f.replacement, "lxsd a3, (s6), a3") != NULL);
+    CHECK(strstr(f.replacement, "(6 -> 4 bytes)") != NULL);
+
+    // The scale is log2 of the access size and nothing else, so a shift
+    // the load's width does not match is a different computation. This
+    // is the condition the whole population rests on: without it the
+    // triple reads 78% higher on libLLVM.
+    static const uint8_t mismatch[] = {
+        0x93, 0x96, 0x37, 0x00,     // slli a3, a5, 3
+        0xb3, 0x86, 0x66, 0x01,     // add  a3, a3, s6
+        0x83, 0xa6, 0x06, 0x00,     // lw   a3, 0(a3)
+        0x67, 0x80, 0x00, 0x00,     // ret
+    };
+    CHECK(run_window_exts(handle, check_scaled_indexed_load, mismatch,
+                          sizeof mismatch, 0x1000, zilx, NULL) == 0);
+
+    // A halfword, where the address register is not the loaded one and
+    // the walk has to prove it dead.
+    static const uint8_t half[] = {
+        0x93, 0x96, 0x17, 0x00,     // slli a3, a5, 1
+        0xb3, 0x86, 0x66, 0x01,     // add  a3, a3, s6
+        0x03, 0xd7, 0x06, 0x00,     // lhu  a4, 0(a3)
+        0x93, 0x06, 0x00, 0x00,     // li   a3, 0
+        0x67, 0x80, 0x00, 0x00,     // ret
+    };
+    CHECK(run_window_exts(handle, check_scaled_indexed_load, half,
+                          sizeof half, 0x1000, zilx, &f) == 1);
+    CHECK(strstr(f.replacement, "lxshu a4, (s6), a5") != NULL);
+
+    // Byte loads scale by 1, so their shift amount is zero, there is no
+    // `slli` to fold, and a byte load behind one is a shift of
+    // something else. That site is the unscaled check's.
+    static const uint8_t byte[] = {
+        0x93, 0x96, 0x17, 0x00,     // slli a3, a5, 1
+        0xb3, 0x86, 0x66, 0x01,     // add  a3, a3, s6
+        0x03, 0xc7, 0x06, 0x00,     // lbu  a4, 0(a3)
+        0x93, 0x06, 0x00, 0x00,     // li   a3, 0
+        0x67, 0x80, 0x00, 0x00,     // ret
+    };
+    CHECK(run_window_exts(handle, check_scaled_indexed_load, byte,
+                          sizeof byte, 0x1000, zilx, NULL) == 0);
+
+    // The gate is check_indexed_load's: Zilx positively present, not
+    // merely un-denied, so an object declaring nothing at all is silent
+    // where every other gated check would fire.
+    CHECK(run_window_exts(handle, check_scaled_indexed_load, self,
+                          sizeof self, 0x1000, RISCVLINT_EXT_DECLARED,
+                          NULL) == 0);
+    CHECK(run_window_exts(handle, check_scaled_indexed_load, self,
+                          sizeof self, 0x1000, 0, NULL) == 0);
+
+    // Zilx has no indexed store and no indexed floating-point load.
+    static const uint8_t store[] = {
+        0x93, 0x96, 0x37, 0x00,     // slli a3, a5, 3
+        0xb3, 0x86, 0x66, 0x01,     // add  a3, a3, s6
+        0x23, 0xb0, 0xe6, 0x00,     // sd   a4, 0(a3)
+        0x67, 0x80, 0x00, 0x00,     // ret
+    };
+    CHECK(run_window_exts(handle, check_scaled_indexed_load, store,
+                          sizeof store, 0x1000, zilx, NULL) == 0);
+    static const uint8_t fp[] = {
+        0x93, 0x96, 0x37, 0x00,     // slli a3, a5, 3
+        0xb3, 0x86, 0x66, 0x01,     // add  a3, a3, s6
+        0x07, 0xb5, 0x06, 0x00,     // fld  fa0, 0(a3)
+        0x67, 0x80, 0x00, 0x00,     // ret
+    };
+    CHECK(run_window_exts(handle, check_scaled_indexed_load, fp, sizeof fp,
+                          0x1000, zilx, NULL) == 0);
+
+    // base + (index << N) and nothing else: there is no displacement to
+    // carry the 8 with.
+    static const uint8_t off[] = {
+        0x93, 0x96, 0x37, 0x00,     // slli a3, a5, 3
+        0xb3, 0x86, 0x66, 0x01,     // add  a3, a3, s6
+        0x83, 0xb6, 0x86, 0x00,     // ld   a3, 8(a3)
+        0x67, 0x80, 0x00, 0x00,     // ret
+    };
+    CHECK(run_window_exts(handle, check_scaled_indexed_load, off, sizeof off,
+                          0x1000, zilx, NULL) == 0);
+
+    // `add a3,a3,a3` doubles the shifted value, which is a wider shift
+    // and not this rewrite -- and leaves no operand to call the base.
+    static const uint8_t twice[] = {
+        0x93, 0x96, 0x37, 0x00,     // slli a3, a5, 3
+        0xb3, 0x86, 0xd6, 0x00,     // add  a3, a3, a3
+        0x83, 0xb6, 0x06, 0x00,     // ld   a3, 0(a3)
+        0x67, 0x80, 0x00, 0x00,     // ret
+    };
+    CHECK(run_window_exts(handle, check_scaled_indexed_load, twice,
+                          sizeof twice, 0x1000, zilx, NULL) == 0);
+
+    // Two writes disappear, so either one still being read declines the
+    // fold. These two buffers differ in one register and isolate the
+    // proofs: the shifted index read afterwards, then the address.
+    static const uint8_t live_index[] = {
+        0x93, 0x96, 0x37, 0x00,     // slli a3, a5, 3
+        0x33, 0x87, 0x66, 0x01,     // add  a4, a3, s6
+        0x03, 0x38, 0x07, 0x00,     // ld   a6, 0(a4)
+        0x13, 0x85, 0x06, 0x00,     // mv   a0, a3
+        0x67, 0x80, 0x00, 0x00,     // ret
+    };
+    CHECK(run_window_exts(handle, check_scaled_indexed_load, live_index,
+                          sizeof live_index, 0x1000, zilx, NULL) == 0);
+    static const uint8_t live_addr[] = {
+        0x93, 0x96, 0x37, 0x00,     // slli a3, a5, 3
+        0x33, 0x87, 0x66, 0x01,     // add  a4, a3, s6
+        0x03, 0x38, 0x07, 0x00,     // ld   a6, 0(a4)
+        0x13, 0x05, 0x07, 0x00,     // mv   a0, a4
+        0x67, 0x80, 0x00, 0x00,     // ret
+    };
+    CHECK(run_window_exts(handle, check_scaled_indexed_load, live_addr,
+                          sizeof live_addr, 0x1000, zilx, NULL) == 0);
+
+    // The same three registers with both killed afterwards, which is
+    // the walk answering rather than the encoding.
+    static const uint8_t walked[] = {
+        0x93, 0x96, 0x37, 0x00,     // slli a3, a5, 3
+        0x33, 0x87, 0x66, 0x01,     // add  a4, a3, s6
+        0x03, 0x38, 0x07, 0x00,     // ld   a6, 0(a4)
+        0x93, 0x06, 0x00, 0x00,     // li   a3, 0
+        0x13, 0x07, 0x00, 0x00,     // li   a4, 0
+        0x67, 0x80, 0x00, 0x00,     // ret
+    };
+    CHECK(run_window_exts(handle, check_scaled_indexed_load, walked,
+                          sizeof walked, 0x1000, zilx, &f) == 1);
+    CHECK(strstr(f.replacement, "lxsd a6, (s6), a5") != NULL);
+
+    // One site is one rewrite. The `add` in the middle is also the
+    // unscaled check's match, so a scaled finding has to replace that
+    // one rather than stand beside it -- otherwise the pair would be
+    // counted twice and counted as the worse fold.
+    const char *sc = "address scaled for one indexed load";
+    const char *un = "address computed for one indexed load";
+    title_tally t = { sc, un, 0, 0 };
+    scan_titles(handle, self, sizeof self, 0x1000, zilx, &t);
+    CHECK(t.na == 1 && t.nb == 0);
+
+    // And the suppression is precise rather than blanket: where the
+    // scaled fold declines, the unscaled one still has its own finding.
+    title_tally t2 = { sc, un, 0, 0 };
+    scan_titles(handle, mismatch, sizeof mismatch, 0x1000, zilx, &t2);
+    CHECK(t2.na == 0 && t2.nb == 1);
+}
+
 // A bit count spelled out longhand. The buffer is clang's own output
 // for a 32-bit SWAR popcount of a0 into a5 -- masks hoisted, stages
 // computed in place, the final shift an `srliw` -- with `li a0,0` after
@@ -3406,6 +3616,7 @@ int main(void)
     test_cchain(handle);
     test_swar_popcount(handle);
     test_indexed_load(handle);
+    test_scaled_indexed_load(handle);
     test_sweep();
     test_fli_table();
     test_fp_pool_to_fli(handle);
