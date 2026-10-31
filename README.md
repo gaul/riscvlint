@@ -937,7 +937,37 @@ is not mistaken for a clean one.
 
 A finding is worth more with a function name on it than without, and
 which name is available depends entirely on what the toolchain left
-behind. riscvlint tries two sources, in this order:
+behind. It buys two things: the `<name+0x..>` on each `-v` line, and
+the by-function block in the summary, which is what turns a
+whole-binary count into "and here is where to start":
+
+```console
+$ ./riscvlint corpus/go/golang-1.26-go--gofmt
+Optimization opportunities by type:
+   ...
+Optimization opportunities by function:
+     229  go/ast.Walk
+     164  go/parser.(*resolver).Visit
+     114  time.parse
+      98  fmt.(*pp).printValue
+      94  internal/fmtsort.compare
+      94  runtime.selectgo
+     ...
+   22205  in 3124 more functions
+```
+
+The ten holding the most, the tail summed into a residue line, and --
+where there are any -- an `outside every function range` row for the
+findings no name covers: code before a section's first symbol, past the
+end of a sized one, or past the end of what Go's table describes.
+Counted apart rather than charged to the nearest neighbour, which would
+be a guess dressed as a fact. It is tallied at the finding sink with the
+same lookup the annotation uses, in every mode and not only under `-v`,
+so the two cannot disagree about where a finding is. An object with
+nothing to attribute against leaves the block out rather than printing
+one row saying so.
+
+Two sources are tried, in this order:
 
 * the ELF symbol table's `STT_FUNC` entries, bounded by `st_size` where
   the symbol carries one. This is what a locally built object has, and

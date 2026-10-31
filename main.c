@@ -205,6 +205,129 @@ static uint64_t total_insns;
 // data-laden section is not read as a clean one.
 static uint64_t total_skipped;
 
+// ---- the by-function tally ----
+//
+// A whole-binary count says how much there is; this says where to
+// start. Keyed by the name the -v annotation prints, so the two cannot
+// disagree about which function a finding is in.
+//
+// A hash rather than the by-type table's linear scan: that one has one
+// entry per check and this has one per function with a finding, which
+// in `gh` is tens of thousands against 1,358,204 findings.
+typedef struct {
+    char *name;             // owned: the file is unmapped before printing
+    uint64_t count;
+} func_entry;
+
+static func_entry *func_tally;
+static size_t func_cap, func_used;
+// Findings the symbol tables and Go's table both place under no
+// function: code before a section's first symbol, or past the end of a
+// sized one. Counted apart rather than attributed to the nearest
+// neighbour, which would be a guess dressed as a fact.
+static uint64_t func_unattributed;
+
+static uint64_t name_hash(const char *s)
+{
+    uint64_t h = 0xcbf29ce484222325ull;             // FNV-1a
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        h ^= *p;
+        h *= 0x100000001b3ull;
+    }
+    return h;
+}
+
+static bool func_tally_grow(void)
+{
+    size_t cap = func_cap ? func_cap * 2 : 1024;
+    func_entry *old = func_tally;
+    size_t old_cap = func_cap;
+    func_entry *grown = calloc(cap, sizeof *grown);
+    if (!grown) return false;
+    func_tally = grown;
+    func_cap = cap;
+    func_used = 0;
+    for (size_t i = 0; i < old_cap; i++) {
+        if (!old[i].name) continue;
+        // Rehash by moving the owned pointer rather than copying the
+        // string again.
+        size_t j = name_hash(old[i].name) & (cap - 1);
+        while (func_tally[j].name) j = (j + 1) & (cap - 1);
+        func_tally[j] = old[i];
+        func_used++;
+    }
+    free(old);
+    return true;
+}
+
+static void func_tally_add(const char *name)
+{
+    if (func_used * 10 >= func_cap * 7 && !func_tally_grow()) {
+        fprintf(stderr, "out of memory tallying functions\n");
+        exit(2);
+    }
+    size_t i = name_hash(name) & (func_cap - 1);
+    while (func_tally[i].name) {
+        if (strcmp(func_tally[i].name, name) == 0) {
+            func_tally[i].count++;
+            return;
+        }
+        i = (i + 1) & (func_cap - 1);
+    }
+    // The name points into the mapped file, which is unmapped before
+    // the summary prints, so it has to be copied. Written out rather
+    // than reaching for strdup, which -std=c11 does not declare.
+    size_t len = strlen(name);
+    char *owned = malloc(len + 1);
+    if (owned) memcpy(owned, name, len + 1);
+    if (!owned) {
+        fprintf(stderr, "out of memory tallying functions\n");
+        exit(2);
+    }
+    func_tally[i].name = owned;
+    func_tally[i].count = 1;
+    func_used++;
+}
+
+static int cmp_func(const void *a, const void *b)
+{
+    const func_entry *fa = a, *fb = b;
+    if (fa->count != fb->count) return fb->count > fa->count ? 1 : -1;
+    return strcmp(fa->name, fb->name);
+}
+
+#define FUNC_TOP 10
+
+static void func_tally_print(void)
+{
+    // Nothing to attribute against -- a Debian C++ or Rust binary --
+    // leaves this out rather than printing one row saying so.
+    if (!func_used) return;
+
+    func_entry *rows = malloc(func_used * sizeof *rows);
+    if (!rows) return;
+    size_t n = 0;
+    for (size_t i = 0; i < func_cap; i++)
+        if (func_tally[i].name) rows[n++] = func_tally[i];
+    qsort(rows, n, sizeof rows[0], cmp_func);
+
+    printf("Optimization opportunities by function:\n");
+    size_t shown = n < FUNC_TOP ? n : FUNC_TOP;
+    for (size_t i = 0; i < shown; i++)
+        printf("%8" PRIu64 "  %s\n", rows[i].count, rows[i].name);
+    if (n > shown) {
+        uint64_t rest = 0;
+        for (size_t i = shown; i < n; i++) rest += rows[i].count;
+        printf("%8" PRIu64 "  in %zu more function%s\n", rest, n - shown,
+               n - shown == 1 ? "" : "s");
+    }
+    if (func_unattributed)
+        printf("%8" PRIu64 "  outside every function range\n",
+               func_unattributed);
+    printf("\n");
+    free(rows);
+}
+
 static void tally_add(const char *title)
 {
     for (size_t i = 0; i < ntitles; i++)
@@ -547,11 +670,17 @@ static void report(void *ctx, const riscvlint_finding *f)
     const report_ctx *c = ctx;
     tally_add(f->title);
     total_findings++;
-    if (!verbose) return;
 
+    // Looked up in every mode, not only under -v: the by-function
+    // summary is keyed by the same name the annotation prints, so the
+    // two cannot disagree about where a finding is.
     uint64_t delta = 0;
     const char *sym = symbolize(c->base, c->map_len, c->eh, c->go,
                                 f->address, &delta);
+    if (sym) func_tally_add(sym);
+    else func_unattributed++;
+
+    if (!verbose) return;
     printf("%s at offset: 0x%" PRIx64, f->title, f->address);
     if (sym) {
         if (delta) printf(" <%s+0x%" PRIx64 ">", sym, delta);
@@ -982,6 +1111,7 @@ int main(int argc, char **argv)
                 printf("%8" PRIu64 "  %s\n", tally[i].count, tally[i].title);
             printf("\n");
         }
+        func_tally_print();
         // Only when there were any, so the usual run is unchanged: a
         // scan that resynchronized past undecodable halfwords is not a
         // clean sweep of the section, and nothing else said so.

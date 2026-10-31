@@ -41,8 +41,8 @@ TEXT_ADDR = 0x11000
 # Two functions, each an `auipc ra,0` + `jalr ra,16(ra)` call pair that
 # folds to `jal` -- the smallest thing that reports a finding -- with the
 # second starting eight bytes in.
-TEXT = bytes.fromhex('97000000') + bytes.fromhex('e7800001') + \
-       bytes.fromhex('97000000') + bytes.fromhex('e7800001')
+PAIR = bytes.fromhex('97000000') + bytes.fromhex('e7800001')
+TEXT = PAIR * 2
 NAMES = [b'main.alpha', b'main.beta']
 
 def pclntab(magic=0xfffffff1, minlc=4, ptrsize=8, text_start=0,
@@ -83,14 +83,14 @@ def pclntab(magic=0xfffffff1, minlc=4, ptrsize=8, text_start=0,
     assert len(hdr) == 72, len(hdr)
     return hdr + funcname + functab + funcs
 
-def elf(path, pcln):
+def elf(path, pcln, text=TEXT):
     shstr = b'\0.text\0.gopclntab\0.shstrtab\0'
     name_text = shstr.index(b'.text\0')
     name_pcln = shstr.index(b'.gopclntab\0')
     name_shstr = shstr.index(b'.shstrtab\0')
     ehsize, shentsize, nsec = 64, 64, 4
     off = ehsize
-    text_off = off;  off += len(TEXT)
+    text_off = off;  off += len(text)
     pcln_off = off;  off += len(pcln)
     shstr_off = off; off += len(shstr)
     sh_off = (off + 7) & ~7
@@ -109,11 +109,11 @@ def elf(path, pcln):
         return struct.pack('<IIQQQQIIQQ', name, typ, flags, addr, offset,
                            size, 0, 0, 1, 0)
     sh = shdr(0, 0, 0, 0, 0, 0)
-    sh += shdr(name_text, 1, 0x2 | 0x4, TEXT_ADDR, text_off, len(TEXT))
+    sh += shdr(name_text, 1, 0x2 | 0x4, TEXT_ADDR, text_off, len(text))
     sh += shdr(name_pcln, 1, 0x2, 0, pcln_off, len(pcln))
     sh += shdr(name_shstr, 3, 0, 0, shstr_off, len(shstr))
 
-    blob = bytes(eh) + TEXT + pcln + shstr
+    blob = bytes(eh) + text + pcln + shstr
     blob += b'\0' * (sh_off - len(blob)) + sh
     open(os.path.join(out, path), 'wb').write(blob)
 
@@ -135,6 +135,9 @@ elf('nameoff_wild', pclntab(nameoffs=[1, 0x7fffffff]))
 # A textStart that neither candidate can rescue: the functions would
 # land outside every executable section.
 elf('textstart_wild', pclntab(text_start=0xdead0000, sentinel=1 << 30))
+# Code past the end of the table's coverage, which the by-function
+# summary has to own up to rather than charge to the last function.
+elf('partial', pclntab(), text=PAIR * 3)
 PY
 
 named()
@@ -185,6 +188,26 @@ for m in bad_magic old_magic bad_ptrsize bad_minlc pad_set nfunc_zero \
         bad "$m: table refused, scan intact" "named $n, $t findings (want 0, $base)"
     fi
 done
+
+# A finding past the sentinel belongs to no function, and the
+# by-function summary says so rather than charging it to main.beta.
+got=$("$ROOT/riscvlint" "$WORK/partial" 2>/dev/null |
+          sed -n 's/^ *\([0-9]*\)  outside every function range$/\1/p')
+if [ "$got" = 1 ]; then
+    ok "a finding past the table's coverage is counted apart"
+else
+    bad "a finding past the table's coverage is counted apart" \
+        "outside-row count: '${got:-absent}'"
+fi
+# And the two inside it are still named, so the row is an addition
+# rather than the table giving up.
+got=$("$ROOT/riscvlint" -v "$WORK/partial" 2>/dev/null |
+          grep -o '<[^>]*>' | tr '\n' ' ')
+if [ "$got" = "<main.alpha> <main.beta> " ]; then
+    ok "the covered findings keep their names"
+else
+    bad "the covered findings keep their names" "got: $got"
+fi
 
 # --json carries the same name, since it goes through the same lookup.
 if command -v python3 > /dev/null 2>&1; then
