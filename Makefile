@@ -49,6 +49,11 @@ integration-test: riscvlint
 integration-test-regen: riscvlint
 	./scripts/run_fixtures.sh regen
 
+# The driver's exit status, which the snapshot suite cannot cover: it
+# compares stdout and discards the status.
+driver-test: riscvlint
+	./scripts/driver_test.sh
+
 # Corpus-mining research utilities (see "Mining tools" in README.md);
 # not part of the default build or test targets.
 tools: tools/pairscan tools/defuse tools/candscan
@@ -71,4 +76,5 @@ clean:
 	rm -f riscvlint riscvlint_test libriscvlint.a \
 		tools/pairscan tools/defuse tools/candscan *.o
 
-.PHONY: all build clean lib test integration-test integration-test-regen tools
+.PHONY: all build clean lib test integration-test integration-test-regen \
+	driver-test tools

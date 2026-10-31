@@ -1,5 +1,12 @@
 // riscvlint driver: walk the executable sections of a riscv64 ELF,
 // run the checks over each, and report findings.
+//
+// The exit status follows the grep convention: 0 for a clean scan, 1
+// when any opportunity was found, 2 on a tool failure -- a bad
+// invocation, an unreadable or malformed file, an allocation failure.
+// Without the third value a CI job cannot tell a dirty scan from a
+// broken run, and `riscvlint ./bianry && echo clean` reports a typo as
+// a clean binary.
 
 #include "riscvlint.h"
 
@@ -489,13 +496,16 @@ int main(int argc, char **argv)
         return 2;
     }
     cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
+    unsigned failures = 0;
     for (; argi < argc; argi++)
-        scan_file(handle, argv[argi]);
+        if (scan_file(handle, argv[argi]) != 0) failures++;
     cs_close(&handle);
 
     // The census is the whole report of a -i run; there are no findings
-    // to summarize below it.
-    if (census_mode) return 0;
+    // to summarize below it. It is a description of the file rather than
+    // a verdict on it, so it never sets the "found something" status --
+    // but a file that could not be read is still a tool failure.
+    if (census_mode) return failures ? 2 : 0;
 
     if (ntitles) {
         qsort(tally, ntitles, sizeof tally[0], cmp_tally);
@@ -506,5 +516,9 @@ int main(int argc, char **argv)
     }
     printf("%" PRIu64 " optimization opportunities in %" PRIu64
            " instructions\n", total_findings, total_insns);
-    return 0;
+    // A tool failure outranks a dirty scan: if one of five files could
+    // not be read, what the other four reported is not the answer to the
+    // question that was asked.
+    if (failures) return 2;
+    return total_findings ? 1 : 0;
 }

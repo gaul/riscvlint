@@ -741,6 +741,26 @@ faults. The census counts both the same way, because from the
 encodings they are the same thing; the sample addresses are what tells
 them apart.
 
+## Exit status
+
+The grep convention, so riscvlint can gate a test suite and CI can tell
+a dirty scan from a broken run:
+
+* **0** -- a clean scan, no opportunities found;
+* **1** -- at least one opportunity found;
+* **2** -- a tool failure: a bad invocation, an unknown `-m` name, an
+  unreadable or malformed file, an allocation failure.
+
+A tool failure outranks a dirty scan, so a run over five binaries one of
+which could not be read exits 2 whatever the other four reported: what
+they found is not the answer to the question that was asked. The `-i`
+census is a description of the file rather than a verdict on it and so
+never returns 1 -- nothing in it is a finding -- but a file it could not
+read is still a 2.
+
+`make driver-test` covers all three; the snapshot suite cannot, because
+it compares stdout and discards the status.
+
 ## Building
 
 Requires Capstone 6. Capstone 5.0.x decodes RISC-V too thinly to be
@@ -762,10 +782,10 @@ static on purpose: with a shared link the system's Capstone 5 wins at run
 time and reports subtly wrong output rather than failing.
 
 `make test` runs the unit suite, `make integration-test` the snapshot
-fixtures under `fixtures/`, and `make tools` the mining utilities. The
-fixture harness exits 2 rather than 0 when it cannot find an assembler
-that targets riscv64, so a missing toolchain cannot pass by testing
-nothing.
+fixtures under `fixtures/`, `make driver-test` the driver's exit
+statuses, and `make tools` the mining utilities. Both shell suites exit
+2 rather than 0 when they cannot find an assembler that targets
+riscv64, so a missing toolchain cannot pass by testing nothing.
 
 ## Mining tools
 
