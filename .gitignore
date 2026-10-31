@@ -4,6 +4,7 @@ libriscvlint.a
 tools/pairscan
 tools/defuse
 tools/candscan
+tools/tblgen_probe
 corpus/
 results/
 *.o

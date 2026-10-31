@@ -1283,50 +1283,82 @@ instructions it is 0.025%: the compilers emit the atomic directly, and
 what is left is the handful of places they could not. Sized, and too
 small to write.
 
-### SWAR popcount -> Zbb `cpop` -- at most 27, and the one baseline object does not count bits
+### SWAR popcount -> Zbb `cpop` -- **reopened at ~3,900; the rejection was wrong by 147x**
 
-Bounded rather than counted, which is the only honest form: without
-Zbb, `llvm.ctpop` expands to the Hacker's Delight sequence, and its
-four masks are what a detector would key on. The `-c` census counts the
-chains that build each, which sizes the candidate without writing it.
+Rejected here on a bound, then overturned by the second baseline C++
+object, which is the whole reason that object was added. The figure was
+wrong by two orders of magnitude and the cause was a defect in one of
+this project's own tools, so the whole episode is kept rather than
+quietly replaced.
 
-| constant | libxul | libLLVM | go compile | ripgrep | corpus |
-|---|---:|---:|---:|---:|---:|
-| `0x55555555` | 53 | 2 | 1 | 0 | 107 |
-| `0x33333333` | 706 | 1 | 1 | 0 | 842 |
-| `0x0f0f0f0f` | 27 | 1 | 1 | 0 | 41 |
-| `0x01010101` | 1,475 | 26 | 0 | 17 | 1,943 |
-| any 64-bit form | 0 | 0 | 0 | 0 | **0** |
+**What the rejection said.** Without Zbb, `llvm.ctpop` expands to the
+Hacker's Delight sequence, whose four masks a detector would key on.
+The `-c` census counts the chains that build each, and came back with
+53, 706, **27** and 1,475 for libxul. A sequence needs all four, so --
+the argument went -- the smallest column bounds how many can be
+co-located: at most 27. libxul also had zero `cpop` while libllvm20,
+which declares Zbb, had 1,291, so the population looked like a fact
+about which binaries had been collected.
 
-A sequence needs all four, so the smallest column bounds the number
-that can be co-located: **at most 27 in libxul, at most 1 anywhere
-else.** And the counts are wildly unbalanced, which says most of these
-constants are something else entirely -- `0x01010101` is the byte
-broadcast every `memchr` and `strlen` uses, and at 1,475 against 27 it
-cannot be popcount.
+**The bound was not a bound.** riscvlint's `-c` census only matches a
+chain whose steps are **contiguous**, and LLVM's scheduler interleaves
+them. Here is a real 32-bit SWAR popcount, at `debian-libllvm22`
+0x4c92640:
 
-The zero row is the stronger signal. The 64-bit popcount is where the
-sequence costs most -- a dozen instructions and four 64-bit constants
--- and not one of those constants is built anywhere in 73 million
-instructions.
+```
+4c92640: lui  a3,0x33333
+4c92644: addi a3,a3,819        # a3 = 0x33333333, counted
+4c92648: sub  a1,a1,a2         # x -= (x>>1) & 0x5555...
+4c9264a: and  a2,a1,a3
+4c9264e: srli a1,a1,0x2
+4c92650: and  a1,a1,a3
+4c92652: lui  a3,0xf0f1        <-- this chain starts here
+4c92656: add  a1,a1,a2
+4c92658: srli a2,a1,0x4
+4c9265c: add  a1,a1,a2
+4c9265e: lui  a2,0x1010
+4c92662: addi a3,a3,-241       <-- and finishes five instructions later
+4c92666: and  a1,a1,a3         #    0x0f0f0f0f, not counted
+```
 
-What the corpus does instead settles it:
+So the smallest column was the most undercounted rather than the
+binding one, and using it as a bound inverted the error.
 
-| object | declares Zbb | `cpop`/`cpopw` |
-|---|---|---:|
-| libxul | no | **0** |
-| libLLVM | yes | 1,291 |
-| go compile | no attributes | 41 |
-| ripgrep | yes | 1 |
+**What the masks actually number.** Counted by encoding instead --
+`lui rd,imm20` is one word per rd, so the count needs no disassembly
+and no adjacency at all:
 
-libLLVM counts bits 1,291 times and spells it `cpop` because it was
-allowed to. libxul is the one baseline-rv64gc object in the corpus and
-it does not count bits at all. So the population this check would
-report exists only on a target without Zbb, and the only such target
-here has nothing to report -- which makes the figure a property of
-which binaries are in the corpus rather than of the compilers. A third
-baseline C++ object that happened to use `__builtin_popcountll` could
-change the answer; nothing in this corpus can.
+| | `0x55555` | `0x33333` | `0xf0f1` | `0x1010` |
+|---|---:|---:|---:|---:|
+| libxul (baseline) | 4,007 | 3,983 | **3,972** | 6,647 |
+| debian-libllvm22 (baseline) | 3,097 | 3,113 | 3,109 | 3,158 |
+| ubuntu-libllvm22 (RVA23) | 17 | 9 | 5 | 97 |
+
+libxul's `0x0f0f0f0f` is 3,972, not 27: the census undercounted it
+**147-fold**. And the measurement validates itself -- the first three
+masks have no use outside this sequence and they agree to within 1%,
+which a coincidence does not do, while the fourth is in excess because
+`0x01010101` is also the byte broadcast every `memchr` uses.
+
+**So libxul does count bits**, about 3,970 times, and "the one baseline
+object does not count bits" was the undercount talking rather than an
+observation. The `libllvm22` pair settles what the alternative is: the
+RVA23 build of that release uses `cpop`/`cpopw` 2,016 times and emits 5
+of these masks, the baseline build emits 3,109 of them and no `cpop` at
+all, and neither calls out to `__popcountdi2`.
+
+**Where that leaves the candidate.** Around 3,900 sites in the two
+baseline C++ objects, which would place it above ten of the twenty-two
+shipped checks. What it needs before it can be written is a detector
+that correlates the masks across a scheduling window rather than
+matching adjacent pairs -- the same gap, from the other side, as the
+census limitation. The fold is also unusually large for this project:
+twelve-odd instructions to one `cpop`, where every shipped check
+rewrites one, two or a short run.
+
+One thing the old entry got right and keeps: the 64-bit masks really
+are absent everywhere. The sequence LLVM emits on RV64 is the 32-bit
+one, which is why looking for `0x5555555555555555` found nothing.
 
 ### Redundant mask after a zero-extending load -- 1,354
 

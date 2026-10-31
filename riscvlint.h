@@ -931,6 +931,24 @@ size_t riscvlint_scan(riscvlint_state *state, csh handle,
 // `li`. A branch into the middle ends it, since the instructions after
 // the target are then reached without the ones before.
 //
+// **The steps must be contiguous, and that makes the census an
+// undercount.** A scheduler is free to put unrelated work between a
+// `lui` and its `addi`, and LLVM's does: in the SWAR popcount at
+// `debian-libllvm22` 0x4c92640 the `0x0f0f0f0f` pair is five
+// instructions apart, so that chain is invisible here while the
+// `0x33333333` pair beside it is counted. Non-uniformly, therefore --
+// a value whose chain the scheduler tends to split reads as rarer than
+// one whose chain it leaves alone, which is worse than a flat
+// undercount because it reorders the ranking.
+//
+// Do not read a low count as evidence of absence. TODO.md's popcount
+// entry is what that mistake looks like: the four masks of one
+// sequence came back at 53, 706, 27 and 1,475, the 27 was taken for a
+// bound on how many sequences could exist, and the sequences were
+// there all along. Fixing it means carrying a per-register table of
+// chains in flight, the way the windowed memory table already carries
+// slots, rather than requiring adjacency.
+//
 // Two things the report says that a by-value tally alone would not.
 //
 // Whether the value is a *constant* or an *address*: in a linked

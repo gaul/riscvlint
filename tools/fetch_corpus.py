@@ -3,17 +3,32 @@
 so the mining tools see real optimized code from three different
 compilers rather than toy test cases.
 
-Ubuntu 26.04 (resolute) is the source for all but one. Firefox is the
-exception: Ubuntu ships it as a snap and its riscv64 deb does not exist,
-so libxul.so comes from Debian instead. That is worth knowing when
-reading any extension-gated figure -- Ubuntu 26.04 targets RVA23 and
-Debian riscv64 targets the rv64gc baseline, so the same check can be
+Ubuntu 26.04 (resolute) is the source for most. Which distro a package
+comes from is never incidental: **Ubuntu riscv64 targets RVA23 and
+Debian riscv64 targets the rv64gc baseline**, so the same check can be
 silent on one and loud on the other for reasons that have nothing to do
-with the compiler."""
+with the compiler. Surveyed rather than assumed -- over the 100
+most-installed packages in each (popcon order), Ubuntu 26.10's 407
+riscv64 ELFs carry one single arch string and it names every RVA23
+extension, while Debian sid's 494 carry three variants and not one Zb,
+V or Zfa token between them.
+
+Two members exist to make that difference measurable rather than merely
+known: `libllvm22` at upstream 22.1.8 from **both** distros, which is
+the same source, the same Debian packaging lineage and the same
+compiler differing only in `-march`. Every "what would rebuilding for
+RVA23 buy me" figure this project reports is otherwise a prediction
+against an object that was never rebuilt; this pair is the control.
+Firefox's libxul.so comes from Debian for a duller reason -- Ubuntu
+ships Firefox as a snap and has no riscv64 deb at all."""
 import hashlib, os, subprocess, sys, tempfile, shutil, struct
 
 BASE = "http://ports.ubuntu.com/ubuntu-ports/pool"
 DEBIAN = "http://deb.debian.org/debian/pool"
+# lang, url, and an optional tag replacing the package name in the
+# corpus filename. The tag exists because the same package can come
+# from two distros: both libllvm22 debs unpack a `libLLVM.so.22.1`, and
+# without a distinguishing name the second would land on the first.
 PKGS = [
     # lang, url
     ("cpp",  f"{BASE}/universe/l/llvm-toolchain-20/libllvm20_20.1.8-2ubuntu8_riscv64.deb"),
@@ -26,9 +41,15 @@ PKGS = [
     # body of Rust that is neither a search tool nor a one-binary CLI.
     ("rust", f"{BASE}/main/r/rust-coreutils/rust-coreutils_0.10.0-1ubuntu2_riscv64.deb"),
     # libxul.so, from Debian -- see the module docstring. The largest
-    # single C++ object available for riscv64 anywhere, and the only
-    # corpus member not built for RVA23.
+    # single C++ object available for riscv64 anywhere.
     ("cpp",  f"{DEBIAN}/main/f/firefox-esr/firefox-esr_153.1.0esr-1_riscv64.deb"),
+    # The controlled pair: libLLVM 22.1.8 built for the rv64gc baseline
+    # and for RVA23, from the same upstream release. 132 MB and 138 MB
+    # of C++, which makes each of them larger than libxul.
+    ("cpp",  f"{DEBIAN}/main/l/llvm-toolchain-22/libllvm22_22.1.8-1+b2_riscv64.deb",
+             "debian-libllvm22"),
+    ("cpp",  f"{BASE}/main/l/llvm-toolchain-22/libllvm22_22.1.8-1ubuntu1_riscv64.deb",
+             "ubuntu-libllvm22"),
     ("go",   f"{BASE}/main/g/golang-1.26/golang-1.26-go_1.26.0-1_riscv64.deb"),
     ("go",   f"{BASE}/universe/g/gh/gh_2.46.0-4_riscv64.deb"),
     ("go",   f"{BASE}/main/r/restic/restic_0.18.1-3ubuntu1_riscv64.deb"),
@@ -53,7 +74,9 @@ def main():
     for lang in ("cpp", "rust", "go"):
         os.makedirs(os.path.join(ROOT, lang), exist_ok=True)
     os.makedirs(DEBS, exist_ok=True)
-    for lang, url in PKGS:
+    for entry in PKGS:
+        lang, url = entry[0], entry[1]
+        tag = entry[2] if len(entry) > 2 else None
         deb = os.path.join(DEBS, os.path.basename(url).replace("%2b", "+"))
         if not os.path.exists(deb) or os.path.getsize(deb) == 0:
             print(f"GET {os.path.basename(deb)}", flush=True)
@@ -67,7 +90,7 @@ def main():
             for name in os.listdir(tmp):
                 if name.startswith("data.tar"):
                     subprocess.run(["tar", "xf", name], cwd=tmp, check=True)
-            pkg = os.path.basename(deb).split("_")[0]
+            pkg = tag or os.path.basename(deb).split("_")[0]
             # Group by content before copying anything. A multi-call
             # binary ships under one name per applet -- uutils has about
             # 120 of them, all byte-identical and 10 MB each -- and

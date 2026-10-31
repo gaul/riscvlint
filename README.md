@@ -1043,6 +1043,15 @@ immediate -- `li`, `lui`, `c.li`, `c.lui` -- followed by however many
 middle ends it, since the instructions after the target are then
 reached without the ones before.
 
+**The steps have to be contiguous, so the census undercounts.** A
+scheduler may put unrelated work between a `lui` and its `addi`, and
+LLVM's does -- in one SWAR popcount in the corpus the `0x0f0f0f0f` pair
+is five instructions apart, so that chain is missed while the
+`0x33333333` pair beside it is counted. The undercount is therefore
+uneven, which reorders the ranking rather than just shortening it, and
+a low count here is not evidence that a value is rarely built. TODO.md's
+popcount entry is what mistaking it for one costs.
+
 ```console
 $ ./riscvlint -c -q corpus/cpp/firefox-esr--libxul.so
 Constant chains in corpus/cpp/firefox-esr--libxul.so: 2219042 materializations, 2395605 instructions
@@ -1341,36 +1350,77 @@ model, and the checker itself should decode raw encodings.
 
 ## Corpus
 
-The figures in TODO.md come from 73,139,165 instructions of riscv64 code
--- three toolchains, so a finding can be attributed to one rather than
-assumed universal:
+The figures in TODO.md come from 108,165,211 instructions of riscv64
+code -- three toolchains, so a finding can be attributed to one rather
+than assumed universal:
 
 | language | binaries | source packages |
 |---|---|---|
-| C++ | 11 | `libllvm20`, `libqt6core6t64`, `firefox-esr` |
+| C++ | 13 | `libllvm22` (twice), `libllvm20`, `libqt6core6t64`, `firefox-esr` |
 | Rust | 6 | `ripgrep`, `fd-find`, `bat`, `hyperfine`, `rust-coreutils` |
 | Go | 12 | `golang-1.26-go`, `gh`, `restic` |
 
-All but one come from Ubuntu 26.04 (resolute). Firefox is the exception:
-Ubuntu ships it as a snap and has no riscv64 deb, so `libxul.so` comes
-from Debian -- and that turns out to be the most useful thing about it.
+Which distro a package comes from is the most important thing about it,
+and it is surveyed rather than assumed. Over the 100 most-installed
+packages of each (popcon order), unpacked and read:
 
-Ubuntu 26.04 riscv64 targets RVA23, so most of this is not a
-baseline-rv64gc corpus: `Tag_RISCV_arch` carries
-`zba1p0_zbb1p0_zbs1p0_v1p0_zicond1p0_zcb1p0` and the code uses it. Read
-the Zba families in TODO.md accordingly -- those are compiler misses on a
-target that has the instructions, not the absence of an extension.
+| | riscv64 ELFs | distinct `Tag_RISCV_arch` | Zba/Zbb/Zbs/Zcb/Zfa/V |
+|---|---:|---:|---|
+| Ubuntu 26.10 (stonking) | 407 | 1 | all of them, in all 407 |
+| Debian sid | 494 | 3 | **none, in any** |
 
-`libxul.so` is the counterweight: Debian riscv64 targets the rv64gc
-baseline, so it declares no `zba`, `zbb`, `zbs`, `zicond` or `zcb` at
-all. It is the only corpus member for which `-m rva23` answers anything,
-and what it answers is large -- 70,697 extra findings from the two Zba
-checks alone. Every "GCC and LLVM already take that extension" result in
-TODO.md is a statement about an RVA23 target, and libxul is where you
-can see what the same compilers do without one.
+So **Ubuntu riscv64 is uniformly RVA23 and Debian riscv64 is uniformly
+rv64gc baseline**, with no per-package variation on either side worth
+hunting for. Read every extension-gated figure in TODO.md with that in
+mind: a Zba result from an Ubuntu object is a compiler miss on a target
+that has the instructions, and the same check against a Debian object
+is a question about what rebuilding would buy.
 
-At 35,581,433 instructions it is also half the corpus by itself, which is
-worth remembering before reading any pooled figure as representative.
+### The libllvm22 pair
+
+`libllvm22` is in the corpus twice, from both distros, at the same
+upstream release (22.1.8) and the same Debian packaging lineage:
+
+| | instructions | RVA22 | RVA23 |
+|---|---:|---|---|
+| `debian-libllvm22` | 17,409,506 | none | none |
+| `ubuntu-libllvm22` | 17,616,540 | Zba 297,616, Zbb 56,930, Zbs 53,217 | V 380,719, Zcb 166,673, Zicond 118,139, Zfa 381 |
+
+It was added to be the control every "what would rebuilding for RVA23
+buy me" figure lacks -- those are all predictions about an object
+nobody rebuilt. **It is not a clean control, and the reason is worth
+more than the pair was.** The two builds differ in compiler as well as
+in `-march`: Ubuntu's has 140,895 `addi sp,s0,-K` frame-pointer
+teardowns and Debian's has 1, which is the idiom TODO.md already
+attributes to clang against GCC. Both binaries are stripped of
+`.comment`, so that inference is from codegen rather than from a
+producer string, but a 140,000-to-1 ratio in one idiom is not a
+`-march` effect.
+
+So read the pair as two baseline-versus-RVA23 builds of the same
+source, not as one variable changed. What it establishes anyway:
+
+* riscvlint predicts 174,980 Zcb-compressible instructions in the
+  baseline build under `-m rva23`; the RVA23 build of the same release
+  contains 166,673 actual Zcb instructions. Within 5%, across two
+  compilers -- suggestive, and confounded, and the first time any such
+  prediction has been held against a real rebuild at all;
+* the Zba checks predict 39,460 (21,627 shift-add plus 17,833
+  `zext.w`) against 297,616 Zba instructions realized, which is the
+  honest shape of a *subset* predictor: riscvlint checks two Zba idioms
+  and the compiler uses `add.uw`, `slli.uw` and the `sh*add.uw` family
+  besides;
+* and it overturned a rejection this project had already recorded, by
+  exposing a 147-fold undercount in the `-c` census rather than by
+  disagreeing with libxul. TODO.md's popcount entry has it.
+
+`libxul.so` remains the other baseline C++ member, and at 35,581,433
+instructions it is still the largest single object from one source. It
+was never the problem, though -- the lesson the pair taught is about the
+tool, not the corpus. A check about counting bits measured 27 sites
+against libxul and looked dead; the real figure is 3,972, and the `-c`
+census had undercounted it 147-fold because LLVM's scheduler splits the
+`lui` from its `addi`. A second object is what made that visible.
 
 `corpus/` is not checked in. Fetch it with
 `tools/fetch_corpus.py`, then:
