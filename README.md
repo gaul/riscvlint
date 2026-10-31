@@ -3,8 +3,8 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Thirty-five checks are implemented and the ledger's candidate list
-holds ten, all from a JIT corpus. [TODO.md](TODO.md) is that ledger: every candidate that was
+Thirty-six checks are implemented and the ledger's candidate list
+holds nine, all from a JIT corpus. [TODO.md](TODO.md) is that ledger: every candidate that was
 measured, the population it came back with, and the ones rejected on
 that evidence.
 What got written was decided by the corpus rather than by intuition,
@@ -12,9 +12,9 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Thirty-five of them, and the table lists twenty-seven. The jump pair
-has so far been measured over the JetStream corpus of TODO.md, which
-the table does not cover. Seven report nothing over this corpus -- the bit count because no baseline object
+Thirty-six of them, and the table lists twenty-seven. The jump pair
+and the constant chain have so far been measured over the JetStream
+corpus of TODO.md, which the table does not cover. Seven report nothing over this corpus -- the bit count because no baseline object
 declares Zbb; the three indexed loads, the equality branch and the
 compare-exchange loop because those five require their extension to be
 positively present rather than merely un-denied, and no object declares
@@ -746,6 +746,46 @@ except a handful of `jalr ra,0(ra)` that were already two.
   `sb zero` and `sh zero` have no compressed spelling at all -- the two
   figures are the same and the finding matches the disassembly byte for
   byte.
+
+* **constant built in more instructions than li needs** -- a chain of
+  `lui` or `li` followed by `addi`, `addiw`, `slli`, `ori` or `xori`
+  reading and writing the same register, in either width, longer than
+  the plain RV64I recurrence needs for the value it ends up holding:
+  `lui`+`addiw` for a 32-bit value, otherwise the high part
+  recursively, one `slli` by its trailing zeros plus twelve, and an
+  `addi` for the low twelve bits.
+
+  ```
+   12e77b0: lui t6, 0x156
+   12e77b4: addi t6, t6, 866
+   12e77b8: slli t6, t6, 0xb
+   12e77bc: ori t6, t6, 0x3f0
+   12e77c0: slli t6, t6, 0x6
+   12e77c4: ori t6, t6, 0x0    -> li t6, 0x2ac6c4fc00 in 4 instructions
+  ```
+
+  The recurrence is a construction, so it is achievable, and that is
+  all a finding saying "more than needed" has to know; the assemblers
+  find shorter sequences for some values, which makes the count an
+  upper bound and the check conservative. The chain ends at the first
+  instruction that is not such a step or that another path joins, and
+  a relocated instruction anywhere in it drops the site, since in an
+  unlinked object the immediates are placeholders. The replacement is
+  priced at the chain's own encoding class, as the branch-over-jump
+  entry prices its branch, so that the saving does not include what the
+  compression check already reports.
+
+  Compilers emit the recurrence themselves. V8 does not: its builtin
+  and code addresses go through a fixed six-instruction sequence that
+  `set_target_address` can patch any 48-bit value into, and the
+  JetStream corpus (TODO.md, entry 37) has 554,655 of those where four
+  instructions do, 402,172 of them feeding a `jalr`. The check reports
+  562,957 there, 4,488,784 bytes or 3.0% of the corpus's code: 407,910
+  in Maglev, 85,201 in TurboFan, 48,735 in baseline and 21,056 in
+  regexp code. By what the value needs, 554,655 are four instructions,
+  2,292 three, 1,288 two and 4,722 one, the last being pairs such as
+  `lui a5,4; slli a5,a5,4` for what `lui a5,0x40` holds. Whether the
+  package corpus has any is for the table's next regeneration to say.
 
 * **constant re-materialization** -- a constant built into a register
   while the same value is still live in another, where the constant is

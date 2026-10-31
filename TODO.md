@@ -1482,7 +1482,7 @@ which is to the digit what check 3 reports over this corpus.
 | # | opportunity | estimate | where | status |
 |---|---|---:|---|---|
 | 36 | `auipc rd,hi` + `jr lo(rd)` to a target inside `j`'s reach | 1,116,777 | ML 703K, TF 224K, BL 111K, RE 73K | **implemented**, 720,121 |
-| 37 | a constant built in more instructions than `li` needs | 558,869 | ML 404K, TF 83K, BL 49K, RE 21K | candidate |
+| 37 | a constant built in more instructions than `li` needs | 558,869 | ML 404K, TF 83K, BL 49K, RE 21K | **implemented**, 562,957 |
 | 38 | an instruction with no architectural effect | 812,586 | ML 764K | candidate |
 | 39 | a conditional branch whose target is an unconditional jump | 177,202 | ML 137K, TF 17K, RE 14K | candidate |
 | 40 | pushes one stack adjustment would do | 81,103 runs | ML 78K | candidate |
@@ -1530,7 +1530,7 @@ usually a `li` into another register followed by a call, and the walk
 treats a call as possibly reading its arguments; t6 is not one, so most
 exits pass, and the ones that do not are the ones that jump on.
 
-## 37. A constant built in more instructions than `li` needs -- 558,869
+## 37. A constant built in more instructions than `li` needs -- 562,957  [implemented]
 
 A chain of `lui` or `li` followed by `addi`/`addiw`/`slli`/`ori`/`xori`
 on one register, longer than the plain RV64I recurrence needs for the
@@ -1551,6 +1551,17 @@ object the same shape carries HI20/LO12 relocations and its immediates
 are placeholders, which riscvlint_is_relocated already handles and
 leaves the check nothing to say about them; over a linked object it is
 a measurement of the compiler's `li`.
+
+What check_long_li reports: 562,957 chains worth 4,488,784 bytes, 3.0%
+of the corpus's code -- 407,910 Maglev, 85,201 TurboFan, 48,735
+baseline, 21,056 regexp, 55 wrappers. By what the value needs: 554,655
+four instructions, 2,292 three, 1,288 two and 4,722 one, the last being
+pairs such as `lui a5,4; slli a5,a5,4` for what `lui a5,0x40` holds.
+The check and the miner agree to the digit on the 554,655 and differ
+only on the short pairs, where the check sees 4,722 that one instruction
+holds and the miner's grammar saw 772. The replacement is priced at the
+chain's own encoding class, four bytes an instruction here since V8
+emits no compressed instruction, so a six-for-four site saves eight.
 
 ## 38. An instruction with no architectural effect -- 812,586
 
@@ -1631,7 +1642,7 @@ not tracked (about 75K, every one a dispatch handle that a later
 
 # Remaining candidates
 
-Ten, 37 to 46, all from the JetStream corpus above; over the package
+Nine, 38 to 46, all from the JetStream corpus above; over the package
 corpus there are none. Thirty-four checks are implemented and everything
 this file sized over that corpus is either written or recorded as
 rejected with the evidence that rejected it. The last thirteen did not come from a corpus probe at all: 23

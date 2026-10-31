@@ -25,6 +25,10 @@ instruction compressible to a base C form at offset: 0x10: -> c.addiw (4 -> 2 by
 instruction compressible to a base C form at offset: 0x14: -> c.lui (4 -> 2 bytes) (1 instructions)
   lui a5, 4
 
+constant built in more instructions than li needs at offset: 0x14: -> li a5, 0x40000 in 1 instructions (8 -> 4 bytes) (2 instructions)
+  lui a5, 4
+  slli a5, a5, 4
+
 dead register definition at offset: 0x18: -> delete; nothing reads a5 (4 bytes) (1 instructions)
   slli a5, a5, 4
 
@@ -139,5 +143,6 @@ instruction compressible to a base C form at offset: 0xc4: -> c.jr (4 -> 2 bytes
 Optimization opportunities by type:
       35  instruction compressible to a base C form
       11  dead register definition
+       1  constant built in more instructions than li needs
 
-46 optimization opportunities in 50 instructions
+47 optimization opportunities in 50 instructions

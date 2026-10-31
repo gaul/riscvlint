@@ -1369,6 +1369,25 @@ bool check_not_logic_fold(riscvlint_state *state, const cs_insn *insn,
 bool check_jump_pair_to_j(riscvlint_state *state, const cs_insn *insn,
                           riscvlint_finding *finding);
 
+// A constant built on one register -- `lui` or `li`, then `addi`,
+// `addiw`, `slli`, `ori` or `xori` reading and writing that register,
+// in either width -- in more instructions than the plain RV64I
+// recurrence needs for the value the chain ends up holding. The chain
+// ends at the first instruction that is not such a step or that another
+// path joins; a relocated instruction anywhere in it drops the site,
+// since in an unlinked object the immediates are placeholders.
+//
+// The replacement is priced at the chain's own encoding class, as the
+// branch-over-jump check prices its branch, so that the saving does not
+// include what the compression check already reports.
+//
+// Measured population: 558,869 chains in the JetStream corpus (TODO.md,
+// entry 37), 554,655 of them V8's fixed six-instruction load of a
+// 48-bit builtin address where four do. Compilers emit the recurrence
+// themselves, so over the package corpus the shape is rare.
+bool check_long_li(riscvlint_state *state, const cs_insn *insn,
+                   riscvlint_finding *finding);
+
 // ---- running every check ----
 //
 // Called once per finding, with `ctx` as given. The finding is valid

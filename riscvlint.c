@@ -5319,6 +5319,185 @@ bool check_jump_pair_to_j(riscvlint_state *state, const cs_insn *insn,
     return true;
 }
 
+// ---- a constant built in more instructions than li needs ----
+
+typedef enum { LI_NONE, LI_START, LI_STEP } li_step_kind;
+
+// What the instruction `w` does to a constant being built in a register:
+// starts one (lui, c.lui, li, c.li) or extends one it reads and writes
+// in the same register (addi, addiw, slli, ori, xori and the compressed
+// addi, addiw and slli). `cur` is the value so far; on a START it is
+// ignored. The arithmetic is done unsigned and reinterpreted, since the
+// chains that matter here wrap by design.
+static li_step_kind li_chain_step(uint32_t w, unsigned size, int64_t cur,
+                                  unsigned *rd, int64_t *val)
+{
+    uint64_t u = (uint64_t)cur;
+    if (size == 4) {
+        unsigned op = RV_OPCODE(w), f3 = (w >> 12) & 0x7u;
+        unsigned d = (w >> 7) & 0x1fu, s1 = (w >> 15) & 0x1fu;
+        int64_t imm = sign_extend((uint64_t)(w >> 20) & 0xfffu, 12);
+        if (d == 0) return LI_NONE;
+        if (op == 0x37u) {                                      // lui
+            *rd = d;
+            *val = sign_extend((uint64_t)(w & 0xfffff000u), 32);
+            return LI_START;
+        }
+        if (op == 0x13u && f3 == 0 && s1 == 0) {                // li
+            *rd = d;
+            *val = imm;
+            return LI_START;
+        }
+        if (s1 != d) return LI_NONE;
+        *rd = d;
+        if (op == 0x13u) {
+            switch (f3) {
+            case 0: *val = (int64_t)(u + (uint64_t)imm); return LI_STEP;
+            case 1:                                             // slli
+                if ((w >> 26) != 0) return LI_NONE;
+                *val = (int64_t)(u << ((w >> 20) & 0x3fu));
+                return LI_STEP;
+            case 4: *val = (int64_t)(u ^ (uint64_t)imm); return LI_STEP;
+            case 6: *val = (int64_t)(u | (uint64_t)imm); return LI_STEP;
+            default: return LI_NONE;
+            }
+        }
+        if (op == 0x1bu && f3 == 0) {                           // addiw
+            *val = sign_extend((u + (uint64_t)imm) & 0xffffffffu, 32);
+            return LI_STEP;
+        }
+        return LI_NONE;
+    }
+    if (size != 2) return LI_NONE;
+    unsigned cop = w & 0x3u, f3 = (w >> 13) & 0x7u;
+    unsigned d = (w >> 7) & 0x1fu;
+    int64_t imm6 = sign_extend((uint64_t)(((w >> 12) & 1u) << 5) |
+                               ((w >> 2) & 0x1fu), 6);
+    if (d == 0) return LI_NONE;
+    if (cop == 1) {
+        switch (f3) {
+        case 2:                                                 // c.li
+            *rd = d;
+            *val = imm6;
+            return LI_START;
+        case 3:                                                 // c.lui
+            if (d == 2 || imm6 == 0) return LI_NONE;
+            *rd = d;
+            *val = imm6 << 12;
+            return LI_START;
+        case 0:                                                 // c.addi
+            if (imm6 == 0) return LI_NONE;                      // a hint
+            *rd = d;
+            *val = (int64_t)(u + (uint64_t)imm6);
+            return LI_STEP;
+        case 1:                                                 // c.addiw
+            *rd = d;
+            *val = sign_extend((u + (uint64_t)imm6) & 0xffffffffu, 32);
+            return LI_STEP;
+        default:
+            return LI_NONE;
+        }
+    }
+    if (cop == 2 && f3 == 0) {                                  // c.slli
+        unsigned sh = (((w >> 12) & 1u) << 5) | ((w >> 2) & 0x1fu);
+        if (sh == 0) return LI_NONE;                            // a hint
+        *rd = d;
+        *val = (int64_t)(u << sh);
+        return LI_STEP;
+    }
+    return LI_NONE;
+}
+
+// The plain RV64I recurrence for materializing `v`: lui and addiw, or
+// either alone, for a value that fits 32 bits; otherwise the high part
+// recursively, one slli by its trailing zeros plus twelve, and an addi
+// for the low twelve bits where they are not zero. It is a construction
+// and so achievable, which is all a check saying "more than needed" has
+// to know; the assemblers find shorter ones for some values, which
+// makes this an upper bound and the check conservative.
+//
+// It is priced at the encoding class of the chain it replaces -- four
+// bytes an instruction where the chain had a four-byte instruction in
+// it, the compressed form where the chain was all compressed and the
+// form exists -- the rule the branch-over-jump check uses, so that
+// compression stays the compression check's finding.
+static void li_plan(int64_t v, unsigned rd, bool compressed, unsigned *insns,
+                    unsigned *bytes)
+{
+    int64_t lo = sign_extend((uint64_t)v & 0xfffu, 12);
+    bool fits6 = lo >= -32 && lo <= 31;
+    if (v >= INT32_MIN && v <= INT32_MAX) {
+        int64_t hi20 = sign_extend((((uint64_t)v - (uint64_t)lo) >> 12) &
+                                   0xfffffu, 20);
+        if (hi20 != 0) {
+            (*insns)++;
+            *bytes += (compressed && rd != 2 && hi20 >= -32 && hi20 <= 31)
+                          ? 2 : 4;
+        }
+        if (lo != 0 || hi20 == 0) {
+            (*insns)++;
+            *bytes += (compressed && fits6) ? 2 : 4;
+        }
+        return;
+    }
+    int64_t hi = (int64_t)((uint64_t)v - (uint64_t)lo) >> 12;
+    while ((hi & 1) == 0) hi >>= 1;
+    li_plan(hi, rd, compressed, insns, bytes);
+    (*insns)++;
+    *bytes += compressed ? 2 : 4;
+    if (lo != 0) {
+        (*insns)++;
+        *bytes += (compressed && fits6) ? 2 : 4;
+    }
+}
+
+bool check_long_li(riscvlint_state *state, const cs_insn *insn,
+                   riscvlint_finding *finding)
+{
+    uint32_t w;
+    if (!riscvlint_word_at(state, insn->address, &w)) return false;
+    unsigned rd, r;
+    int64_t val;
+    if (li_chain_step(w, insn->size, 0, &rd, &val) != LI_START) return false;
+    // In an unlinked object the immediates are placeholders waiting on
+    // HI20/LO12 relocations and the value computed from them is fiction.
+    if (riscvlint_is_relocated(state, insn->address)) return false;
+
+    unsigned len = 1, bytes = insn->size;
+    bool compressed = insn->size == 2;
+    uint64_t at = insn->address + insn->size;
+    for (;;) {
+        uint32_t w2;
+        if (!riscvlint_word_at(state, at, &w2)) break;
+        unsigned size2 = rv_insn_len(w2);
+        int64_t next;
+        if (li_chain_step(w2, size2, val, &r, &next) != LI_STEP || r != rd)
+            break;
+        // A side entry into the chain arrives with a value this chain
+        // did not build, so the chain ends where another path joins it.
+        if (riscvlint_is_branch_target(state, at)) break;
+        if (riscvlint_is_relocated(state, at)) return false;
+        val = next;
+        len++;
+        bytes += size2;
+        if (size2 == 4) compressed = false;
+        at += size2;
+    }
+    if (len < 2) return false;
+
+    unsigned need = 0, nbytes = 0;
+    li_plan(val, rd, compressed, &need, &nbytes);
+    if (need >= len || nbytes > bytes) return false;
+
+    finding->title = "constant built in more instructions than li needs";
+    finding->address = insn->address;
+    finding->insn_count = len;
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "li %s, 0x%" PRIx64 " in %u instructions (%u -> %u bytes)",
+             rv_reg_name(rd), (uint64_t)val, need, bytes, nbytes);
+    return true;
+}
+
 // ---- running every check ----
 
 static const riscvlint_check_fn riscvlint_checks[] = {
@@ -5357,6 +5536,7 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_cas_loop_to_amocas,
     check_not_logic_fold,
     check_jump_pair_to_j,
+    check_long_li,
 };
 
 size_t riscvlint_scan(riscvlint_state *state, csh handle,

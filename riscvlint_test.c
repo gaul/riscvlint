@@ -5438,6 +5438,51 @@ static void test_jump_pair_to_j(csh handle)
     CHECK(run_words(handle, check_jump_pair_to_j, zero, 6, 0x1000, NULL) == 0);
 }
 
+// check_long_li: a constant chain longer than the li recurrence needs.
+static void test_long_li(csh handle)
+{
+    riscvlint_finding f;
+
+    // V8's fixed 48-bit load: lui t6,0x156; addi 866; slli 11; ori 0x3f0;
+    // slli 6; ori 0; then the jalr through it. Six instructions for
+    // 0x2ac6c4fc00, which lui+addiw+slli 16+addi -1024 builds in four.
+    uint32_t v8[] = { 0x00156fb7u, 0x362f8f93u, 0x00bf9f93u, 0x3f0fef93u,
+                      0x006f9f93u, 0x000fef93u, 0x000f80e7u };
+    CHECK(run_words(handle, check_long_li, v8, 7, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement,
+                 "li t6, 0x2ac6c4fc00 in 4 instructions (24 -> 16 bytes)") == 0);
+    CHECK(f.insn_count == 6 && f.address == 0x1000);
+
+    // li a0,1; slli a0,a0,12; addi a0,a0,5 builds 0x1005: lui 1 + addiw 5.
+    uint32_t three[] = { 0x00100513u, 0x00c51513u, 0x00550513u, 0x00008067u };
+    CHECK(run_words(handle, check_long_li, three, 4, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement,
+                 "li a0, 0x1005 in 2 instructions (12 -> 8 bytes)") == 0);
+    CHECK(f.insn_count == 3);
+
+    // Optimal chains are not reported: lui+addiw, li+slli, a lone li.
+    uint32_t opt1[] = { 0x000015b7u, 0x0055859bu, 0x00008067u };
+    CHECK(run_words(handle, check_long_li, opt1, 3, 0x1000, NULL) == 0);
+    uint32_t opt2[] = { 0x00200613u, 0x02361613u, 0x00008067u };
+    CHECK(run_words(handle, check_long_li, opt2, 3, 0x1000, NULL) == 0);
+    uint32_t opt3[] = { 0x00100513u, 0x00008067u };
+    CHECK(run_words(handle, check_long_li, opt3, 2, 0x1000, NULL) == 0);
+
+    // A `j` back to the slli makes it a side entry, which ends the
+    // chain at the li: one instruction is never too many.
+    uint32_t entry[] = { 0x00100513u, 0x00c51513u, 0x00550513u,
+                         0xff9ff06fu /* j -8 */ };
+    CHECK(run_words(handle, check_long_li, entry, 4, 0x1000, NULL) == 0);
+
+    // Compressed: c.li a4,1; c.slli a4,12; c.addi a4,5 is six bytes
+    // where c.lui a4,1 + c.addiw a4,5 is four.
+    uint8_t rvc[] = { 0x05, 0x47, 0x32, 0x07, 0x15, 0x07, 0x82, 0x80 };
+    CHECK(run_window(handle, check_long_li, rvc, sizeof rvc, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement,
+                 "li a4, 0x1005 in 2 instructions (6 -> 4 bytes)") == 0);
+    CHECK(f.insn_count == 3);
+}
+
 int main(void)
 {
     csh handle;
@@ -5474,6 +5519,7 @@ int main(void)
     test_branch_over_jump(handle);
     test_transfer_to_next(handle);
     test_jump_pair_to_j(handle);
+    test_long_li(handle);
     test_zero_store_run(handle);
     test_bitcast_through_frame(handle);
     test_cchain(handle);
