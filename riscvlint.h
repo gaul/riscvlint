@@ -217,6 +217,18 @@ bool rv_decode_srli(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
 bool rv_decode_srai(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
                     unsigned *shamt);
 
+// ---- the atomics the A extension reserves ----
+//
+// Both live in the AMO major opcode with a funct5 of their own, carry
+// the aq and rl ordering bits, and have no compressed spelling, so both
+// decoders insist on four bytes. `width` comes back 4 or 8 for the word
+// and doubleword forms; the quad and sub-word ones belong to extensions
+// no check here reads.
+bool rv_decode_lr(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
+                  unsigned *width, unsigned *aq, unsigned *rl);
+bool rv_decode_sc(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
+                  unsigned *rs2, unsigned *width, unsigned *aq, unsigned *rl);
+
 // ---- analysis state ----
 //
 // One section at a time. The state owns the side-entry map, which is
@@ -243,6 +255,7 @@ typedef enum {
     RISCVLINT_EXT_ZFA = 1u << 5,
     RISCVLINT_EXT_ZILX = 1u << 6,
     RISCVLINT_EXT_ZIBI = 1u << 7,
+    RISCVLINT_EXT_ZACAS = 1u << 8,
     RISCVLINT_EXT_DECLARED = 1u << 31,
 } riscvlint_ext;
 
@@ -1253,6 +1266,50 @@ bool check_slli_srli_to_zexth(riscvlint_state *state, const cs_insn *insn,
 // has 309 and 165 shapes under `-m zbb`. See TODO.md.
 bool check_slli_srai_to_sext(riscvlint_state *state, const cs_insn *insn,
                              riscvlint_finding *finding);
+
+// A compare-exchange written as an LR/SC retry loop, which Zacas's
+// `amocas` does in one instruction:
+//
+//     L: lr.d.aq  rt, (ra)
+//        bne      rt, rexp, fail
+//        sc.d.rl  rs, rnew, (ra)
+//        bnez     rs, L
+//
+// becomes `mv rt,rexp` (or `li rt,0`) plus
+// `amocas.d.aqrl rt, rnew, (ra)`, leaving the comparison where it is:
+// amocas writes the loaded value to rt exactly as the loop did, so the
+// `bne` after it still decides the same thing.
+//
+// Two things make this unlike every other check here, and both follow
+// from amocas tying its destination to its expected-value operand.
+// The window is a loop rather than a straight line -- the loop head is
+// a branch target by construction, so only the three instructions after
+// it are asked about side entries -- and the replacement is two
+// instructions rather than one, because getting the expected value into
+// the destination register costs one the loop did not need.
+//
+// Scoped to a body of exactly one instruction, 13,072 of the corpus's
+// 14,655 LR/SC loops; a longer body is a read-modify-write around the
+// comparison and a different claim. `beq` in the body is refused, since
+// it leaves on a match rather than a mismatch.
+//
+// The ordering bits are the union of the pair's, so an `lr.aq` with an
+// `sc.rl` becomes `amocas.aqrl`: at least as strong as what it replaces
+// and never weaker.
+//
+// Gated on positive presence, as the Zilx and Zibi checks are. Zacas is
+// ratified rather than experimental, but it is in no profile and no
+// object in the corpus declares it.
+//
+// Measured population: the corpus holds 14,655 LR/SC loops and 14,499
+// are compare-exchanges, but the store's result register is only
+// provably dead in a small fraction of them -- nothing writes it after
+// the fold, and the project's liveness proves deadness only by
+// redefinition, declining at a call or a return. There are no plain or
+// sub-word read-modify-write loops at all: 0 of 14,655, so neither an
+// AMO arm nor a Zabha one would have anything to report. See TODO.md.
+bool check_cas_loop_to_amocas(riscvlint_state *state, const cs_insn *insn,
+                              riscvlint_finding *finding);
 
 // ---- running every check ----
 //

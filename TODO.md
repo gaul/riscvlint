@@ -1456,9 +1456,9 @@ second instruction writes it is one dominant idiom plus nothing.
 
 # Remaining candidates
 
-None. Thirty-two checks are implemented and everything this file ever
+None. Thirty-three checks are implemented and everything this file ever
 sized is either written or recorded as rejected with the evidence that
-rejected it. The last eleven did not come from a corpus probe at all: 23
+rejected it. The last twelve did not come from a corpus probe at all: 23
 came from walking armlint's check table against this one, 24 came from a
 rejection in this file being wrong, 25, 26 and 27 are the three
 addressing modes of a ratification plan for an extension that does not
@@ -1474,7 +1474,8 @@ the corpus doubled, and it was found by asking what a constant that is
 for anyone; 32 came from ranking the pair dump by dependent frequency
 and finding a shape one already-written check had left half-done; 33 is
 that same shape with one funct6 bit flipped, which 32's own test
-asserted was silent.
+asserted was silent; and 34 came from walking armlint's check table
+against this one a second time, which is where 23 came from too.
 
 That last one is worth reading as a worked example rather than a
 number. The SWAR popcount was rejected on a bound that was not a bound
@@ -3284,6 +3285,113 @@ change: `rv_decode_extension` already decoded `sext.b` and `sext.h`
 themselves, as OP-IMM funct3 001 with immediates 0x604 and 0x605, so
 that check_redundant_extension could recognise them as guarantees. What
 was missing was only the two-instruction producer.
+
+## 34. A compare-exchange loop foldable to amocas -- 469  [implemented]
+
+```
+L: lr.d.aq  rt, (ra)
+   bne      rt, rexp, fail      <- the comparison, and the whole body
+   sc.d.rl  rs, rnew, (ra)
+   bnez     rs, L               <- retry on a failed store
+```
+
+becomes `mv rt,rexp` and `amocas.d.aqrl rt, rnew, (ra)`, with the
+comparison left where it is. `amocas` writes the loaded value to rt
+exactly as the loop did, on both paths, so the `bne` after it still
+decides the same thing.
+
+### How it was found
+
+By walking armlint's check table against this one, which is how entry 23
+was found and had not been done since. armlint has `check_lse_rmw` for
+the AArch64 shape -- an `ldxr`/`stxr` loop where one LSE atomic would do
+-- and riscvlint had no atomics check at all.
+
+### Two measurements that matter more than the population
+
+The corpus holds 37,669 `lr` instructions and 14,655 of them begin a
+loop this shape recognises: an `sc` within twelve instructions followed
+by a branch back to the `lr`.
+
+| | loops |
+|---|---:|
+| compare-exchange -- a branch out before the `sc` | 14,499 |
+| plain read-modify-write, which an existing AMO folds | **0** |
+| sub-word, which Zabha would fold | **0** |
+| body of exactly one instruction | 13,072 |
+
+The two zeros are the useful half. There is **no** LR/SC loop anywhere
+in 108 million instructions that today's `amoadd`, `amoand`, `amoor`,
+`amoxor`, `amoswap`, `amomax` or `amomin` would fold, and none that
+Zabha's byte and halfword atomics would. Whenever an AMO exists for the
+operation, all three toolchains emit it. Both of those were candidates
+worth an hour before they were measured, and neither survives it.
+
+What is left is compare-exchange, for which the A extension has no
+single instruction and Zacas does.
+
+### What the check reports -- 469 under `-m zacas`
+
+| language | objects | sites |
+|---|---:|---:|
+| C++ | 13 | 279 |
+| Rust | 6 | 50 |
+| Go | 12 | 140 |
+| **total** | **31** | **469** |
+
+The most even language split of any entry here; everything else in this
+file is dominated by one toolchain. 254 are in libxul, 36 in go
+`compile`, 27 in `asm`, 17 in libQt6Core, 16 in fd, 12 each in `link`
+and uutils, 11 in ripgrep, 9 in most of the remaining Go tools.
+
+2,156 bytes: 106 sites at `(12 -> 8)`, 223 at `(14 -> 10)` and 140 at
+`(16 -> 10)`. 356 need a `mv` to place the expected value and 113 a
+`li`, the comparison there having been against zero.
+
+### 469 of 14,499, and the precondition that takes the rest
+
+The store-conditional's result register disappears with the fold --
+nothing writes it afterwards -- so it has to be dead on both ways out of
+the loop. It usually cannot be proved so: this project's liveness
+establishes deadness only by a redefinition before any read, declining
+at a call or a return, and a compare-exchange is normally followed by
+one or the other. In ripgrep that costs 173 of 191 loops, in libQt6Core
+278 of 295, in go `compile` 402 of 439.
+
+Nothing else costs anything measurable. No site is lost to a
+relocation, a mis-shaped retry branch, a width mismatch between the load
+and the store, or a comparison against the wrong register -- the four
+tests that make the shape a compare-exchange rather than something else
+reject only `beq` bodies, 173 of them in `compile`.
+
+There is an option here that was not taken. The fold could be offered
+with an added `li rs,0` -- on the fall-through path the loop guarantees
+the store succeeded, so the register it would have written is zero --
+which would recover most of the 14,030 and make the replacement three
+instructions saving about two bytes. That trades a proof for an
+assumption about what the following code wants, which is not the trade
+the rest of this file makes, so it is recorded here instead.
+
+### Why this one looks different from the other thirty-three
+
+Two departures, both forced by the instruction rather than chosen.
+
+`amocas` ties its destination to its expected-value operand -- LLVM
+spells the constraint `$rd = $rd_wb` -- so the expected value has to
+arrive in the register the loaded value leaves in, and getting it there
+costs an instruction the loop did not need. That is why the replacement
+is two instructions where every other check's is one.
+
+And the window is a loop. The head is a branch target by construction,
+its own retry branch pointing at it, so unlike every other check this
+one cannot refuse branch targets at its first instruction -- it asks
+about the three after it instead. The comparison's exit is required to
+leave the four-instruction window rather than land inside it.
+
+The ordering bits are the union of the pair's, so `lr.aq` with `sc.rl`
+becomes `amocas.aqrl`. That is at least as strong as the two
+instructions it replaces and never weaker, which is the direction a
+suggestion may err in. All four variants occur in the corpus.
 
 # Ranked for C++ and Rust specifically
 

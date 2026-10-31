@@ -232,6 +232,50 @@ bool rv_decode_srai(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
     return true;
 }
 
+// The AMO opcode's width field: funct3 010 is the word form and 011 the
+// doubleword. 000 and 001 are Zabha's byte and halfword, 100 the quad,
+// and none of those is a width this project reads.
+static bool amo_width(uint32_t w, unsigned *width)
+{
+    switch ((w >> 12) & 0x7u) {
+    case 2u: *width = 4; return true;
+    case 3u: *width = 8; return true;
+    default: return false;
+    }
+}
+
+bool rv_decode_lr(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
+                  unsigned *width, unsigned *aq, unsigned *rl)
+{
+    if (size != 4) return false;
+    if (RV_OPCODE(w) != 0x2fu) return false;
+    if (((w >> 27) & 0x1fu) != 0x02u) return false;          // funct5 00010
+    // LR takes no second source and the field is required to be zero,
+    // so a nonzero one is not an LR however it decodes elsewhere.
+    if (((w >> 20) & 0x1fu) != 0u) return false;
+    if (!amo_width(w, width)) return false;
+    *aq = (w >> 26) & 1u;
+    *rl = (w >> 25) & 1u;
+    *rd = (w >> 7) & 0x1fu;
+    *rs1 = (w >> 15) & 0x1fu;
+    return true;
+}
+
+bool rv_decode_sc(uint32_t w, unsigned size, unsigned *rd, unsigned *rs1,
+                  unsigned *rs2, unsigned *width, unsigned *aq, unsigned *rl)
+{
+    if (size != 4) return false;
+    if (RV_OPCODE(w) != 0x2fu) return false;
+    if (((w >> 27) & 0x1fu) != 0x03u) return false;          // funct5 00011
+    if (!amo_width(w, width)) return false;
+    *aq = (w >> 26) & 1u;
+    *rl = (w >> 25) & 1u;
+    *rd = (w >> 7) & 0x1fu;
+    *rs1 = (w >> 15) & 0x1fu;
+    *rs2 = (w >> 20) & 0x1fu;
+    return true;
+}
+
 bool rv_pure_def(uint32_t w, unsigned size, unsigned *rd)
 {
     if (size == 4) {
@@ -309,6 +353,7 @@ unsigned riscvlint_parse_arch(const char *arch)
     if (strstr(arch, "_zfa")) exts |= RISCVLINT_EXT_ZFA;
     if (strstr(arch, "_zilx")) exts |= RISCVLINT_EXT_ZILX;
     if (strstr(arch, "_zibi")) exts |= RISCVLINT_EXT_ZIBI;
+    if (strstr(arch, "_zacas")) exts |= RISCVLINT_EXT_ZACAS;
     // C is spelled `_c2p0` in the base run and `_zca1p0` once the
     // Zc* split gave it a name of its own; a conforming string carries
     // whichever the assembler wrote, and some carry both.
@@ -1481,6 +1526,10 @@ bool riscvlint_parse_ext_name(const char *name, unsigned *exts)
         // Zilx: LLVM has it as an RISCVExperimentalExtension at 0.1,
         // where Zilx at least has a ratification plan behind it.
         { "zibi",  RISCVLINT_EXT_ZIBI },
+        // Zacas is ratified rather than experimental, and still in no
+        // profile -- RVA23 does not mandate it. Same treatment as the
+        // other two: named on its own or not at all.
+        { "zacas", RISCVLINT_EXT_ZACAS },
         // Every profile from RVA20 up mandates C.
         { "rva20", RISCVLINT_EXT_C },
         { "rva22", RISCVLINT_EXT_ZBA | RISCVLINT_EXT_ZBB | RISCVLINT_EXT_ZBS |
@@ -4915,6 +4964,157 @@ bool check_slli_srai_to_sext(riscvlint_state *state, const cs_insn *insn,
     return true;
 }
 
+// A compare-exchange written as an LR/SC retry loop, which Zacas does
+// with one `amocas`:
+//
+//     L: lr.d.aq  rt, (ra)
+//        bne      rt, rexp, fail      <- the comparison, and the body
+//        sc.d.rl  rs, rnew, (ra)
+//        bnez     rs, L               <- retry on a failed store
+//
+// becomes `mv rt,rexp` (or `li rt,0`) and then
+// `amocas.d.aqrl rt, rnew, (ra)`, with the comparison left where it is.
+// Four instructions and a backward branch become two, and the `bne`
+// still decides the same thing afterwards: amocas leaves the loaded
+// value in rt exactly as the loop did, on both paths.
+//
+// This is the only check here whose window is a loop rather than a
+// straight line, and the only one whose replacement is two
+// instructions. Both follow from amocas's operand constraint --
+// LLVM ties $rd to $rd_wb, so the expected value arrives in the same
+// register the loaded value leaves in, and getting it there costs an
+// instruction the loop did not need.
+//
+// Scoped to a body of exactly one instruction, which is 13,072 of the
+// corpus's 14,655 LR/SC loops. A longer body is a read-modify-write
+// around the comparison and a different claim.
+//
+// Three things are deliberately not matched. `beq` in the body exits on
+// a match rather than a mismatch, which is a different idiom and not a
+// compare-exchange. A loop whose body is anything but a branch on the
+// loaded value is not a comparison. And the plain and sub-word
+// read-modify-write loops that the A extension and Zabha would fold are
+// absent from this corpus entirely -- 0 of 14,655 -- so neither has an
+// arm here.
+//
+// The ordering bits are the union of the pair's: an `lr.aq` with an
+// `sc.rl` becomes `amocas.aqrl`. That is at least as strong as the two
+// instructions it replaces and never weaker, which is the direction a
+// suggestion is allowed to err in.
+static const char *amocas_suffix(unsigned aq, unsigned rl)
+{
+    if (aq && rl) return ".aqrl";
+    if (aq) return ".aq";
+    if (rl) return ".rl";
+    return "";
+}
+
+bool check_cas_loop_to_amocas(riscvlint_state *state, const cs_insn *insn,
+                              riscvlint_finding *finding)
+{
+    // Positively present, for check_indexed_load's reason: Zacas is
+    // ratified but in no profile, and no object in the corpus declares
+    // it, so the permissive reading would put 14,499 findings on code
+    // that cannot execute one.
+    if (!(riscvlint_state_extensions(state) & RISCVLINT_EXT_ZACAS))
+        return false;
+    if (insn->size != 4) return false;
+
+    uint32_t w1;
+    if (!riscvlint_word_at(state, insn->address, &w1)) return false;
+    unsigned rt, ra, width, laq, lrl;
+    if (!rv_decode_lr(w1, insn->size, &rt, &ra, &width, &laq, &lrl))
+        return false;
+    if (rt == 0 || ra == 0) return false;
+
+    // The body: one conditional branch that leaves the loop when the
+    // loaded value is not the expected one. `bne`/`bnez` only, funct3 1.
+    uint64_t second = insn->address + 4;
+    uint32_t w2;
+    if (!riscvlint_word_at(state, second, &w2)) return false;
+    unsigned len2 = rv_insn_len(w2);
+    unsigned b1, b2, bf3;
+    int64_t boff;
+    if (!rv_decode_cond_branch(w2, len2, &b1, &b2, &bf3, &boff)) return false;
+    if (bf3 != 1u) return false;
+    unsigned rexp;
+    if (b1 == rt) rexp = b2;
+    else if (b2 == rt) rexp = b1;
+    else return false;
+
+    uint64_t third = second + len2;
+    uint32_t w3;
+    if (!riscvlint_word_at(state, third, &w3)) return false;
+    unsigned rs, sa, rnew, swidth, saq, srl;
+    if (!rv_decode_sc(w3, rv_insn_len(w3), &rs, &sa, &rnew, &swidth, &saq,
+                      &srl))
+        return false;
+    // Same location, same width, and a result register to retry on.
+    if (sa != ra || swidth != width || rs == 0) return false;
+
+    uint64_t fourth = third + 4;
+    uint32_t w4;
+    if (!riscvlint_word_at(state, fourth, &w4)) return false;
+    unsigned len4 = rv_insn_len(w4);
+    unsigned r1, r2, rf3;
+    int64_t roff;
+    if (!rv_decode_cond_branch(w4, len4, &r1, &r2, &rf3, &roff)) return false;
+    // `bnez rs` back to the lr: sc writes zero on success, so a retry is
+    // a branch taken on nonzero.
+    if (rf3 != 1u) return false;
+    if (!((r1 == rs && r2 == 0) || (r2 == rs && r1 == 0))) return false;
+    if ((uint64_t)((int64_t)fourth + roff) != insn->address) return false;
+
+    uint64_t after = fourth + len4;
+    // The comparison has to leave the loop rather than land inside it.
+    uint64_t exit = (uint64_t)((int64_t)second + boff);
+    if (exit >= insn->address && exit < after) return false;
+
+    // The loop head is a branch target by construction -- its own retry
+    // branch targets it -- so only the three instructions after it are
+    // asked. Anything arriving in the middle of a compare-exchange
+    // would not have run the lr.
+    if (riscvlint_is_branch_target(state, second) ||
+        riscvlint_is_branch_target(state, third) ||
+        riscvlint_is_branch_target(state, fourth))
+        return false;
+    if (riscvlint_is_relocated(state, insn->address) ||
+        riscvlint_is_relocated(state, second) ||
+        riscvlint_is_relocated(state, third) ||
+        riscvlint_is_relocated(state, fourth))
+        return false;
+
+    // The sc's result register disappears, so it has to be dead on both
+    // ways out: past the retry branch and at the comparison's target.
+    if (riscvlint_liveness(state, after, rs) != RISCVLINT_LIVE_DEAD)
+        return false;
+    if (riscvlint_liveness(state, exit, rs) != RISCVLINT_LIVE_DEAD)
+        return false;
+
+    // The setup is `li rt,0` where the comparison was against x0 and
+    // `mv rt,rexp` otherwise. Both compress: c.li names any register
+    // and c.mv any two nonzero ones, and rt is nonzero here. So the
+    // replacement is two bytes plus the four of the amocas, and the
+    // comparison -- unchanged, and counted on both sides -- keeps its
+    // own length.
+    char setup[24];
+    if (rexp == 0) snprintf(setup, sizeof setup, "li %s, 0", rv_reg_name(rt));
+    else snprintf(setup, sizeof setup, "mv %s, %s", rv_reg_name(rt),
+                  rv_reg_name(rexp));
+    unsigned before = 4 + len2 + 4 + len4;
+    unsigned fold = 2 + 4 + len2;
+
+    finding->title = "compare-exchange loop foldable to amocas";
+    finding->address = insn->address;
+    finding->insn_count = 4;
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "%s ; amocas.%c%s %s, %s, (%s) (%u -> %u bytes)", setup,
+             width == 8 ? 'd' : 'w', amocas_suffix(laq | saq, lrl | srl),
+             rv_reg_name(rt), rv_reg_name(rnew), rv_reg_name(ra), before,
+             fold);
+    return true;
+}
+
 // ---- running every check ----
 
 static const riscvlint_check_fn riscvlint_checks[] = {
@@ -4950,6 +5150,7 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_const_ord_branch,
     check_slli_srli_to_zexth,
     check_slli_srai_to_sext,
+    check_cas_loop_to_amocas,
 };
 
 size_t riscvlint_scan(riscvlint_state *state, csh handle,

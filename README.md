@@ -3,8 +3,8 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Thirty-two checks are implemented and the ledger's candidate list is
-empty. [TODO.md](TODO.md) is that ledger: every candidate that was
+Thirty-three checks are implemented and the ledger's candidate list
+is empty. [TODO.md](TODO.md) is that ledger: every candidate that was
 measured, the population it came back with, and the ones rejected on
 that evidence.
 What got written was decided by the corpus rather than by intuition,
@@ -12,13 +12,13 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Thirty-two of them, and the table lists twenty-six. Six report
+Thirty-three of them, and the table lists twenty-six. Seven report
 nothing over this corpus -- the bit count because no baseline object
-declares Zbb; the three indexed loads and the equality branch because
-those four require their extension to be positively present rather
-than merely un-denied, and no object declares Zilx or Zibi; and the
-unsigned divide by a power of two because all three toolchains already
-do that fold themselves. Those entries below say why. Every figure is
+declares Zbb; the three indexed loads, the equality branch and the
+compare-exchange loop because those five require their extension to be
+positively present rather than merely un-denied, and no object declares
+Zilx, Zibi or Zacas; and the unsigned divide by a power of two because
+all three toolchains already do that fold themselves. Those entries below say why. Every figure is
 what the check itself reports over the [corpus](#corpus) --
 108,165,211 instructions of three toolchains across 31 objects --
 rather than what a mining tool estimated for it. The two have differed
@@ -166,6 +166,52 @@ except a handful of `jalr ra,0(ra)` that were already two.
   Go site is lost to a relocation, to an sp/gp/tp destination, or to a
   multiply that does not read the constant exactly once, and the only
   branch-target rejections anywhere in the corpus are libxul's two.
+
+* **compare-exchange loop foldable to amocas** -- the one check here
+  whose window is a loop rather than a straight line, and the one whose
+  replacement is two instructions rather than one. Both follow from
+  `amocas` tying its destination to its expected-value operand.
+
+  ```
+  L: lr.d.aq  rt, (ra)
+     bne      rt, rexp, fail      <- the comparison, and the whole body
+     sc.d.rl  rs, rnew, (ra)
+     bnez     rs, L               <- retry on a failed store
+  ```
+
+  becomes `mv rt,rexp` and then `amocas.d.aqrl rt, rnew, (ra)`, with the
+  comparison left exactly where it is: `amocas` writes the loaded value
+  to rt just as the loop did, so the `bne` after it still decides the
+  same thing on both paths. Four instructions and a backward branch
+  become two. The ordering bits are the union of the pair's, which is at
+  least as strong as what it replaces and never weaker.
+
+  Population: **469** sites under `-m zacas` -- 279 C++, 140 Go, 50
+  Rust, the most even split of any check here -- worth 2,156 bytes: 106
+  at `(12 -> 8)`, 223 at `(14 -> 10)` and 140 at `(16 -> 10)`. 254 are
+  in libxul, 36 in go `compile`, 27 in `asm`, 17 in libQt6Core, 16 in
+  fd, 12 each in `link` and uutils, 11 in ripgrep. 356 need a `mv` to
+  place the expected value and 113 a `li`, the comparison there having
+  been against zero.
+
+  The corpus holds **14,655** LR/SC loops and 14,499 of them are
+  compare-exchanges, so 469 is 3% of the shape. The rest go to one
+  precondition that cannot be relaxed: the store-conditional's result
+  register disappears with the fold, nothing writes it afterwards, and
+  deadness here can only be proved by a redefinition before any read --
+  which a loop followed by a call or a return does not give. Offering
+  the fold with an added `li rs,0` would recover most of them, and
+  TODO.md records that as an option rather than taking it.
+
+  Two things the corpus does **not** contain, which is the more useful
+  half of the measurement: a plain read-modify-write loop that today's
+  `amoadd`/`amoand`/`amoor` would fold, and a sub-word one that Zabha
+  would. Zero of 14,655, either kind. Whenever an AMO exists, all three
+  toolchains emit it.
+
+  Gated on positive presence like the Zilx and Zibi checks. Zacas is
+  ratified rather than experimental, but it is in no profile and no
+  object declares it, so every figure here is a `-m zacas` figure.
 
 * **constant loaded for one equality branch** -- `li rc,K` +
   `beq`/`bne rx,rc,L`, which Zibi's `beqi`/`bnei rx,K,L` does in one
@@ -1159,11 +1205,11 @@ except a handful of `jalr ra,0(ra)` that were already two.
 
 `-m <name>` pins the extensions the checks may assume, and may be
 repeated. Names are either extensions (`zba`, `zbb`, `zbs`, `zcb`,
-`zfa`, `zilx`, `zibi`, `c`) or profiles that bundle them (`rva20`,
-`rva22`, `rva23`). `zilx` and `zibi` are the two no profile contains,
-so they only ever arrive by being named -- and the checks behind them
-are the four that want the extension positively present rather than
-merely un-denied.
+`zfa`, `zilx`, `zibi`, `zacas`, `c`) or profiles that bundle them
+(`rva20`, `rva22`, `rva23`). `zilx`, `zibi` and `zacas` are the three no
+profile contains, so they only ever arrive by being named -- and the
+checks behind them are the five that want the extension positively
+present rather than merely un-denied.
 
 `-m` replaces what the object declares, in both directions, because both
 are useful and neither is expressible if the flag merely adds to the

@@ -4821,6 +4821,229 @@ static void test_slli_srai_to_sext(csh handle)
     CHECK(run_sext(handle, sh48, sizeof sh48, 0, NULL));
 }
 
+static bool run_cas(csh handle, const uint8_t *bytes, size_t len,
+                    unsigned exts, riscvlint_finding *out)
+{
+    static uint8_t buf[256];
+    memcpy(buf, bytes, len);
+    riscvlint_state *state = riscvlint_state_create();
+    if (!state) return false;
+    bool fired = false;
+    riscvlint_state_set_extensions(state, exts);
+    if (riscvlint_state_set_section(state, handle, buf, len, 0x1000)) {
+        cs_insn *insn = cs_malloc(handle);
+        const uint8_t *p = buf;
+        size_t remain = len;
+        uint64_t addr = 0x1000;
+        if (insn && cs_disasm_iter(handle, &p, &remain, &addr, insn)) {
+            riscvlint_finding f;
+            memset(&f, 0, sizeof f);
+            fired = check_cas_loop_to_amocas(state, insn, &f);
+            if (fired && out) *out = f;
+        }
+        if (insn) cs_free(insn, 1);
+    }
+    riscvlint_state_destroy(state);
+    return fired;
+}
+
+static void test_decode_lr_sc(void)
+{
+    unsigned rd, rs1, rs2, width, aq, rl;
+    // lr.d a3,(a0) and sc.d.rl a5,a4,(a0).
+    CHECK(rv_decode_lr(0x100536afu, 4, &rd, &rs1, &width, &aq, &rl));
+    CHECK(rd == 13 && rs1 == 10 && width == 8 && aq == 0 && rl == 0);
+    CHECK(rv_decode_sc(0x1ae537afu, 4, &rd, &rs1, &rs2, &width, &aq, &rl));
+    CHECK(rd == 15 && rs1 == 10 && rs2 == 14 && width == 8);
+    CHECK(aq == 0 && rl == 1);
+    // An lr with a nonzero rs2 field is not an lr.
+    CHECK(!rv_decode_lr(0x100536afu | (1u << 20), 4, &rd, &rs1, &width,
+                        &aq, &rl));
+    // Neither decodes the other's funct5, and an amoadd is neither.
+    CHECK(!rv_decode_sc(0x100536afu, 4, &rd, &rs1, &rs2, &width, &aq, &rl));
+    CHECK(!rv_decode_lr(0x1ae537afu, 4, &rd, &rs1, &width, &aq, &rl));
+    CHECK(!rv_decode_lr(0x00e5362fu, 4, &rd, &rs1, &width, &aq, &rl));
+    // Zabha's byte and halfword widths are not read here.
+    CHECK(!rv_decode_lr((0x100536afu & ~0x7000u), 4, &rd, &rs1, &width,
+                        &aq, &rl));
+}
+
+static void test_cas_loop_to_amocas(csh handle)
+{
+    riscvlint_finding f;
+    const unsigned Z = RISCVLINT_EXT_ZACAS;
+
+    // The shape ripgrep, libQt6Core and the Go tools all have: a
+    // compare-exchange against a register, retried on a failed store.
+    // Both ways out of the loop redefine a5, which is the only way the
+    // walk proves the store's result register dead.
+    static const uint8_t cas[] = {
+        0xaf, 0x36, 0x05, 0x10,      // lr.d a3,(a0)
+        0x63, 0x97, 0xc6, 0x00,      // bne a3,a2,F
+        0xaf, 0x37, 0xe5, 0x1a,      // sc.d.rl a5,a4,(a0)
+        0xf5, 0xfb,                  // c.bnez a5,L
+        0x81, 0x47,                  // c.li a5,0
+        0x82, 0x80,                  // c.ret
+        0x85, 0x47,                  // c.li a5,1
+        0x82, 0x80,                  // c.ret
+    };
+    CHECK(run_cas(handle, cas, sizeof cas, Z, &f));
+    CHECK(strcmp(f.replacement,
+                 "mv a3, a2 ; amocas.d.rl a3, a4, (a0) (14 -> 10 bytes)") == 0);
+    CHECK(f.insn_count == 4 && f.address == 0x1000);
+    CHECK(strcmp(f.title,
+                 "compare-exchange loop foldable to amocas") == 0);
+
+    // Comparing against zero: the expected value is x0, so the setup is
+    // a `li` and the compressed branch makes the window smaller.
+    static const uint8_t zero[] = {
+        0xaf, 0x36, 0x05, 0x10,      // lr.d a3,(a0)
+        0x91, 0xe6,                  // c.bnez a3,F
+        0xaf, 0x37, 0xe5, 0x1a,      // sc.d.rl a5,a4,(a0)
+        0xfd, 0xfb,                  // c.bnez a5,L
+        0x81, 0x47,                  // c.li a5,0
+        0x82, 0x80,                  // c.ret
+        0x85, 0x47,                  // c.li a5,1
+        0x82, 0x80,                  // c.ret
+    };
+    CHECK(run_cas(handle, zero, sizeof zero, Z, &f));
+    CHECK(strcmp(f.replacement,
+                 "li a3, 0 ; amocas.d.rl a3, a4, (a0) (12 -> 8 bytes)") == 0);
+
+    // `beq` leaves the loop when the value *matches*, which is not a
+    // compare-exchange.
+    static const uint8_t beqbody[] = {
+        0xaf, 0x36, 0x05, 0x10,      // lr.d a3,(a0)
+        0x63, 0x87, 0xc6, 0x00,      // beq a3,a2,F
+        0xaf, 0x37, 0xe5, 0x1a,      // sc.d.rl a5,a4,(a0)
+        0xf5, 0xfb,                  // c.bnez a5,L
+        0x81, 0x47,                  // c.li a5,0
+        0x82, 0x80,                  // c.ret
+        0x85, 0x47,                  // c.li a5,1
+        0x82, 0x80,                  // c.ret
+    };
+    CHECK(!run_cas(handle, beqbody, sizeof beqbody, Z, NULL));
+
+    // A branch that does not read the loaded value is not the
+    // comparison.
+    static const uint8_t otherreg[] = {
+        0xaf, 0x36, 0x05, 0x10,      // lr.d a3,(a0)
+        0x63, 0x97, 0xc5, 0x00,      // bne a1,a2,F
+        0xaf, 0x37, 0xe5, 0x1a,      // sc.d.rl a5,a4,(a0)
+        0xf5, 0xfb,                  // c.bnez a5,L
+        0x81, 0x47,                  // c.li a5,0
+        0x82, 0x80,                  // c.ret
+        0x85, 0x47,                  // c.li a5,1
+        0x82, 0x80,                  // c.ret
+    };
+    CHECK(!run_cas(handle, otherreg, sizeof otherreg, Z, NULL));
+
+    // The store conditional on a different address than the load.
+    static const uint8_t otheraddr[] = {
+        0xaf, 0x36, 0x05, 0x10,      // lr.d a3,(a0)
+        0x63, 0x97, 0xc6, 0x00,      // bne a3,a2,F
+        0xaf, 0xb7, 0xe5, 0x1a,      // sc.d.rl a5,a4,(a1)
+        0xf5, 0xfb,                  // c.bnez a5,L
+        0x81, 0x47,                  // c.li a5,0
+        0x82, 0x80,                  // c.ret
+        0x85, 0x47,                  // c.li a5,1
+        0x82, 0x80,                  // c.ret
+    };
+    CHECK(!run_cas(handle, otheraddr, sizeof otheraddr, Z, NULL));
+
+    // A word load with a doubleword store: not a pair at all, and
+    // amocas has one width.
+    static const uint8_t widthmix[] = {
+        0xaf, 0x26, 0x05, 0x10,      // lr.w a3,(a0)
+        0x63, 0x97, 0xc6, 0x00,      // bne a3,a2,F
+        0xaf, 0x37, 0xe5, 0x1a,      // sc.d.rl a5,a4,(a0)
+        0xf5, 0xfb,                  // c.bnez a5,L
+        0x81, 0x47,                  // c.li a5,0
+        0x82, 0x80,                  // c.ret
+        0x85, 0x47,                  // c.li a5,1
+        0x82, 0x80,                  // c.ret
+    };
+    CHECK(!run_cas(handle, widthmix, sizeof widthmix, Z, NULL));
+
+    // Retrying when the store *succeeded* is the wrong polarity: sc
+    // writes zero on success.
+    static const uint8_t retryeqz[] = {
+        0xaf, 0x36, 0x05, 0x10,      // lr.d a3,(a0)
+        0x63, 0x97, 0xc6, 0x00,      // bne a3,a2,F
+        0xaf, 0x37, 0xe5, 0x1a,      // sc.d.rl a5,a4,(a0)
+        0xf5, 0xdb,                  // c.beqz a5,L
+        0x81, 0x47,                  // c.li a5,0
+        0x82, 0x80,                  // c.ret
+        0x85, 0x47,                  // c.li a5,1
+        0x82, 0x80,                  // c.ret
+    };
+    CHECK(!run_cas(handle, retryeqz, sizeof retryeqz, Z, NULL));
+
+    // Retrying on a register the sc did not write.
+    static const uint8_t retryreg[] = {
+        0xaf, 0x36, 0x05, 0x10,      // lr.d a3,(a0)
+        0x63, 0x97, 0xc6, 0x00,      // bne a3,a2,F
+        0xaf, 0x37, 0xe5, 0x1a,      // sc.d.rl a5,a4,(a0)
+        0x75, 0xfb,                  // c.bnez a4,L
+        0x81, 0x47,                  // c.li a5,0
+        0x82, 0x80,                  // c.ret
+        0x85, 0x47,                  // c.li a5,1
+        0x82, 0x80,                  // c.ret
+    };
+    CHECK(!run_cas(handle, retryreg, sizeof retryreg, Z, NULL));
+
+    // The store's result read on the fall-through path. This is where
+    // 94% of the corpus's loops go: nothing writes a5 after the fold,
+    // so a surviving read would see a stale value.
+    static const uint8_t liveft[] = {
+        0xaf, 0x36, 0x05, 0x10,      // lr.d a3,(a0)
+        0x63, 0x97, 0xc6, 0x00,      // bne a3,a2,F
+        0xaf, 0x37, 0xe5, 0x1a,      // sc.d.rl a5,a4,(a0)
+        0xf5, 0xfb,                  // c.bnez a5,L
+        0x3e, 0x85,                  // c.mv a0,a5
+        0x82, 0x80,                  // c.ret
+        0x85, 0x47,                  // c.li a5,1
+        0x82, 0x80,                  // c.ret
+    };
+    CHECK(!run_cas(handle, liveft, sizeof liveft, Z, NULL));
+
+    // ...and read on the comparison's exit path, which a fall-through
+    // proof alone would miss.
+    static const uint8_t liveex[] = {
+        0xaf, 0x36, 0x05, 0x10,      // lr.d a3,(a0)
+        0x63, 0x97, 0xc6, 0x00,      // bne a3,a2,F
+        0xaf, 0x37, 0xe5, 0x1a,      // sc.d.rl a5,a4,(a0)
+        0xf5, 0xfb,                  // c.bnez a5,L
+        0x81, 0x47,                  // c.li a5,0
+        0x82, 0x80,                  // c.ret
+        0x3e, 0x85,                  // c.mv a0,a5
+        0x82, 0x80,                  // c.ret
+    };
+    CHECK(!run_cas(handle, liveex, sizeof liveex, Z, NULL));
+
+    // A body of two instructions is a read-modify-write around the
+    // comparison, which this check is deliberately scoped out of:
+    // 1,583 of the corpus's 14,655 loops.
+    static const uint8_t twobody[] = {
+        0xaf, 0x36, 0x05, 0x10,      // lr.d a3,(a0)
+        0x85, 0x06,                  // addi a3,a3,1
+        0x63, 0x97, 0xc6, 0x00,      // bne a3,a2,F
+        0xaf, 0x37, 0xe5, 0x1a,      // sc.d.rl a5,a4,(a0)
+        0xed, 0xfb,                  // c.bnez a5,L
+        0x81, 0x47,                  // c.li a5,0
+        0x82, 0x80,                  // c.ret
+        0x85, 0x47,                  // c.li a5,1
+        0x82, 0x80,                  // c.ret
+    };
+    CHECK(!run_cas(handle, twobody, sizeof twobody, Z, NULL));
+    // Positive presence, as the Zilx and Zibi checks want: Zacas is
+    // ratified but in no profile, so declaring nothing is not enough.
+    CHECK(!run_cas(handle, cas, sizeof cas, 0, NULL));
+    CHECK(!run_cas(handle, cas, sizeof cas, RISCVLINT_EXT_DECLARED, NULL));
+    CHECK(run_cas(handle, cas, sizeof cas,
+                  RISCVLINT_EXT_DECLARED | RISCVLINT_EXT_ZACAS, NULL));
+}
+
 static void test_census(csh handle)
 {
     static const uint8_t code[] = {
@@ -4999,6 +5222,8 @@ int main(void)
     test_slli_srli_to_zexth(handle);
     test_decode_srai();
     test_slli_srai_to_sext(handle);
+    test_decode_lr_sc();
+    test_cas_loop_to_amocas(handle);
     test_census(handle);
 
     cs_close(&handle);
