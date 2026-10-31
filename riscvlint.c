@@ -3546,25 +3546,39 @@ static void cchain_note_anchor(riscvlint_cchain *c, uint64_t anchor)
     c->anchors_rebuilt++;
 }
 
-// One step of a chain: `addi`/`addiw`/`slli` whose source is its own
-// destination. Returns false for anything else, which ends the chain.
+// One step of a chain: `addi`/`addiw`/`slli` reading a register whose
+// chain is in flight. `reg` is the one read and `dst` the one written,
+// and they need not be the same -- the allocator writes the finished
+// constant somewhere else whenever the partial value is still live,
+// and requiring `rd == rs1` lost 46% of the chains in libLLVM's
+// baseline build. The transform is left to the caller to apply, since
+// which chain this extends is not a property of the instruction.
 //
 // `addi rd,rd,imm` and `c.addi` are the same step; so are `slli` and
 // `c.slli`, which rv_decode_slli already folds together. `addiw` is
 // its own case because it truncates, and that truncation is exactly
 // what RISCVMatInt uses it for.
-static bool cchain_step(uint32_t w, unsigned size, unsigned reg,
-                        int64_t *val)
+typedef struct {
+    unsigned reg;       // the register read: whose chain this extends
+    unsigned dst;       // the register written, which may be another
+    bool shift;         // slli, rather than an addition
+    unsigned shamt;
+    int64_t imm;
+    bool w_form;        // addiw: the result is sign-extended from bit 31
+} cchain_step;
+
+static bool cchain_step_of(uint32_t w, unsigned size, cchain_step *st)
 {
     unsigned rd, rs1, shamt;
     int64_t imm;
     if (rv_decode_slli(w, size, &rd, &rs1, &shamt)) {
-        if (rd != reg || rs1 != reg) return false;
-        *val = (int64_t)((uint64_t)*val << shamt);
+        st->reg = rs1;
+        st->dst = rd;
+        st->shift = true;
+        st->shamt = shamt;
         return true;
     }
-    // addi, in both widths and both spellings.
-    bool w_form = false;
+    bool w_form;
     if (size == 4) {
         unsigned op = RV_OPCODE(w);
         if ((op != 0x13u && op != 0x1bu) || ((w >> 12) & 0x7u) != 0)
@@ -3586,10 +3600,22 @@ static bool cchain_step(uint32_t w, unsigned size, unsigned reg,
     } else {
         return false;
     }
-    if (rd != reg || rs1 != reg) return false;
-    uint64_t sum = (uint64_t)*val + (uint64_t)imm;
-    *val = w_form ? (int64_t)(int32_t)(uint32_t)sum : (int64_t)sum;
+    st->reg = rs1;
+    st->dst = rd;
+    st->shift = false;
+    st->imm = imm;
+    st->w_form = w_form;
     return true;
+}
+
+static void cchain_apply(const cchain_step *st, int64_t *val)
+{
+    if (st->shift) {
+        *val = (int64_t)((uint64_t)*val << st->shamt);
+        return;
+    }
+    uint64_t sum = (uint64_t)*val + (uint64_t)st->imm;
+    *val = st->w_form ? (int64_t)(int32_t)(uint32_t)sum : (int64_t)sum;
 }
 
 // Count a finished chain.
@@ -3624,6 +3650,26 @@ static void cchain_finish(riscvlint_cchain *c, int64_t value, unsigned ninsn,
     }
 }
 
+// A chain in flight, one slot per general register.
+typedef struct {
+    bool open;
+    int64_t val;
+    unsigned ninsn;
+    uint64_t start;
+} cchain_live;
+
+static void cchain_close(riscvlint_cchain *c, cchain_live *slot)
+{
+    if (!slot->open) return;
+    slot->open = false;
+    cchain_finish(c, slot->val, slot->ninsn, slot->start);
+}
+
+static void cchain_close_all(riscvlint_cchain *c, cchain_live *live)
+{
+    for (unsigned i = 0; i < 32; i++) cchain_close(c, &live[i]);
+}
+
 void riscvlint_cchain_scan(riscvlint_cchain *c, csh handle,
                            const riscvlint_state *targets,
                            const uint8_t *code, size_t len, uint64_t vaddr)
@@ -3632,13 +3678,23 @@ void riscvlint_cchain_scan(riscvlint_cchain *c, csh handle,
     cs_insn *insn = cs_malloc(handle);
     if (!insn) return;
 
-    // The chain under construction: its register, its value so far, how
-    // many instructions it has taken, and where it started.
-    bool open = false;
-    unsigned reg = 0;
-    int64_t value = 0;
-    unsigned ninsn = 0;
-    uint64_t start = 0;
+    // One chain per register rather than one at a time, because the
+    // steps of a chain are not adjacent. A scheduler puts unrelated
+    // work between a `lui` and its `addi` -- in the SWAR popcount at
+    // libLLVM 0x4c92640 they are five instructions apart, with another
+    // chain opening in between -- and an adjacency rule counted the
+    // pairs it left alone and missed the ones it split. That is not a
+    // flat undercount: it reads a value whose chain the scheduler tends
+    // to separate as rarer than one it leaves alone, which reorders the
+    // ranking. On libxul it reported 27 sites for `0x0f0f0f0f` where
+    // the true figure is 3,972.
+    //
+    // A chain ends when its value is consumed, which is the rule that
+    // makes this safe to carry: the first instruction to *read* the
+    // register closes it, so a later `addi` on the same register starts
+    // a new chain rather than extending a finished one.
+    cchain_live live[32];
+    memset(live, 0, sizeof live);
 
     const uint8_t *p = code;
     size_t remain = len;
@@ -3646,41 +3702,84 @@ void riscvlint_cchain_scan(riscvlint_cchain *c, csh handle,
     while (remain >= 2) {
         uint64_t at = addr;
         if (!cs_disasm_iter(handle, &p, &remain, &addr, insn)) {
-            open = false;                   // an unreadable halfword
+            // An unreadable halfword: what follows is not reached from
+            // what came before in any way worth tracking.
+            cchain_close_all(c, live);
             p += 2; remain -= 2; addr += 2;
             continue;
         }
         uint32_t w = 0;
-        memcpy(&w, code + (at - vaddr),
-               insn->size < 4 ? insn->size : 4);
+        memcpy(&w, code + (at - vaddr), insn->size < 4 ? insn->size : 4);
 
         // A branch landing here means the instructions before are not
         // necessarily the ones that ran.
-        bool target = targets && riscvlint_is_branch_target(targets, at);
+        if (targets && riscvlint_is_branch_target(targets, at))
+            cchain_close_all(c, live);
 
-        if (open && !target && cchain_step(w, insn->size, reg, &value)) {
-            ninsn++;
+        // A step first, since it both reads and writes its register and
+        // would otherwise close the chain it is part of.
+        cchain_step st;
+        if (cchain_step_of(w, insn->size, &st) && live[st.reg].open &&
+            st.dst != 0) {
+            cchain_live moved = live[st.reg];
+            cchain_apply(&st, &moved.val);
+            moved.ninsn++;
+            if (st.dst != st.reg) {
+                // The step derived the value into another register, and
+                // the source stays in flight: an `addi` reading a
+                // register whose chain is open may be *completing* that
+                // constant into a fresh register, or may be *using* it
+                // as a base, and nothing in the instruction tells the
+                // two apart. Dropping the source assumed the first and
+                // cost 23% of libLLVM's mask chains, because the second
+                // is what an address computation off a built constant
+                // looks like. Keeping it counts both, so the price is
+                // that instructions shared between a value and a value
+                // derived from it are counted under each.
+                cchain_close(c, &live[st.dst]);
+            }
+            live[st.dst] = moved;
             continue;
         }
-        // Whatever is under the cursor is not a step, so the chain that
-        // was open is finished and gets counted.
-        if (open) {
-            cchain_finish(c, value, ninsn, start);
-            open = false;
+
+        // Anything else ends the chains it touches: a write supersedes
+        // the value being built, and a read is what the value was built
+        // for.
+        cs_regs rr, rw;
+        uint8_t nr = 0, nw = 0;
+        if (cs_regs_access(handle, insn, rr, &nr, rw, &nw) == CS_ERR_OK) {
+            for (uint8_t i = 0; i < nr; i++) {
+                unsigned n = cs_reg_to_num(rr[i]);
+                if (n < 32) cchain_close(c, &live[n]);
+            }
+            for (uint8_t i = 0; i < nw; i++) {
+                unsigned n = cs_reg_to_num(rw[i]);
+                if (n < 32) cchain_close(c, &live[n]);
+            }
+        } else {
+            // No answer about the registers is no basis for keeping any
+            // chain open.
+            cchain_close_all(c, live);
         }
-        // And it may itself start one.
+
+        // And it may itself start one. After the closes above, so that
+        // `lui rd,X` over a register already building something counts
+        // the old chain and begins a new one.
         unsigned rd;
         int64_t v0;
-        if (!target && decode_const(w, insn->size, &rd, &v0)) {
-            open = true;
-            reg = rd;
-            value = v0;
-            ninsn = 1;
-            start = at;
+        if (decode_const(w, insn->size, &rd, &v0) && rd < 32) {
+            live[rd].open = true;
+            live[rd].val = v0;
+            live[rd].ninsn = 1;
+            live[rd].start = at;
         }
+
+        // A call or an unconditional transfer ends the straight line,
+        // and nothing in flight survives it.
+        if (rv_ends_region(w, insn->size)) cchain_close_all(c, live);
     }
-    // A chain running to the end of the section still happened.
-    if (open) cchain_finish(c, value, ninsn, start);
+    // Chains running to the end of the section still happened.
+    cchain_close_all(c, live);
     cs_free(insn, 1);
 }
 

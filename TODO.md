@@ -1137,63 +1137,90 @@ expanding alike when this landed.
 ## Constant chains, as the `-c` report measures them  [implemented]
 
 Not a candidate check -- a report, armlint's `-c` ported. Recorded here
-because it sizes a population the backlog never did, and two of its
-numbers are the kind that get re-derived from intuition otherwise.
+because it sizes a population the backlog never did, and because its
+first version was wrong in a way worth keeping.
 
-**Single-instruction materializations are 93% of the population.** Over
-libLLVM: 1,127,190 materializations costing 1,154,753 instructions, of
-which 1,101,483 are one instruction. The remaining 25,707 chains cost
-53,270. Any reading of "constants are expensive here" has to start
-after that subtraction, and a report that does not make it is a list of
-`li rd,0`.
+**Adjacency was the wrong model, by 147x.** The recognizer first
+required a chain's steps to be consecutive. LLVM's scheduler batches
+the `lui`s of several constants and completes them out of order and
+sometimes into other registers, so libxul's `0x0f0f0f0f` read as 27
+sites against a true 3,972. The sequence that makes it obvious, at
+libxul 0x3267b2a, is a 64-bit SWAR popcount:
 
-**The address/literal split is most of what the report is.** Before it,
-libLLVM looked like 13,978 address chains; after, 1,132. The naive test
--- does the value land in any allocated section -- is useless in a
-shared object, because every low address belongs to the linker's own
-tables: libLLVM's first `SHT_PROGBITS` section is at 0xe5ef80 and the
-nine below it are notes, symbol and version tables, hashes, strings and
-relocations, so `0xffff` and `0xc00` both read as addresses. Requiring
-program data (`SHT_PROGBITS` or `SHT_NOBITS`) and a two-instruction
-chain -- the only length a `%hi`/`%lo` pair can be -- is what the
-figures above use.
+```
+lui  a1,0x55555      four luis together: an adjacency rule closes each
+lui  a2,0x33333      after one instruction, at 0x55555000 and friends,
+lui  a3,0xf0f1       and bins all four as untallied one-instruction
+lui  a4,0x1010       values
+srai s0,s6,0x3f      unrelated work in the middle
+addi s1,a1,1365      a1's chain completes into *s1*
+addi a2,a2,819       this one completes in place
+```
 
-The residue is irreducible and worth recording so nobody tries again:
-libLLVM builds `0x7ffffff` 696 times, which is 2^27-1 and a mask, and
-it falls inside a loaded section. Once the linker has consumed the
-relocation, nothing in the bytes distinguishes a literal from a pointer
-that happens to equal it.
+One chain per register now, closed when its value is first read, and a
+step may write a register other than the one it reads. Two iterations
+were needed and the middle one was worse than either end: dropping the
+source register on a cross-register step lost 23% of the mask chains,
+because `addi rd,rs,imm` reading a built constant is as often an
+address computation *using* it as a completion *of* it, and nothing in
+the instruction says which. Keeping the source in flight counts both,
+at the price of counting shared instructions under each.
+
+**Held to an oracle that needs no recognizer.** `lui rd,imm20` is one
+word per rd, so the encoding can be counted directly:
+
+| mask | census | `lui` encodings | |
+|---|---:|---:|---|
+| libxul `0x55555555` | 3,976 | 4,007 | -0.8% |
+| libxul `0x33333333` | 3,972 | 3,983 | -0.3% |
+| libxul `0x0f0f0f0f` | 3,969 | 3,972 | -0.1% |
+| debian-libllvm22 `0x0f0f0f0f` | 3,107 | 3,109 | -0.1% |
+
+The residual is the right sign: a `lui` whose completion never arrives
+is counted as a one-instruction value rather than guessed at.
+
+**Still not followed:** composition through a register-register `add`
+or `or`, which is how RISCVMatInt joins the halves of a 64-bit value. A
+chain stops at the last `addi`/`slli`, so a 64-bit mask surfaces as its
+shifted high half -- `0x5555555500000000`, 2,867 times in libxul. That
+is the next thing to extend, and unlike the `addi` case it is
+unambiguous: an `add` of two registers both holding open chains is a
+constant whatever else is true.
 
 ### What the corpus builds
 
 | object | materializations | chains of 2+ | insns | distinct values |
 |---|---:|---:|---:|---:|
-| libxul | 2,219,042 | 159,200 | 335,763 | 12,504 |
-| libLLVM | 1,127,190 | 25,707 | 53,270 | 9,045 |
-| libQt6Core | 66,508 | 2,112 | 4,309 | 376 |
-| ripgrep | 54,779 | 757 | 1,557 | 171 |
-| gh | 206,978 | 18,603 | 37,847 | 6,551 |
-| go compile | 213,827 | 44,370 | 89,071 | 9,705 |
+| libxul | 2,716,710 | 397,465 | 870,601 | 29,026 |
+| debian-libllvm22 | 1,475,654 | 137,548 | 301,617 | 21,109 |
+| ubuntu-libllvm22 | 1,380,418 | 72,481 | 153,382 | 19,588 |
+
+The last two rows are the same source at the same release, so the
+difference between them is mostly what RVA23 removes: 65,067 fewer
+multi-instruction chains, because `cpop` replaces a dozen instructions
+and four masks, `zext.w` replaces a shift pair, and the Zb families
+replace idioms that needed a mask built first.
 
 The costliest values are diagnostic on sight, which is the argument for
-the report existing. libxul: the sign bit 18,757 times, then four
-values shaped `0xfff?800000000000` -- SpiderMonkey's NaN-boxed JSVal
-tags, 30,000 materializations of a handful of type tags -- and
-`0xffffffff80004005`, `NS_ERROR_FAILURE`, 2,569 times. libLLVM:
-`0xaaaaaaab` 1,346 times and `0xcccccccd` 425, the divide-by-3 and
-divide-by-5 magic numbers, one chain per inlined division. go compile
-rebuilds `0x15c5` 458 times out of 730 builds, inside the functions
-that already had it.
+the report existing. libxul: the sign bit 27,954 times, then values
+shaped `0xfff?800000000000` -- SpiderMonkey's NaN-boxed JSVal tags --
+and `0xffffffff80004005`, `NS_ERROR_FAILURE`, 6,434 times.
+`0x5555555500000000` 2,867 times is the 64-bit popcount mask described
+above.
 
 ### Why none of this became a check
 
 A chain is not a finding. `lui`+`addiw` is the shortest way to build
 `0xaaaaaaab` and riscvlint has nothing shorter to suggest; what the
-report says is that the *source* builds the same thing 1,346 times,
-which is a compiler or a program question rather than a peephole. The
-rebuild figure is the closest thing to actionable and it is explicitly
-not a miss count: proving a rebuild unnecessary needs dominance and
-liveness over the whole function, which no check here has.
+report says is that the *source* builds the same thing thousands of
+times, which is a compiler or a program question rather than a
+peephole. The rebuild figure is the closest thing to actionable and it
+is explicitly not a miss count: proving a rebuild unnecessary needs
+dominance and liveness over the whole function, which no check here
+has.
+
+What the report did earn is the popcount candidate below, which it had
+first buried and then, once the recognizer was right, reopened.
 
 ## Measured and rejected
 
@@ -1324,9 +1351,10 @@ them. Here is a real 32-bit SWAR popcount, at `debian-libllvm22`
 So the smallest column was the most undercounted rather than the
 binding one, and using it as a bound inverted the error.
 
-**What the masks actually number.** Counted by encoding instead --
+**What the masks actually number.** Counted by encoding --
 `lui rd,imm20` is one word per rd, so the count needs no disassembly
-and no adjacency at all:
+and no adjacency at all -- and, since the census was fixed, by the
+census too:
 
 | | `0x55555` | `0x33333` | `0xf0f1` | `0x1010` |
 |---|---:|---:|---:|---:|
@@ -1334,11 +1362,12 @@ and no adjacency at all:
 | debian-libllvm22 (baseline) | 3,097 | 3,113 | 3,109 | 3,158 |
 | ubuntu-libllvm22 (RVA23) | 17 | 9 | 5 | 97 |
 
-libxul's `0x0f0f0f0f` is 3,972, not 27: the census undercounted it
-**147-fold**. And the measurement validates itself -- the first three
-masks have no use outside this sequence and they agree to within 1%,
-which a coincidence does not do, while the fourth is in excess because
-`0x01010101` is also the byte broadcast every `memchr` uses.
+libxul's `0x0f0f0f0f` is 3,972, not 27: the census had undercounted it
+**147-fold**, and now reports 3,969. The measurement validates itself
+besides -- the first three masks have no use outside this sequence and
+they agree to within 1%, which a coincidence does not do, while the
+fourth is in excess because `0x01010101` is also the byte broadcast
+every `memchr` uses.
 
 **So libxul does count bits**, about 3,970 times, and "the one baseline
 object does not count bits" was the undercount talking rather than an
@@ -1347,18 +1376,21 @@ RVA23 build of that release uses `cpop`/`cpopw` 2,016 times and emits 5
 of these masks, the baseline build emits 3,109 of them and no `cpop` at
 all, and neither calls out to `__popcountdi2`.
 
-**Where that leaves the candidate.** Around 3,900 sites in the two
-baseline C++ objects, which would place it above ten of the twenty-two
-shipped checks. What it needs before it can be written is a detector
-that correlates the masks across a scheduling window rather than
-matching adjacent pairs -- the same gap, from the other side, as the
-census limitation. The fold is also unusually large for this project:
-twelve-odd instructions to one `cpop`, where every shipped check
-rewrites one, two or a short run.
+**Where that leaves the candidate.** Around 3,900 sites in libxul and
+3,100 in the baseline libllvm22, which would place it above ten of the
+twenty-two shipped checks. The detector it needs now exists in part --
+the `-c` census finds the masks -- but a check has to do more than find
+them: it must prove the twelve-odd instructions between them really are
+the sequence, and nothing else, before suggesting one `cpop`. That is
+a larger fold than anything shipped, where every check rewrites one
+instruction, two, or a short run.
 
-One thing the old entry got right and keeps: the 64-bit masks really
-are absent everywhere. The sequence LLVM emits on RV64 is the 32-bit
-one, which is why looking for `0x5555555555555555` found nothing.
+One thing the old entry got wrong in the same breath: the 64-bit masks
+are not absent, they were invisible for a second reason. RISCVMatInt
+joins a 64-bit value's halves with a register-register `add`, which the
+census still does not follow, so `0x5555555555555555` surfaces as
+`0x5555555500000000` -- 2,867 times in libxul. The 64-bit popcount is
+there, and it is the expensive one.
 
 ### Redundant mask after a zero-extending load -- 1,354
 

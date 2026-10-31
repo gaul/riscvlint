@@ -1043,32 +1043,55 @@ immediate -- `li`, `lui`, `c.li`, `c.lui` -- followed by however many
 middle ends it, since the instructions after the target are then
 reached without the ones before.
 
-**The steps have to be contiguous, so the census undercounts.** A
-scheduler may put unrelated work between a `lui` and its `addi`, and
-LLVM's does -- in one SWAR popcount in the corpus the `0x0f0f0f0f` pair
-is five instructions apart, so that chain is missed while the
-`0x33333333` pair beside it is counted. The undercount is therefore
-uneven, which reorders the ranking rather than just shortening it, and
-a low count here is not evidence that a value is rarely built. TODO.md's
-popcount entry is what mistaking it for one costs.
+**The steps need not be adjacent.** One chain is tracked per register
+and it ends when its value is *consumed* -- the first instruction to
+read the register closes it, so a later `addi` on the same register
+begins a new chain rather than extending a finished one. A step may
+also write a register other than the one it reads, because the
+allocator puts the finished constant elsewhere whenever the partial
+value is still live.
+
+That costs something and buys more. The cost: instructions shared
+between a value and a value derived from it are counted under each. The
+purchase, measured against an oracle that needs no chain recognizer at
+all -- `lui rd,imm20` is one word per `rd`, so the encoding can simply
+be counted -- is that the census now agrees with it to within 1.3% on
+the four SWAR popcount masks, across libxul and both `libllvm22`
+builds. An adjacency rule put libxul's `0x0f0f0f0f` at 27 against a
+true 3,972, because of sequences like this one at 0x3267b2a:
+
+```
+lui  a1,0x55555      four luis together, so an adjacency rule closes
+lui  a2,0x33333      each after one instruction at 0x55555000 and
+lui  a3,0xf0f1       friends, and bins all four as untallied
+lui  a4,0x1010       one-instruction values
+srai s0,s6,0x3f      unrelated work in the middle
+addi s1,a1,1365      a1's chain completes into *s1*, not a1
+addi a2,a2,819       this one completes in place
+```
+
+Not followed: composition through a register-register `add` or `or`,
+which is how `RISCVMatInt` joins the halves of a 64-bit value. A chain
+stops at the last `addi`/`slli`, so the sequence above reports
+`0x5555555500000000` rather than `0x5555555555555555` -- the 64-bit
+masks appear as their shifted high halves, 2,867 of them in libxul.
 
 ```console
 $ ./riscvlint -c -q corpus/cpp/firefox-esr--libxul.so
-Constant chains in corpus/cpp/firefox-esr--libxul.so: 2219042 materializations, 2395605 instructions
-  one instruction: 2059842
-  two or more: 159200 chains, 335763 instructions, 12504 distinct values
-    of which addresses: 5833 chains, 11669 instructions
-    of which constants: 153367 chains, 324094 instructions
+Constant chains in corpus/cpp/firefox-esr--libxul.so: 2716710 materializations, 3189846 instructions
+  one instruction: 2319245
+  two or more: 397465 chains, 870601 instructions, 29026 distinct values
+    of which addresses: 18871 chains, 37756 instructions
+    of which constants: 378594 chains, 832845 instructions
   costliest values:
-       37590 insns  0x8000000000000000 (-9223372036854775808) 18757 chains
-       23904 insns  0xfff9800000000000 (-1829587348619264) 11952 chains
-       14914 insns  0xfffb000000000000 (-1407374883553280) 7457 chains
-       14034 insns  0xfffe000000000000 (-562949953421312) 7017 chains
-       10550 insns  0x8000000000000001 (-9223372036854775807) 3515 chains
+       56390 insns  0x8000000000000000 (-9223372036854775808) 27954 chains
+       37256 insns  0xfff9800000000000 (-1829587348619264) 18628 chains
+       27476 insns  0xfffe000000000000 (-562949953421312) 13738 chains
+       24970 insns  0x2000100000000 (562954248388608) 12485 chains
+       23949 insns  0x8000000000000001 (-9223372036854775807) 7974 chains
        ...
   rebuilt inside one function: not counted, nothing named the functions
 ```
-
 Read off that one run: the sign bit 18,757 times, then four values of
 the form `0xfff?800000000000`, which are SpiderMonkey's NaN-boxed JSVal
 tags -- 30,000 materializations of a handful of type tags -- and
@@ -1080,15 +1103,17 @@ chain per inlined division.
 Three things the report does that a by-value tally alone would not.
 
 **Single-instruction values are counted and not tallied.** `li a0,0`
-has no cheaper spelling, and libLLVM materializes something in one
-instruction 1,101,483 times, so ranking those by cost would make the
+has no cheaper spelling, and libxul materializes something in one
+instruction 2,319,245 times, so ranking those by cost would make the
 report a list of "build zero". The totals keep them; the ranked list
 starts at two.
 
 **Addresses are told from literals.** In a linked object `lui`+`addi`
 of a symbol's `%hi`/`%lo` is indistinguishable from arithmetic on a
-literal, and conflating them buries the constants: before the split
-libLLVM reported 13,978 chains as addresses, against 1,132 after. Two
+literal, and conflating them buries the constants: libxul reports
+18,871 address chains against 378,594 constant ones, where the naive
+test -- any allocated section -- put a large part of the second column
+in the first. Two
 conditions, both principled. The value must land in a section holding
 *program* data -- `SHT_PROGBITS` or `SHT_NOBITS`, not the linker's own
 tables, which in a shared object are everything at the low addresses a

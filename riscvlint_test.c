@@ -2765,6 +2765,41 @@ static void test_cchain(csh handle)
     CHECK(!address);
     riscvlint_cchain_destroy(c);
 
+    // Non-adjacent steps and a cross-register completion, which is what
+    // the per-register tracking exists for. These are libxul's own bytes
+    // at 0x3267b2a: two mask materializations whose `lui`s the scheduler
+    // batched, with unrelated work between, and the first completing
+    // into a register other than the one it was built in.
+    static const uint8_t split[] = {
+        0xb7, 0x55, 0x55, 0x55,        // lui a1,0x55555
+        0x37, 0x36, 0x33, 0x33,        // lui a2,0x33333
+        0x13, 0x54, 0xfb, 0x43,        // srai s0,s6,0x3f   (unrelated)
+        0x93, 0x84, 0x55, 0x55,        // addi s1,a1,1365 -> 0x55555555
+        0x13, 0x06, 0x36, 0x33,        // addi a2,a2,819  -> 0x33333333
+    };
+    c = riscvlint_cchain_create();
+    if (!c) { CHECK(false); return; }
+    riscvlint_cchain_scan(c, handle, NULL, split, sizeof split, 0x1000);
+    // Both masks are found at two instructions each, which an adjacency
+    // rule reports as neither: it would close `lui a1` against `lui a2`
+    // and bin both at one instruction.
+    CHECK(riscvlint_cchain_lookup(c, 0x55555555, &chains, &insns, NULL, NULL));
+    CHECK(chains == 1 && insns == 2);
+    CHECK(riscvlint_cchain_lookup(c, 0x33333333, &chains, &insns, NULL, NULL));
+    CHECK(chains == 1 && insns == 2);
+    // The cross-register step left a1 in flight rather than consuming
+    // it, because an `addi` reading a built constant may be using it as
+    // a base rather than completing it. Nothing finished a1, so it
+    // closes as a one-instruction value and is not tallied.
+    CHECK(!riscvlint_cchain_lookup(c, 0x55555000, NULL, NULL, NULL, NULL));
+    // Three materializations: the two masks and a1's leftover. The
+    // `lui a1` is counted under both its own and s1's chain, which is
+    // the price of not guessing which of the two the step was.
+    CHECK(riscvlint_cchain_chains(c) == 3);
+    CHECK(riscvlint_cchain_instructions(c) == 5);
+    CHECK(riscvlint_cchain_values(c) == 2);
+    riscvlint_cchain_destroy(c);
+
     // Everything tolerates NULL, as the census does.
     riscvlint_cchain_destroy(NULL);
     riscvlint_cchain_set_hooks(NULL, NULL, NULL, NULL, NULL);
