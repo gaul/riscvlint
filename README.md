@@ -1595,6 +1595,43 @@ the categories built around them have flagless replacements.
   plain file, `rank.py` says so rather than reporting the upper bound as
   a number.
 
+* `tools/v8dump2elf.py` turns a V8 code dump (`d8 --print-opt-code
+  --print-maglev-code --print-code --print-regexp-code` on a build with
+  `v8_enable_disassembler=true`) into ELF objects the checker can scan:
+  one executable section per contiguous run of instructions, a symbol
+  per section naming the tier and the function (`TF_foo`, `ML_foo`,
+  `BL_foo`, `RE_<pattern>`, ...; a recompile gets `.2`, `.3`), and two
+  sidecars, `--map` (section, size, JIT address) and `--relocs` (every
+  object's RelocInfo entries by offset). V8 prints every instruction as
+  an 8-digit word, a compressed one zero-extended, so the bytes are
+  sliced by the encoding's own length bits and cross-checked against
+  the next line's address. Constant pools and jump tables split the
+  section rather than staying in it, since the checker has no mode that
+  steps over them. Sections get unique synthetic addresses rather than
+  their JIT addresses, because V8 frees code and reuses addresses: over
+  a JetStream run a third of the objects share an address with an
+  earlier one, and nothing keyed by address could tell them apart.
+  `--arch` declares the host's ISA string (in the assembler's spelling,
+  `rv64i2p1_..._c2p0_zba1p0...`) so the extension gate reads `declared`
+  rather than `unrestricted`. The output is split into ELFs of 2,000
+  sections by default, because the checker attributes each finding by a
+  linear scan of the symbol table and a dump yields millions of them.
+
+  `tools/v8_analyze_findings.py` then joins `riscvlint --json` output
+  for those ELFs with the two sidecars, attributing by symbol and offset
+  rather than address: findings by check and tier, the share that
+  repeat an earlier copy of the same function (a JIT recompiles after
+  every deopt; copies are matched on name, code size, offset and
+  bytes), the share containing a relocated instruction (toolchain-forced
+  rather than a missed fold; deopt entries, which only annotate call
+  return addresses, do not count), and samples per check.
+  `tools/v8_jetstream_dump.sh` runs JetStream 3 under `d8` with the
+  printers on, and `tools/v8_analyze.sh` runs the whole chain over a
+  dump. The run script leaves out the Wasm workloads: `--print-code`
+  also prints every Wasm function from the background compile threads,
+  which interleaves with and corrupts the JS listing, and `bomb-workers`,
+  whose Worker isolates do the same to stdout.
+
 The checks in `riscvlint.c` decode raw encodings rather than reading
 Capstone's operand model, and the reason is not stylistic. Capstone
 reports `auipc`'s operand as the raw imm20 field rather than the
