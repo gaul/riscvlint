@@ -1412,6 +1412,28 @@ bool check_long_li(riscvlint_state *state, const cs_insn *insn,
 bool check_no_effect(riscvlint_state *state, const cs_insn *insn,
                      riscvlint_finding *finding);
 
+// Values pushed one at a time -- `addi sp,sp,-8` + `sd r,0(sp)`, again
+// and again -- where one adjustment by the total and the same stores at
+// re-computed offsets leave memory and sp exactly as the run did. The
+// run is every sp decrement and sp-relative access from the first
+// decrement on, with anything between them that neither reads nor
+// writes sp; it ends at a side entry, a transfer, a release, an access
+// that stores or loads sp itself, or a total one addi cannot subtract.
+// Each access's new offset must still fit its immediate. Reported once,
+// at the first decrement, when there are at least two.
+//
+// Priced at the run's own encoding class, as check_long_li prices its
+// chain: four bytes for the merged addi in an uncompressed run, and an
+// access keeps four bytes if it had them.
+//
+// Measured population: 259,684 runs in the JetStream corpus (TODO.md,
+// entry 40), 2,093,116 bytes: Maglev's prologue pushes each register and
+// each zeroed slot with its own Push(), and baseline loads each value
+// just before pushing it, which the run tolerates. Compilers allocate a
+// frame once.
+bool check_push_run(riscvlint_state *state, const cs_insn *insn,
+                    riscvlint_finding *finding);
+
 // ---- running every check ----
 //
 // Called once per finding, with `ctx` as given. The finding is valid

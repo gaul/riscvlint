@@ -1485,7 +1485,7 @@ which is to the digit what check 3 reports over this corpus.
 | 37 | a constant built in more instructions than `li` needs | 558,869 | ML 404K, TF 83K, BL 49K, RE 21K | **implemented**, 562,957 |
 | 38 | an instruction with no architectural effect | 812,586 | ML 764K | **implemented**, 812,586 |
 | 39 | a conditional branch whose target is an unconditional jump | 177,202 | ML 137K, TF 17K, RE 14K | candidate |
-| 40 | pushes one stack adjustment would do | 81,103 runs | ML 78K | candidate |
+| 40 | pushes one stack adjustment would do | 81,103 runs | ML 78K | **implemented**, 259,684 |
 | 41 | `li rt,0` + a store of rt | 43,002 | BL 20K, ML 13K, RE 7K | candidate |
 | 42 | a branch over a constant move that Zbb `max`/`min` does | 31,906 | ML | candidate |
 | 43 | `li rc,0` + `beq`/`bne rx,rc` | 29,089 | TF 25K | candidate |
@@ -1596,20 +1596,46 @@ architecture positively lacks Zicfilp, and never where the architecture
 is unknown. V8's lacks it, and uses the encoding as its constant-pool
 guard.
 
-## 39 to 46. Eight more shapes from the JetStream corpus
+## 40. Pushes one stack adjustment would do -- 259,684  [implemented]
+
+`addi sp,sp,-8` + `sd r,0(sp)`, again and again. `MacroAssembler::push`
+on this port is exactly that pair, and Maglev's prologue calls it for
+the context, the function and the argument count and then once per
+tagged stack slot to zero it -- fully unrolled below sixteen slots, a
+loop of eight above -- before a bare `Sub64` for the untagged slots.
+The variadic `Push(r1, r2, ...)` in the same header adjusts once and
+stores at offsets; the prologue does not use it. Baseline pushes each
+argument just after loading it through s0, the interleaved form the
+miner counted as 329,280 triples.
+
+The fold is one `addi sp,sp,-total` at the first decrement, with every
+sp-relative access in the run re-offset by what the decrements after it
+would have subtracted: the same stores to the same addresses in the same
+order, and only sp's intermediate values gone. So the run can carry
+anything between its decrements that neither reads nor writes sp, which
+is what admits baseline's loads. It ends at a side entry, a transfer, a
+release, an access that stores or loads sp itself, or a total past one
+`addi`'s reach, and a re-offset access must still fit its immediate.
+Reported once, at the first decrement.
+
+What check_push_run reports: 259,684 runs worth 2,093,116 bytes, 1.4%
+of the corpus's code -- 523,279 `addi`s -- 129,227 baseline, 127,370
+Maglev, 3,020 regexp, 67 wrappers. By adjustments: 148,192 of two,
+55,306 of three, 24,740 of four, 12,063 of five and 19,383 of six or
+more, the longest 22. It is the first of these checks to come in above
+its estimate rather than under it. The miner counted runs of adjacent
+pairs only, so every run with a load between its pushes -- all of
+baseline's and part of Maglev's -- fell outside its 81,103, and a
+prologue ending in the untagged-slot `Sub64` counted one adjustment
+short. Regexp code agrees with it: 3,020 against 3,016.
+
+## 39 and 41 to 46. Seven more shapes from the JetStream corpus
 
 * **39**, a branch whose target is a `j`: jump threading. 177,202, and
   38,002 more `j` whose target is another `j`. Check 19 reads
   `bcc L1; j X; L1:`; this is `bcc L; ...; L: j X`, where the branch can
   be retargeted when X is inside its reach. Many sites are both at once
   (`bnez a0,L1; j A; L1: j B`).
-* **40**, `addi sp,sp,-8` + `sd r,0(sp)` repeated: 81,103 runs (43,778
-  of two, 16,496 of three, 7,904 of four, 3,122 of five, 9,803 of six
-  or more), almost all Maglev prologues pushing one register at a time
-  when the variadic `Push(r1, r2, ...)` adjusts once. About 162K
-  instructions. Baseline interleaves a load with each push (`ld;
-  addi sp,-8; sd`, 329,280 triples), which a check tolerating an
-  intervening instruction would take as well.
 * **41**, a register loaded with zero and then stored: 43,002, `sd x0`
   being free. 19,930 in baseline, 12,635 in Maglev.
 * **42**, `li t2,K; blt t2,a5,+8; li a5,K`, Maglev's argument-count
@@ -1634,18 +1660,20 @@ which are 30's Zibi shape and need the extension.
 
 ### What the corpus says about V8
 
-Four habits of the riscv64 port account for 36, 37, 38 and 40, and are
-CLs rather than checks. `BranchLong` emits `auipc`+`jr` for every
-unbound label where `bcc`+`j` would do, and `j` alone reaches any
-function in this corpus. Short builtin calls are disabled whenever
+Five habits of the riscv64 port account for 36, 37, 38 and 40, and each
+is a CL as well as a check's finding. `BranchLong` emits `auipc`+`jr`
+for every unbound label where `bcc`+`j` would do, and `j` alone reaches
+any function in this corpus. Short builtin calls are disabled whenever
 pointer compression is off (the `v8_enable_short_builtin_calls` clause
 in `BUILD.gn`), which is riscv64's default, so Maglev and TurboFan call
-every builtin through a six-instruction `li` and baseline through
-`lui; add s6; ld; jalr` -- 940,521 of those, about a quarter of all
-baseline instructions. `Assembler::stop()` spends eight bytes on a
-trap that `ebreak` alone, or `c.ebreak` in two, expresses on hardware.
-And `MultiPush`/`MultiPop` with nothing to push still adjust `sp` by
-zero.
+every builtin through a six-instruction `li` and baseline through `lui;
+add s6; ld; jalr` -- 940,521 of those, about a quarter of all baseline
+instructions. `Assembler::stop()` spends eight bytes on a trap that
+`ebreak` alone, or `c.ebreak` in two, expresses on hardware.
+`MultiPush`/`MultiPop` with nothing to push still adjust `sp` by zero.
+And Maglev's prologue pushes the context, the function, the argument
+count and a zero for every tagged slot with one `Push()` each, where the
+variadic `Push` beside it adjusts once.
 
 Two things it says about check 9, the extension the producer already
 guarantees: `srai` and `srli` by 32 or more leave a sign- or
@@ -1656,13 +1684,13 @@ not tracked (about 75K, every one a dispatch handle that a later
 
 # Remaining candidates
 
-Eight, 39 to 46, all from the JetStream corpus above; over the package
-corpus there are none. Thirty-seven checks are implemented, 36 to 38
-being the first three from that corpus, and everything this file sized
-over the package corpus is either written or recorded as rejected with
-the evidence that rejected it. Thirteen of the package entries, 23 to
-35, did not come from a corpus probe at all: 23
-came from walking armlint's check table against this one, 24 came from a
+Seven, 39 and 41 to 46, all from the JetStream corpus above; over the
+package corpus there are none. Thirty-eight checks are implemented, 36
+to 38 and 40 being the four from that corpus so far, and everything
+this file sized over the package corpus is either written or recorded
+as rejected with the evidence that rejected it. Thirteen of the package
+entries, 23 to 35, did not come from a corpus probe at all: 23 came
+from walking armlint's check table against this one, 24 came from a
 rejection in this file being wrong, 25, 26 and 27 are the three
 addressing modes of a ratification plan for an extension that does not
 exist in hardware yet, and 28, 29 and 30 all came out of one pair dump

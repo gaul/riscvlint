@@ -5532,6 +5532,78 @@ static void test_no_effect(csh handle)
     CHECK(strcmp(f.replacement, "delete; a move onto itself (2 bytes)") == 0);
 }
 
+// check_push_run: values pushed one at a time.
+static void test_push_run(csh handle)
+{
+    riscvlint_finding f;
+    const uint32_t push8 = 0xff810113u;          // addi sp,sp,-8
+    const uint32_t sd_s7 = 0x01713023u;          // sd s7,0(sp)
+    const uint32_t sd_a1 = 0x00b13023u;          // sd a1,0(sp)
+    const uint32_t sd_a0 = 0x00a13023u;          // sd a0,0(sp)
+    const uint32_t ret = 0x00008067u;
+
+    // Maglev's prologue: three pushes, then a bare -16 for the rest of
+    // the frame, then `addi t2,sp,-304` reading sp. One addi of -40 and
+    // the stores at 32, 24 and 16; reported once, at the first push.
+    uint32_t maglev[] = { push8, sd_s7, push8, sd_a1, push8, sd_a0,
+                          0xff010113u /* addi sp,sp,-16 */,
+                          0xed010393u /* addi t2,sp,-304 */, ret };
+    CHECK(run_words(handle, check_push_run, maglev, 9, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement,
+                 "one addi sp, sp, -40 for 4 adjustments (28 -> 16 bytes)") == 0);
+    CHECK(f.insn_count == 7 && f.address == 0x1000);
+    CHECK(strcmp(f.title, "pushes one stack adjustment would do") == 0);
+
+    // Baseline loads each value just before pushing it; the load reads
+    // s0, not sp, so it stays where it is.
+    uint32_t baseline[] = { push8, 0x01313023u /* sd s3,0(sp) */,
+                            0xf9043983u /* ld s3,-112(s0) */,
+                            push8, 0x01313023u, ret };
+    CHECK(run_words(handle, check_push_run, baseline, 6, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement,
+                 "one addi sp, sp, -16 for 2 adjustments (16 -> 12 bytes)") == 0);
+    CHECK(f.insn_count == 5);
+
+    // Not reported: `mv s0,sp` between the pushes reads sp; a store of sp
+    // itself would store a different value; a release ends the run; and
+    // a `j` back to the second push makes it a side entry.
+    uint32_t reads[] = { push8, sd_a0, 0x00010413u /* mv s0,sp */,
+                         push8, sd_a1, ret };
+    CHECK(run_words(handle, check_push_run, reads, 6, 0x1000, NULL) == 0);
+    uint32_t self[] = { push8, 0x00213023u /* sd sp,0(sp) */, push8, sd_a0,
+                        ret };
+    CHECK(run_words(handle, check_push_run, self, 5, 0x1000, NULL) == 0);
+    uint32_t release[] = { push8, sd_a0, 0x01010113u /* addi sp,sp,16 */,
+                           push8, sd_a1, ret };
+    CHECK(run_words(handle, check_push_run, release, 6, 0x1000, NULL) == 0);
+    uint32_t entry[] = { push8, sd_a0, push8, sd_a1, ret,
+                         0xff5ff06fu /* j -12 */ };
+    CHECK(run_words(handle, check_push_run, entry, 6, 0x1000, NULL) == 0);
+
+    // Limits of the immediates: -2048 and -8 more is past what one addi
+    // subtracts, and a store at 2040 moved up by 16 is past its own
+    // offset field.
+    uint32_t total[] = { 0x80010113u /* addi sp,sp,-2048 */, sd_a0, push8,
+                         sd_a1, ret };
+    CHECK(run_words(handle, check_push_run, total, 5, 0x1000, NULL) == 0);
+    uint32_t reach[] = { push8, 0x7ea13c23u /* sd a0,2040(sp) */,
+                         0xff010113u /* addi sp,sp,-16 */, sd_a1, ret };
+    CHECK(run_words(handle, check_push_run, reach, 5, 0x1000, NULL) == 0);
+
+    // Compressed: c.addi16sp -64; c.sdsp a0,0(sp); c.addi16sp -16;
+    // c.sdsp a1,0(sp) is one c.addi16sp -80 and a0's store at 16, two
+    // bytes saved. With c.addi sp,-8 for the second adjustment the total
+    // is -72, which no compressed addi spells, and nothing is saved.
+    uint8_t rvc[] = { 0x39, 0x71, 0x2a, 0xe0, 0x7d, 0x71, 0x2e, 0xe0,
+                      0x82, 0x80 };
+    CHECK(run_window(handle, check_push_run, rvc, sizeof rvc, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement,
+                 "one addi sp, sp, -80 for 2 adjustments (8 -> 6 bytes)") == 0);
+    uint8_t odd[] = { 0x39, 0x71, 0x2a, 0xe0, 0x61, 0x11, 0x2e, 0xe0,
+                      0x82, 0x80 };
+    CHECK(run_window(handle, check_push_run, odd, sizeof odd, 0x1000, NULL) == 0);
+}
+
 int main(void)
 {
     csh handle;
@@ -5570,6 +5642,7 @@ int main(void)
     test_jump_pair_to_j(handle);
     test_long_li(handle);
     test_no_effect(handle);
+    test_push_run(handle);
     test_zero_store_run(handle);
     test_bitcast_through_frame(handle);
     test_cchain(handle);

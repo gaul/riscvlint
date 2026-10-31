@@ -1263,6 +1263,11 @@ struct riscvlint_state {
     // which is what makes a single watermark enough.
     uint64_t zrun_end;
 
+    // The same watermark for check_push_run: the address after the last
+    // instruction of the run it has already judged, so that the second
+    // push of a run is not reported again as the start of a shorter one.
+    uint64_t push_end;
+
     // The address of an `add` that a deeper Zilx fold has already
     // claimed -- check_scaled_indexed_load's triple or
     // check_zext_indexed_load's quad. The unscaled check matches that
@@ -1375,6 +1380,7 @@ bool riscvlint_state_set_section(riscvlint_state *state, csh handle,
     state->handle = handle;
     memset(&state->fp, 0, sizeof state->fp);
     state->zrun_end = 0;
+    state->push_end = 0;
     state->zilx_folded = UINT64_MAX;
     memset(state->guarantees, 0, sizeof state->guarantees);
     memset(&state->win, 0, sizeof state->win);
@@ -5663,6 +5669,186 @@ bool check_no_effect(riscvlint_state *state, const cs_insn *insn,
     return true;
 }
 
+// ---- walking ahead of the cursor ----
+
+// Whether `w` might read or write integer register `r`, answered from
+// the register fields rather than by decoding the instruction: true
+// whenever a field that names a register in some format names r here,
+// whatever this format makes of those bits, and true for the registers
+// the compressed forms name implicitly. An immediate whose bits happen
+// to spell r answers true as well, which costs a finding and never
+// licenses one. The walks that use it run ahead of the driver's
+// cursor, where there is no decoded instruction to ask, as
+// zrun_store's does.
+//
+// Zcmp and Zcmt share the c.fsdsp encoding space and name lists of
+// registers that no field spells, so everything there answers true.
+static bool rv_may_name(uint32_t w, unsigned size, unsigned r)
+{
+    if (size == 4)
+        return ((w >> 7) & 0x1fu) == r || ((w >> 15) & 0x1fu) == r ||
+               ((w >> 20) & 0x1fu) == r;
+    if (size != 2) return true;
+    unsigned q = w & 0x3u, f3 = (w >> 13) & 0x7u;
+    if (q == 2 && f3 == 5) return true;               // c.fsdsp, Zcmp, Zcmt
+    if (r == 2 && q == 0 && f3 == 0) return true;     // c.addi4spn
+    if (r == 2 && q == 2 && f3 != 0 && f3 != 4) return true;   // sp-based
+    if (r == 1 && q == 2 && f3 == 4 && ((w >> 12) & 1u) &&
+        ((w >> 2) & 0x1fu) == 0)
+        return true;                                  // c.jalr links ra
+    return ((w >> 7) & 0x1fu) == r || ((w >> 2) & 0x1fu) == r ||
+           8u + ((w >> 7) & 0x7u) == r || 8u + ((w >> 2) & 0x7u) == r;
+}
+
+// An instruction a forward walk cannot see past: a transfer of any kind,
+// which leaves the straight line, or a system instruction, which reads
+// registers no field names -- ecall's arguments -- or hands control to
+// a debugger that may read any of them.
+static bool rv_stops_walk(uint32_t w, unsigned size)
+{
+    if (rv_ends_region(w, size) || is_cond_branch_raw(w, size)) return true;
+    if (size == 4) return RV_OPCODE(w) == 0x73u;
+    return (w & 0xffffu) == 0x9002u;                  // c.ebreak
+}
+
+// ---- pushes one stack adjustment would do ----
+
+// The constant an instruction adds to sp in place: `addi sp,sp,K`,
+// `c.addi16sp K`, or `c.addi sp,K`, which CI format allows since it
+// takes any rd.
+static bool rv_decode_sp_adjust(uint32_t w, unsigned size, int64_t *k)
+{
+    if (size == 4) {
+        unsigned rd, rs1;
+        return rv_decode_addi(w, 4, &rd, &rs1, k) && rd == 2 && rs1 == 2;
+    }
+    if (size != 2 || ((w >> 7) & 0x1fu) != 2) return false;
+    if ((w & 0xe003u) == 0x6001u) {                   // c.addi16sp
+        // nzimm[9] is bit 12 and bits 6:2 are nzimm[4|6|8:7|5].
+        uint64_t v = (((uint64_t)(w >> 12) & 1u) << 9) |
+                     (((uint64_t)(w >> 6) & 1u) << 4) |
+                     (((uint64_t)(w >> 5) & 1u) << 6) |
+                     (((uint64_t)(w >> 3) & 0x3u) << 7) |
+                     (((uint64_t)(w >> 2) & 1u) << 5);
+        *k = sign_extend(v, 10);
+        return *k != 0;
+    }
+    if ((w & 0xe003u) == 0x0001u) {                   // c.addi sp,K
+        *k = ci_imm6(w);
+        return *k != 0;
+    }
+    return false;
+}
+
+// What `addi sp,sp,K` costs at the encoding class of the run it
+// replaces, as check_long_li prices its chain: in a compressed run,
+// c.addi16sp for a multiple of 16 in its range and c.addi for a six-bit
+// value; otherwise four bytes, whatever the compression check would say
+// about them.
+static unsigned sp_adjust_bytes(int64_t k, bool compressed)
+{
+    if (!compressed || k == 0) return 4;
+    if (k % 16 == 0 && k >= -512 && k <= 496) return 2;
+    return fits6(k) ? 2 : 4;
+}
+
+#define PUSH_WALK     64    // instructions a run may span
+#define PUSH_ACCESSES 32    // sp-relative accesses it may carry
+
+bool check_push_run(riscvlint_state *state, const cs_insn *insn,
+                    riscvlint_finding *finding)
+{
+    if (insn->address < state->push_end) return false;
+    if (insn->size != 2 && insn->size != 4) return false;
+    uint32_t w;
+    if (!riscvlint_word_at(state, insn->address, &w)) return false;
+    int64_t k;
+    if (!rv_decode_sp_adjust(w, insn->size, &k) || k >= 0) return false;
+    if (riscvlint_is_relocated(state, insn->address)) return false;
+
+    // Every access through sp between the first adjustment and the last
+    // is re-offset by what the adjustments after it would have
+    // subtracted, so that it reaches the same address with sp already
+    // at its final value. Memory sees the same stores in the same order;
+    // only sp's intermediate values are gone.
+    struct {
+        rv_mem_kind kind;
+        unsigned data, size;
+        int64_t off;
+        int64_t below;          // what the run had subtracted by then
+    } acc[PUSH_ACCESSES];
+    unsigned nacc = 0, nadj = 1, bytes = insn->size;
+    unsigned seen = 1, span = 1;
+    int64_t total = -k;
+    uint64_t at = insn->address + insn->size, end = at;
+    for (int budget = PUSH_WALK; budget > 0; budget--) {
+        // A side entry would arrive expecting sp where the run had it.
+        if (riscvlint_is_branch_target(state, at)) break;
+        uint32_t w2;
+        if (!riscvlint_word_at(state, at, &w2)) break;
+        unsigned len = rv_insn_len(w2);
+        if (riscvlint_is_relocated(state, at)) break;
+        seen++;
+        int64_t k2, off;
+        rv_mem_kind kind;
+        unsigned data, base;
+        if (rv_decode_sp_adjust(w2, len, &k2)) {
+            // A release ends the run, and so does a total one addi
+            // cannot subtract.
+            if (k2 >= 0 || total - k2 > 2048) break;
+            total -= k2;
+            nadj++;
+        } else if (len == 2 && (w2 & 0x3u) == 2u && ((w2 >> 13) & 0x7u) == 5u) {
+            break;      // c.fsdsp's space, which Zcmp's push reuses
+        } else if (rv_decode_mem(w2, len, &kind, &data, &base, &off) &&
+                   base == 2) {
+            // An integer access naming sp as its data either stores sp's
+            // own value, which the fold changes, or loads into sp.
+            if (!rv_mem_is_fp(kind) && data == 2) break;
+            if (nacc == PUSH_ACCESSES) break;
+            acc[nacc].kind = kind;
+            acc[nacc].data = data;
+            acc[nacc].size = len;
+            acc[nacc].off = off;
+            acc[nacc].below = total;
+            nacc++;
+        } else {
+            // Anything else may sit between pushes -- baseline code loads
+            // each value just before pushing it -- provided it neither
+            // reads sp, which would see the wrong value, nor writes it.
+            if (rv_may_name(w2, len, 2) || rv_stops_walk(w2, len)) break;
+            at += len;
+            continue;
+        }
+        bytes += len;
+        at += len;
+        end = at;
+        span = seen;
+    }
+    state->push_end = end;
+    if (nadj < 2) return false;
+
+    bool zcb = riscvlint_may_use(state, RISCVLINT_EXT_ZCB);
+    unsigned after = sp_adjust_bytes(-total, insn->size == 2);
+    for (unsigned i = 0; i < nacc; i++) {
+        int64_t off = acc[i].off + (total - acc[i].below);
+        if (off > 2047) return false;
+        after += acc[i].size == 2
+                     ? rv_mem_encoded_size(acc[i].kind, acc[i].data, 2, off,
+                                           zcb)
+                     : 4;
+    }
+    if (after >= bytes) return false;
+
+    finding->title = "pushes one stack adjustment would do";
+    finding->address = insn->address;
+    finding->insn_count = span;
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "one addi sp, sp, -%" PRId64 " for %u adjustments (%u -> %u "
+             "bytes)", total, nadj, bytes, after);
+    return true;
+}
+
 // ---- running every check ----
 
 static const riscvlint_check_fn riscvlint_checks[] = {
@@ -5703,6 +5889,7 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_jump_pair_to_j,
     check_long_li,
     check_no_effect,
+    check_push_run,
 };
 
 size_t riscvlint_scan(riscvlint_state *state, csh handle,

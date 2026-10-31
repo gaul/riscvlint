@@ -1,0 +1,133 @@
+instruction compressible to a base C form at offset: 0x0: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd s0, 0(sp)
+
+instruction compressible to a base C form at offset: 0x4: -> c.mv (4 -> 2 bytes) (1 instructions)
+  mv s0, sp
+
+instruction compressible to a base C form at offset: 0x8: -> c.addi (4 -> 2 bytes) (1 instructions)
+  addi sp, sp, -8
+
+pushes one stack adjustment would do at offset: 0x8: -> one addi sp, sp, -40 for 4 adjustments (28 -> 16 bytes) (7 instructions)
+  addi sp, sp, -8
+  sd s7, 0(sp)
+  addi sp, sp, -8
+  sd a1, 0(sp)
+  addi sp, sp, -8
+  sd a0, 0(sp)
+  addi sp, sp, -0x10
+
+instruction compressible to a base C form at offset: 0xc: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd s7, 0(sp)
+
+instruction compressible to a base C form at offset: 0x10: -> c.addi (4 -> 2 bytes) (1 instructions)
+  addi sp, sp, -8
+
+instruction compressible to a base C form at offset: 0x14: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a1, 0(sp)
+
+instruction compressible to a base C form at offset: 0x18: -> c.addi (4 -> 2 bytes) (1 instructions)
+  addi sp, sp, -8
+
+instruction compressible to a base C form at offset: 0x1c: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a0, 0(sp)
+
+instruction compressible to a base C form at offset: 0x20: -> c.addi16sp (4 -> 2 bytes) (1 instructions)
+  addi sp, sp, -0x10
+
+instruction compressible to a base C form at offset: 0x2c: -> c.addi (4 -> 2 bytes) (1 instructions)
+  addi sp, sp, -8
+
+pushes one stack adjustment would do at offset: 0x2c: -> one addi sp, sp, -24 for 3 adjustments (24 -> 16 bytes) (8 instructions)
+  addi sp, sp, -8
+  sd s3, 0(sp)
+  ld s3, -0x70(s0)
+  addi sp, sp, -8
+  sd s3, 0(sp)
+  ld s3, -0x68(s0)
+  addi sp, sp, -8
+  sd s3, 0(sp)
+
+instruction compressible to a base C form at offset: 0x30: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd s3, 0(sp)
+
+instruction compressible to a base C form at offset: 0x38: -> c.addi (4 -> 2 bytes) (1 instructions)
+  addi sp, sp, -8
+
+instruction compressible to a base C form at offset: 0x3c: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd s3, 0(sp)
+
+instruction compressible to a base C form at offset: 0x44: -> c.addi (4 -> 2 bytes) (1 instructions)
+  addi sp, sp, -8
+
+instruction compressible to a base C form at offset: 0x48: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd s3, 0(sp)
+
+dead register definition at offset: 0x4c: -> delete; nothing reads t0 (4 bytes) (1 instructions)
+  mv t0, sp
+
+instruction compressible to a base C form at offset: 0x4c: -> c.mv (4 -> 2 bytes) (1 instructions)
+  mv t0, sp
+
+instruction compressible to a base C form at offset: 0x50: -> c.addi (4 -> 2 bytes) (1 instructions)
+  addi sp, sp, -8
+
+instruction compressible to a base C form at offset: 0x54: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a0, 0(sp)
+
+instruction compressible to a base C form at offset: 0x58: -> c.mv (4 -> 2 bytes) (1 instructions)
+  mv a1, sp
+
+instruction compressible to a base C form at offset: 0x5c: -> c.addi (4 -> 2 bytes) (1 instructions)
+  addi sp, sp, -8
+
+instruction compressible to a base C form at offset: 0x60: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a1, 0(sp)
+
+dead register definition at offset: 0x64: -> delete; nothing reads t0 (4 bytes) (1 instructions)
+  mv t0, sp
+
+instruction compressible to a base C form at offset: 0x64: -> c.mv (4 -> 2 bytes) (1 instructions)
+  mv t0, sp
+
+instruction compressible to a base C form at offset: 0x68: -> c.addi (4 -> 2 bytes) (1 instructions)
+  addi sp, sp, -8
+
+instruction compressible to a base C form at offset: 0x6c: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd sp, 0(sp)
+
+instruction compressible to a base C form at offset: 0x70: -> c.addi (4 -> 2 bytes) (1 instructions)
+  addi sp, sp, -8
+
+instruction compressible to a base C form at offset: 0x74: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a0, 0(sp)
+
+instruction compressible to a base C form at offset: 0x78: -> c.mv (4 -> 2 bytes) (1 instructions)
+  mv t0, sp
+
+instruction compressible to a base C form at offset: 0x7c: -> c.addi (4 -> 2 bytes) (1 instructions)
+  addi sp, sp, -8
+
+instruction compressible to a base C form at offset: 0x80: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a0, 0(sp)
+
+instruction compressible to a base C form at offset: 0x84: -> c.addi (4 -> 2 bytes) (1 instructions)
+  addi sp, sp, -8
+
+instruction compressible to a base C form at offset: 0x88: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a1, 0(sp)
+
+instruction compressible to a base C form at offset: 0x8c: -> c.bnez (4 -> 2 bytes) (1 instructions)
+  bnez a2, 0x84
+
+pushes one stack adjustment would do at offset: 0x90: -> one addi sp, sp, -80 for 2 adjustments (8 -> 6 bytes) (4 instructions)
+  addi sp, sp, -0x40
+  sd a0, 0(sp)
+  addi sp, sp, -0x10
+  sd a1, 0(sp)
+
+Optimization opportunities by type:
+      32  instruction compressible to a base C form
+       3  pushes one stack adjustment would do
+       2  dead register definition
+
+37 optimization opportunities in 41 instructions

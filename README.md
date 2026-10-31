@@ -3,8 +3,8 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Thirty-seven checks are implemented and the ledger's candidate list
-holds eight, all from a JIT corpus. [TODO.md](TODO.md) is that ledger:
+Thirty-eight checks are implemented and the ledger's candidate list
+holds seven, all from a JIT corpus. [TODO.md](TODO.md) is that ledger:
 every candidate that was measured, the population it came back with,
 and the ones rejected on that evidence.
 What got written was decided by the corpus rather than by intuition,
@@ -12,19 +12,20 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Thirty-seven of them, and the table lists twenty-seven. The jump pair,
-the constant chain and the no-op have so far been measured over the
-JetStream corpus of TODO.md, which the table does not cover. Seven
-report nothing over this corpus -- the bit count because no baseline
-object declares Zbb; the three indexed loads, the equality branch and the
-compare-exchange loop because those five require their extension to be
-positively present rather than merely un-denied, and no object declares
-Zilx, Zibi or Zacas; and the unsigned divide by a power of two because
-all three toolchains already do that fold themselves. Those entries below say why. Every figure is
-what the check itself reports over the [corpus](#corpus) --
-108,165,211 instructions of three toolchains across 31 objects --
-rather than what a mining tool estimated for it. The two have differed
-by an order of magnitude every time both were measured.
+Thirty-eight of them, and the table lists twenty-seven. The jump pair,
+the constant chain, the no-op and the push run have so far been measured
+over the JetStream corpus of TODO.md, which the table does not cover.
+Seven report nothing over this corpus -- the bit count because no
+baseline object declares Zbb; the three indexed loads, the equality
+branch and the compare-exchange loop because those five require their
+extension to be positively present rather than merely un-denied, and no
+object declares Zilx, Zibi or Zacas; and the unsigned divide by a power
+of two because all three toolchains already do that fold themselves.
+Those entries below say why. Every figure is what the check itself
+reports over the [corpus](#corpus) -- 108,165,211 instructions of three
+toolchains across 31 objects -- rather than what a mining tool estimated
+for it. The two have differed by an order of magnitude every time both
+were measured.
 
 The table is generated, not maintained: `scripts/check_table.py` scans
 the corpus and prints it, which is how adding two objects stopped
@@ -546,6 +547,38 @@ except a handful of `jalr ra,0(ra)` that were already two.
   It reads as advice to delete one instruction, not to drop the frame
   pointer. Ubuntu builds with `-fno-omit-frame-pointer` deliberately, and
   the frame pointer stays.
+
+* **pushes one stack adjustment would do** -- values pushed one at a
+  time, `addi sp,sp,-8` + `sd r,0(sp)` again and again, where one
+  adjustment by the total and the same stores at new offsets leave
+  memory and sp exactly as the run did. V8's Maglev prologue pushes the
+  context, the function, the argument count and then a zero for every
+  tagged stack slot that way:
+
+  ```
+   2851e80: addi sp, sp, -8
+   2851e84: sd s7, 0(sp)
+   2851e88: addi sp, sp, -8
+   2851e8c: sd a1, 0(sp)
+   ...                               -> one addi sp, sp, -88 for 11
+   2851ed4: sd zero, 0(sp)              adjustments (88 -> 48 bytes)
+  ```
+
+  The run takes every sp decrement and sp-relative access from the first
+  decrement on, and anything between them that neither reads nor writes
+  sp -- baseline code loads each value through s0 just before pushing
+  it, and those loads stay where they are. It ends at a side entry, a
+  transfer, a release, an access that stores or loads sp itself, or a
+  total one `addi` cannot subtract, and each access's new offset has to
+  fit its immediate. Memory sees the same stores in the same order; only
+  sp's intermediate values are gone, and nothing in the run could read
+  them.
+
+  The JetStream corpus (TODO.md, entry 40) has 259,684 runs, worth
+  2,093,116 bytes or 1.4% of its code: 129,227 in baseline, 127,370 in
+  Maglev, 3,020 in regexp code. 148,192 are two adjustments and 19,383
+  are six or more. Compilers allocate a frame once, so the package
+  corpus is not expected to have any.
 
 * **comparison a branch could have made** -- `slt`/`sltu`/`xor`/`sub`
   writing a condition into a register, then `beqz`/`bnez` testing it,
