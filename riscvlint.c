@@ -1167,13 +1167,21 @@ struct riscvlint_state {
     // which is what makes a single watermark enough.
     uint64_t zrun_end;
 
-    // The address of an `add` that check_scaled_indexed_load has
-    // already folded into one scaled indexed load. The unscaled check
-    // matches that same `add` and must not report it a second time:
-    // with Zilx present the site is one `lxsd`, not an `lxd` beside a
-    // surviving `slli`. UINT64_MAX is "none", since a section can
+    // The address of an `add` that a deeper Zilx fold has already
+    // claimed -- check_scaled_indexed_load's triple or
+    // check_zext_indexed_load's quad. The unscaled check matches that
+    // same `add` and must not report it a second time: with Zilx
+    // present the site is one `lxsd` or `lxsuwd`, not an `lxd` beside a
+    // surviving shift. UINT64_MAX is "none", since a section can
     // legitimately begin at address 0.
-    uint64_t zilx_scaled;
+    //
+    // One address is enough for both writers, because they cannot
+    // disagree. Each fires at an `slli` and writes the `add` one or two
+    // instructions later; the scaled one wants a shift of 1, 2 or 3 and
+    // the zero-extending one a shift of 32, so no instruction is both;
+    // and nothing between the write and the read can be an `slli` --
+    // it is the quad's `srli` or the triple's own `add`.
+    uint64_t zilx_folded;
 
     // What each register's current value is known to guarantee about its
     // own high bits, for check_redundant_extension. Cleared at every
@@ -1271,7 +1279,7 @@ bool riscvlint_state_set_section(riscvlint_state *state, csh handle,
     state->handle = handle;
     memset(&state->fp, 0, sizeof state->fp);
     state->zrun_end = 0;
-    state->zilx_scaled = UINT64_MAX;
+    state->zilx_folded = UINT64_MAX;
     memset(state->guarantees, 0, sizeof state->guarantees);
     memset(&state->win, 0, sizeof state->win);
     if (!state->probe) state->probe = cs_malloc(handle);
@@ -3337,10 +3345,10 @@ bool check_indexed_load(riscvlint_state *state, const cs_insn *insn,
     // `-m zilx` asks the what-if, and otherwise not at all.
     if (!(riscvlint_state_extensions(state) & RISCVLINT_EXT_ZILX))
         return false;
-    // An `add` the scaled fold has already folded into one `lxs*`. The
-    // scaled shape starts an instruction earlier, so it has been judged
-    // by the time the cursor arrives here. See `zilx_scaled`.
-    if (insn->address == state->zilx_scaled) return false;
+    // An `add` a deeper fold has already turned into one `lxs*`. Both
+    // of those shapes start earlier than this one, so they have been
+    // judged by the time the cursor arrives here. See `zilx_folded`.
+    if (insn->address == state->zilx_folded) return false;
     if (insn->size != 2 && insn->size != 4) return false;
     uint32_t w1;
     if (!riscvlint_word_at(state, insn->address, &w1)) return false;
@@ -3501,7 +3509,139 @@ bool check_scaled_indexed_load(riscvlint_state *state, const cs_insn *insn,
              rv_reg_name(rb), rv_reg_name(ri), before);
     // The add is the unscaled check's match too, and one site is one
     // rewrite rather than two.
-    state->zilx_scaled = second;
+    state->zilx_folded = second;
+    return true;
+}
+
+// ---- an address scaled from a zero-extended index ----
+//
+// See riscvlint.h for the shape and for why the `srli` amount is what
+// decides both the scale and whether this is an array index at all.
+
+// The zero-extending indexed mnemonic for a load kind, and the scale
+// the form implies -- log2 of the access size, exactly as the plain
+// scaled mode. The `srli` that follows a `slli ...,32` shifts right by
+// 32 minus that, so a byte load's pair is `zext.w` itself.
+static const char *zilx_zext_name(rv_mem_kind kind, unsigned *scale)
+{
+    switch (kind) {
+    case RV_MEM_LB:  *scale = 0; return "lxsuwb";
+    case RV_MEM_LBU: *scale = 0; return "lxsuwbu";
+    case RV_MEM_LH:  *scale = 1; return "lxsuwh";
+    case RV_MEM_LHU: *scale = 1; return "lxsuwhu";
+    case RV_MEM_LW:  *scale = 2; return "lxsuww";
+    case RV_MEM_LWU: *scale = 2; return "lxsuwwu";
+    case RV_MEM_LD:  *scale = 3; return "lxsuwd";
+    default:         return NULL;   // stores, and the FP loads
+    }
+}
+
+bool check_zext_indexed_load(riscvlint_state *state, const cs_insn *insn,
+                             riscvlint_finding *finding)
+{
+    // Positively present, not merely un-denied, for the reason
+    // check_indexed_load states at length.
+    if (!(riscvlint_state_extensions(state) & RISCVLINT_EXT_ZILX))
+        return false;
+    if (insn->size != 2 && insn->size != 4) return false;
+
+    uint32_t w1;
+    if (!riscvlint_word_at(state, insn->address, &w1)) return false;
+    unsigned rt1, ri, sh1;
+    if (!rv_decode_slli(w1, insn->size, &rt1, &ri, &sh1)) return false;
+    // Only 32. The zero-extension is from bit 31 and nothing else, so a
+    // different left shift is a different value however the right shift
+    // that follows it is spelled.
+    if (sh1 != 32 || rt1 == 0 || ri == 0) return false;
+
+    uint64_t second = insn->address + insn->size;
+    uint32_t w2;
+    if (!riscvlint_word_at(state, second, &w2)) return false;
+    unsigned len2 = rv_insn_len(w2);
+    unsigned rt2, srs, sh2;
+    if (!rv_decode_srli(w2, len2, &rt2, &srs, &sh2)) return false;
+    // It has to be this slli's result being shifted back, and srli
+    // rather than srai: the value is zero-extended, not sign-extended.
+    if (srs != rt1 || rt2 == 0) return false;
+
+    uint64_t third = second + len2;
+    uint32_t w3;
+    if (!riscvlint_word_at(state, third, &w3)) return false;
+    unsigned len3 = rv_insn_len(w3);
+    unsigned rd, ars1, ars2;
+    if (!rv_decode_add(w3, len3, &rd, &ars1, &ars2)) return false;
+    if (rd == 0) return false;
+    // Read exactly once, for the reason the scaled check gives.
+    bool a_is_idx = ars1 == rt2, b_is_idx = ars2 == rt2;
+    if (a_is_idx == b_is_idx) return false;
+    unsigned rb = a_is_idx ? ars2 : ars1;
+    if (rb == 0) return false;
+
+    uint64_t fourth = third + len3;
+    uint32_t w4;
+    if (!riscvlint_word_at(state, fourth, &w4)) return false;
+    unsigned len4 = rv_insn_len(w4);
+    rv_mem_kind kind;
+    unsigned data, base;
+    int64_t off;
+    if (!rv_decode_mem(w4, len4, &kind, &data, &base, &off)) return false;
+    if (base != rd || off != 0) return false;
+    unsigned scale;
+    const char *name = zilx_zext_name(kind, &scale);
+    // The right shift carries the scale, and the scale is the access
+    // width: `slli x,32` + `srli x,28` scales by 16, which is a stride
+    // through 16-byte structures and not something a load width can
+    // name. That shape is most of what reaches here -- 10,133 sites in
+    // debian-libllvm22 at `srli 28` alone -- so without this test the
+    // check would read more than three times its real population.
+    if (!name || sh2 != 32 - scale) return false;
+
+    // sp, gp and tp hold what the ABI says they hold and are never
+    // dead. Three writes are on offer here, so the test covers all of
+    // them.
+    if (rd == 2 || rd == 3 || rd == 4) return false;
+    if (rt1 == 2 || rt1 == 3 || rt1 == 4) return false;
+    if (rt2 == 2 || rt2 == 3 || rt2 == 4) return false;
+
+    // Four instructions means three interior addresses, any one of
+    // which being a branch target makes this not a straight line.
+    if (riscvlint_is_branch_target(state, second) ||
+        riscvlint_is_branch_target(state, third) ||
+        riscvlint_is_branch_target(state, fourth))
+        return false;
+    if (riscvlint_is_relocated(state, insn->address) ||
+        riscvlint_is_relocated(state, second) ||
+        riscvlint_is_relocated(state, third) ||
+        riscvlint_is_relocated(state, fourth))
+        return false;
+
+    // Three writes disappear rather than the scaled shape's two: the
+    // widened index, the narrowed index and the address. Each is killed
+    // by construction wherever a later instruction of the quad
+    // overwrites it, and the rest is the walk's to prove. The common
+    // case writes one register throughout -- `slli a5,a5,32` +
+    // `srli a5,a5,29` + `add a5,a0,a5` + `ld a5,0(a5)` -- and needs no
+    // walk at all.
+    uint64_t after = fourth + len4;
+    if (data != rd &&
+        riscvlint_liveness(state, after, rd) != RISCVLINT_LIVE_DEAD)
+        return false;
+    if (rt2 != rd && data != rt2 &&
+        riscvlint_liveness(state, after, rt2) != RISCVLINT_LIVE_DEAD)
+        return false;
+    if (rt1 != rt2 && rt1 != rd && data != rt1 &&
+        riscvlint_liveness(state, after, rt1) != RISCVLINT_LIVE_DEAD)
+        return false;
+
+    unsigned before = insn->size + len2 + len3 + len4;
+    finding->title = "address scaled from a zero-extended index";
+    finding->address = insn->address;
+    finding->insn_count = 4;
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "%s %s, (%s), %s (%u -> 4 bytes)", name, rv_reg_name(data),
+             rv_reg_name(rb), rv_reg_name(ri), before);
+    // The add is the unscaled check's match too. See `zilx_folded`.
+    state->zilx_folded = third;
     return true;
 }
 
@@ -4133,6 +4273,7 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_swar_popcount,
     check_indexed_load,
     check_scaled_indexed_load,
+    check_zext_indexed_load,
 };
 
 size_t riscvlint_scan(riscvlint_state *state, csh handle,

@@ -3149,6 +3149,150 @@ static void test_scaled_indexed_load(csh handle)
     CHECK(t2.na == 0 && t2.nb == 1);
 }
 
+// An address scaled from a zero-extended index. Same provenance as the
+// buffers above: clang assembled every one of them.
+static void test_zext_indexed_load(csh handle)
+{
+    riscvlint_finding f;
+    const unsigned zilx = RISCVLINT_EXT_DECLARED | RISCVLINT_EXT_ZILX;
+
+    // One register throughout, which is what the compiler emits and
+    // what needs no liveness walk: the srli overwrites the slli, the
+    // add overwrites the srli, the load overwrites the add.
+    static const uint8_t self[] = {
+        0x13, 0x17, 0x07, 0x02,     // slli a4, a4, 32
+        0x13, 0x57, 0xd7, 0x01,     // srli a4, a4, 29
+        0x33, 0x07, 0xe5, 0x00,     // add  a4, a0, a4
+        0x03, 0x37, 0x07, 0x00,     // ld   a4, 0(a4)
+        0x67, 0x80, 0x00, 0x00,     // ret
+    };
+    CHECK(run_window_exts(handle, check_zext_indexed_load, self,
+                          sizeof self, 0x1000, zilx, &f) == 1);
+    CHECK(f.address == 0x1000 && f.insn_count == 4);
+    CHECK(strstr(f.replacement, "lxsuwd a4, (a0), a4") != NULL);
+    CHECK(strstr(f.replacement, "(16 -> 4 bytes)") != NULL);
+
+    // All four compressed, which is as cheap as the base ISA can spell
+    // base + (zext32(index) << 3) and still ten bytes against four.
+    static const uint8_t packed[] = {
+        0x02, 0x17,                 // c.slli a4, 32
+        0x75, 0x83,                 // c.srli a4, 29
+        0x2a, 0x97,                 // c.add  a4, a0
+        0x18, 0x63,                 // c.ld   a4, 0(a4)
+        0x82, 0x80,                 // c.jr   ra
+    };
+    CHECK(run_window_exts(handle, check_zext_indexed_load, packed,
+                          sizeof packed, 0x1000, zilx, &f) == 1);
+    CHECK(strstr(f.replacement, "(8 -> 4 bytes)") != NULL);
+
+    // A byte load's scale is 1, so its shift is zero and the pair is
+    // `zext.w` itself -- which the Zba check also claims, under a
+    // different extension and as a different rewrite.
+    static const uint8_t byte[] = {
+        0x13, 0x97, 0x06, 0x02,     // slli a4, a3, 32
+        0x13, 0x57, 0x07, 0x02,     // srli a4, a4, 32
+        0x33, 0x07, 0xe5, 0x00,     // add  a4, a0, a4
+        0x83, 0x47, 0x07, 0x00,     // lbu  a5, 0(a4)
+        0x13, 0x07, 0x00, 0x00,     // li   a4, 0
+        0x67, 0x80, 0x00, 0x00,     // ret
+    };
+    CHECK(run_window_exts(handle, check_zext_indexed_load, byte, sizeof byte,
+                          0x1000, zilx, &f) == 1);
+    CHECK(strstr(f.replacement, "lxsuwbu a5, (a0), a3") != NULL);
+
+    // `srli 28` scales by 16, a stride through 16-byte structures that
+    // no load width names. This is the shape that dominates what
+    // reaches the test -- 10,133 sites in debian-libllvm22 -- so it is
+    // the one rejection that decides the population.
+    static const uint8_t stride[] = {
+        0x13, 0x97, 0x06, 0x02,     // slli a4, a3, 32
+        0x13, 0x57, 0xc7, 0x01,     // srli a4, a4, 28
+        0x33, 0x07, 0xe5, 0x00,     // add  a4, a0, a4
+        0x83, 0x37, 0x07, 0x00,     // ld   a5, 0(a4)
+        0x13, 0x07, 0x00, 0x00,     // li   a4, 0
+        0x67, 0x80, 0x00, 0x00,     // ret
+    };
+    CHECK(run_window_exts(handle, check_zext_indexed_load, stride,
+                          sizeof stride, 0x1000, zilx, NULL) == 0);
+
+    // `srai` shifts the sign back in, so the index is sign-extended and
+    // this addressing mode is the wrong one.
+    static const uint8_t arith[] = {
+        0x13, 0x97, 0x06, 0x02,     // slli a4, a3, 32
+        0x13, 0x57, 0xd7, 0x41,     // srai a4, a4, 29
+        0x33, 0x07, 0xe5, 0x00,     // add  a4, a0, a4
+        0x83, 0x37, 0x07, 0x00,     // ld   a5, 0(a4)
+        0x13, 0x07, 0x00, 0x00,     // li   a4, 0
+        0x67, 0x80, 0x00, 0x00,     // ret
+    };
+    CHECK(run_window_exts(handle, check_zext_indexed_load, arith,
+                          sizeof arith, 0x1000, zilx, NULL) == 0);
+
+    // The srli writing a register the slli did not, which is about a
+    // third of libxul's population and the case that needs all three
+    // liveness proofs at once.
+    static const uint8_t split[] = {
+        0x13, 0x97, 0x06, 0x02,     // slli a4, a3, 32
+        0x93, 0x57, 0xd7, 0x01,     // srli a5, a4, 29
+        0x33, 0x08, 0xf5, 0x00,     // add  a6, a0, a5
+        0x83, 0x38, 0x08, 0x00,     // ld   a7, 0(a6)
+        0x13, 0x07, 0x00, 0x00,     // li   a4, 0
+        0x93, 0x07, 0x00, 0x00,     // li   a5, 0
+        0x13, 0x08, 0x00, 0x00,     // li   a6, 0
+        0x67, 0x80, 0x00, 0x00,     // ret
+    };
+    CHECK(run_window_exts(handle, check_zext_indexed_load, split,
+                          sizeof split, 0x1000, zilx, &f) == 1);
+    CHECK(strstr(f.replacement, "lxsuwd a7, (a0), a3") != NULL);
+
+    // The same quad with the widened index read afterwards. That is the
+    // proof the scaled shape never has to make, so it gets its own
+    // buffer: the other two registers still die.
+    static const uint8_t live_wide[] = {
+        0x13, 0x97, 0x06, 0x02,     // slli a4, a3, 32
+        0x93, 0x57, 0xd7, 0x01,     // srli a5, a4, 29
+        0x33, 0x08, 0xf5, 0x00,     // add  a6, a0, a5
+        0x83, 0x38, 0x08, 0x00,     // ld   a7, 0(a6)
+        0x13, 0x05, 0x07, 0x00,     // mv   a0, a4
+        0x93, 0x07, 0x00, 0x00,     // li   a5, 0
+        0x13, 0x08, 0x00, 0x00,     // li   a6, 0
+        0x67, 0x80, 0x00, 0x00,     // ret
+    };
+    CHECK(run_window_exts(handle, check_zext_indexed_load, live_wide,
+                          sizeof live_wide, 0x1000, zilx, NULL) == 0);
+
+    // Still loads only, and still integer loads only.
+    static const uint8_t store[] = {
+        0x13, 0x17, 0x07, 0x02,     // slli a4, a4, 32
+        0x13, 0x57, 0xd7, 0x01,     // srli a4, a4, 29
+        0x33, 0x07, 0xe5, 0x00,     // add  a4, a0, a4
+        0x23, 0x30, 0xf7, 0x00,     // sd   a5, 0(a4)
+        0x67, 0x80, 0x00, 0x00,     // ret
+    };
+    CHECK(run_window_exts(handle, check_zext_indexed_load, store,
+                          sizeof store, 0x1000, zilx, NULL) == 0);
+
+    // The same gate as the other two: positively present, not merely
+    // un-denied.
+    CHECK(run_window_exts(handle, check_zext_indexed_load, self, sizeof self,
+                          0x1000, RISCVLINT_EXT_DECLARED, NULL) == 0);
+    CHECK(run_window_exts(handle, check_zext_indexed_load, self, sizeof self,
+                          0x1000, 0, NULL) == 0);
+
+    // And the same claim on the `add`: four instructions folding to one
+    // is not an unscaled finding beside two surviving shifts.
+    const char *zx = "address scaled from a zero-extended index";
+    const char *un = "address computed for one indexed load";
+    title_tally t = { zx, un, 0, 0 };
+    scan_titles(handle, self, sizeof self, 0x1000, zilx, &t);
+    CHECK(t.na == 1 && t.nb == 0);
+
+    // Where the width test declines, the unscaled finding stands.
+    title_tally t2 = { zx, un, 0, 0 };
+    scan_titles(handle, stride, sizeof stride, 0x1000, zilx, &t2);
+    CHECK(t2.na == 0 && t2.nb == 1);
+}
+
 // A bit count spelled out longhand. The buffer is clang's own output
 // for a 32-bit SWAR popcount of a0 into a5 -- masks hoisted, stages
 // computed in place, the final shift an `srliw` -- with `li a0,0` after
@@ -3617,6 +3761,7 @@ int main(void)
     test_swar_popcount(handle);
     test_indexed_load(handle);
     test_scaled_indexed_load(handle);
+    test_zext_indexed_load(handle);
     test_sweep();
     test_fli_table();
     test_fp_pool_to_fli(handle);

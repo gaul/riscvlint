@@ -841,10 +841,11 @@ bool check_dead_def(riscvlint_state *state, const cs_insn *insn,
 //
 // This reports the unscaled shape: two adjacent instructions, an `add`
 // of two registers feeding a zero-offset integer load of the register
-// it wrote. The scaled shape is three instructions with an intervening
-// register and is a different match, in check_scaled_indexed_load
-// below -- which also tells this check to stay quiet at an `add` that
-// fold has already claimed, since one site is one rewrite.
+// it wrote. The two deeper shapes are separate checks below --
+// check_scaled_indexed_load's three instructions and
+// check_zext_indexed_load's four -- and each tells this one to stay
+// quiet at an `add` it has already claimed, since one site is one
+// rewrite.
 //
 // Loads only, and integer loads only. Zilx has no indexed store and no
 // indexed floating-point load, so a store or an `flw` through a
@@ -898,6 +899,53 @@ bool check_indexed_load(riscvlint_state *state, const cs_insn *insn,
 // sequence and Zilx removes it.
 bool check_scaled_indexed_load(riscvlint_state *state, const cs_insn *insn,
                                riscvlint_finding *finding);
+
+// `slli rt,ri,32` + `srli rt,rt,32-N` + `add rd,rb,rt` +
+// `ld rt2,0(rd)`, which Zilx's third addressing mode does in one:
+// `lxsuwd rt2,(rb),ri`. That mode is funct5 0b11110 and computes
+// base + (zext32(index) << log2(size)), so it folds the zero-extension
+// as well as the scale -- which is what `a[i]` costs when the index is
+// a 32-bit unsigned value and the array is addressed through a 64-bit
+// base. Four instructions on the base ISA, two with Zba's `shNadd.uw`,
+// one with Zilx.
+//
+// The `slli` must be by 32 exactly, because the zero-extension is from
+// bit 31 and nothing else. The `srli` then carries the scale, and the
+// scale is the access width: `slli x,32` + `srli x,28` scales by 16,
+// which is a stride through 16-byte structures and not anything a load
+// width can name. A byte load's scale is 1 and its pair is therefore
+// `zext.w` itself.
+//
+// What that test costs is not uniform, and the two big C++ objects
+// disagree about it by a factor of thirty. In libxul 82 of 3,829
+// width-tested quads disagree, 2%. In debian-libllvm22 12,799 of
+// 18,411 do, 70% -- 10,133 of them at `srli 28` alone, which is one
+// program's 16-byte structures showing up as a shape this extension
+// cannot address. So the test is nearly free on one object and decides
+// the number on the other, which is the argument for keeping it rather
+// than reporting the quad on its shape alone.
+//
+// Three writes disappear rather than two, the widened index, the
+// narrowed index and the address, so the liveness walk can be asked
+// three times. The common case writes one register throughout and
+// needs no walk: `slli a5,a5,32` + `srli a5,a5,29` + `add a5,a0,a5` +
+// `ld a5,0(a5)`. The `srli` writing a register the `slli` did not is
+// allowed and is the case that needs all three proofs; it is 1,194 of
+// libxul's 3,747 width-matching quads and 347 of libLLVM's 5,612, so
+// refusing it to save a query would cost real sites.
+//
+// Like the scaled shape this claims the `add` and silences the
+// unscaled check there, for the same reason: with Zilx present the
+// site is one `lxsuwd`, not an `lxd` with two surviving shifts.
+//
+// Measured population under `-m zilx`: see TODO.md. ripgrep has none
+// of it and neither does any object declaring Zba, which here is a
+// stronger statement than it was for the scaled shape -- Zba's
+// `add.uw` and `shNadd.uw` do base + zext32(index) scaled in a single
+// instruction, so the four-instruction sequence does not exist on
+// those targets at all.
+bool check_zext_indexed_load(riscvlint_state *state, const cs_insn *insn,
+                             riscvlint_finding *finding);
 
 // ---- a bit count spelled out longhand ----
 

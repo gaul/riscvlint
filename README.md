@@ -3,7 +3,7 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Twenty-five checks are implemented and the ledger's candidate list is
+Twenty-six checks are implemented and the ledger's candidate list is
 empty. [TODO.md](TODO.md) is that ledger: every candidate that was
 measured, the population it came back with, and the ones rejected on
 that evidence.
@@ -12,9 +12,9 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Twenty-five of them, and the table lists twenty-two. Three report
+Twenty-six of them, and the table lists twenty-two. Four report
 nothing under any object's own declaration -- the bit count because no
-baseline object declares Zbb, and the two indexed loads because they
+baseline object declares Zbb, and the three indexed loads because they
 are the ones requiring their extension to be positively present rather
 than merely un-denied. Those entries below say why. Every figure is
 what the check itself reports over the [corpus](#corpus) --
@@ -651,21 +651,20 @@ except a handful of `jalr ra,0(ra)` that were already two.
 
   [zilx]: https://riscv.atlassian.net/wiki/spaces/USXX/pages/2057142278/RISC-V+Indexed+Integer+Load+Zilx+Ratification+Plan
 
-  Population: **162,792** sites across the corpus under `-m zilx`,
+  Population: **157,829** sites across the corpus under `-m zilx`,
   which would place it fourth in the table above if it appeared there:
-  54,170 in libxul, 40,929 in `debian-libllvm22`, 18,860 in Ubuntu's
-  libLLVM 22, and 20,018 across the twelve Go objects. **Nearly half
-  saves no space**: in
-  libxul 24,888 of the 54,170 are a compressed `c.add` and a compressed
-  load folding to a four-byte `lxd`, four bytes for four. Those still
-  remove an instruction and an address dependency, and the finding says
-  `(4 -> 4 bytes)` so a reader can tell; 21,661 save two bytes and
-  7,621 save four.
+  52,435 in libxul, 38,183 in `debian-libllvm22`, 18,860 in Ubuntu's
+  libLLVM 22, and 19,741 across the twelve Go objects. **Nearly half
+  saves no space**: in libxul 24,602 of the 52,435 are a compressed
+  `c.add` and a compressed load folding to a four-byte `lxd`, four
+  bytes for four. Those still remove an instruction and an address
+  dependency, and the finding says `(4 -> 4 bytes)` so a reader can
+  tell; 20,212 save two bytes and 7,621 save four.
 
   `-m zilx` is the only extension name here that no profile turns on --
   Zilx is in none of RVA20, RVA22, RVA23 or RVB23 as of LLVM's
-  `RISCVProfiles.td` -- and the two Zilx checks are the only ones that
-  require their extension to be **positively present** rather than
+  `RISCVProfiles.td` -- and the three Zilx checks are the only ones
+  that require their extension to be **positively present** rather than
   merely un-denied. Every other gated check fires on an object that
   declares no attributes, because treating "absent" as "no" would
   silence a check on the very code it exists for. That rule assumes the
@@ -674,8 +673,8 @@ except a handful of `jalr ra,0(ra)` that were already two.
   findings on the Go objects alone, suggesting an instruction nobody
   can execute. They fire when an object declares `_zilx` or when
   `-m zilx` asks the what-if, and otherwise not at all -- which is why
-  every figure in these two entries is an `-m zilx` figure and neither
-  check appears in the table.
+  every figure in these three entries is an `-m zilx` figure and none
+  of the three appears in the table.
 
   Loads only, and integer loads only: Zilx has no indexed store and no
   indexed floating-point load, so a store or an `fld` through a computed
@@ -683,9 +682,9 @@ except a handful of `jalr ra,0(ra)` that were already two.
   no unscaled encoding, but the scaled byte form's scale factor is 1, so
   `lb`/`lbu` fold to `lxsb`/`lxsbu` with identical arithmetic.
 
-  The *scaled* shape is the check below, and the two do not overlap: a
-  scaled finding replaces the unscaled one at the same `add` rather
-  than standing beside it.
+  The two deeper shapes are the checks below, and none of the three
+  overlap: a scaled or zero-extending finding replaces the unscaled one
+  at the same `add` rather than standing beside it.
 
 * **address scaled for one indexed load** -- `slli rt,ri,3` +
   `add rd,rb,rt` + `ld rt2,0(rd)`, which Zilx's scaled form does in
@@ -709,12 +708,13 @@ except a handful of `jalr ra,0(ra)` that were already two.
   bytes, 2,837 save four, 946 save six and 3 save eight.
 
   These are not new sites. Each one's `add` was already an unscaled
-  finding, so the two columns above sum to what the unscaled check
-  alone reported before this one existed -- 62,620 in libxul, 51,494 in
-  `debian-libllvm22`. What the scaled fold adds is depth rather than
-  breadth: libxul's saving at those same sites goes from 78,260 bytes
-  to 100,182, because 6,226 of the sites that saved nothing at all now
-  save at least two.
+  finding, so the three Zilx columns sum per object to what the
+  unscaled check alone reported before the other two existed:
+  8,450 + 1,735 + 52,435 = 62,620 in libxul,
+  10,565 + 2,746 + 38,183 = 51,494 in `debian-libllvm22`. What the
+  deeper folds add is depth rather than breadth -- libxul's saving at
+  those same 62,620 sites goes from 78,260 bytes to 108,844, because
+  6,512 of the sites that saved nothing at all now save at least two.
 
   Two writes disappear here rather than one, the shifted index and the
   address, so both have to be gone. Each dies by construction wherever
@@ -737,6 +737,59 @@ except a handful of `jalr ra,0(ra)` that were already two.
   show -- but eight other Zba objects say the same thing.) So the
   sequence has two answers at two prices: Zba halves it and Zilx
   removes it.
+
+* **address scaled from a zero-extended index** -- `slli rt,ri,32` +
+  `srli rt,rt,29` + `add rd,rb,rt` + `ld rt2,0(rd)`, which Zilx's third
+  addressing mode does in one: `lxsuwd rt2,(rb),ri`. That mode is
+  funct5 `0b11110` and computes base + (zext32(index) << log2(size)),
+  so it folds the zero-extension as well as the scale. This is what
+  `a[i]` costs when the index is a 32-bit unsigned value and the array
+  is addressed through a 64-bit base: the RV64 ABI keeps a 32-bit value
+  sign-extended in its register and an `unsigned` index is not, so the
+  top word has to be cleared first, which the base ISA spells as a
+  shift left and a shift back. Four instructions on rv64gc, two with
+  Zba's `shNadd.uw`, one with Zilx.
+
+  The `slli` must be by 32 exactly, since the zero-extension is from
+  bit 31 and nothing else; the `srli` then carries the scale, and the
+  scale is the access width. A byte load's scale is 1, so its pair is
+  `zext.w` itself.
+
+  Population: **4,963** sites under `-m zilx` -- 2,746 in
+  `debian-libllvm22`, 1,735 in libxul, 277 across Go, **0** in Rust.
+  Every one saves at least four bytes, four instructions being eight at
+  the very least: libxul's are 216 at `(8 -> 4)`, 728 at `(10 -> 4)`
+  and 791 at `(12 -> 4)`, 11,560 bytes.
+
+  **What the width test costs is not uniform, and the two big C++
+  objects disagree about it by a factor of thirty.** In libxul 82 of
+  3,829 width-tested quads shift by an amount no load width matches --
+  2%. In `debian-libllvm22` 12,799 of 18,411 do -- 70%, and 10,133 of
+  those at `srli 28` alone, a stride of 16 this extension cannot
+  address. riscvlint sees the stride and not the type, so read that as
+  one program's data structures showing through rather than as a fact
+  about 16-byte records. Either way the same test is nearly free on one
+  object and decides the number on the other, which is the argument for
+  keeping it rather than reporting the quad on its shape alone.
+
+  Three writes disappear rather than two -- the widened index, the
+  narrowed index and the address -- so the liveness walk can be asked
+  three times. The common case writes one register throughout and needs
+  no walk: `slli a5,a5,32` + `srli a5,a5,29` + `add a5,a0,a5` +
+  `ld a5,0(a5)`. Of libxul's 3,747 width-matching quads the proofs cost
+  1,352 to the address, 531 to the narrowed index and 100 to the
+  widened one, with 29 more to a branch into the middle. The `srli`
+  writing a register the `slli` did not is allowed and is the case
+  needing all three proofs at once; it is 1,194 of libxul's 3,747
+  width-matching quads and 347 of libLLVM's 5,612, so refusing it to
+  save a query would cost real sites.
+
+  **Not one of these is in an object that declares Zba**, which is a
+  stronger statement than the scaled shape's 77: Zba's `add.uw` and
+  `shNadd.uw` do base + zext32(index) scaled in a single instruction,
+  so the four-instruction sequence does not exist on those targets at
+  all rather than merely being rarer. ripgrep has no `slli ...,32` +
+  `srli` pair anywhere in it.
 
 * **a bit count spelled out longhand** -- twelve instructions and four
   mask constants that compute a population count, which Zbb's `cpop`

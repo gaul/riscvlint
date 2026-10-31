@@ -1456,13 +1456,13 @@ second instruction writes it is one dominant idiom plus nothing.
 
 # Remaining candidates
 
-None. Twenty-five checks are implemented and everything this file ever
+None. Twenty-six checks are implemented and everything this file ever
 sized is either written or recorded as rejected with the evidence that
-rejected it. The last four did not come from a corpus probe at all: 23
+rejected it. The last five did not come from a corpus probe at all: 23
 came from walking armlint's check table against this one, 24 came from a
-rejection in this file being wrong, and 25 and 26 came from a
-ratification plan for an extension that does not exist in hardware
-yet.
+rejection in this file being wrong, and 25, 26 and 27 are the three
+addressing modes of a ratification plan for an extension that does not
+exist in hardware yet.
 
 That last one is worth reading as a worked example rather than a
 number. The SWAR popcount was rejected on a bound that was not a bound
@@ -1764,7 +1764,7 @@ Measured, so nobody has to re-derive it: of the three tests at the
 final shift, the shift-width test costs 5 sites, the branch-target test
 0, and the liveness proof 1,717.
 
-## 25. An address computed for one indexed load -- 162,792  [implemented]
+## 25. An address computed for one indexed load -- 157,829  [implemented]
 
 Not sized from a probe either. It came from the Zilx ratification plan:
 the extension that gives RV64 the addressing mode it has never had, and
@@ -1783,30 +1783,33 @@ in rs1 with the base in rs2, the reverse of a normal load. Worth noting
 for the census: capstone does not decode them, so a binary that
 actually contained Zilx would have those words read as atomics.
 
-### What the check reports -- 162,792, and nearly half of it free
+### What the check reports -- 157,829, and nearly half of it free
 
-Corpus-wide under `-m zilx`, by language and with the scaled column
-beside it for the reason entry 26 gives:
+Corpus-wide under `-m zilx`, by language and with the two deeper
+columns beside it for the reason entries 26 and 27 give:
 
-| language | objects | unscaled | scaled |
-|---|---:|---:|---:|
-| C++ | 13 | 138,924 | 20,002 |
-| Rust | 6 | 3,850 | 50 |
-| Go | 12 | 20,018 | 5,170 |
-| **total** | **31** | **162,792** | **25,222** |
+| language | objects | unscaled | scaled | zext32 |
+|---|---:|---:|---:|---:|
+| C++ | 13 | 134,238 | 20,002 | 4,686 |
+| Rust | 6 | 3,850 | 50 | 0 |
+| Go | 12 | 19,741 | 5,170 | 277 |
+| **total** | **31** | **157,829** | **25,222** | **4,963** |
 
-The largest individual objects: 54,170 in libxul, 40,929 in
-debian-libllvm22, 18,860 in ubuntu-libllvm22, 18,697 in libllvm20.
+Those three columns sum to 188,014, which is what this check alone
+reported before the other two existed: every site either of them finds
+was already one of this one's. The largest individual objects here:
+52,435 in libxul, 38,183 in debian-libllvm22, 18,860 in
+ubuntu-libllvm22, 18,697 in libllvm20.
 
-**Nearly half saves no space.** In libxul 24,888 of the 54,170 are a
+**Nearly half saves no space.** In libxul 24,602 of the 52,435 are a
 compressed `c.add` and a compressed load folding to a four-byte `lxd`
 -- four bytes for four. The finding prints `(4 -> 4 bytes)` so a reader
 can tell, and the rewrite still removes an instruction and an address
-dependency; 21,661 save two bytes and 7,621 save four, for 73,806 in
+dependency; 20,212 save two bytes and 7,621 save four, for 70,908 in
 all. This is the branch-over-jump situation again, where the byte
 column understates what the fold does and is the honest number anyway.
 
-ripgrep's 927 against libxul's 54,170 is not a compiler difference. It
+ripgrep's 927 against libxul's 52,435 is not a compiler difference. It
 declares Zba, so its `slli`+`add` pairs are already single `sh*add`
 instructions and the shapes mostly do not arise.
 
@@ -1820,9 +1823,10 @@ mean what its position implied. The four-object sum was also measured
 before entry 26 existed and so counts the scaled triples as unscaled
 finds; 62,620 and 51,494 are now 54,170 + 8,450 and 40,929 + 10,565.
 
-The scaled shape is entry 26 below, and the two checks never both fire
-at one site: a scaled finding replaces the unscaled one at the same
-`add` rather than standing beside it.
+The two deeper shapes are entries 26 and 27 below, and no two of the
+three ever fire at one site: a scaled or zero-extending finding
+replaces the unscaled one at the same `add` rather than standing beside
+it.
 
 ### The gate, and the one place the standing rule does not hold
 
@@ -1832,8 +1836,9 @@ RISCVProfiles.td. So unlike Zcb, Zfa or the bit count there is no "what
 would rebuilding for RVA23 buy me" reading -- it asserts a specific
 target, which is armlint's `-m cssc` position.
 
-This check and entry 26 are also the only two that require their
-extension to be **positively present** rather than merely un-denied,
+This check and entries 26 and 27 are also the only three that require
+their extension to be **positively present** rather than merely
+un-denied,
 and that is a deliberate departure. The standing rule, written down
 when the Zba checks were first gated, is that an object declaring no
 attributes leaves a check unrestricted, because Go emits no
@@ -1874,10 +1879,10 @@ there is no `(4 -> 4 bytes)` row to apologise for. libxul's 8,450 are
 
 Each scaled triple's `add` was already an unscaled finding, so this
 check reclassifies rather than discovers. The arithmetic is exact: per
-object, scaled + unscaled equals what entry 25 reported before this one
-existed. libxul 8,450 + 54,170 = 62,620; debian-libllvm22
-10,565 + 40,929 = 51,494; go `compile` 969 + 2,559 = 3,528; ripgrep
-0 + 927 = 927.
+object the three Zilx columns sum to what entry 25 reported alone.
+libxul 8,450 + 1,735 + 52,435 = 62,620; debian-libllvm22
+10,565 + 2,746 + 38,183 = 51,494; go `compile` 969 + 22 + 2,537 =
+3,528; ripgrep 0 + 0 + 927 = 927.
 
 Which is why the two checks do not both fire. `check_scaled_indexed_load`
 records the `add` it covered and `check_indexed_load` declines there,
@@ -1885,11 +1890,13 @@ because with Zilx present the site is one `lxsd` and not an `lxd`
 beside a surviving `slli`. Counting both would double the site and
 credit the worse fold.
 
-What the deeper fold buys is bytes, not sites. At libxul's same 62,620
-sites the saving goes from 78,260 bytes to 100,182, a 28% increase, and
-it reconciles down to the instruction: of the 8,450 that moved, 6,226
-were `(4 -> 4)` and saved nothing, 2,221 saved two and 3 saved four, so
-they contributed 4,454 bytes before and 26,376 after.
+What the deeper folds buy is bytes, not sites. At libxul's same 62,620
+sites the saving goes from 78,260 bytes to 108,844, a 39% increase, and
+it reconciles down to the instruction. Of the 8,450 that moved to the
+scaled check, 6,226 were `(4 -> 4)` and saved nothing, 2,221 saved two
+and 3 saved four: 4,454 bytes before, 26,376 after. Of the 1,735 that
+moved to entry 27, 286 were `(4 -> 4)` and 1,449 saved two: 2,898
+before, 11,560 after. What is left in entry 25 saves 70,908.
 
 The state field is `zilx_scaled`, a watermark in the same spirit as
 `zrun_end`: the driver walks a section in address order and the `slli`
@@ -1958,13 +1965,116 @@ the other eight Zba objects say the same thing without needing to be.
 So the sequence has two answers at two prices, which is the argument
 this project started from: Zba halves it, and Zilx removes it.
 
-### Not written: the zero-extended index
+### The zero-extending mode is entry 27, below.
 
 LLVM's `RISCVInstrInfoZilx.td` has a third addressing mode at funct5
 `0b11110`, `lxsuw*`, which zero-extends a 32-bit index before scaling
-it. Its shape is `slli rt,ri,32` + `srli rt,rt,32-N` + `add` + load,
-four instructions rather than three, and it overlaps
-`check_slli_srli_to_zext`'s pair. Not sized and not written.
+it. It was recorded here as unsized and unwritten; it is now written,
+and the figure is 4,963.
+
+## 27. An address scaled from a zero-extended index -- 4,963  [implemented]
+
+`slli rt,ri,32` + `srli rt,rt,32-N` + `add rd,rb,rt` + `ld rt2,0(rd)`,
+which Zilx's third addressing mode does in one: `lxsuwd rt2,(rb),ri`.
+Funct5 `0b11110`, computing base + (zext32(index) << log2(size)), so
+it folds the zero-extension as well as the scale.
+
+This is what `a[i]` costs when the index is a 32-bit unsigned value and
+the array is reached through a 64-bit base. The RV64 ABI keeps a 32-bit
+value sign-extended in its register, an `unsigned` index is not, so the
+top word has to be cleared before the value can be an offset -- which
+the base ISA spells as a shift left and a shift back. Four instructions
+on rv64gc, two with Zba's `shNadd.uw`, one with Zilx.
+
+### What the check reports -- 4,963, and all of it saves four bytes
+
+| language | objects | sites |
+|---|---:|---:|
+| C++ | 13 | 4,686 |
+| Rust | 6 | 0 |
+| Go | 12 | 277 |
+| **total** | **31** | **4,963** |
+
+Largest objects: 2,746 in debian-libllvm22, 1,735 in libxul, 135 in go
+`link`, 78 in libmozsqlite3.
+
+Four instructions is eight bytes at the very least against a four-byte
+fold, so every site saves at least four. libxul's 1,735 are 216 at
+`(8 -> 4)`, 728 at `(10 -> 4)` and 791 at `(12 -> 4)` -- 11,560 bytes;
+debian-libllvm22's 2,746 are 1,096, 1,457 and 193 of those three --
+14,670 bytes. Nothing reaches `(14 -> 4)` or `(16 -> 4)` in either,
+because `c.slli` and `c.srli` cover the shift amounts this shape uses
+and at least two of the four are always compressed.
+
+### The width test, and why its value is not uniform
+
+The `slli` must be by 32 exactly, since the zero-extension is from bit
+31 and nothing else. The `srli` then carries the scale, and the scale
+is the access width: `slli x,32` + `srli x,28` scales by 16, a stride
+through 16-byte structures that no load width names.
+
+What that test costs differs between the two big C++ objects by a
+factor of thirty:
+
+| object | integer loads of a foldable width | shift disagrees | share |
+|---|---:|---:|---:|
+| libxul | 3,829 | 82 | 2% |
+| debian-libllvm22 | 18,411 | 12,799 | 70% |
+
+10,133 of libLLVM's rejections are `srli 28` alone, a stride of 16.
+What riscvlint sees is the stride and not the type, so read that as one
+program's data structures showing through rather than as a fact about
+16-byte records. Either way the same test is nearly free on one object
+and decides the number on the other, which is the argument for keeping
+it rather than reporting the quad on its shape: reading the shape alone
+would put libLLVM at 18,411 against a real 5,612.
+
+### What soundness costs here
+
+Three writes disappear rather than the scaled shape's two -- the
+widened index, the narrowed index and the address -- so the liveness
+walk can be asked three times:
+
+| | libxul | debian-libllvm22 | go `compile` |
+|---|---:|---:|---:|
+| width-matching quads | 3,747 | 5,612 | 52 |
+| branch into the middle | 29 | 19 | 0 |
+| the address still read | 1,352 | 2,210 | 25 |
+| the narrowed index still read | 531 | 422 | 5 |
+| the widened index still read | 100 | 215 | 0 |
+| **reported** | **1,735** | **2,746** | **22** |
+
+The common case writes one register throughout and needs no walk at
+all: `slli a5,a5,32` + `srli a5,a5,29` + `add a5,a0,a5` +
+`ld a5,0(a5)`. The `srli` writing a register the `slli` did not is
+allowed, and is the case needing all three proofs at once; it is 1,194
+of libxul's 3,747 and 347 of libLLVM's 5,612, so refusing it to save a
+query would cost real sites. The relocation and sp/gp/tp tests cost 0
+on all three objects.
+
+All three width-matching rows reproduce the probe that preceded the
+check exactly -- 3,747, 5,612 and 52 -- which is how the check was
+checked.
+
+### Zero on every object that declares Zba
+
+Not 77 as in entry 26, but **0**, and the difference is not noise.
+Zba's `add.uw` and `shNadd.uw` compute base + (zext32(index) << N) in
+a *single* instruction, so where Zba is available the four-instruction
+sequence does not exist at all rather than merely being rarer. ripgrep
+has no `slli ...,32` + `srli` pair anywhere in it.
+
+Which gives the shape three prices rather than two: four instructions
+on rv64gc, two with Zba, one with Zilx.
+
+### Deliberately not suppressed: the byte case and zext.w
+
+A byte load's scale is 1, so its pair is `slli 32` + `srli 32`, which
+is `check_slli_srli_to_zext`'s exact match. Both fire, and that is
+deliberate: they are different extensions answering differently, the
+same way the scaled shape's `slli`+`add` is also the `shNadd` check's.
+Suppression is for two checks claiming one site under one extension,
+which is what `zilx_folded` is for.
 
 ### 16 and 20. A computation a live register already holds -- 29,595 of 39,274  [implemented]
 
