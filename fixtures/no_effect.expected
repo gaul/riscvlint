@@ -1,0 +1,80 @@
+instruction compressible to a base C form at offset: 0x0: -> c.mv (4 -> 2 bytes) (1 instructions)
+  mv a0, a0
+
+instruction with no architectural effect at offset: 0x0: -> delete; a move onto itself (4 bytes) (1 instructions)
+  mv a0, a0
+
+instruction compressible to a base C form at offset: 0x4: -> c.mv (4 -> 2 bytes) (1 instructions)
+  mv sp, sp
+
+instruction with no architectural effect at offset: 0x4: -> delete; a move onto itself (4 bytes) (1 instructions)
+  mv sp, sp
+
+instruction with no architectural effect at offset: 0x8: -> delete; an or with zero (4 bytes) (1 instructions)
+  ori t6, t6, 0
+
+instruction with no architectural effect at offset: 0xc: -> delete; an xor with zero (4 bytes) (1 instructions)
+  xori a1, a1, 0
+
+instruction compressible to a base C form at offset: 0x10: -> c.andi (4 -> 2 bytes) (1 instructions)
+  andi a2, a2, -1
+
+instruction with no architectural effect at offset: 0x10: -> delete; an and with all ones (4 bytes) (1 instructions)
+  andi a2, a2, -1
+
+instruction with no architectural effect at offset: 0x14: -> delete; a shift by zero (4 bytes) (1 instructions)
+  slli a3, a3, 0
+
+instruction with no architectural effect at offset: 0x18: -> delete; a shift by zero (4 bytes) (1 instructions)
+  srai a4, a4, 0
+
+instruction with no architectural effect at offset: 0x1c: -> delete; an add of zero (4 bytes) (1 instructions)
+  add a5, a5, zero
+
+instruction with no architectural effect at offset: 0x20: -> delete; a subtract of zero (4 bytes) (1 instructions)
+  sub a6, a6, zero
+
+instruction with no architectural effect at offset: 0x24: -> delete; an or with itself (4 bytes) (1 instructions)
+  or a7, a7, a7
+
+instruction with no architectural effect at offset: 0x28: -> delete; a write to x0 (4 bytes) (1 instructions)
+  lui zero, 0x54321
+
+instruction with no architectural effect at offset: 0x2c: -> delete; a write to x0 (4 bytes) (1 instructions)
+  lpad 0
+
+instruction with no architectural effect at offset: 0x30: -> delete; a floating-point move onto itself (4 bytes) (1 instructions)
+  fmv.d fa0, fa0
+
+instruction compressible to a base C form at offset: 0x38: -> c.addiw (4 -> 2 bytes) (1 instructions)
+  sext.w a0, a0
+
+instruction compressible to a base C form at offset: 0x44: -> c.addi (4 -> 2 bytes) (1 instructions)
+  addi a0, a0, 1
+
+instruction compressible to a base C form at offset: 0x48: -> c.add (4 -> 2 bytes) (1 instructions)
+  add a0, a0, a1
+
+instruction with no architectural effect at offset: 0x4c: -> delete; a move onto itself (2 bytes) (1 instructions)
+  mv a0, a0
+
+instruction with no architectural effect at offset: 0x4e: -> delete; a move onto itself (2 bytes) (1 instructions)
+  c.addi a1, 0
+
+instruction with no architectural effect at offset: 0x50: -> delete; an and with all ones (2 bytes) (1 instructions)
+  andi a0, a0, -1
+
+instruction with no architectural effect at offset: 0x52: -> delete; a write to x0 (2 bytes) (1 instructions)
+  c.li zero, 5
+
+instruction with no architectural effect at offset: 0x54: -> delete; a shift by zero (2 bytes) (1 instructions)
+  c.slli64 a0
+
+instruction compressible to a base C form at offset: 0x5a: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+Optimization opportunities by type:
+      18  instruction with no architectural effect
+       7  instruction compressible to a base C form
+
+25 optimization opportunities in 27 instructions

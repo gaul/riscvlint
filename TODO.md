@@ -1483,7 +1483,7 @@ which is to the digit what check 3 reports over this corpus.
 |---|---|---:|---|---|
 | 36 | `auipc rd,hi` + `jr lo(rd)` to a target inside `j`'s reach | 1,116,777 | ML 703K, TF 224K, BL 111K, RE 73K | **implemented**, 720,121 |
 | 37 | a constant built in more instructions than `li` needs | 558,869 | ML 404K, TF 83K, BL 49K, RE 21K | **implemented**, 562,957 |
-| 38 | an instruction with no architectural effect | 812,586 | ML 764K | candidate |
+| 38 | an instruction with no architectural effect | 812,586 | ML 764K | **implemented**, 812,586 |
 | 39 | a conditional branch whose target is an unconditional jump | 177,202 | ML 137K, TF 17K, RE 14K | candidate |
 | 40 | pushes one stack adjustment would do | 81,103 runs | ML 78K | candidate |
 | 41 | `li rt,0` + a store of rt | 43,002 | BL 20K, ML 13K, RE 7K | candidate |
@@ -1563,7 +1563,7 @@ holds and the miner's grammar saw 772. The replacement is priced at the
 chain's own encoding class, four bytes an instruction here since V8
 emits no compressed instruction, so a six-for-four site saves eight.
 
-## 38. An instruction with no architectural effect -- 812,586
+## 38. An instruction with no architectural effect -- 812,586  [implemented]
 
 Three spellings make it up. `lui zero,0x54321`, 425,026: the second
 half of `Assembler::stop()`, which is `ebreak` followed by a `lui` into
@@ -1580,7 +1580,21 @@ register -- so none of it is reported today.
 check: alignment padding exists for its width. The forms here have no
 such alibi. The `lui` into x0 is a hint encoding by the ISA's own
 reckoning, and the ones in this corpus are markers the JIT reads back
-through its own disassembler, which is the JIT's business to keep.
+through its own disassembler, which is the JIT's business to keep. The
+two hint families the ISA has assigned to writes of x0 -- Zicbop's
+prefetches, `ori x0,rs,imm`, and Zihintntl's `add x0,x0,x2..x5` -- are
+left alone, since a processor that implements them does act on them.
+
+What check_no_effect reports: all 812,586, to the digit what the miner
+counted once `ebreak` and `nop` are set aside, worth 3,250,344 bytes,
+2.1% of the corpus's code -- 763,931 Maglev, 27,568 TurboFan, 18,700
+baseline, 2,250 regexp, 137 wrappers. One encoding needed a gate on the
+way in: Capstone prints `auipc x0,imm` as `lpad`, because that is what
+it is -- Zicfilp's landing pad, which an object built for that
+extension relies on -- so the check reports it only where the declared
+architecture positively lacks Zicfilp, and never where the architecture
+is unknown. V8's lacks it, and uses the encoding as its constant-pool
+guard.
 
 ## 39 to 46. Eight more shapes from the JetStream corpus
 
@@ -1642,7 +1656,7 @@ not tracked (about 75K, every one a dispatch handle that a later
 
 # Remaining candidates
 
-Nine, 38 to 46, all from the JetStream corpus above; over the package
+Eight, 39 to 46, all from the JetStream corpus above; over the package
 corpus there are none. Thirty-four checks are implemented and everything
 this file sized over that corpus is either written or recorded as
 rejected with the evidence that rejected it. The last thirteen did not come from a corpus probe at all: 23

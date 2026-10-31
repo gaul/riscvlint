@@ -3,8 +3,8 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Thirty-six checks are implemented and the ledger's candidate list
-holds nine, all from a JIT corpus. [TODO.md](TODO.md) is that ledger: every candidate that was
+Thirty-seven checks are implemented and the ledger's candidate list
+holds eight, all from a JIT corpus. [TODO.md](TODO.md) is that ledger: every candidate that was
 measured, the population it came back with, and the ones rejected on
 that evidence.
 What got written was decided by the corpus rather than by intuition,
@@ -12,9 +12,9 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Thirty-six of them, and the table lists twenty-seven. The jump pair
-and the constant chain have so far been measured over the JetStream
-corpus of TODO.md, which the table does not cover. Seven report nothing over this corpus -- the bit count because no baseline object
+Thirty-seven of them, and the table lists twenty-seven. The jump pair,
+the constant chain and the no-op have so far been measured over the
+JetStream corpus of TODO.md, which the table does not cover. Seven report nothing over this corpus -- the bit count because no baseline object
 declares Zbb; the three indexed loads, the equality branch and the
 compare-exchange loop because those five require their extension to be
 positively present rather than merely un-denied, and no object declares
@@ -614,6 +614,45 @@ except a handful of `jalr ra,0(ra)` that were already two.
   register, which makes it a PC materialization rather than a no-op --
   16 sites, all in Firefox, and the one thing separating this check from
   a wrong one.
+
+* **instruction with no architectural effect** -- the no-ops that are
+  not `nop`: an operation whose result is the value it read (`mv x,x`,
+  `addi x,x,0`, `ori x,x,0`, a shift by zero, an and with all ones,
+  `fsgnj.d f,f,f`), or a write to x0 that is neither the canonical nop
+  nor one of the two hint families the ISA has assigned there,
+  Zicbop's prefetches (`ori x0,rs,imm`) and Zihintntl's non-temporal
+  hints (`add x0,x0,x2..x5`). The W forms are not in it: `addiw x,x,0`
+  sign-extends, and is the extension check's.
+
+  ```
+   12e77d0: ebreak
+   12e77d4: lui zero, 0x54321        -> delete; a write to x0
+   12e77d8: mv sp, sp                -> delete; a move onto itself
+  ```
+
+  `nop` itself stays unreported, for the reason the compression check's
+  entry in TODO.md gives: alignment padding exists for its width. The
+  forms here have no such alibi. A write to x0 is hint space by the
+  ISA's own reckoning, and a JIT may be using one as a marker it reads
+  back through its own disassembler -- V8's stop code after `ebreak`
+  and its constant-pool guard are both `lui`/`auipc` into x0 -- which
+  the finding cannot know and the processor does not act on. Where the
+  instruction is also compressible the compression check reports it
+  too; deleting it is the larger saving and subsumes the smaller.
+
+  The JetStream corpus (TODO.md, entry 38) has 812,586: 425,026 stop
+  codes, one after every Maglev deferred block, 206,424 `mv sp,sp` from
+  `MultiPush`/`MultiPop` handed an empty register list, and 181,136
+  `ori t6,t6,0` ending V8's fixed-length address load when the low six
+  bits of the address are zero. The check reports all 812,586,
+  3,250,344 bytes or 2.1% of the corpus's code: 763,931 in Maglev,
+  27,568 in TurboFan, 18,700 in baseline and 2,250 in regexp code.
+
+  One encoding is gated. `auipc x0,imm` is Zicfilp's `lpad`, the
+  landing pad an object built for that extension relies on, so it is
+  reported only where the declared architecture positively lacks
+  Zicfilp -- V8's does, and uses the encoding as its constant-pool
+  guard -- and never where the architecture is unknown.
 
 * **redundant reload** -- the same (base, displacement, width,
   signedness) loaded twice with nothing in between that could have

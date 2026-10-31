@@ -5483,6 +5483,55 @@ static void test_long_li(csh handle)
     CHECK(f.insn_count == 3);
 }
 
+// check_no_effect: the no-ops that are not nop.
+static void test_no_effect(csh handle)
+{
+    riscvlint_finding f;
+
+    // Reported, one each: mv a0,a0; addi sp,sp,0; ori t6,t6,0;
+    // andi a2,a2,-1; slli a3,a3,0; lui zero,0x54321; add a5,a5,zero;
+    // fsgnj.d fa0,fa0,fa0.
+    uint32_t yes[] = { 0x00050513u, 0x00010113u, 0x000fef93u, 0xfff67613u,
+                       0x00069693u, 0x54321037u, 0x000787b3u, 0x22a50553u,
+                       0x00008067u };
+    CHECK(run_words(handle, check_no_effect, yes, 9, 0x1000, &f) == 8);
+    CHECK(strcmp(f.replacement, "delete; a move onto itself (4 bytes)") == 0);
+    CHECK(f.insn_count == 1 && f.address == 0x1000);
+    uint32_t stop[] = { 0x54321037u, 0x00008067u };
+    CHECK(run_words(handle, check_no_effect, stop, 2, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "delete; a write to x0 (4 bytes)") == 0);
+
+    // `auipc zero,0` is Zicfilp's lpad: reported where the declared
+    // architecture lacks the extension, not where it has it, and not
+    // where nothing is declared.
+    uint8_t lpad[] = { 0x17, 0x00, 0x00, 0x00, 0x67, 0x80, 0x00, 0x00 };
+    CHECK(run_window_exts(handle, check_no_effect, lpad, sizeof lpad, 0x1000,
+                          RISCVLINT_EXT_DECLARED, &f) == 1);
+    CHECK(strcmp(f.replacement, "delete; a write to x0 (4 bytes)") == 0);
+    CHECK(run_window_exts(handle, check_no_effect, lpad, sizeof lpad, 0x1000,
+                          RISCVLINT_EXT_DECLARED | RISCVLINT_EXT_ZICFILP,
+                          NULL) == 0);
+    CHECK(run_window_exts(handle, check_no_effect, lpad, sizeof lpad, 0x1000,
+                          0, NULL) == 0);
+    CHECK(riscvlint_parse_arch("rv64i2p1_zicfilp1p0") ==
+          (RISCVLINT_EXT_DECLARED | RISCVLINT_EXT_ZICFILP));
+
+    // Not reported: nop; addiw a0,a0,0, which sign-extends; the
+    // prefetch hint `ori zero,a0,0`; the non-temporal hint
+    // `add zero,zero,t0`; and the honest operations around them.
+    uint32_t no[] = { 0x00000013u, 0x0005051bu, 0x00056013u, 0x00500033u,
+                      0x00150513u /* addi a0,a0,1 */,
+                      0x00b50533u /* add a0,a0,a1 */, 0x00008067u };
+    CHECK(run_words(handle, check_no_effect, no, 7, 0x1000, NULL) == 0);
+
+    // Compressed: c.mv a0,a0; c.addi a1,0; c.andi a0,-1; c.li zero,5;
+    // c.slli a0,0 are reported; c.nop and the hint c.add zero,t0 are not.
+    uint8_t rvc[] = { 0x2a, 0x85, 0x81, 0x05, 0x7d, 0x99, 0x15, 0x40,
+                      0x02, 0x05, 0x01, 0x00, 0x16, 0x90, 0x82, 0x80 };
+    CHECK(run_window(handle, check_no_effect, rvc, sizeof rvc, 0x1000, &f) == 5);
+    CHECK(strcmp(f.replacement, "delete; a move onto itself (2 bytes)") == 0);
+}
+
 int main(void)
 {
     csh handle;
@@ -5520,6 +5569,7 @@ int main(void)
     test_transfer_to_next(handle);
     test_jump_pair_to_j(handle);
     test_long_li(handle);
+    test_no_effect(handle);
     test_zero_store_run(handle);
     test_bitcast_through_frame(handle);
     test_cchain(handle);

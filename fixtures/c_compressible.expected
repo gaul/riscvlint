@@ -116,6 +116,9 @@ instruction compressible to a base C form at offset: 0x78: -> c.addi (4 -> 2 byt
 instruction compressible to a base C form at offset: 0x7c: -> c.mv (4 -> 2 bytes) (1 instructions)
   mv a5, a5
 
+instruction with no architectural effect at offset: 0x7c: -> delete; a move onto itself (4 bytes) (1 instructions)
+  mv a5, a5
+
 instruction compressible to a base C form at offset: 0x80: -> c.jr (4 -> 2 bytes) (1 instructions)
   jr a5
 
@@ -137,12 +140,16 @@ dead register definition at offset: 0x9c: -> delete; nothing reads a5 (4 bytes) 
 dead register definition at offset: 0xb0: -> delete; nothing reads a5 (4 bytes) (1 instructions)
   addi a5, a4, 8
 
+instruction with no architectural effect at offset: 0xbc: -> delete; a write to x0 (4 bytes) (1 instructions)
+  addi zero, a5, 8
+
 instruction compressible to a base C form at offset: 0xc4: -> c.jr (4 -> 2 bytes) (1 instructions)
   ret 
 
 Optimization opportunities by type:
       35  instruction compressible to a base C form
       11  dead register definition
+       2  instruction with no architectural effect
        1  constant built in more instructions than li needs
 
-47 optimization opportunities in 50 instructions
+49 optimization opportunities in 50 instructions

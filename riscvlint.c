@@ -374,6 +374,7 @@ unsigned riscvlint_parse_arch(const char *arch)
     if (strstr(arch, "_zilx")) exts |= RISCVLINT_EXT_ZILX;
     if (strstr(arch, "_zibi")) exts |= RISCVLINT_EXT_ZIBI;
     if (strstr(arch, "_zacas")) exts |= RISCVLINT_EXT_ZACAS;
+    if (strstr(arch, "_zicfilp")) exts |= RISCVLINT_EXT_ZICFILP;
     // C is spelled `_c2p0` in the base run and `_zca1p0` once the
     // Zc* split gave it a name of its own; a conforming string carries
     // whichever the assembler wrote, and some carry both.
@@ -5498,6 +5499,170 @@ bool check_long_li(riscvlint_state *state, const cs_insn *insn,
     return true;
 }
 
+// ---- an instruction with no architectural effect ----
+
+// The no-ops that are not `nop`: an integer or floating-point operation
+// whose result is the value it read, or a write to x0 other than the
+// canonical nop and the two hint families the ISA has assigned there --
+// Zicbop's prefetches, which are `ori x0,rs1,imm`, and Zihintntl's
+// non-temporal hints, which are `add x0,x0,x2..x5` in either width.
+// Every other write to x0 is hint space nobody has claimed, and what a
+// processor does with it is nothing. `what` names the form.
+static bool rv_decode_no_effect(uint32_t w, unsigned size, const char **what)
+{
+    if (size == 4) {
+        unsigned op = RV_OPCODE(w), f3 = (w >> 12) & 0x7u, f7 = w >> 25;
+        unsigned rd = (w >> 7) & 0x1fu, rs1 = (w >> 15) & 0x1fu;
+        unsigned rs2 = (w >> 20) & 0x1fu;
+        int64_t imm = sign_extend((uint64_t)(w >> 20) & 0xfffu, 12);
+        switch (op) {
+        case 0x37u:                                   // lui
+        case 0x17u:                                   // auipc
+            if (rd != 0) return false;
+            *what = "a write to x0";
+            return true;
+        case 0x13u:                                   // OP-IMM
+            if (rd == 0) {
+                if (f3 == 0 && rs1 == 0 && imm == 0) return false;   // nop
+                if (f3 == 6) return false;            // a prefetch hint
+                *what = "a write to x0";
+                return true;
+            }
+            if (rs1 != rd) return false;
+            switch (f3) {
+            case 0:
+                if (imm != 0) return false;
+                *what = "a move onto itself";
+                return true;
+            case 1:
+            case 5:
+                if (((w >> 20) & 0x3fu) != 0) return false;
+                if (f7 != 0 && f7 != 0x20u) return false;
+                *what = "a shift by zero";
+                return true;
+            case 4:
+            case 6:
+                if (imm != 0) return false;
+                *what = f3 == 4 ? "an xor with zero" : "an or with zero";
+                return true;
+            case 7:
+                if (imm != -1) return false;
+                *what = "an and with all ones";
+                return true;
+            default:
+                return false;
+            }
+        case 0x33u:                                   // OP
+            if (rd == 0) {
+                if (f7 == 0 && f3 == 0 && rs1 == 0 && rs2 >= 2 && rs2 <= 5)
+                    return false;                     // a non-temporal hint
+                *what = "a write to x0";
+                return true;
+            }
+            if (f7 == 0) {
+                bool self_zero = (rs1 == rd && rs2 == 0) || (rs2 == rd && rs1 == 0);
+                if (f3 == 0 && self_zero) { *what = "an add of zero"; return true; }
+                if (f3 == 6 && self_zero) { *what = "an or with zero"; return true; }
+                if (f3 == 4 && self_zero) { *what = "an xor with zero"; return true; }
+                if (f3 == 6 && rs1 == rd && rs2 == rd) { *what = "an or with itself"; return true; }
+                if (f3 == 7 && rs1 == rd && rs2 == rd) { *what = "an and with itself"; return true; }
+                if ((f3 == 1 || f3 == 5) && rs1 == rd && rs2 == 0) { *what = "a shift by zero"; return true; }
+                return false;
+            }
+            if (f7 == 0x20u) {
+                if (f3 == 0 && rs1 == rd && rs2 == 0) { *what = "a subtract of zero"; return true; }
+                if (f3 == 5 && rs1 == rd && rs2 == 0) { *what = "a shift by zero"; return true; }
+            }
+            return false;
+        case 0x1bu:                                   // OP-IMM-32
+        case 0x3bu:                                   // OP-32: the W forms sign-extend
+            if (rd != 0) return false;
+            *what = "a write to x0";
+            return true;
+        case 0x53u:                                   // OP-FP: fsgnj with one source is fmv
+            if (f3 != 0 || rs1 != rd || rs2 != rd) return false;
+            if (f7 != 0x10u && f7 != 0x11u && f7 != 0x12u) return false;
+            *what = "a floating-point move onto itself";
+            return true;
+        default:
+            return false;
+        }
+    }
+    if (size != 2) return false;
+    unsigned cop = w & 0x3u, f3 = (w >> 13) & 0x7u, rd = (w >> 7) & 0x1fu;
+    unsigned rs2 = (w >> 2) & 0x1fu;
+    unsigned u6 = (((w >> 12) & 1u) << 5) | ((w >> 2) & 0x1fu);
+    int64_t imm6 = sign_extend((uint64_t)u6, 6);
+    if (cop == 1) {
+        switch (f3) {
+        case 0:                                       // c.addi; rd x0 is c.nop
+            if (rd == 0 || imm6 != 0) return false;
+            *what = "a move onto itself";
+            return true;
+        case 2:                                       // c.li
+        case 3:                                       // c.lui
+            if (rd != 0) return false;
+            *what = "a write to x0";
+            return true;
+        case 4: {
+            unsigned sel = (w >> 10) & 0x3u;
+            if (sel == 2 && imm6 == -1) { *what = "an and with all ones"; return true; }
+            if (sel < 2 && u6 == 0) { *what = "a shift by zero"; return true; }
+            return false;
+        }
+        default:
+            return false;
+        }
+    }
+    if (cop == 2) {
+        if (f3 == 0) {                                // c.slli
+            if (rd == 0 && u6 == 0) return false;
+            if (rd == 0) { *what = "a write to x0"; return true; }
+            if (u6 == 0) { *what = "a shift by zero"; return true; }
+            return false;
+        }
+        if (f3 == 4 && rs2 != 0) {                    // c.mv / c.add
+            bool add = ((w >> 12) & 1u) != 0;
+            if (rd == 0) {
+                if (add && rs2 >= 2 && rs2 <= 5) return false;   // non-temporal hint
+                *what = "a write to x0";
+                return true;
+            }
+            if (!add && rd == rs2) { *what = "a move onto itself"; return true; }
+            return false;
+        }
+    }
+    return false;
+}
+
+bool check_no_effect(riscvlint_state *state, const cs_insn *insn,
+                     riscvlint_finding *finding)
+{
+    uint32_t w;
+    if (!riscvlint_word_at(state, insn->address, &w)) return false;
+    const char *what;
+    if (!rv_decode_no_effect(w, insn->size, &what)) return false;
+    // `auipc x0,imm` is Zicfilp's `lpad`, the landing pad an object
+    // built for that extension relies on. It is a no-op only where the
+    // declared architecture positively lacks the extension; an unknown
+    // architecture might have it, and is given the benefit of the doubt.
+    if (insn->size == 4 && RV_OPCODE(w) == RV_OP_AUIPC &&
+        riscvlint_may_use(state, RISCVLINT_EXT_ZICFILP))
+        return false;
+    // A relocation would fill the immediate in later; whatever it fills
+    // in, an instruction that does not write is not changed by it, but
+    // a `lui x0` in an unlinked object is still a placeholder and not a
+    // marker, so leave it to the linker.
+    if (riscvlint_is_relocated(state, insn->address)) return false;
+
+    finding->title = "instruction with no architectural effect";
+    finding->address = insn->address;
+    finding->insn_count = 1;
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "delete; %s (%u bytes)", what, insn->size);
+    return true;
+}
+
 // ---- running every check ----
 
 static const riscvlint_check_fn riscvlint_checks[] = {
@@ -5537,6 +5702,7 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_not_logic_fold,
     check_jump_pair_to_j,
     check_long_li,
+    check_no_effect,
 };
 
 size_t riscvlint_scan(riscvlint_state *state, csh handle,

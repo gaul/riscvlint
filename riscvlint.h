@@ -260,6 +260,7 @@ typedef enum {
     RISCVLINT_EXT_ZILX = 1u << 6,
     RISCVLINT_EXT_ZIBI = 1u << 7,
     RISCVLINT_EXT_ZACAS = 1u << 8,
+    RISCVLINT_EXT_ZICFILP = 1u << 9,
     RISCVLINT_EXT_DECLARED = 1u << 31,
 } riscvlint_ext;
 
@@ -1387,6 +1388,29 @@ bool check_jump_pair_to_j(riscvlint_state *state, const cs_insn *insn,
 // themselves, so over the package corpus the shape is rare.
 bool check_long_li(riscvlint_state *state, const cs_insn *insn,
                    riscvlint_finding *finding);
+
+// An instruction that changes nothing and is not `nop`: an integer or
+// floating-point operation whose result is the value it read (`mv x,x`,
+// `addi x,x,0`, `ori x,x,0`, a shift by zero, an and with all ones,
+// `fsgnj.d f,f,f`), or a write to x0 that is neither the canonical nop
+// nor one of the two hint families the ISA has assigned there (Zicbop's
+// prefetches, Zihintntl's non-temporal hints). The W forms are not
+// no-ops -- `addiw x,x,0` sign-extends -- and are the extension check's.
+//
+// `nop` itself stays unreported: alignment padding exists for its
+// width, as the compression check's entry in TODO.md records. The forms
+// here have no such alibi, though a JIT may be using a write to x0 as a
+// marker it reads back, which the finding cannot know and the README
+// says. `auipc x0,imm` is Zicfilp's `lpad`, so that one form is
+// reported only where the declared architecture positively lacks the
+// extension, and never where the architecture is unknown.
+//
+// Measured population: 812,586 in the JetStream corpus (TODO.md, entry
+// 38): 425,026 `lui zero,0x54321` stop codes, 206,424 `mv sp,sp` from
+// an empty register list, 181,136 `ori t6,t6,0` ending a fixed-length
+// address load.
+bool check_no_effect(riscvlint_state *state, const cs_insn *insn,
+                     riscvlint_finding *finding);
 
 // ---- running every check ----
 //
