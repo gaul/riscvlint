@@ -2404,6 +2404,150 @@ static void test_c_form(void)
     CHECK(!rv_c_form(0x6588u, 2, f, sizeof f));       // already two bytes
 }
 
+// Constant chains. The encodings are clang's for rv64gc; the buffer
+// holds one four-byte chain, one compressed three-step chain, two
+// single-instruction materializations, and the four-byte chain again
+// so the rebuild path has something to find.
+static const uint8_t cchain_code[] = {
+    0x37, 0xb5, 0xaa, 0xaa,        // lui a0,0xaaaab
+    0x1b, 0x05, 0xb5, 0xaa,        // addiw a0,a0,-1365   -> 0xffffffffaaaaaaab
+    0x95, 0x45,                    // c.li a1,5           -> 5, one instruction
+    0x05, 0x66,                    // c.lui a2,0x1
+    0x41, 0x06,                    // c.addi a2,a2,16
+    0x12, 0x06,                    // c.slli a2,a2,4      -> 0x10100
+    0x81, 0x46,                    // c.li a3,0           -> 0, one instruction
+    0x82, 0x80,                    // c.ret
+    0x37, 0xb7, 0xaa, 0xaa,        // lui a4,0xaaaab
+    0x1b, 0x07, 0xb7, 0xaa,        // addiw a4,a4,-1365   -> the same value
+    0x82, 0x80,                    // c.ret
+};
+
+#define CC_MAGIC ((int64_t)0xffffffffaaaaaaabull)   // the divide-by-3 magic
+
+// Hooks. `one_function` puts every chain in the same function, so the
+// second build of a value is a rebuild; `per_address` gives each its
+// own, so none is.
+static uint64_t cc_one_function(void *ctx, uint64_t addr)
+{
+    (void)ctx; (void)addr;
+    return 0x1000;
+}
+
+static uint64_t cc_per_address(void *ctx, uint64_t addr)
+{
+    (void)ctx;
+    return addr;
+}
+
+static uint64_t cc_no_function(void *ctx, uint64_t addr)
+{
+    (void)ctx; (void)addr;
+    return 0;
+}
+
+static bool cc_mapped_magic(void *ctx, uint64_t value)
+{
+    (void)ctx;
+    return value == (uint64_t)CC_MAGIC;
+}
+
+static bool cc_mapped_long(void *ctx, uint64_t value)
+{
+    (void)ctx;
+    return value == 0x10100;        // reached by a three-step chain
+}
+
+static void test_cchain(csh handle)
+{
+    size_t chains, insns, rebuilt;
+    bool address;
+
+    // No hooks: the totals and the by-value figures stand on their own.
+    riscvlint_cchain *c = riscvlint_cchain_create();
+    CHECK(c != NULL);
+    if (!c) return;
+    riscvlint_cchain_scan(c, handle, NULL, cchain_code, sizeof cchain_code,
+                          0x1000);
+    // Five materializations: two of them one instruction, three chains.
+    CHECK(riscvlint_cchain_chains(c) == 5);
+    CHECK(riscvlint_cchain_instructions(c) == 9);
+    CHECK(riscvlint_cchain_values(c) == 2);     // only the chains are tallied
+    CHECK(riscvlint_cchain_lookup(c, CC_MAGIC, &chains, &insns, &rebuilt,
+                                  &address));
+    CHECK(chains == 2 && insns == 4 && rebuilt == 0 && !address);
+    CHECK(riscvlint_cchain_lookup(c, 0x10100, &chains, &insns, NULL, NULL));
+    CHECK(chains == 1 && insns == 3);
+    // The single-instruction values are counted in the totals and kept
+    // out of the tally, which is what stops a report about expensive
+    // constants being a list of `li rd,0`.
+    CHECK(!riscvlint_cchain_lookup(c, 5, NULL, NULL, NULL, NULL));
+    CHECK(!riscvlint_cchain_lookup(c, 0, NULL, NULL, NULL, NULL));
+    riscvlint_cchain_destroy(c);
+
+    // One function: the second build of the magic is a rebuild.
+    c = riscvlint_cchain_create();
+    if (!c) { CHECK(false); return; }
+    riscvlint_cchain_set_hooks(c, NULL, NULL, cc_one_function, NULL);
+    riscvlint_cchain_scan(c, handle, NULL, cchain_code, sizeof cchain_code,
+                          0x1000);
+    CHECK(riscvlint_cchain_lookup(c, CC_MAGIC, &chains, NULL, &rebuilt, NULL));
+    CHECK(chains == 2 && rebuilt == 1);
+    riscvlint_cchain_destroy(c);
+
+    // A function each: the same two builds, no rebuild. The figure is
+    // about repetition inside one function, not about the binary.
+    c = riscvlint_cchain_create();
+    if (!c) { CHECK(false); return; }
+    riscvlint_cchain_set_hooks(c, NULL, NULL, cc_per_address, NULL);
+    riscvlint_cchain_scan(c, handle, NULL, cchain_code, sizeof cchain_code,
+                          0x1000);
+    CHECK(riscvlint_cchain_lookup(c, CC_MAGIC, NULL, NULL, &rebuilt, NULL));
+    CHECK(rebuilt == 0);
+    riscvlint_cchain_destroy(c);
+
+    // No function at all -- a stripped C++ binary -- is not a function
+    // every chain shares: nothing may be called a rebuild.
+    c = riscvlint_cchain_create();
+    if (!c) { CHECK(false); return; }
+    riscvlint_cchain_set_hooks(c, NULL, NULL, cc_no_function, NULL);
+    riscvlint_cchain_scan(c, handle, NULL, cchain_code, sizeof cchain_code,
+                          0x1000);
+    CHECK(riscvlint_cchain_lookup(c, CC_MAGIC, NULL, NULL, &rebuilt, NULL));
+    CHECK(rebuilt == 0);
+    riscvlint_cchain_destroy(c);
+
+    // The address label, and the rule that only a two-instruction chain
+    // can carry it: `lui` sets bits 31:12 and the `addi` the low twelve,
+    // so the %hi/%lo idiom is exactly two instructions and a longer
+    // chain is arithmetic however the value lands.
+    c = riscvlint_cchain_create();
+    if (!c) { CHECK(false); return; }
+    riscvlint_cchain_set_hooks(c, cc_mapped_magic, NULL, NULL, NULL);
+    riscvlint_cchain_scan(c, handle, NULL, cchain_code, sizeof cchain_code,
+                          0x1000);
+    CHECK(riscvlint_cchain_lookup(c, CC_MAGIC, NULL, NULL, NULL, &address));
+    CHECK(address);
+    riscvlint_cchain_destroy(c);
+
+    c = riscvlint_cchain_create();
+    if (!c) { CHECK(false); return; }
+    riscvlint_cchain_set_hooks(c, cc_mapped_long, NULL, NULL, NULL);
+    riscvlint_cchain_scan(c, handle, NULL, cchain_code, sizeof cchain_code,
+                          0x1000);
+    CHECK(riscvlint_cchain_lookup(c, 0x10100, NULL, NULL, NULL, &address));
+    CHECK(!address);
+    riscvlint_cchain_destroy(c);
+
+    // Everything tolerates NULL, as the census does.
+    riscvlint_cchain_destroy(NULL);
+    riscvlint_cchain_set_hooks(NULL, NULL, NULL, NULL, NULL);
+    riscvlint_cchain_scan(NULL, handle, NULL, cchain_code, sizeof cchain_code,
+                          0x1000);
+    riscvlint_cchain_print(NULL, "none", false);
+    CHECK(riscvlint_cchain_chains(NULL) == 0);
+    CHECK(!riscvlint_cchain_lookup(NULL, 0, NULL, NULL, NULL, NULL));
+}
+
 // Zfa's fli table, against LLVM's RISCVLoadFPImm::getLoadFPImm. The
 // entry numbers are the ones LLVM's own table yields, so a wrong
 // transcription shows up here rather than as a suggestion the assembler
@@ -2784,6 +2928,7 @@ int main(void)
     test_transfer_to_next(handle);
     test_zero_store_run(handle);
     test_bitcast_through_frame(handle);
+    test_cchain(handle);
     test_fli_table();
     test_fp_pool_to_fli(handle);
     test_census(handle);

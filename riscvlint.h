@@ -915,6 +915,76 @@ size_t riscvlint_scan(riscvlint_state *state, csh handle,
                       riscvlint_finding_fn on_finding, void *ctx,
                       uint64_t *instructions, uint64_t *skipped);
 
+// ---- constant chains (`-c`) ----
+//
+// Every constant the code materializes, tallied by value and ranked by
+// the instructions it costs. armlint's `-c` with the axis RISC-V
+// forces: there, a chain is MOVZ/MOVN plus MOVKs and its length is the
+// value's width in halfwords; here it is whatever RISCVMatInt chose,
+// and the question "how much does this constant cost" has a different
+// answer per value rather than per width.
+//
+// What a chain is: an instruction that builds a value out of x0 and an
+// immediate -- `li`, `lui`, `c.li`, `c.lui` -- followed by however many
+// `addi`/`addiw`/`slli` steps read its own result and nothing else.
+// That is the shape RISCVMatInt emits and the shape GNU as emits for
+// `li`. A branch into the middle ends it, since the instructions after
+// the target are then reached without the ones before.
+//
+// Two things the report says that a by-value tally alone would not.
+//
+// Whether the value is a *constant* or an *address*: in a linked
+// object `lui`+`addi` of a symbol's %hi/%lo is indistinguishable from
+// arithmetic on a literal, and conflating them makes the report
+// useless -- in libxul the split is 5,671 addresses against 29,701
+// constants. The caller decides, through riscvlint_mapped_fn, since
+// "does this value address something the file maps" is a question
+// about the container.
+//
+// And whether a chain *rebuilds* a value its own function already
+// built, which is the difference between a constant that is expensive
+// and one that is expensive repeatedly. The caller supplies the
+// function identity through riscvlint_anchor_fn, for the same reason.
+// Note what this does not claim: a rebuild is not necessarily a miss.
+// Telling the two apart needs dominance and liveness, which this does
+// not have.
+
+typedef struct riscvlint_cchain riscvlint_cchain;
+
+// True when `value` falls inside something the file maps -- any
+// allocated section -- which is what tells an address from a literal.
+// A caller with nothing to say returns false and gets everything
+// counted as a constant.
+typedef bool (*riscvlint_mapped_fn)(void *ctx, uint64_t value);
+
+// The function holding `addr`, as an opaque identity: its start
+// address, or 0 where none is known. Two chains agree on a function
+// exactly when this agrees, so a caller with no symbols returns 0 and
+// no chain is counted as a rebuild.
+typedef uint64_t (*riscvlint_anchor_fn)(void *ctx, uint64_t addr);
+
+riscvlint_cchain *riscvlint_cchain_create(void);
+void riscvlint_cchain_destroy(riscvlint_cchain *c);
+void riscvlint_cchain_set_hooks(riscvlint_cchain *c,
+                                riscvlint_mapped_fn mapped, void *mapped_ctx,
+                                riscvlint_anchor_fn anchor, void *anchor_ctx);
+// Walks `len` bytes at `vaddr`, recognizing every chain. `targets`, when
+// non-NULL, is the state whose side-entry map says where a branch lands,
+// so a chain is not read across one; a caller without it loses the few
+// chains a target splits rather than reporting them as one.
+void riscvlint_cchain_scan(riscvlint_cchain *c, csh handle,
+                           const riscvlint_state *targets,
+                           const uint8_t *code, size_t len, uint64_t vaddr);
+void riscvlint_cchain_print(const riscvlint_cchain *c, const char *path,
+                            bool samples);
+// For the tests: totals, and the figures for one value.
+size_t riscvlint_cchain_chains(const riscvlint_cchain *c);
+size_t riscvlint_cchain_instructions(const riscvlint_cchain *c);
+size_t riscvlint_cchain_values(const riscvlint_cchain *c);
+bool riscvlint_cchain_lookup(const riscvlint_cchain *c, int64_t value,
+                             size_t *chains, size_t *insns, size_t *rebuilt,
+                             bool *address);
+
 // ---- ISA census ----
 //
 // A by-extension tally of every instruction decoded: armlint's census

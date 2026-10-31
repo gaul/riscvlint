@@ -1027,6 +1027,87 @@ libLLVM covering 16.9 MB of a 51.9 MB `.text`, so it would name about a
 third of the findings and leave the rest looking like they belong to
 whichever export preceded them.
 
+## Constant chains (`-c`)
+
+`riscvlint -c` adds a second report to the scan: every constant the
+code materializes, tallied by value and ranked by the instructions it
+costs. armlint's `-c` with the axis RISC-V forces -- there a chain is
+`movz`/`movn` plus `movk`s and its length is the value's width in
+halfwords, here it is whatever `RISCVMatInt` chose, so "how much does
+this constant cost" has an answer per value rather than per width.
+
+A chain is an instruction that builds a value out of x0 and an
+immediate -- `li`, `lui`, `c.li`, `c.lui` -- followed by however many
+`addi`/`addiw`/`slli` steps read only its own result. That is what
+`RISCVMatInt` emits and what GNU as emits for `li`. A branch into the
+middle ends it, since the instructions after the target are then
+reached without the ones before.
+
+```console
+$ ./riscvlint -c -q corpus/cpp/firefox-esr--libxul.so
+Constant chains in corpus/cpp/firefox-esr--libxul.so: 2219042 materializations, 2395605 instructions
+  one instruction: 2059842
+  two or more: 159200 chains, 335763 instructions, 12504 distinct values
+    of which addresses: 5833 chains, 11669 instructions
+    of which constants: 153367 chains, 324094 instructions
+  costliest values:
+       37590 insns  0x8000000000000000 (-9223372036854775808) 18757 chains
+       23904 insns  0xfff9800000000000 (-1829587348619264) 11952 chains
+       14914 insns  0xfffb000000000000 (-1407374883553280) 7457 chains
+       14034 insns  0xfffe000000000000 (-562949953421312) 7017 chains
+       10550 insns  0x8000000000000001 (-9223372036854775807) 3515 chains
+       ...
+  rebuilt inside one function: not counted, nothing named the functions
+```
+
+Read off that one run: the sign bit 18,757 times, then four values of
+the form `0xfff?800000000000`, which are SpiderMonkey's NaN-boxed JSVal
+tags -- 30,000 materializations of a handful of type tags -- and
+further down `0xffffffff80004005`, which is `NS_ERROR_FAILURE`, 2,569
+times. libLLVM's list is led by `0xaaaaaaab` 1,346 times and
+`0xcccccccd` 425: the divide-by-3 and divide-by-5 magic numbers, one
+chain per inlined division.
+
+Three things the report does that a by-value tally alone would not.
+
+**Single-instruction values are counted and not tallied.** `li a0,0`
+has no cheaper spelling, and libLLVM materializes something in one
+instruction 1,101,483 times, so ranking those by cost would make the
+report a list of "build zero". The totals keep them; the ranked list
+starts at two.
+
+**Addresses are told from literals.** In a linked object `lui`+`addi`
+of a symbol's `%hi`/`%lo` is indistinguishable from arithmetic on a
+literal, and conflating them buries the constants: before the split
+libLLVM reported 13,978 chains as addresses, against 1,132 after. Two
+conditions, both principled. The value must land in a section holding
+*program* data -- `SHT_PROGBITS` or `SHT_NOBITS`, not the linker's own
+tables, which in a shared object are everything at the low addresses a
+small literal collides with (libLLVM's first `PROGBITS` section is at
+0xe5ef80 and the nine below it are notes, symbol and version tables,
+hashes, strings and relocations, which is why `0xffff` and `0xc00` used
+to read as addresses). And the chain must be exactly two instructions,
+since `lui` sets bits 31:12 and the `addi` the low twelve: the
+`%hi`/`%lo` idiom is two and anything longer is arithmetic. What
+remains is irreducible -- libLLVM builds `0x7ffffff` 696 times, which
+is 2^27-1 and a mask, and it falls inside a loaded section anyway.
+Nothing in the bytes tells the two apart once the linker has consumed
+the relocation that did.
+
+**Rebuilds are reported per function.** A value its own function
+already built is the difference between a constant that is expensive
+and one that is expensive repeatedly: `golang-1.26-go--compile` rebuilds
+`0x15c5` 458 times out of 730 builds. This needs function boundaries,
+so it reads them from the same place the annotation does -- and says
+`not counted, nothing named the functions` rather than `none` on an
+object that has no symbols, which is every C++ and Rust binary here.
+Note what a rebuild is not: it is not necessarily a miss. Telling those
+apart needs dominance and liveness, which this does not have.
+
+`-v` adds up to four sample addresses per value, which is what checking
+one in a disassembler takes. `--json` describes the lint scan alone, so
+the combination is refused.
+
 ## Exit status
 
 The grep convention, so riscvlint can gate a test suite and CI can tell

@@ -3362,6 +3362,486 @@ size_t riscvlint_scan(riscvlint_state *state, csh handle,
     return found;
 }
 
+// ---- constant chains ----
+//
+// See riscvlint.h for what a chain is and what the two hooks are for.
+
+#define CCHAIN_SAMPLES 4
+#define CCHAIN_TOP     15
+
+typedef struct {
+    int64_t value;
+    uint64_t chains;            // times built
+    uint64_t insns;             // instructions those builds cost
+    uint64_t rebuilt;           // builds of a value the function had
+    uint64_t rebuilt_insns;
+    bool address;               // lands in something the file maps
+    uint64_t samples[CCHAIN_SAMPLES];
+    unsigned nsamples;
+    bool used;
+} cchain_val;
+
+// One (function, value) pair that has been built. A second chain
+// hitting the same pair is a rebuild.
+typedef struct {
+    uint64_t anchor;
+    int64_t value;
+    bool used;
+} cchain_seen;
+
+struct riscvlint_cchain {
+    cchain_val *vals;
+    size_t vals_cap, vals_used;
+    cchain_seen *seen;
+    size_t seen_cap, seen_used;
+    uint64_t chains, insns;
+    // Materializations that took one instruction. Counted but not
+    // tallied by value: `li a0,0` has no cheaper spelling, so ranking
+    // it by cost puts 229,650 copies of "build zero" at the top of a
+    // report about what constants are expensive. Restricting the tally
+    // to chains of two or more is also what makes the address
+    // classification mean anything -- a one-instruction value that
+    // happens to equal a mapped address is a small literal, and in a
+    // shared object whose sections start near zero that is most of
+    // them.
+    uint64_t singles;
+    uint64_t rebuilt, rebuilt_insns;
+    uint64_t anchors_rebuilt;   // distinct functions holding a rebuild
+    bool anchored;              // some chain was placed in a function
+    uint64_t *anchor_list;      // their identities, for the count
+    size_t anchor_cap, anchor_used;
+    bool overflowed;            // a table could not grow; figures are low
+    riscvlint_mapped_fn mapped;
+    void *mapped_ctx;
+    riscvlint_anchor_fn anchor;
+    void *anchor_ctx;
+};
+
+static uint64_t cchain_hash(uint64_t v)
+{
+    // splitmix64's finalizer: the values are often small and often
+    // differ only in their low bits, which a weaker mix leaves
+    // colliding in runs.
+    v += 0x9e3779b97f4a7c15ull;
+    v = (v ^ (v >> 30)) * 0xbf58476d1ce4e5b9ull;
+    v = (v ^ (v >> 27)) * 0x94d049bb133111ebull;
+    return v ^ (v >> 31);
+}
+
+riscvlint_cchain *riscvlint_cchain_create(void)
+{
+    riscvlint_cchain *c = calloc(1, sizeof *c);
+    return c;
+}
+
+void riscvlint_cchain_destroy(riscvlint_cchain *c)
+{
+    if (!c) return;
+    free(c->vals);
+    free(c->seen);
+    free(c->anchor_list);
+    free(c);
+}
+
+void riscvlint_cchain_set_hooks(riscvlint_cchain *c,
+                                riscvlint_mapped_fn mapped, void *mapped_ctx,
+                                riscvlint_anchor_fn anchor, void *anchor_ctx)
+{
+    if (!c) return;
+    c->mapped = mapped;
+    c->mapped_ctx = mapped_ctx;
+    c->anchor = anchor;
+    c->anchor_ctx = anchor_ctx;
+}
+
+static bool cchain_vals_grow(riscvlint_cchain *c)
+{
+    size_t cap = c->vals_cap ? c->vals_cap * 2 : 1024;
+    cchain_val *grown = calloc(cap, sizeof *grown);
+    if (!grown) return false;
+    for (size_t i = 0; i < c->vals_cap; i++) {
+        if (!c->vals[i].used) continue;
+        size_t j = cchain_hash((uint64_t)c->vals[i].value) & (cap - 1);
+        while (grown[j].used) j = (j + 1) & (cap - 1);
+        grown[j] = c->vals[i];
+    }
+    free(c->vals);
+    c->vals = grown;
+    c->vals_cap = cap;
+    return true;
+}
+
+static cchain_val *cchain_val_at(riscvlint_cchain *c, int64_t value)
+{
+    if (c->vals_used * 10 >= c->vals_cap * 7 && !cchain_vals_grow(c)) {
+        c->overflowed = true;
+        return NULL;
+    }
+    size_t i = cchain_hash((uint64_t)value) & (c->vals_cap - 1);
+    while (c->vals[i].used) {
+        if (c->vals[i].value == value) return &c->vals[i];
+        i = (i + 1) & (c->vals_cap - 1);
+    }
+    c->vals[i].used = true;
+    c->vals[i].value = value;
+    c->vals_used++;
+    return &c->vals[i];
+}
+
+static bool cchain_seen_grow(riscvlint_cchain *c)
+{
+    size_t cap = c->seen_cap ? c->seen_cap * 2 : 1024;
+    cchain_seen *grown = calloc(cap, sizeof *grown);
+    if (!grown) return false;
+    for (size_t i = 0; i < c->seen_cap; i++) {
+        if (!c->seen[i].used) continue;
+        size_t j = cchain_hash(c->seen[i].anchor ^
+                               cchain_hash((uint64_t)c->seen[i].value)) &
+                   (cap - 1);
+        while (grown[j].used) j = (j + 1) & (cap - 1);
+        grown[j] = c->seen[i];
+    }
+    free(c->seen);
+    c->seen = grown;
+    c->seen_cap = cap;
+    return true;
+}
+
+// True when this function has built this value before.
+static bool cchain_seen_before(riscvlint_cchain *c, uint64_t anchor,
+                               int64_t value)
+{
+    if (!anchor) return false;          // no function: nothing to repeat in
+    if (c->seen_used * 10 >= c->seen_cap * 7 && !cchain_seen_grow(c)) {
+        c->overflowed = true;
+        return false;
+    }
+    uint64_t h = cchain_hash(anchor ^ cchain_hash((uint64_t)value));
+    size_t i = h & (c->seen_cap - 1);
+    while (c->seen[i].used) {
+        if (c->seen[i].anchor == anchor && c->seen[i].value == value)
+            return true;
+        i = (i + 1) & (c->seen_cap - 1);
+    }
+    c->seen[i].used = true;
+    c->seen[i].anchor = anchor;
+    c->seen[i].value = value;
+    c->seen_used++;
+    return false;
+}
+
+// Counts a function once however many rebuilds it holds.
+static void cchain_note_anchor(riscvlint_cchain *c, uint64_t anchor)
+{
+    for (size_t i = 0; i < c->anchor_used; i++)
+        if (c->anchor_list[i] == anchor) return;
+    if (c->anchor_used == c->anchor_cap) {
+        size_t cap = c->anchor_cap ? c->anchor_cap * 2 : 256;
+        uint64_t *grown = realloc(c->anchor_list, cap * sizeof *grown);
+        if (!grown) { c->overflowed = true; return; }
+        c->anchor_list = grown;
+        c->anchor_cap = cap;
+    }
+    c->anchor_list[c->anchor_used++] = anchor;
+    c->anchors_rebuilt++;
+}
+
+// One step of a chain: `addi`/`addiw`/`slli` whose source is its own
+// destination. Returns false for anything else, which ends the chain.
+//
+// `addi rd,rd,imm` and `c.addi` are the same step; so are `slli` and
+// `c.slli`, which rv_decode_slli already folds together. `addiw` is
+// its own case because it truncates, and that truncation is exactly
+// what RISCVMatInt uses it for.
+static bool cchain_step(uint32_t w, unsigned size, unsigned reg,
+                        int64_t *val)
+{
+    unsigned rd, rs1, shamt;
+    int64_t imm;
+    if (rv_decode_slli(w, size, &rd, &rs1, &shamt)) {
+        if (rd != reg || rs1 != reg) return false;
+        *val = (int64_t)((uint64_t)*val << shamt);
+        return true;
+    }
+    // addi, in both widths and both spellings.
+    bool w_form = false;
+    if (size == 4) {
+        unsigned op = RV_OPCODE(w);
+        if ((op != 0x13u && op != 0x1bu) || ((w >> 12) & 0x7u) != 0)
+            return false;
+        w_form = op == 0x1bu;
+        rd = (w >> 7) & 0x1fu;
+        rs1 = (w >> 15) & 0x1fu;
+        imm = sign_extend((uint64_t)(w >> 20) & 0xfffu, 12);
+    } else if (size == 2) {
+        // c.addi is op 01 funct3 000; c.addiw is op 01 funct3 001. Both
+        // read and write the same register, and a zero immediate is a
+        // hint rather than an addition.
+        if ((w & 0xe003u) == 0x0001u) w_form = false;
+        else if ((w & 0xe003u) == 0x2001u) w_form = true;
+        else return false;
+        rd = rs1 = (w >> 7) & 0x1fu;
+        imm = ci_imm6(w);
+        if (rd == 0 || imm == 0) return false;
+    } else {
+        return false;
+    }
+    if (rd != reg || rs1 != reg) return false;
+    uint64_t sum = (uint64_t)*val + (uint64_t)imm;
+    *val = w_form ? (int64_t)(int32_t)(uint32_t)sum : (int64_t)sum;
+    return true;
+}
+
+// Count a finished chain.
+static void cchain_finish(riscvlint_cchain *c, int64_t value, unsigned ninsn,
+                          uint64_t start)
+{
+    c->chains++;
+    c->insns += ninsn;
+    if (ninsn < 2) { c->singles++; return; }
+
+    cchain_val *v = cchain_val_at(c, value);
+    if (!v) return;
+    v->chains++;
+    v->insns += ninsn;
+    if (v->nsamples < CCHAIN_SAMPLES) v->samples[v->nsamples++] = start;
+    // Only a two-instruction chain can be a `%hi`/`%lo` pair, which is
+    // the only way `lui`+`addi` spells an address: `lui` sets bits
+    // 31:12 and the `addi` the low twelve, so the idiom is exactly two
+    // and anything longer is arithmetic on a literal. A PC-relative
+    // address is `auipc`-based and is not a chain at all.
+    if (ninsn == 2 && c->mapped && c->mapped(c->mapped_ctx, (uint64_t)value))
+        v->address = true;
+
+    uint64_t anchor = c->anchor ? c->anchor(c->anchor_ctx, start) : 0;
+    if (anchor) c->anchored = true;
+    if (cchain_seen_before(c, anchor, value)) {
+        v->rebuilt++;
+        v->rebuilt_insns += ninsn;
+        c->rebuilt++;
+        c->rebuilt_insns += ninsn;
+        cchain_note_anchor(c, anchor);
+    }
+}
+
+void riscvlint_cchain_scan(riscvlint_cchain *c, csh handle,
+                           const riscvlint_state *targets,
+                           const uint8_t *code, size_t len, uint64_t vaddr)
+{
+    if (!c) return;
+    cs_insn *insn = cs_malloc(handle);
+    if (!insn) return;
+
+    // The chain under construction: its register, its value so far, how
+    // many instructions it has taken, and where it started.
+    bool open = false;
+    unsigned reg = 0;
+    int64_t value = 0;
+    unsigned ninsn = 0;
+    uint64_t start = 0;
+
+    const uint8_t *p = code;
+    size_t remain = len;
+    uint64_t addr = vaddr;
+    while (remain >= 2) {
+        uint64_t at = addr;
+        if (!cs_disasm_iter(handle, &p, &remain, &addr, insn)) {
+            open = false;                   // an unreadable halfword
+            p += 2; remain -= 2; addr += 2;
+            continue;
+        }
+        uint32_t w = 0;
+        memcpy(&w, code + (at - vaddr),
+               insn->size < 4 ? insn->size : 4);
+
+        // A branch landing here means the instructions before are not
+        // necessarily the ones that ran.
+        bool target = targets && riscvlint_is_branch_target(targets, at);
+
+        if (open && !target && cchain_step(w, insn->size, reg, &value)) {
+            ninsn++;
+            continue;
+        }
+        // Whatever is under the cursor is not a step, so the chain that
+        // was open is finished and gets counted.
+        if (open) {
+            cchain_finish(c, value, ninsn, start);
+            open = false;
+        }
+        // And it may itself start one.
+        unsigned rd;
+        int64_t v0;
+        if (!target && decode_const(w, insn->size, &rd, &v0)) {
+            open = true;
+            reg = rd;
+            value = v0;
+            ninsn = 1;
+            start = at;
+        }
+    }
+    // A chain running to the end of the section still happened.
+    if (open) cchain_finish(c, value, ninsn, start);
+    cs_free(insn, 1);
+}
+
+size_t riscvlint_cchain_chains(const riscvlint_cchain *c)
+{
+    return c ? c->chains : 0;
+}
+
+size_t riscvlint_cchain_instructions(const riscvlint_cchain *c)
+{
+    return c ? c->insns : 0;
+}
+
+size_t riscvlint_cchain_values(const riscvlint_cchain *c)
+{
+    return c ? c->vals_used : 0;
+}
+
+bool riscvlint_cchain_lookup(const riscvlint_cchain *c, int64_t value,
+                             size_t *chains, size_t *insns, size_t *rebuilt,
+                             bool *address)
+{
+    if (!c || !c->vals_cap) return false;
+    size_t i = cchain_hash((uint64_t)value) & (c->vals_cap - 1);
+    for (size_t n = 0; n < c->vals_cap; n++) {
+        const cchain_val *v = &c->vals[i];
+        if (!v->used) return false;
+        if (v->value == value) {
+            if (chains) *chains = v->chains;
+            if (insns) *insns = v->insns;
+            if (rebuilt) *rebuilt = v->rebuilt;
+            if (address) *address = v->address;
+            return true;
+        }
+        i = (i + 1) & (c->vals_cap - 1);
+    }
+    return false;
+}
+
+static int cchain_cmp_cost(const void *a, const void *b)
+{
+    const cchain_val *const *pa = a, *const *pb = b;
+    const cchain_val *x = *pa, *y = *pb;
+    if (x->insns != y->insns) return y->insns > x->insns ? 1 : -1;
+    if (x->chains != y->chains) return y->chains > x->chains ? 1 : -1;
+    return x->value < y->value ? -1 : x->value > y->value ? 1 : 0;
+}
+
+static int cchain_cmp_rebuilt(const void *a, const void *b)
+{
+    const cchain_val *const *pa = a, *const *pb = b;
+    const cchain_val *x = *pa, *y = *pb;
+    if (x->rebuilt_insns != y->rebuilt_insns)
+        return y->rebuilt_insns > x->rebuilt_insns ? 1 : -1;
+    return x->value < y->value ? -1 : x->value > y->value ? 1 : 0;
+}
+
+// A value as both hex and signed decimal. The hex is what a reader
+// recognizes a magic number by and the decimal is what they recognize a
+// struct size by, and which of the two a given constant wants is not
+// something the tool can know.
+static void cchain_render(int64_t v, char *out, size_t outsz)
+{
+    snprintf(out, outsz, "0x%" PRIx64 " (%" PRId64 ")", (uint64_t)v, v);
+}
+
+static void cchain_rows(const riscvlint_cchain *c, const char *title,
+                        int (*cmp)(const void *, const void *),
+                        bool rebuilt_only, bool samples)
+{
+    const cchain_val **rows = malloc(c->vals_used * sizeof *rows);
+    if (!rows) return;
+    size_t n = 0;
+    for (size_t i = 0; i < c->vals_cap; i++) {
+        if (!c->vals[i].used) continue;
+        if (rebuilt_only && !c->vals[i].rebuilt) continue;
+        rows[n++] = &c->vals[i];
+    }
+    if (!n) { free(rows); return; }
+    qsort(rows, n, sizeof rows[0], cmp);
+
+    printf("  %s:\n", title);
+    size_t shown = n < CCHAIN_TOP ? n : CCHAIN_TOP;
+    for (size_t i = 0; i < shown; i++) {
+        const cchain_val *v = rows[i];
+        char text[48];
+        cchain_render(v->value, text, sizeof text);
+        if (rebuilt_only)
+            printf("    %8" PRIu64 " insns  %-28s %" PRIu64 " rebuilt of %"
+                   PRIu64 "\n", v->rebuilt_insns, text, v->rebuilt,
+                   v->chains);
+        else
+            printf("    %8" PRIu64 " insns  %-28s %" PRIu64 " chain%s%s\n",
+                   v->insns, text, v->chains, v->chains == 1 ? "" : "s",
+                   v->address ? ", an address" : "");
+        if (samples && v->nsamples) {
+            printf("             at");
+            for (unsigned j = 0; j < v->nsamples; j++)
+                printf(" 0x%" PRIx64, v->samples[j]);
+            printf("%s\n", v->chains > v->nsamples ? " ..." : "");
+        }
+    }
+    if (n > shown)
+        printf("    %zu more value%s\n", n - shown, n - shown == 1 ? "" : "s");
+    free(rows);
+}
+
+void riscvlint_cchain_print(const riscvlint_cchain *c, const char *path,
+                            bool samples)
+{
+    if (!c) return;
+    uint64_t multi = c->chains - c->singles;
+    printf("Constant chains in %s: %" PRIu64 " materializations, %" PRIu64
+           " instructions\n", path, c->chains, c->insns);
+    printf("  one instruction: %" PRIu64 "\n", c->singles);
+    printf("  two or more: %" PRIu64 " chains, %" PRIu64
+           " instructions, %zu distinct values\n", multi,
+           c->insns - c->singles, c->vals_used);
+    if (!multi) { printf("\n"); return; }
+
+    uint64_t addr_chains = 0, addr_insns = 0;
+    for (size_t i = 0; i < c->vals_cap; i++) {
+        if (!c->vals[i].used || !c->vals[i].address) continue;
+        addr_chains += c->vals[i].chains;
+        addr_insns += c->vals[i].insns;
+    }
+    // The split is the whole reason this report is readable. In a
+    // linked object `lui`+`addi` of a symbol's %hi/%lo looks exactly
+    // like arithmetic on a literal, and only the container can say
+    // which it is. Not proof either way: a literal that happens to
+    // equal a mapped address reads as an address, which is why the
+    // single-instruction values are kept out of this -- they are where
+    // the collisions nearly all are.
+    printf("    of which addresses: %" PRIu64 " chains, %" PRIu64
+           " instructions\n", addr_chains, addr_insns);
+    printf("    of which constants: %" PRIu64 " chains, %" PRIu64
+           " instructions\n", multi - addr_chains,
+           c->insns - c->singles - addr_insns);
+
+    cchain_rows(c, "costliest values", cchain_cmp_cost, false, samples);
+    if (c->rebuilt) {
+        printf("  rebuilt inside one function: %" PRIu64 " chains, %" PRIu64
+               " instructions, %" PRIu64 " function%s\n", c->rebuilt,
+               c->rebuilt_insns, c->anchors_rebuilt,
+               c->anchors_rebuilt == 1 ? "" : "s");
+        cchain_rows(c, "costliest rebuilds", cchain_cmp_rebuilt, true,
+                    samples);
+    } else if (!c->anchored) {
+        // Not "none found": nothing said where a function begins, so
+        // the question was never asked. A stripped C++ or Rust binary
+        // is this case; see "Attribution" in README.md.
+        printf("  rebuilt inside one function: not counted, nothing named "
+               "the functions\n");
+    } else {
+        printf("  rebuilt inside one function: none\n");
+    }
+    if (c->overflowed)
+        printf("  note: a table could not grow; the figures above are low\n");
+    printf("\n");
+}
+
 // ---- ISA census ----
 //
 // See riscvlint.h for what the census claims, where the profile rungs

@@ -1134,6 +1134,67 @@ tells `rva22` and `rva23` apart -- Zcb missed RVA22's ratification window
 and is mandatory in RVA23U64 -- so the two profile names stopped
 expanding alike when this landed.
 
+## Constant chains, as the `-c` report measures them  [implemented]
+
+Not a candidate check -- a report, armlint's `-c` ported. Recorded here
+because it sizes a population the backlog never did, and two of its
+numbers are the kind that get re-derived from intuition otherwise.
+
+**Single-instruction materializations are 93% of the population.** Over
+libLLVM: 1,127,190 materializations costing 1,154,753 instructions, of
+which 1,101,483 are one instruction. The remaining 25,707 chains cost
+53,270. Any reading of "constants are expensive here" has to start
+after that subtraction, and a report that does not make it is a list of
+`li rd,0`.
+
+**The address/literal split is most of what the report is.** Before it,
+libLLVM looked like 13,978 address chains; after, 1,132. The naive test
+-- does the value land in any allocated section -- is useless in a
+shared object, because every low address belongs to the linker's own
+tables: libLLVM's first `SHT_PROGBITS` section is at 0xe5ef80 and the
+nine below it are notes, symbol and version tables, hashes, strings and
+relocations, so `0xffff` and `0xc00` both read as addresses. Requiring
+program data (`SHT_PROGBITS` or `SHT_NOBITS`) and a two-instruction
+chain -- the only length a `%hi`/`%lo` pair can be -- is what the
+figures above use.
+
+The residue is irreducible and worth recording so nobody tries again:
+libLLVM builds `0x7ffffff` 696 times, which is 2^27-1 and a mask, and
+it falls inside a loaded section. Once the linker has consumed the
+relocation, nothing in the bytes distinguishes a literal from a pointer
+that happens to equal it.
+
+### What the corpus builds
+
+| object | materializations | chains of 2+ | insns | distinct values |
+|---|---:|---:|---:|---:|
+| libxul | 2,219,042 | 159,200 | 335,763 | 12,504 |
+| libLLVM | 1,127,190 | 25,707 | 53,270 | 9,045 |
+| libQt6Core | 66,508 | 2,112 | 4,309 | 376 |
+| ripgrep | 54,779 | 757 | 1,557 | 171 |
+| gh | 206,978 | 18,603 | 37,847 | 6,551 |
+| go compile | 213,827 | 44,370 | 89,071 | 9,705 |
+
+The costliest values are diagnostic on sight, which is the argument for
+the report existing. libxul: the sign bit 18,757 times, then four
+values shaped `0xfff?800000000000` -- SpiderMonkey's NaN-boxed JSVal
+tags, 30,000 materializations of a handful of type tags -- and
+`0xffffffff80004005`, `NS_ERROR_FAILURE`, 2,569 times. libLLVM:
+`0xaaaaaaab` 1,346 times and `0xcccccccd` 425, the divide-by-3 and
+divide-by-5 magic numbers, one chain per inlined division. go compile
+rebuilds `0x15c5` 458 times out of 730 builds, inside the functions
+that already had it.
+
+### Why none of this became a check
+
+A chain is not a finding. `lui`+`addiw` is the shortest way to build
+`0xaaaaaaab` and riscvlint has nothing shorter to suggest; what the
+report says is that the *source* builds the same thing 1,346 times,
+which is a compiler or a program question rather than a peephole. The
+rebuild figure is the closest thing to actionable and it is explicitly
+not a miss count: proving a rebuild unnecessary needs dominance and
+liveness over the whole function, which no check here has.
+
 ## Measured and rejected
 
 Worth recording so nobody re-derives them from intuition.

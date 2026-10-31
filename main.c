@@ -194,6 +194,11 @@ static bool census_mode;
 // hardware"). Neither is expressible if the flag merely unions.
 static unsigned forced_exts;
 static bool have_forced;
+// -c: also report the constants the code materializes, tallied by value
+// and ranked by what they cost. An additional report rather than a
+// replacement, as armlint's is: it answers a question about the binary
+// that the findings do not.
+static bool cchain_mode;
 // --json: the findings as a document keyed by absolute address instead
 // of the human report. It replaces that report rather than adding to
 // it, so the notes and the summary stay off stdout under it.
@@ -834,6 +839,56 @@ static bool image_read(void *ctx, uint64_t vaddr, void *out, size_t n)
     return false;
 }
 
+// ---- the hooks the constant census needs ----
+
+typedef struct {
+    const uint8_t *base;
+    size_t map_len;
+    const Elf64_Ehdr *eh;
+    const go_functab *go;
+} anchor_ctx;
+
+// riscvlint_mapped_fn: whether a value addresses something the file
+// maps. Program data only -- SHT_PROGBITS and the .bss-shaped
+// SHT_NOBITS -- not the linker's own metadata, which in a shared object
+// is everything at the low addresses a small literal collides with.
+// libLLVM's first PROGBITS section is at 0xe5ef80 and the nine below it
+// are notes, symbol and version tables, hashes, strings and
+// relocations; without this test `0xffff` and `0xc00` read as addresses
+// because they land in `.dynstr`.
+//
+// This stays a heuristic, and the irreducible part is a literal that
+// numerically coincides with real program data: libLLVM builds
+// `0x7ffffff` 696 times, which is 2^27-1 and a mask, and it falls
+// inside a loaded section all the same. Nothing in the bytes tells the
+// two apart once the linker has consumed the relocation that did.
+static bool value_is_mapped(void *ctx, uint64_t value)
+{
+    const anchor_ctx *a = ctx;
+    const Elf64_Shdr *sh = (const Elf64_Shdr *)(a->base + a->eh->e_shoff);
+    for (unsigned i = 0; i < a->eh->e_shnum; i++) {
+        if ((sh[i].sh_flags & SHF_ALLOC) == 0) continue;
+        if (sh[i].sh_type != SHT_PROGBITS && sh[i].sh_type != SHT_NOBITS)
+            continue;
+        if (!sh[i].sh_addr || !sh[i].sh_size) continue;
+        if (value >= sh[i].sh_addr && value < sh[i].sh_addr + sh[i].sh_size)
+            return true;
+    }
+    return false;
+}
+
+// riscvlint_anchor_fn: the start of the function holding `addr`, which
+// is its identity. Derived from the same lookup the annotation and the
+// by-function summary use, so all three agree on what a function is.
+static uint64_t anchor_of(void *ctx, uint64_t addr)
+{
+    const anchor_ctx *a = ctx;
+    uint64_t delta = 0;
+    if (!symbolize(a->base, a->map_len, a->eh, a->go, addr, &delta))
+        return 0;
+    return addr - delta;
+}
+
 // ---- scanning ----
 
 static void scan_section(csh handle, riscvlint_state *state,
@@ -907,6 +962,14 @@ static int scan_file(csh handle, const char *path)
         // nothing on it, so it needs no state and no extension mask.
         riscvlint_state *state = NULL;
         riscvlint_census *census = NULL;
+        anchor_ctx actx = { base, map_len, eh, &go };
+        riscvlint_cchain *cchain = NULL;
+        if (cchain_mode) {
+            cchain = riscvlint_cchain_create();
+            if (!cchain) { munmap((void *)base, map_len); return -1; }
+            riscvlint_cchain_set_hooks(cchain, value_is_mapped, &actx,
+                                       anchor_of, &actx);
+        }
         if (census_mode) {
             census = riscvlint_census_create();
             if (!census) { munmap((void *)base, map_len); return -1; }
@@ -980,6 +1043,24 @@ static int scan_file(csh handle, const char *path)
             if (sh[i].sh_offset > map_len ||
                 sh[i].sh_size > map_len - sh[i].sh_offset)
                 continue;
+            if (cchain) {
+                // The scan wants the side-entry map to know where a
+                // branch lands, and only the lint state builds one. A
+                // -i -c run has no state, so the chains a target splits
+                // are read as one -- stated in the report rather than
+                // silently absorbed.
+                if (state &&
+                    riscvlint_state_set_section(state, handle,
+                                                base + sh[i].sh_offset,
+                                                sh[i].sh_size, sh[i].sh_addr))
+                    riscvlint_cchain_scan(cchain, handle, state,
+                                          base + sh[i].sh_offset,
+                                          sh[i].sh_size, sh[i].sh_addr);
+                else
+                    riscvlint_cchain_scan(cchain, handle, NULL,
+                                          base + sh[i].sh_offset,
+                                          sh[i].sh_size, sh[i].sh_addr);
+            }
             if (census)
                 riscvlint_census_scan(census, handle, base + sh[i].sh_offset,
                                       sh[i].sh_size, sh[i].sh_addr);
@@ -1011,6 +1092,10 @@ static int scan_file(csh handle, const char *path)
         } else {
             riscvlint_state_destroy(state);
         }
+        if (cchain) {
+            riscvlint_cchain_print(cchain, path, verbose);
+            riscvlint_cchain_destroy(cchain);
+        }
     }
     munmap((void *)base, map_len);
     return rc;
@@ -1026,7 +1111,7 @@ static int cmp_tally(const void *a, const void *b)
 int main(int argc, char **argv)
 {
     static const char usage[] =
-        "usage: %s [-v] [-i] [--json] "
+        "usage: %s [-v] [-i] [-c] [--json] "
         "[-m zba|zbb|zbs|zcb|zfa|c|rva20|rva22|rva23]... <binary>...\n";
     int argi = 1;
     while (argi < argc && argv[argi][0] == '-' && argv[argi][1]) {
@@ -1039,6 +1124,8 @@ int main(int argc, char **argv)
             // line of noise.
         } else if (strcmp(argv[argi], "-i") == 0) {
             census_mode = true;
+        } else if (strcmp(argv[argi], "-c") == 0) {
+            cchain_mode = true;
         } else if (strcmp(argv[argi], "--json") == 0) {
             json_mode = true;
         } else if (strcmp(argv[argi], "-m") == 0 && argi + 1 < argc) {
@@ -1081,6 +1168,11 @@ int main(int argc, char **argv)
     // for.
     if (json_mode && verbose) {
         fprintf(stderr, "%s: --json and -v are separate reports; pick one\n",
+                argv[0]);
+        return 2;
+    }
+    if (json_mode && cchain_mode) {
+        fprintf(stderr, "%s: --json and -c are separate reports; pick one\n",
                 argv[0]);
         return 2;
     }
