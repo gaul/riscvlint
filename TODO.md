@@ -1488,7 +1488,7 @@ which is to the digit what check 3 reports over this corpus.
 | 40 | pushes one stack adjustment would do | 81,103 runs | ML 78K | **implemented**, 259,684 |
 | 41 | `li rt,0` + a store of rt | 43,002 | BL 20K, ML 13K, RE 7K | **implemented**, 31,052 |
 | 42 | a branch over a constant move that Zbb `max`/`min` does | 31,906 | ML | candidate |
-| 43 | `li rc,0` + `beq`/`bne rx,rc` | 29,089 | TF 25K | candidate |
+| 43 | `li rc,0` + `beq`/`bne rx,rc` | 29,089 | TF 25K | **implemented**, 1,658 |
 | 44 | an immediate operand materialized into a register | 20,743 | ML | candidate |
 | 45 | `slli k` + `srli k`, k >= 53 -> `andi` | 17,097 | BL 12K, ML 5K | candidate |
 | 46 | `and` with a materialized 0xffff -> `zext.h` | 1,499 | ML | candidate |
@@ -1653,7 +1653,36 @@ zero is usually stored or pushed as a call's argument, and the call
 comes before anything redefines the register, which the liveness walk
 treats as a possible read.
 
-## 39 and 42 to 46. Six more shapes from the JetStream corpus
+## 43. Zero loaded for an equality branch -- 1,658  [implemented]
+
+`li rc,0` + `beq`/`bne` comparing rc with another register: `beqz` or
+`bnez` on that register, with no `li`. The equality half of 31's shape
+at zero, which no check had: Zibi leaves zero out of `beqi`'s range
+because x0 already compares against it, so 30 never sees the pair, and
+31 takes only the ordered comparisons.
+
+What check_zero_eq_branch reports: 1,658 sites worth 8,154 bytes, every
+one in TurboFan, 947 becoming `beqz` and 711 `bnez`; 761 of them give
+back the branch's two bytes as well, where the register is one of
+x8-x15 and the target near, priced as 31 prices its own. The conditions
+are 31's -- the `li` immediately before the branch, no side entry into
+it, neither relocated, the zero dead on both successors -- and the last
+is where the population goes. Of the miner's 29,089, which allowed two
+instructions between the `li` and the branch, 24,383 are adjacent, so
+6.8% survive.
+
+A sample part, code.elf.10, says why: 79 of its 906 adjacent pairs are
+reported, and of the 827 declined, 165 reach an `auipc`+`jr` on the
+fall-through before anything touches the register, 83 read the zero
+again, 44 reach a call, and 388 leave through a `j` first, whose target
+decides. The `jr` is V8's far jump, 36's shape, and the liveness walk
+cannot follow an indirect jump, so every liveness proof in this corpus
+stops at one. Teaching the walk the `auipc`+`jr` pair -- the target is
+in the two immediates, as check_jump_pair_to_j computes it -- would
+raise this check and every other that asks the walk, and is the one
+improvement here that is not a new check.
+
+## 39, 42 and 44 to 46. Five more shapes from the JetStream corpus
 
 * **39**, a branch whose target is a `j`: jump threading. 177,202, and
   38,002 more `j` whose target is another `j`. Check 19 reads
@@ -1664,9 +1693,6 @@ treats as a possible read.
   clamp in the epilogue: 31,906 sites that are Zbb's `max`. 4,162 more
   branch over a `mv` (a select, Zicond's `czero` pair) and 892 over an
   `fsgnj.d`.
-* **43**, `li rc,0` + `beq`/`bne rx,rc`: 29,089 (25,077 in TurboFan),
-  the equality half that 31 covers only for ordered comparisons;
-  against zero no extension is needed, the branch is `beqz`/`bnez`.
 * **44**, `li a3,1; add t2,a2,a3; addw a4,a2,a3`: Maglev's
   overflow-checked add with a constant operand the register allocator
   materialized, 20,743 sites where `addi`/`addiw` would do. This file
@@ -1706,9 +1732,9 @@ not tracked (about 75K, every one a dispatch handle that a later
 
 # Remaining candidates
 
-Six, 39 and 42 to 46, all from the JetStream corpus above; over the
-package corpus there are none. Thirty-nine checks are implemented, 36
-to 38, 40 and 41 being the five from that corpus so far, and everything
+Five, 39, 42 and 44 to 46, all from the JetStream corpus above; over
+the package corpus there are none. Forty checks are implemented, 36 to
+38, 40, 41 and 43 being the six from that corpus so far, and everything
 this file sized over the package corpus is either written or recorded
 as rejected with the evidence that rejected it. Thirteen of the package
 entries, 23 to 35, did not come from a corpus probe at all: 23 came

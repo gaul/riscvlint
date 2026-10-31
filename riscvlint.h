@@ -1208,7 +1208,8 @@ bool check_const_eq_branch(riscvlint_state *state, const cs_insn *insn,
 //
 // Equality against a constant is check_const_eq_branch's and needs
 // Zibi; this needs nothing, which is why the two are separate checks
-// rather than one with a gate inside it.
+// rather than one with a gate inside it. Equality against zero needs
+// nothing either, and is check_zero_eq_branch's.
 //
 // The two unsigned forms become `beqz` or `bnez`, which compress when
 // the register is one of x8-x15 and the displacement fits CB format, so
@@ -1450,6 +1451,23 @@ bool check_push_run(riscvlint_state *state, const cs_insn *insn,
 // Measured population: 31,052 sites in the JetStream corpus (TODO.md,
 // entry 41), rewriting 40,979 stores. Compilers store x0 directly.
 bool check_zero_for_store(riscvlint_state *state, const cs_insn *insn,
+                          riscvlint_finding *finding);
+
+// The equality half of check_const_ord_branch's shape against zero:
+// `li rc,0` + `beq`/`bne` comparing rc with another register, which is
+// `beqz`/`bnez` on that register and no `li`. Zibi leaves zero out of
+// beqi's range because x0 already compares against it, so
+// check_const_eq_branch never sees this pair, and check_const_ord_branch
+// takes only the ordered comparisons. The conditions are theirs: the
+// `li` immediately before the branch, the branch not a branch target,
+// neither relocated, and rc dead on both successors. Priced as
+// check_const_ord_branch prices its beqz, compressed where the register
+// is one of x8-x15 and the displacement fits CB format.
+//
+// Measured population: 1,658 sites in the JetStream corpus (TODO.md,
+// entry 43), every one TurboFan's, of 24,383 adjacent pairs; the
+// liveness proof declines most of the rest.
+bool check_zero_eq_branch(riscvlint_state *state, const cs_insn *insn,
                           riscvlint_finding *finding);
 
 // ---- running every check ----

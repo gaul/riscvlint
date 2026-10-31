@@ -1,0 +1,77 @@
+instruction compressible to a base C form at offset: 0x0: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a7, 0
+
+zero loaded for an equality branch at offset: 0x0: -> beqz a6, 0xc (8 -> 4 bytes) (2 instructions)
+  li a7, 0
+  beq a6, a7, 0xc
+
+dead register definition at offset: 0x8: -> delete; nothing reads a7 (4 bytes) (1 instructions)
+  li a7, 9
+
+instruction compressible to a base C form at offset: 0x8: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a7, 9
+
+dead register definition at offset: 0xc: -> delete; nothing reads a7 (4 bytes) (1 instructions)
+  li a7, 8
+
+instruction compressible to a base C form at offset: 0xc: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a7, 8
+
+instruction compressible to a base C form at offset: 0x10: -> c.li (4 -> 2 bytes) (1 instructions)
+  li t0, 0
+
+zero loaded for an equality branch at offset: 0x10: -> bnez a0, 0x1c (8 -> 2 bytes) (2 instructions)
+  li t0, 0
+  bne t0, a0, 0x1c
+
+dead register definition at offset: 0x18: -> delete; nothing reads t0 (4 bytes) (1 instructions)
+  li t0, 9
+
+instruction compressible to a base C form at offset: 0x18: -> c.li (4 -> 2 bytes) (1 instructions)
+  li t0, 9
+
+instruction compressible to a base C form at offset: 0x1c: -> c.li (4 -> 2 bytes) (1 instructions)
+  li t0, 8
+
+instruction compressible to a base C form at offset: 0x20: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a7, 0
+
+constant loaded for a branch against zero at offset: 0x20: -> bltz a6, 0x2c (8 -> 4 bytes) (2 instructions)
+  li a7, 0
+  blt a6, a7, 0x2c
+
+dead register definition at offset: 0x28: -> delete; nothing reads a7 (4 bytes) (1 instructions)
+  li a7, 9
+
+instruction compressible to a base C form at offset: 0x28: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a7, 9
+
+dead register definition at offset: 0x2c: -> delete; nothing reads a7 (4 bytes) (1 instructions)
+  li a7, 8
+
+instruction compressible to a base C form at offset: 0x2c: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a7, 8
+
+instruction compressible to a base C form at offset: 0x30: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a7, 0
+
+instruction compressible to a base C form at offset: 0x38: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a7, 9
+
+instruction compressible to a base C form at offset: 0x3c: -> c.mv (4 -> 2 bytes) (1 instructions)
+  mv a0, a7
+
+zero loaded for an equality branch at offset: 0x40: -> beqz a4, 0x48 (6 -> 2 bytes) (2 instructions)
+  li a5, 0
+  beq a4, a5, 0x48
+
+dead register definition at offset: 0x46: -> delete; nothing reads a5 (2 bytes) (1 instructions)
+  li a5, 9
+
+Optimization opportunities by type:
+      12  instruction compressible to a base C form
+       6  dead register definition
+       3  zero loaded for an equality branch
+       1  constant loaded for a branch against zero
+
+22 optimization opportunities in 21 instructions

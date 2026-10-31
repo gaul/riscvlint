@@ -3,8 +3,8 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Thirty-nine checks are implemented and the ledger's candidate list
-holds six, all from a JIT corpus. [TODO.md](TODO.md) is that ledger:
+Forty checks are implemented and the ledger's candidate list holds
+five, all from a JIT corpus. [TODO.md](TODO.md) is that ledger:
 every candidate that was measured, the population it came back with,
 and the ones rejected on that evidence.
 What got written was decided by the corpus rather than by intuition,
@@ -12,20 +12,20 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Thirty-nine of them, and the table lists twenty-seven. The jump pair,
-the constant chain, the no-op, the push run and the zero store have so
-far been measured over the JetStream corpus of TODO.md, which the table
-does not cover. Seven report nothing over this corpus -- the bit count
-because no baseline object declares Zbb; the three indexed loads, the
-equality branch and the compare-exchange loop because those five require
-their extension to be positively present rather than merely un-denied,
-and no object declares Zilx, Zibi or Zacas; and the unsigned divide by a
-power of two because all three toolchains already do that fold
-themselves. Those entries below say why. Every figure is what the check
-itself reports over the [corpus](#corpus) -- 108,165,211 instructions of
-three toolchains across 31 objects -- rather than what a mining tool
-estimated for it. The two have differed by an order of magnitude every
-time both were measured.
+Forty of them, and the table lists twenty-seven. The jump pair, the
+constant chain, the no-op, the push run, the zero store and the zero
+branch have so far been measured over the JetStream corpus of TODO.md,
+which the table does not cover. Seven report nothing over this corpus --
+the bit count because no baseline object declares Zbb; the three indexed
+loads, the equality branch and the compare-exchange loop because those
+five require their extension to be positively present rather than merely
+un-denied, and no object declares Zilx, Zibi or Zacas; and the unsigned
+divide by a power of two because all three toolchains already do that
+fold themselves. Those entries below say why. Every figure is what the
+check itself reports over the [corpus](#corpus) -- 108,165,211
+instructions of three toolchains across 31 objects -- rather than what a
+mining tool estimated for it. The two have differed by an order of
+magnitude every time both were measured.
 
 The table is generated, not maintained: `scripts/check_table.py` scans
 the corpus and prints it, which is how adding two objects stopped
@@ -345,6 +345,26 @@ except a handful of `jalr ra,0(ra)` that were already two.
   because ordered comparison does not commute -- the same blindness that
   cost the divide check its apparent population, here worth a factor of
   eighteen.
+
+* **zero loaded for an equality branch** -- the equality half of the
+  entry above, at zero: `li rc,0` + `beq`/`bne` against it is `beqz` or
+  `bnez` on the other register. Zibi leaves zero out of `beqi`'s range
+  because x0 already compares against it, so the Zibi check never sees
+  the pair, and the entry above takes only the ordered comparisons.
+
+  ```
+   2879870: li a7, 0
+   2879874: bne a6, a7, 0x287987c   -> bnez a6, 0x287987c (8 -> 4 bytes)
+  ```
+
+  The conditions and the pricing are the entry above's, the zero dead
+  on both successors included. The JetStream corpus (TODO.md, entry 43)
+  has 1,658, every one in TurboFan, worth 8,154 bytes -- 6.8% of its
+  24,383 adjacent pairs. The rest are declined by those conditions, the
+  liveness proof above all: in a sample part a fifth of the declined
+  pairs reach V8's `auipc`+`jr` far jump on the fall-through before
+  anything touches the register, and the walk cannot follow an indirect
+  jump.
 
 * **unsigned divide or remainder by a power of two** -- `li rc,2^k` +
   `divu rd,rx,rc` is a shift: `srli rd,rx,k`. `divuw` divides the low

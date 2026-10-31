@@ -5663,6 +5663,100 @@ static void test_zero_for_store(csh handle)
                      NULL) == 0);
 }
 
+// check_zero_eq_branch: zero loaded for beq or bne, which beqz and bnez
+// compare against x0 without.
+static void test_zero_eq_branch(csh handle)
+{
+    riscvlint_finding f;
+
+    // c.li a5,0 ; beq a4,a5,.L ; c.li a5,9 ; ret ; c.li a5,8 ; ret.
+    // a4 is one of x8-x15 and the displacement fits CB format, so the
+    // beqz compresses and six bytes become two.
+    static const uint8_t eq[] = {
+        0x81, 0x47,                 // c.li a5,0 (2)
+        0x63, 0x04, 0xf7, 0x00,     // beq a4,a5,.L (4)
+        0xa5, 0x47,                 // c.li a5,9 (2)
+        0x82, 0x80,                 // ret (2)
+        0xa1, 0x47,                 // c.li a5,8 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_window(handle, check_zero_eq_branch, eq, sizeof eq, 0x1000,
+                     &f) == 1);
+    CHECK(strcmp(f.replacement, "beqz a4, 0x100a (6 -> 2 bytes)") == 0);
+    CHECK(f.insn_count == 2 && f.address == 0x1000);
+    CHECK(strcmp(f.title, "zero loaded for an equality branch") == 0);
+    // The ordered check leaves the pair alone.
+    CHECK(!run_ord(handle, eq, sizeof eq, NULL));
+
+    // The zero first and bne: bnez.
+    // c.li a5,0 ; bne a5,a4,.L ; c.li a5,9 ; ret ; c.li a5,8 ; ret
+    static const uint8_t ne[] = {
+        0x81, 0x47, 0x63, 0x94, 0xe7, 0x00, 0xa5, 0x47, 0x82, 0x80,
+        0xa1, 0x47, 0x82, 0x80,
+    };
+    CHECK(run_window(handle, check_zero_eq_branch, ne, sizeof ne, 0x1000,
+                     &f) == 1);
+    CHECK(strcmp(f.replacement, "bnez a4, 0x100a (6 -> 2 bytes)") == 0);
+
+    // t1 is not one of x8-x15: the beqz stays four bytes.
+    // c.li a5,0 ; beq t1,a5,.L ; c.li a5,9 ; ret ; c.li a5,8 ; ret
+    static const uint8_t far[] = {
+        0x81, 0x47, 0x63, 0x04, 0xf3, 0x00, 0xa5, 0x47, 0x82, 0x80,
+        0xa1, 0x47, 0x82, 0x80,
+    };
+    CHECK(run_window(handle, check_zero_eq_branch, far, sizeof far, 0x1000,
+                     &f) == 1);
+    CHECK(strcmp(f.replacement, "beqz t1, 0x100a (6 -> 4 bytes)") == 0);
+
+    // TurboFan's spelling, all four-byte: li a7,0 ; beq a6,a7,.L ;
+    // li a7,9 ; ret ; li a7,8 ; ret.
+    uint32_t tf[] = { 0x00000893u, 0x01180663u, 0x00900893u, 0x00008067u,
+                      0x00800893u, 0x00008067u };
+    CHECK(run_words(handle, check_zero_eq_branch, tf, 6, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "beqz a6, 0x1010 (8 -> 4 bytes)") == 0);
+
+    // Not reported: a constant other than zero, which is the Zibi
+    // check's; an ordered comparison, which is check_const_ord_branch's;
+    // zero compared with x0; the zero read on the fall-through path, and
+    // on the taken one; and a branch into the branch.
+    static const uint8_t one[] = {
+        0x85, 0x47, 0x63, 0x04, 0xf7, 0x00, 0xa5, 0x47, 0x82, 0x80,
+        0xa1, 0x47, 0x82, 0x80,
+    };
+    CHECK(run_window(handle, check_zero_eq_branch, one, sizeof one, 0x1000,
+                     NULL) == 0);
+    static const uint8_t lt[] = {
+        0x81, 0x47, 0x63, 0x44, 0xf7, 0x00, 0xa5, 0x47, 0x82, 0x80,
+        0xa1, 0x47, 0x82, 0x80,
+    };
+    CHECK(run_window(handle, check_zero_eq_branch, lt, sizeof lt, 0x1000,
+                     NULL) == 0);
+    static const uint8_t x0[] = {
+        0x81, 0x47, 0x63, 0x84, 0x07, 0x00, 0xa5, 0x47, 0x82, 0x80,
+        0xa1, 0x47, 0x82, 0x80,
+    };
+    CHECK(run_window(handle, check_zero_eq_branch, x0, sizeof x0, 0x1000,
+                     NULL) == 0);
+    static const uint8_t liveft[] = {
+        0x81, 0x47, 0x63, 0x04, 0xf7, 0x00, 0x3e, 0x85, 0x82, 0x80,
+        0xa1, 0x47, 0x82, 0x80,
+    };
+    CHECK(run_window(handle, check_zero_eq_branch, liveft, sizeof liveft,
+                     0x1000, NULL) == 0);
+    static const uint8_t livetk[] = {
+        0x81, 0x47, 0x63, 0x04, 0xf7, 0x00, 0xa5, 0x47, 0x82, 0x80,
+        0x3e, 0x85, 0x82, 0x80,
+    };
+    CHECK(run_window(handle, check_zero_eq_branch, livetk, sizeof livetk,
+                     0x1000, NULL) == 0);
+    static const uint8_t target[] = {
+        0x81, 0x47, 0x63, 0x04, 0xf7, 0x00, 0xa5, 0x47, 0xed, 0xfe,
+        0xa1, 0x47, 0x82, 0x80,
+    };
+    CHECK(run_window(handle, check_zero_eq_branch, target, sizeof target,
+                     0x1000, NULL) == 0);
+}
+
 int main(void)
 {
     csh handle;
@@ -5703,6 +5797,7 @@ int main(void)
     test_no_effect(handle);
     test_push_run(handle);
     test_zero_for_store(handle);
+    test_zero_eq_branch(handle);
     test_zero_store_run(handle);
     test_bitcast_through_frame(handle);
     test_cchain(handle);

@@ -4782,8 +4782,9 @@ bool check_const_ord_branch(riscvlint_state *state, const cs_insn *insn,
     if (!rv_decode_cond_branch(w2, len2, &brs1, &brs2, &bf3, &off))
         return false;
     // The ordered comparisons only. beq and bne against a constant are
-    // check_const_eq_branch's, which needs Zibi to say anything; these
-    // need nothing, which is the whole point of the split.
+    // check_const_eq_branch's, which needs Zibi to say anything, and
+    // against zero check_zero_eq_branch's; these need nothing, which is
+    // the whole point of the split.
     if (bf3 < 4u) return false;
 
     // Ordered comparison does not commute, so which operand holds the
@@ -5929,6 +5930,75 @@ bool check_zero_for_store(riscvlint_state *state, const cs_insn *insn,
     return true;
 }
 
+// ---- zero loaded for an equality branch ----
+
+bool check_zero_eq_branch(riscvlint_state *state, const cs_insn *insn,
+                          riscvlint_finding *finding)
+{
+    // No extension gate: `beqz` and `bnez` are `beq` and `bne` against
+    // x0, which is also why Zibi's immediate range leaves zero out and
+    // check_const_eq_branch never sees this pair.
+    if (insn->size != 2 && insn->size != 4) return false;
+
+    uint32_t w1;
+    if (!riscvlint_word_at(state, insn->address, &w1)) return false;
+    unsigned rc;
+    int64_t val;
+    if (!decode_const(w1, insn->size, &rc, &val) || val != 0) return false;
+    // sp, gp and tp hold what the ABI says they hold rather than a
+    // comparand, as in check_const_ord_branch.
+    if (rc == 2 || rc == 3 || rc == 4) return false;
+
+    uint64_t second = insn->address + insn->size;
+    uint32_t w2;
+    if (!riscvlint_word_at(state, second, &w2)) return false;
+    unsigned len2 = rv_insn_len(w2);
+    unsigned brs1, brs2, bf3;
+    int64_t off;
+    if (!rv_decode_cond_branch(w2, len2, &brs1, &brs2, &bf3, &off))
+        return false;
+    // Equality only. The ordered comparisons against zero are
+    // check_const_ord_branch's.
+    if (bf3 != 0u && bf3 != 1u) return false;
+    // Exactly one operand is the zero, as in check_const_eq_branch, and
+    // the other is not x0: zero against zero is settled at assembly
+    // time rather than compared.
+    unsigned rx;
+    if (brs2 == rc && brs1 != rc) rx = brs1;
+    else if (brs1 == rc && brs2 != rc) rx = brs2;
+    else return false;
+    if (rx == 0) return false;
+
+    // Folding deletes the `li`, so the branch must not be reachable from
+    // anywhere that did not run it.
+    if (riscvlint_is_branch_target(state, second)) return false;
+    if (riscvlint_is_relocated(state, insn->address) ||
+        riscvlint_is_relocated(state, second))
+        return false;
+
+    // Dead on both successors, for check_const_eq_branch's reason.
+    uint64_t fallthrough = second + len2;
+    uint64_t taken = second + (uint64_t)off;
+    if (riscvlint_liveness(state, fallthrough, rc) != RISCVLINT_LIVE_DEAD)
+        return false;
+    if (riscvlint_liveness(state, taken, rc) != RISCVLINT_LIVE_DEAD)
+        return false;
+
+    // Priced as check_const_ord_branch prices its beqz and bnez, from the
+    // displacement as encoded now.
+    unsigned after = rv_branch_encoded_size(bf3, rx, 0, off);
+    unsigned before = insn->size + len2;
+
+    finding->title = "zero loaded for an equality branch";
+    finding->address = insn->address;
+    finding->insn_count = 2;
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "%s %s, 0x%" PRIx64 " (%u -> %u bytes)",
+             bf3 == 0u ? "beqz" : "bnez", rv_reg_name(rx), taken, before,
+             after);
+    return true;
+}
+
 // ---- running every check ----
 
 static const riscvlint_check_fn riscvlint_checks[] = {
@@ -5971,6 +6041,7 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_no_effect,
     check_push_run,
     check_zero_for_store,
+    check_zero_eq_branch,
 };
 
 size_t riscvlint_scan(riscvlint_state *state, csh handle,
