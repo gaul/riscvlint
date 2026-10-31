@@ -5372,6 +5372,72 @@ static void test_census(csh handle)
     riscvlint_census_destroy(NULL);
 }
 
+// check_jump_pair_to_j: the call pair's shape with x0 for the link
+// register, decided by whether the target reads the auipc's register
+// before writing it.
+static int run_words(csh handle, riscvlint_check_fn fn, const uint32_t *words,
+                     size_t nwords, uint64_t vaddr, riscvlint_finding *out)
+{
+    uint8_t bytes[128];
+    if (nwords * 4 > sizeof bytes) return -1;
+    memcpy(bytes, words, nwords * 4);
+    return run_window(handle, fn, bytes, nwords * 4, vaddr, out);
+}
+
+static void test_jump_pair_to_j(csh handle)
+{
+    riscvlint_finding f;
+    const uint32_t nop = 0x00000013u;
+    const uint32_t ret = 0x00008067u;
+    const uint32_t li_t6_0 = 0x00000f93u;        // addi t6, x0, 0
+    const uint32_t add_a0_t6_a1 = 0x00bf8533u;   // add a0, t6, a1
+
+    // auipc t6,0 ; jr 16(t6), landing on `li t6,0`: t6 is dead there,
+    // so the pair is one `j`.
+    uint32_t dead[] = { enc_auipc(31, 0), enc_jalr(0, 31, 16), nop, nop,
+                        li_t6_0, ret };
+    CHECK(run_words(handle, check_jump_pair_to_j, dead, 6, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "j 0x1010 (8 -> 4 bytes)") == 0);
+    CHECK(f.insn_count == 2 && f.address == 0x1000);
+
+    // The same pair landing on `add a0,t6,a1`: t6 is read first, and
+    // `j` would have left it holding the wrong thing.
+    uint32_t read[] = { enc_auipc(31, 0), enc_jalr(0, 31, 16), nop, nop,
+                        add_a0_t6_a1, ret };
+    CHECK(run_words(handle, check_jump_pair_to_j, read, 6, 0x1000, NULL) == 0);
+
+    // The call spelling writes ra: check_call_pair_to_jal's shape, not
+    // this one's. Nor does a jalr through some other register pair with
+    // the auipc.
+    uint32_t call[] = { enc_auipc(31, 0), enc_jalr(1, 31, 16), nop, nop,
+                        li_t6_0, ret };
+    CHECK(run_words(handle, check_jump_pair_to_j, call, 6, 0x1000, NULL) == 0);
+    uint32_t other[] = { enc_auipc(31, 0), enc_jalr(0, 30, 16), nop, nop,
+                         li_t6_0, ret };
+    CHECK(run_words(handle, check_jump_pair_to_j, other, 6, 0x1000, NULL) == 0);
+
+    // Something branches to the jr (a `j` back to it two words on), so
+    // the jr cannot go.
+    uint32_t entry[] = { enc_auipc(31, 0), enc_jalr(0, 31, 16),
+                         0xffdff06fu /* j -4 */, nop, li_t6_0, ret };
+    CHECK(run_words(handle, check_jump_pair_to_j, entry, 6, 0x1000, NULL) == 0);
+
+    // A target a full megabyte ahead is one byte past j's reach; the
+    // same pair two bytes shorter is inside it. The reach test runs
+    // before the walk, so the far target need not exist.
+    uint32_t far[] = { enc_auipc(31, 0x100), enc_jalr(0, 31, 0), ret };
+    CHECK(run_words(handle, check_jump_pair_to_j, far, 3, 0x1000, NULL) == 0);
+    uint32_t back[] = { li_t6_0, ret, nop, nop,
+                        enc_auipc(31, 0), enc_jalr(0, 31, -16) };
+    CHECK(run_words(handle, check_jump_pair_to_j, back, 6, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "j 0x1000 (8 -> 4 bytes)") == 0);
+
+    // auipc into x0 is not a jump sequence.
+    uint32_t zero[] = { enc_auipc(0, 0), enc_jalr(0, 0, 16), nop, nop,
+                        li_t6_0, ret };
+    CHECK(run_words(handle, check_jump_pair_to_j, zero, 6, 0x1000, NULL) == 0);
+}
+
 int main(void)
 {
     csh handle;
@@ -5407,6 +5473,7 @@ int main(void)
     test_decode_jump();
     test_branch_over_jump(handle);
     test_transfer_to_next(handle);
+    test_jump_pair_to_j(handle);
     test_zero_store_run(handle);
     test_bitcast_through_frame(handle);
     test_cchain(handle);

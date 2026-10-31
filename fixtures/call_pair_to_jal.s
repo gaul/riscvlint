@@ -51,7 +51,8 @@ _start:
 
     // N3) Tail call. Collapsing to `j` would stop writing t1, which is
     //     only safe if t1 is dead -- a liveness question this check
-    //     does not ask.
+    //     does not ask. check_jump_pair_to_j asks it, and reports this
+    //     site because the target writes t1 before reading it.
     auipc   t1, 0
     jalr    zero, 16(t1)
 

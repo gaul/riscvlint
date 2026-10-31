@@ -1,0 +1,43 @@
+jump pair foldable to j at offset: 0x0: -> j 0x8 (8 -> 4 bytes) (2 instructions)
+  auipc t6, 0
+  jr 8(t6)
+
+instruction compressible to a base C form at offset: 0x8: -> c.li (4 -> 2 bytes) (1 instructions)
+  li t6, 0
+
+instruction compressible to a base C form at offset: 0xc: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+instruction compressible to a base C form at offset: 0x1c: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+instruction compressible to a base C form at offset: 0x28: -> c.li (4 -> 2 bytes) (1 instructions)
+  li t6, 0
+
+instruction compressible to a base C form at offset: 0x2c: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+instruction compressible to a base C form at offset: 0x38: -> c.li (4 -> 2 bytes) (1 instructions)
+  li t6, 0
+
+instruction compressible to a base C form at offset: 0x3c: -> c.beqz (4 -> 2 bytes) (1 instructions)
+  beqz a0, 0x34
+
+instruction compressible to a base C form at offset: 0x44: -> c.jr (4 -> 2 bytes) (1 instructions)
+  jr t6
+
+instruction compressible to a base C form at offset: 0x48: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+jump pair foldable to j at offset: 0x4c: -> j 0x8 (8 -> 4 bytes) (2 instructions)
+  auipc t6, 0
+  jr -0x44(t6)
+
+instruction compressible to a base C form at offset: 0x54: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+Optimization opportunities by type:
+      10  instruction compressible to a base C form
+       2  jump pair foldable to j
+
+12 optimization opportunities in 22 instructions

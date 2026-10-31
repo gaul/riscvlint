@@ -1481,7 +1481,7 @@ which is to the digit what check 3 reports over this corpus.
 
 | # | opportunity | estimate | where | status |
 |---|---|---:|---|---|
-| 36 | `auipc rd,hi` + `jr lo(rd)` to a target inside `j`'s reach | 1,116,777 | ML 703K, TF 224K, BL 111K, RE 73K | candidate |
+| 36 | `auipc rd,hi` + `jr lo(rd)` to a target inside `j`'s reach | 1,116,777 | ML 703K, TF 224K, BL 111K, RE 73K | **implemented**, 720,121 |
 | 37 | a constant built in more instructions than `li` needs | 558,869 | ML 404K, TF 83K, BL 49K, RE 21K | candidate |
 | 38 | an instruction with no architectural effect | 812,586 | ML 764K | candidate |
 | 39 | a conditional branch whose target is an unconditional jump | 177,202 | ML 137K, TF 17K, RE 14K | candidate |
@@ -1497,7 +1497,7 @@ which is to the digit what check 3 reports over this corpus.
 counted alongside them (a trap is an effect) and the 15,527 `nop`,
 which this file already declines to report.
 
-## 36. A far jump that `j` would reach -- 1,116,777
+## 36. A far jump that `j` would reach -- 720,121 of 1,116,777  [implemented]
 
 `auipc t6,hi` + `jr lo(t6)`: the jump with +/-2GB of reach, spelled in
 eight bytes through a scratch register, where `j` reaches +/-1MB in
@@ -1518,6 +1518,17 @@ them, the inverted-condition spelling check 19 reads when the jump is a
 `j`; a three-part sample puts 55% of those targets inside the branch's
 own +/-4KB, where the three instructions are one, and the rest at
 `bcc`+`j`. Folding the pair first is what lets check 19 see them.
+
+What check_jump_pair_to_j reports: 720,121 of the 1,116,777 -- 426,516
+Maglev, 135,370 TurboFan, 115,518 baseline, 40,284 regexp, 2,433
+wrappers -- worth 2,880,484 bytes, 1.9% of the corpus's code. The
+396,656 it does not report are the liveness walk's: a target that reads
+the register first, or one where an indirect jump or a call comes
+before any write to it, where the walk answers UNKNOWN and only DEAD
+licenses a rewrite. In Maglev the first instruction of a deopt exit is
+usually a `li` into another register followed by a call, and the walk
+treats a call as possibly reading its arguments; t6 is not one, so most
+exits pass, and the ones that do not are the ones that jump on.
 
 ## 37. A constant built in more instructions than `li` needs -- 558,869
 
@@ -1620,7 +1631,7 @@ not tracked (about 75K, every one a dispatch handle that a later
 
 # Remaining candidates
 
-Eleven, 36 to 46, all from the JetStream corpus above; over the package
+Ten, 37 to 46, all from the JetStream corpus above; over the package
 corpus there are none. Thirty-four checks are implemented and everything
 this file sized over that corpus is either written or recorded as
 rejected with the evidence that rejected it. The last thirteen did not come from a corpus probe at all: 23

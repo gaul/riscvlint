@@ -5259,6 +5259,66 @@ bool check_not_logic_fold(riscvlint_state *state, const cs_insn *insn,
     return true;
 }
 
+// ---- a far jump that j would reach ----
+
+bool check_jump_pair_to_j(riscvlint_state *state, const cs_insn *insn,
+                          riscvlint_finding *finding)
+{
+    if (insn->size != 4) return false;
+
+    uint32_t w1;
+    if (!riscvlint_word_at(state, insn->address, &w1)) return false;
+    unsigned rd1;
+    int64_t hi;
+    if (!rv_decode_auipc(w1, &rd1, &hi)) return false;
+    // auipc into x0 computes nothing; not a jump sequence.
+    if (rd1 == 0) return false;
+
+    uint64_t second = insn->address + 4;
+    uint32_t w2;
+    if (!riscvlint_word_at(state, second, &w2)) return false;
+    unsigned rd2, rs1;
+    int64_t lo;
+    // The four-byte jalr with x0 for the link register, printed `jr`.
+    // The spelling that writes a link register is the call pair's, and
+    // `auipc rd,X` + `c.jr rd` is the same fold saving two bytes with a
+    // different encoding, left to its own check as the call pair leaves
+    // `c.jalr`.
+    if (!rv_decode_jalr(w2, &rd2, &rs1, &lo)) return false;
+    if (rd2 != 0 || rs1 != rd1) return false;
+
+    // Something branching to the jr would lose its transfer.
+    if (riscvlint_is_branch_target(state, second)) return false;
+
+    // In an unlinked object both immediates are placeholders waiting on
+    // a relocation, so the target computed from them is fiction.
+    if (riscvlint_is_relocated(state, insn->address) ||
+        riscvlint_is_relocated(state, second))
+        return false;
+
+    // jalr clears bit 0 of the computed address.
+    int64_t target = ((int64_t)insn->address + hi + lo) & ~(int64_t)1;
+    if (target < 0) return false;
+    if (!rv_jal_reaches(target - (int64_t)insn->address)) return false;
+
+    // This is where the jump parts from the call. `jal rd` writes the
+    // register the pair's jalr wrote, so that fold is exact; `j` writes
+    // nothing, and after it rd holds whatever it held before the pair
+    // instead of the auipc's result. The fold is sound only where
+    // nothing reads rd before writing it, and there is no fall-through
+    // to ask about: the walk starts where control lands.
+    if (riscvlint_liveness(state, (uint64_t)target, rd1) !=
+        RISCVLINT_LIVE_DEAD)
+        return false;
+
+    finding->title = "jump pair foldable to j";
+    finding->address = insn->address;
+    finding->insn_count = 2;
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "j 0x%" PRIx64 " (8 -> 4 bytes)", (uint64_t)target);
+    return true;
+}
+
 // ---- running every check ----
 
 static const riscvlint_check_fn riscvlint_checks[] = {
@@ -5296,6 +5356,7 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_slli_srai_to_sext,
     check_cas_loop_to_amocas,
     check_not_logic_fold,
+    check_jump_pair_to_j,
 };
 
 size_t riscvlint_scan(riscvlint_state *state, csh handle,

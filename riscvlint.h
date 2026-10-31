@@ -1351,6 +1351,24 @@ bool check_cas_loop_to_amocas(riscvlint_state *state, const cs_insn *insn,
 bool check_not_logic_fold(riscvlint_state *state, const cs_insn *insn,
                           riscvlint_finding *finding);
 
+// The call pair's shape with x0 for the link register: `auipc rd,X` +
+// `jr Y(rd)` reaches +/-2GB in eight bytes through a scratch register,
+// and one four-byte `j target` does the same job inside jal's +/-1MB.
+//
+// Unlike the call, the fold changes what rd holds afterwards -- the
+// pair leaves it the auipc's result, `j` leaves it alone -- so a pair
+// is reported only where the liveness walk, started at the target
+// since a jump has no fall-through, finds rd written before it is read.
+// The jr must not be a branch target and neither half may be relocated,
+// as for the call.
+//
+// Measured population: 1,116,777 pairs in the JetStream corpus
+// (TODO.md, entry 36), every one inside j's reach; V8 spells every
+// jump to a not-yet-bound label this way. The package corpus has
+// none: compilers spell a far jump `j` or `tail`.
+bool check_jump_pair_to_j(riscvlint_state *state, const cs_insn *insn,
+                          riscvlint_finding *finding);
+
 // ---- running every check ----
 //
 // Called once per finding, with `ctx` as given. The finding is valid

@@ -3,8 +3,8 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Thirty-four checks are implemented and the ledger's candidate list is
-empty. [TODO.md](TODO.md) is that ledger: every candidate that was
+Thirty-five checks are implemented and the ledger's candidate list
+holds ten, all from a JIT corpus. [TODO.md](TODO.md) is that ledger: every candidate that was
 measured, the population it came back with, and the ones rejected on
 that evidence.
 What got written was decided by the corpus rather than by intuition,
@@ -12,8 +12,9 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Thirty-four of them, and the table lists twenty-seven. Seven report
-nothing over this corpus -- the bit count because no baseline object
+Thirty-five of them, and the table lists twenty-seven. The jump pair
+has so far been measured over the JetStream corpus of TODO.md, which
+the table does not cover. Seven report nothing over this corpus -- the bit count because no baseline object
 declares Zbb; the three indexed loads, the equality branch and the
 compare-exchange loop because those five require their extension to be
 positively present rather than merely un-denied, and no object declares
@@ -96,6 +97,37 @@ except a handful of `jalr ra,0(ra)` that were already two.
   own address, which is what a call to an undefined weak symbol
   degenerates into. Folding one changes nothing, and at 7 sites it is not
   worth a rule.
+
+* **jump pair foldable to j** -- the call pair's shape with x0 for the
+  link register. `auipc t6,X` + `jr Y(t6)` spends eight bytes and a
+  scratch register on a jump that `j` makes in four when the target is
+  inside +/-1MB.
+
+  ```
+   12ea41c: auipc t6, 0x3
+   12ea420: jr -1700(t6)             -> j 0x12ecd78
+  ```
+
+  The call pair folds exactly because `jal` writes the link register
+  the `jalr` wrote. `j` writes nothing, so after the fold t6 holds
+  whatever it held before the pair rather than the auipc's result, and
+  the pair is reported only where the liveness walk finds t6 written
+  before it is read. The walk starts at the target: a jump has no
+  fall-through to ask about. The jr must not be a branch target and
+  neither half may be relocated, as for the call.
+
+  This is V8's shape. `MacroAssembler::BranchLong` spells every jump to
+  a label not yet bound this way, and the JetStream corpus in TODO.md
+  (entry 36) has 1,116,777 of them, every one inside `j`'s reach. The
+  check reports 720,121: 426,516 in Maglev, 135,370 in TurboFan,
+  115,518 in baseline, 40,284 in regexp code and 2,433 in wrappers,
+  2.88 MB of its 151.6 MB. The rest lose to the walk, which answers
+  UNKNOWN rather than DEAD where an indirect jump or a call comes
+  before any write to the register. The package corpus has none:
+  compilers spell a far jump `j` or `tail`. 683,166 of the pairs sit
+  under a conditional branch that skips exactly them, which once the
+  pair is a `j` is the shape the branch-over-jump entry below reads, so
+  the two compose.
 
 * **slli + add foldable to shNadd** -- `slli rd,rs,{1,2,3}` +
   `add rd,rd,rs2` computes a scaled-index address in two dependent
