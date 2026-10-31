@@ -12,6 +12,9 @@ instruction compressible to a base C form at offset: 0x8: -> c.slli (4 -> 2 byte
 instruction compressible to a base C form at offset: 0x10: -> c.slli (4 -> 2 bytes) (1 instructions)
   slli t6, t6, 6
 
+instruction with no architectural effect at offset: 0x14: -> delete; an or with zero (4 bytes) (1 instructions)
+  ori t6, t6, 0
+
 instruction compressible to a base C form at offset: 0x18: -> c.jalr (4 -> 2 bytes) (1 instructions)
   jalr t6
 
@@ -73,5 +76,6 @@ constant built in more instructions than li needs at offset: 0x58: -> li a4, 0x1
 Optimization opportunities by type:
       18  instruction compressible to a base C form
        3  constant built in more instructions than li needs
+       1  instruction with no architectural effect
 
-21 optimization opportunities in 27 instructions
+22 optimization opportunities in 27 instructions
