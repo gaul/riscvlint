@@ -176,7 +176,13 @@ typedef struct {
 // without noticing when a check is added.
 static tally_entry *tally;
 static size_t ntitles, ntitles_cap;
-static bool quiet;      // -q: summary only, for corpus-scale runs
+// -v: print each opportunity as it is found, ahead of the by-type
+// summary. Off by default, which is armlint's and x86lint's polarity
+// and the only one that makes a bare invocation useful: libxul has
+// 567,706 findings, and printing them plus their disassembly is not a
+// report anyone asked for. `-q` asks for that default and is kept as a
+// no-op so the corpus-scale invocations that passed it still work.
+static bool verbose;
 // -i: report which extensions the binary uses instead of what it could
 // drop. It replaces the lint scan rather than adding to it -- the two
 // answer different questions and nothing in the census is a finding.
@@ -313,7 +319,7 @@ static void report(void *ctx, const riscvlint_finding *f)
     const report_ctx *c = ctx;
     tally_add(f->title);
     total_findings++;
-    if (quiet) return;
+    if (!verbose) return;
 
     uint64_t delta = 0;
     const char *sym = symbolize(c->base, c->map_len, c->eh, f->address,
@@ -636,9 +642,9 @@ static int scan_file(csh handle, const char *path)
             json_findings = total_findings;
         }
         if (census) {
-            // -q drops the sample addresses, which is the census's
-            // per-finding detail: the same thing -q drops from a scan.
-            riscvlint_census_print(census, path, arch, !quiet);
+            // -v adds the sample addresses, which are the census's
+            // per-finding detail: the same thing -v adds to a scan.
+            riscvlint_census_print(census, path, arch, verbose);
             riscvlint_census_destroy(census);
         } else {
             riscvlint_state_destroy(state);
@@ -658,12 +664,17 @@ static int cmp_tally(const void *a, const void *b)
 int main(int argc, char **argv)
 {
     static const char usage[] =
-        "usage: %s [-q] [-i] [--json] "
+        "usage: %s [-v] [-i] [--json] "
         "[-m zba|zbb|zbs|zcb|zfa|c|rva20|rva22|rva23]... <binary>...\n";
     int argi = 1;
     while (argi < argc && argv[argi][0] == '-' && argv[argi][1]) {
-        if (strcmp(argv[argi], "-q") == 0) {
-            quiet = true;
+        if (strcmp(argv[argi], "-v") == 0) {
+            verbose = true;
+        } else if (strcmp(argv[argi], "-q") == 0) {
+            // What the default already does. Accepted silently rather
+            // than refused or warned about: it was the flag for
+            // corpus-scale runs, and those are the last place to add a
+            // line of noise.
         } else if (strcmp(argv[argi], "-i") == 0) {
             census_mode = true;
         } else if (strcmp(argv[argi], "--json") == 0) {
@@ -702,11 +713,15 @@ int main(int argc, char **argv)
                 argv[0]);
         return 2;
     }
-    // -q suppresses the per-finding half of the human report, and under
-    // --json that half is the whole document. Nothing to suppress.
-    if (json_mode && quiet)
-        fprintf(stderr, "%s: -q has no effect with --json; the findings are "
-                "the document\n", argv[0]);
+    // -v prints the human report's per-finding half, which would
+    // interleave with the document line for line. Refused for the same
+    // reason -i is: the caller gets to pick, rather than being picked
+    // for.
+    if (json_mode && verbose) {
+        fprintf(stderr, "%s: --json and -v are separate reports; pick one\n",
+                argv[0]);
+        return 2;
+    }
     csh handle;
     if (cs_open(CS_ARCH_RISCV, RISCVLINT_CS_MODE, &handle) != CS_ERR_OK) {
         fprintf(stderr, "capstone: cs_open failed\n");

@@ -157,15 +157,31 @@ else
         "status $status, $(wc -c < "$WORK/out") bytes"
 fi
 
-# 5. The census is a separate report and the combination is refused.
+# 5. The census and the verbose report are separate reports whose
+#    output would interleave with the document, so both combinations are
+#    refused rather than one of them chosen for the caller.
+for flag in -i -v; do
+    set +e
+    "$ROOT/riscvlint" --json $flag "$WORK/clean.o" > "$WORK/out" 2> /dev/null
+    status=$?
+    set -e
+    if [ "$status" = 2 ] && [ ! -s "$WORK/out" ]; then
+        ok "--json with $flag is refused"
+    else
+        bad "--json with $flag is refused" "status $status"
+    fi
+done
+# -q asks for what --json already does and is accepted, so a script that
+# passed it before the verbosity default flipped still produces a
+# document rather than an error.
 set +e
-"$ROOT/riscvlint" --json -i "$WORK/clean.o" > "$WORK/out" 2> /dev/null
+"$ROOT/riscvlint" --json -q "$WORK/dirty.o" > "$WORK/out" 2> /dev/null
 status=$?
 set -e
-if [ "$status" = 2 ] && [ ! -s "$WORK/out" ]; then
-    ok "--json with -i is refused"
+if [ "$status" = 1 ] && parse < "$WORK/out" > /dev/null; then
+    ok "--json with -q still yields a document"
 else
-    bad "--json with -i is refused" "status $status"
+    bad "--json with -q still yields a document" "status $status"
 fi
 
 # 6. The exit status is the scan's, unchanged by the output mode.

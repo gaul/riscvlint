@@ -712,7 +712,7 @@ what the *checks* may assume and so has nothing to say here; passing
 both says so rather than quietly ignoring the flag.
 
 ```console
-$ ./riscvlint -q -i corpus/cpp/firefox-esr--libxul.so
+$ ./riscvlint -i corpus/cpp/firefox-esr--libxul.so
 ISA census of corpus/cpp/firefox-esr--libxul.so: 35581433 instructions, 0 undecodable halfwords skipped
   RV64I baseline: 15279008
   RVA20U64: C (18752804), F (1062316), M (220322), D (176508), A (140873)
@@ -776,9 +776,9 @@ through a runtime dispatch counts the same as one on every path. An
 undecodable halfword may be data in text or an extension this capstone
 cannot decode, so the skipped count bounds what the census could have
 missed -- and treat a small exotic tally in a binary with many skipped
-halfwords with suspicion. Without `-q` the census prints up to four
-sample addresses per extension, which is what checking one in a
-disassembler takes.
+halfwords with suspicion. With `-v` the census prints up to four sample
+addresses per extension, which is what checking one in a disassembler
+takes.
 
 Three results from the corpus. Firefox is a plain rv64gc build
 throughout -- no Zba, no Zbb, no Zbs anywhere in 35.5 million
@@ -800,6 +800,59 @@ Debian's GCC for a V-capable target with no guard at all -- that one
 faults. The census counts both the same way, because from the
 encodings they are the same thing; the sample addresses are what tells
 them apart.
+
+## The report (`-v`)
+
+By default riscvlint prints only the summary: the opportunities grouped
+by type and sorted by prevalence, then a total and the instruction
+count. A large binary has hundreds of thousands of them -- libxul alone
+has 567,706 -- so the per-opportunity detail is suppressed unless asked
+for:
+
+```console
+$ ./riscvlint corpus/rust/ripgrep--rg
+Optimization opportunities by type:
+   31420  call pair foldable to jal
+    5200  redundant stack-pointer restore
+     604  computation a live register already holds
+     259  transfer to the instruction that follows it
+     179  instruction compressible to a base C form
+     ...
+       1  dead store to a frame slot
+
+38295 optimization opportunities in 819303 instructions
+```
+
+Pass `-v` to print each opportunity ahead of that summary -- its
+one-line rewrite plus the instructions it covers, disassembled fresh
+from the file so the report shows exactly what is in it:
+
+```console
+$ ./riscvlint -v corpus/rust/ripgrep--rg
+instruction compressible to a base C form at offset: 0x6da7c: -> c.jr (4 -> 2 bytes) (1 instructions)
+  jr t3
+
+call pair foldable to jal at offset: 0x6e382: -> jal ra, 0xf2e72 (2 instructions)
+  auipc ra, 0x85
+  jalr -0x510(ra)
+...
+```
+
+The `<...>` that would name the containing function appears only when
+the object kept a symbol table to attribute against, which a Debian
+binary has not.
+
+This is armlint's and x86lint's polarity, and riscvlint had the
+opposite one until it was flipped: every finding printed unless `-q`
+said otherwise, which made a bare invocation on a real binary unusable
+and the flag a thing you had to know. `-q` still asks for what is now
+the default and is still accepted, silently, so the corpus-scale
+invocations that passed it keep working -- and those are the last place
+to add a line of noise. `-v` is also what adds the sample addresses to
+the `-i` census, which is that report's own per-finding detail.
+
+Every fixture under `fixtures/` passes `-v`, since what they snapshot is
+the per-finding text; `make driver-test` is what covers the default.
 
 ## `--json`
 
@@ -854,10 +907,10 @@ reads it unadorned, `json.JSONDecoder().raw_decode` in a loop in
 Python. A file the driver rejects leaves stdout empty rather than half a
 document, and the exit status is unchanged by the mode.
 
-`-i` is a separate report whose output would interleave with the
-document, so the combination is refused rather than chosen for the
-caller; `-q` suppresses the per-finding half of the human report, which
-under `--json` is the whole document, so it warns and does nothing.
+`-i` and `-v` are separate reports whose output would interleave with
+the document, so both combinations are refused rather than chosen for
+the caller. `-q` asks for what `--json` already does and is accepted, so
+a script that passed it still gets a document.
 
 The library side is what the mode is built on:
 
@@ -921,9 +974,10 @@ time and reports subtly wrong output rather than failing.
 
 `make test` runs the unit suite, `make integration-test` the snapshot
 fixtures under `fixtures/`, `make driver-test` the driver's exit
-statuses, `make json-test` the `--json` document, and `make tools` the
-mining utilities. Every shell suite exits 2 rather than 0 when it
-cannot find an assembler that targets riscv64, so a missing toolchain
+statuses and verbosity default, `make json-test` the `--json` document,
+and `make tools` the mining utilities. Every shell suite exits 2 rather
+than 0 when it cannot find a clang that targets riscv64 -- and, for the
+linked fixtures, an lld that can link it -- so a missing toolchain
 cannot pass by testing nothing.
 
 ## Mining tools

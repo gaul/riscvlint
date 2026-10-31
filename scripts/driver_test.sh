@@ -39,6 +39,9 @@ $CC $CC_FLAGS -c -o "$WORK/clean.o" "$WORK/clean.s"
 # Not an ELF at all, and an ELF that is not riscv64.
 printf 'not an elf\n' > "$WORK/text.txt"
 
+ok()  { printf "  ok      %s\n" "$1"; PASS=$((PASS + 1)); }
+bad() { printf "  FAIL    %s\n" "$1"; shift; [ $# -eq 0 ] || printf "          %s\n" "$@"; FAIL=$((FAIL + 1)); }
+
 expect()
 {
     want=$1
@@ -71,6 +74,44 @@ expect 2
 # is not a finding there -- but an unreadable one is still a failure.
 expect 0 -q -i "$WORK/dirty.o"
 expect 2 -q -i "$WORK/does-not-exist"
+# -q asks for the default and is kept only so the invocations that
+# passed it still work, so it must stay accepted.
+expect 1 -q "$WORK/dirty.o"
+expect 1 -v "$WORK/dirty.o"
+
+# The verbosity default, which is the other thing the snapshot suite
+# cannot see: every fixture passes -v, so nothing there would notice the
+# polarity flipping back.
+lines()
+{
+    set +e
+    "$ROOT/riscvlint" "$@" "$WORK/dirty.o" 2> /dev/null |
+        grep -c 'at offset: 0x'
+    set -e
+}
+n=$(lines)
+if [ "$n" = 0 ]; then
+    ok "the default prints no per-finding lines"
+else
+    bad "the default prints no per-finding lines" "got $n"
+fi
+n=$(lines -v)
+if [ "$n" -gt 0 ]; then
+    ok "-v prints them ($n)"
+else
+    bad "-v prints them" "got $n"
+fi
+# And the summary is in both, so the default is a report rather than a
+# silence.
+set +e
+"$ROOT/riscvlint" "$WORK/dirty.o" 2>/dev/null | grep -q 'optimization opportunities in'
+got=$?
+set -e
+if [ "$got" = 0 ]; then
+    ok "the default still prints the summary"
+else
+    bad "the default still prints the summary"
+fi
 
 echo
 echo "$PASS passed, $FAIL failed"
