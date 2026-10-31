@@ -3087,6 +3087,70 @@ bool check_dead_def(riscvlint_state *state, const cs_insn *insn,
     return true;
 }
 
+// ---- running every check ----
+
+static const riscvlint_check_fn riscvlint_checks[] = {
+    check_call_pair_to_jal,
+    check_slli_add_to_shadd,
+    check_slli_srli_to_zext,
+    check_dead_def,
+    check_redundant_sp_restore,
+    check_redundant_extension,
+    check_zcb_compressible,
+    check_c_compressible,
+    check_base_add_to_offset,
+    check_redundant_reload,
+    check_store_to_load,
+    check_redundant_load,
+    check_dead_store,
+    check_silent_store,
+    check_const_remat,
+    check_comp_remat,
+    check_cond_to_branch,
+    check_branch_over_jump,
+    check_transfer_to_next,
+    check_zero_store_run,
+    check_bitcast_through_frame,
+};
+
+size_t riscvlint_scan(riscvlint_state *state, csh handle,
+                      const uint8_t *code, size_t len, uint64_t vaddr,
+                      riscvlint_finding_fn on_finding, void *ctx,
+                      uint64_t *instructions, uint64_t *skipped)
+{
+    cs_insn *insn = cs_malloc(handle);
+    if (!insn) return 0;
+    size_t found = 0;
+    const uint8_t *p = code;
+    size_t remain = len;
+    uint64_t addr = vaddr;
+    while (remain >= 2) {
+        if (!cs_disasm_iter(handle, &p, &remain, &addr, insn)) {
+            // Resynchronising past a halfword we could not read means we
+            // do not know what it did to memory.
+            riscvlint_state_drop_window(state);
+            p += 2; remain -= 2; addr += 2;
+            if (skipped) *skipped += 2;
+            continue;
+        }
+        if (instructions) (*instructions)++;
+        for (size_t i = 0;
+             i < sizeof riscvlint_checks / sizeof riscvlint_checks[0]; i++) {
+            riscvlint_finding f;
+            memset(&f, 0, sizeof f);
+            if (riscvlint_checks[i](state, insn, &f)) {
+                found++;
+                if (on_finding) on_finding(ctx, &f);
+            }
+        }
+        // After the checks: the ones that read the window judge this
+        // instruction against the table as it stood before it.
+        riscvlint_state_observe(state, insn);
+    }
+    cs_free(insn, 1);
+    return found;
+}
+
 // ---- ISA census ----
 //
 // See riscvlint.h for what the census claims, where the profile rungs

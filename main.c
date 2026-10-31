@@ -184,8 +184,16 @@ static bool census_mode;
 // hardware"). Neither is expressible if the flag merely unions.
 static unsigned forced_exts;
 static bool have_forced;
+// --json: the findings as a document keyed by absolute address instead
+// of the human report. It replaces that report rather than adding to
+// it, so the notes and the summary stay off stdout under it.
+static bool json_mode;
 static uint64_t total_findings;
 static uint64_t total_insns;
+// Bytes the scan stepped over without linting: halfwords this capstone
+// build could not decode. Reported so that a resynchronized sweep of a
+// data-laden section is not read as a clean one.
+static uint64_t total_skipped;
 
 static void tally_add(const char *title)
 {
@@ -239,75 +247,191 @@ static const char *symbolize(const uint8_t *base, size_t map_len,
     return best;
 }
 
-static void report(const riscvlint_finding *f, csh handle,
-                   const riscvlint_state *state, const uint8_t *base,
-                   size_t map_len, const Elf64_Ehdr *eh)
+// What a finding needs to be printed that the finding itself does not
+// carry: the container it came out of. Passed to riscvlint_scan as the
+// callback's ctx.
+typedef struct {
+    csh handle;
+    const riscvlint_state *state;
+    const uint8_t *base;
+    size_t map_len;
+    const Elf64_Ehdr *eh;
+    const char *section;    // name of the section being scanned
+} report_ctx;
+
+// Walk the instructions a finding covers, disassembled fresh from the
+// file so the report shows exactly what is in it. Each one's text goes
+// through `line`; its encoding is appended to `bytes` while that has
+// room. Returns how many instructions were decoded and writes their
+// total byte length to `*len`, which is the true length whether or not
+// the bytes fit: a run of zero stores has no fixed bound, and reporting
+// a short length for one would be worse than reporting no bytes.
+static unsigned walk_finding(const report_ctx *c, const riscvlint_finding *f,
+                             void (*line)(void *, unsigned, const cs_insn *),
+                             void *lctx, uint8_t *bytes, size_t cap,
+                             size_t *len)
 {
+    if (len) *len = 0;
+    cs_insn *insn = cs_malloc(c->handle);
+    if (!insn) return 0;
+    unsigned n = 0;
+    uint64_t addr = f->address;
+    for (unsigned i = 0; i < f->insn_count; i++) {
+        uint32_t w;
+        if (!riscvlint_word_at(c->state, addr, &w)) break;
+        uint8_t buf[4];
+        memcpy(buf, &w, 4);
+        const uint8_t *p = buf;
+        size_t remain = 4;
+        uint64_t a = addr;
+        if (!cs_disasm_iter(c->handle, &p, &remain, &a, insn)) break;
+        if (line) line(lctx, i, insn);
+        if (len) {
+            if (bytes && *len + insn->size <= cap)
+                memcpy(bytes + *len, buf, insn->size);
+            *len += insn->size;
+        }
+        n++;
+        addr = a;
+    }
+    cs_free(insn, 1);
+    return n;
+}
+
+static void print_line(void *ctx, unsigned i, const cs_insn *insn)
+{
+    (void)ctx; (void)i;
+    printf("  %s %s\n", insn->mnemonic, insn->op_str);
+}
+
+static void report(void *ctx, const riscvlint_finding *f)
+{
+    const report_ctx *c = ctx;
     tally_add(f->title);
     total_findings++;
     if (quiet) return;
 
     uint64_t delta = 0;
-    const char *sym = symbolize(base, map_len, eh, f->address, &delta);
+    const char *sym = symbolize(c->base, c->map_len, c->eh, f->address,
+                                &delta);
     printf("%s at offset: 0x%" PRIx64, f->title, f->address);
     if (sym) {
         if (delta) printf(" <%s+0x%" PRIx64 ">", sym, delta);
         else printf(" <%s>", sym);
     }
     printf(": -> %s (%u instructions)\n", f->replacement, f->insn_count);
-
-    // Print the instructions the finding covers, disassembled fresh so
-    // the report shows exactly what is in the file.
-    cs_insn *insn = cs_malloc(handle);
-    if (insn) {
-        uint64_t addr = f->address;
-        for (unsigned i = 0; i < f->insn_count; i++) {
-            uint32_t w;
-            if (!riscvlint_word_at(state, addr, &w)) break;
-            uint8_t bytes[4];
-            memcpy(bytes, &w, 4);
-            const uint8_t *p = bytes;
-            size_t remain = 4;
-            uint64_t a = addr;
-            if (!cs_disasm_iter(handle, &p, &remain, &a, insn)) break;
-            printf("  %s %s\n", insn->mnemonic, insn->op_str);
-            addr = a;
-        }
-        cs_free(insn, 1);
-    }
+    walk_finding(c, f, print_line, NULL, NULL, 0, NULL);
     printf("\n");
+}
+
+// ---- --json ----
+//
+// The findings as one document per input file, keyed by absolute
+// address. x86lint's and armlint's shape, with the differences RISC-V
+// forces: a finding spans a window of whole instructions, so `text` is
+// an array of lines rather than one string, and `length` is a sum of
+// 2-byte and 4-byte encodings rather than a multiple of four.
+//
+// `vaddr` is absolute and a number rather than a hex string, which is
+// the point of the mode: findings compose with arithmetic and so join
+// against anything else keyed by address.
+//
+// `arch` and `extensions` carry what the human report's `note:` lines
+// say, because a gated finding means nothing without them -- a Zcb
+// finding against an object that declares no Zcb is the answer to "what
+// would rebuilding buy me", not a defect.
+
+#define JSON_BYTES_MAX 256      // 64 instructions, see json_finding
+
+static bool json_first;         // no finding written to this document yet
+// The running totals as they stood when this file's document opened:
+// each document reports its own file's share, and the driver's counters
+// are cumulative across the argument list.
+static uint64_t json_insns, json_skipped, json_findings;
+
+// Copy a string from the file into a JSON string body. Section and
+// symbol names are whatever bytes the file holds, so only what JSON
+// requires is escaped and everything else is passed through: a binary
+// whose string tables are not UTF-8 yields strings that are not either.
+static void json_puts(const char *s)
+{
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        switch (*p) {
+        case '"':  fputs("\\\"", stdout); break;
+        case '\\': fputs("\\\\", stdout); break;
+        case '\n': fputs("\\n", stdout); break;
+        case '\r': fputs("\\r", stdout); break;
+        case '\t': fputs("\\t", stdout); break;
+        default:
+            if (*p < 0x20) printf("\\u%04x", *p);
+            else putchar(*p);
+        }
+    }
+}
+
+static void json_line(void *ctx, unsigned i, const cs_insn *insn)
+{
+    (void)ctx;
+    if (i) fputs(", ", stdout);
+    putchar('"');
+    json_puts(insn->mnemonic);
+    if (insn->op_str[0]) {
+        putchar(' ');
+        json_puts(insn->op_str);
+    }
+    putchar('"');
+}
+
+static void json_finding(void *ctx, const riscvlint_finding *f)
+{
+    const report_ctx *c = ctx;
+    tally_add(f->title);
+    total_findings++;
+
+    // Streamed as they are found rather than collected first: libxul
+    // has 567,706 of them, which is not a document to hold in memory.
+    fputs(json_first ? "    {" : ",\n    {", stdout);
+    json_first = false;
+    printf("\"vaddr\": %" PRIu64 ", \"check\": \"", f->address);
+    json_puts(f->title);
+    fputs("\", \"detail\": \"", stdout);
+    json_puts(f->replacement);
+    fputs("\", \"section\": \"", stdout);
+    json_puts(c->section ? c->section : "");
+    putchar('"');
+
+    uint64_t delta = 0;
+    const char *sym = symbolize(c->base, c->map_len, c->eh, f->address,
+                                &delta);
+    if (sym) {
+        fputs(", \"function\": \"", stdout);
+        json_puts(sym);
+        printf("\", \"function_offset\": %" PRIu64, delta);
+    }
+
+    // Enough for every check but an unbounded run of zero stores, whose
+    // window has no fixed size. `length` is still exact there; `bytes`
+    // is omitted rather than truncated, so a consumer never reads a
+    // short encoding as the whole finding.
+    uint8_t bytes[JSON_BYTES_MAX];
+    size_t len = 0;
+    fputs(", \"text\": [", stdout);
+    walk_finding(c, f, json_line, NULL, bytes, sizeof bytes, &len);
+    printf("], \"length\": %zu", len);
+    if (len && len <= sizeof bytes) {
+        fputs(", \"bytes\": \"", stdout);
+        for (size_t i = 0; i < len; i++) printf("%02x", bytes[i]);
+        putchar('"');
+    }
+    putchar('}');
 }
 
 // ---- scanning ----
 
-static const riscvlint_check_fn checks[] = {
-    check_call_pair_to_jal,
-    check_slli_add_to_shadd,
-    check_slli_srli_to_zext,
-    check_dead_def,
-    check_redundant_sp_restore,
-    check_redundant_extension,
-    check_zcb_compressible,
-    check_c_compressible,
-    check_base_add_to_offset,
-    check_redundant_reload,
-    check_store_to_load,
-    check_redundant_load,
-    check_dead_store,
-    check_silent_store,
-    check_const_remat,
-    check_comp_remat,
-    check_cond_to_branch,
-    check_branch_over_jump,
-    check_transfer_to_next,
-    check_zero_store_run,
-    check_bitcast_through_frame,
-};
-
 static void scan_section(csh handle, riscvlint_state *state,
                          const uint8_t *code, size_t size, uint64_t vaddr,
                          const uint8_t *base, size_t map_len,
-                         const Elf64_Ehdr *eh)
+                         const Elf64_Ehdr *eh, const char *name)
 {
     if (!riscvlint_state_set_section(state, handle, code, size, vaddr))
         return;
@@ -332,31 +456,10 @@ static void scan_section(csh handle, riscvlint_state *state,
         free(offs);
     }
 
-    cs_insn *insn = cs_malloc(handle);
-    if (!insn) return;
-    const uint8_t *p = code;
-    size_t remain = size;
-    uint64_t addr = vaddr;
-    while (remain >= 2) {
-        if (!cs_disasm_iter(handle, &p, &remain, &addr, insn)) {
-            // Resynchronising past a halfword we could not read means we
-            // do not know what it did to memory.
-            riscvlint_state_drop_window(state);
-            p += 2; remain -= 2; addr += 2;
-            continue;
-        }
-        total_insns++;
-        for (size_t i = 0; i < sizeof checks / sizeof checks[0]; i++) {
-            riscvlint_finding f;
-            memset(&f, 0, sizeof f);
-            if (checks[i](state, insn, &f))
-                report(&f, handle, state, base, map_len, eh);
-        }
-        // After the checks: the seven that read the window judge this
-        // instruction against the table as it stood before it.
-        riscvlint_state_observe(state, insn);
-    }
-    cs_free(insn, 1);
+    report_ctx ctx = { handle, state, base, map_len, eh, name };
+    riscvlint_scan(state, handle, code, size, vaddr,
+                   json_mode ? json_finding : report, &ctx,
+                   &total_insns, &total_skipped);
 }
 
 static int scan_file(csh handle, const char *path)
@@ -404,21 +507,58 @@ static int scan_file(csh handle, const char *path)
             // project has produced.
             unsigned declared = riscvlint_parse_arch(arch);
             unsigned effective;
+            const char *source;
             if (have_forced) {
                 effective = forced_exts | RISCVLINT_EXT_DECLARED;
-                if (declared & RISCVLINT_EXT_DECLARED)
+                source = "forced";
+                if (declared & RISCVLINT_EXT_DECLARED && !json_mode)
                     printf("note: %s: -m overrides the arch declared in the "
                            "object\n", path);
             } else {
                 effective = declared;
-                if (!(declared & RISCVLINT_EXT_DECLARED))
+                source = declared & RISCVLINT_EXT_DECLARED ? "declared"
+                                                           : "unrestricted";
+                if (!(declared & RISCVLINT_EXT_DECLARED) && !json_mode)
                     printf("note: %s: no RISC-V arch attributes; "
                            "extension-gated checks left unrestricted "
                            "(pass -m to pin)\n", path);
             }
             riscvlint_state_set_extensions(state, effective);
+            // The two notes above as fields: a reader of the document
+            // needs them for the same reason a reader of the report
+            // does, and stdout is the document's now.
+            if (json_mode) {
+                fputs("{\"file\": \"", stdout);
+                json_puts(path);
+                fputs("\", \"arch\": ", stdout);
+                if (arch) {
+                    putchar('"');
+                    json_puts(arch);
+                    putchar('"');
+                } else {
+                    fputs("null", stdout);
+                }
+                printf(", \"extensions\": \"%s\",\n  \"findings\": [\n",
+                       source);
+                json_first = true;
+            }
         }
         const Elf64_Shdr *sh = (const Elf64_Shdr *)(base + eh->e_shoff);
+        // The section header string table, for --json's `section`. A
+        // name is used only when its offset lands inside the table and
+        // the table's last byte is a NUL, so a truncated or hostile
+        // table yields no name rather than a read off the end.
+        const char *shstr = NULL;
+        size_t shstr_len = 0;
+        if (eh->e_shstrndx < eh->e_shnum) {
+            const Elf64_Shdr *s = &sh[eh->e_shstrndx];
+            if (s->sh_offset < map_len && s->sh_size &&
+                s->sh_size <= map_len - s->sh_offset &&
+                base[s->sh_offset + s->sh_size - 1] == '\0') {
+                shstr = (const char *)(base + s->sh_offset);
+                shstr_len = s->sh_size;
+            }
+        }
         for (unsigned i = 0; i < eh->e_shnum; i++) {
             if ((sh[i].sh_flags & SHF_EXECINSTR) == 0 ||
                 sh[i].sh_type != SHT_PROGBITS || sh[i].sh_size == 0)
@@ -431,7 +571,22 @@ static int scan_file(csh handle, const char *path)
                                       sh[i].sh_size, sh[i].sh_addr);
             else
                 scan_section(handle, state, base + sh[i].sh_offset,
-                             sh[i].sh_size, sh[i].sh_addr, base, map_len, eh);
+                             sh[i].sh_size, sh[i].sh_addr, base, map_len, eh,
+                             shstr && sh[i].sh_name < shstr_len
+                                 ? shstr + sh[i].sh_name : NULL);
+        }
+        if (json_mode && !census) {
+            // The totals close the document because the scan only knows
+            // them then. They are this file's share, which is why they
+            // are recorded before the next file resets them.
+            printf("%s  ],\n  \"instructions\": %" PRIu64
+                   ", \"skipped\": %" PRIu64 ", \"opportunities\": %" PRIu64
+                   "}\n", json_first ? "" : "\n",
+                   total_insns - json_insns, total_skipped - json_skipped,
+                   total_findings - json_findings);
+            json_insns = total_insns;
+            json_skipped = total_skipped;
+            json_findings = total_findings;
         }
         if (census) {
             // -q drops the sample addresses, which is the census's
@@ -456,14 +611,16 @@ static int cmp_tally(const void *a, const void *b)
 int main(int argc, char **argv)
 {
     static const char usage[] =
-        "usage: %s [-q] [-i] [-m zba|zbb|zbs|zcb|c|rva20|rva22|rva23]... "
-        "<binary>...\n";
+        "usage: %s [-q] [-i] [--json] "
+        "[-m zba|zbb|zbs|zcb|c|rva20|rva22|rva23]... <binary>...\n";
     int argi = 1;
     while (argi < argc && argv[argi][0] == '-' && argv[argi][1]) {
         if (strcmp(argv[argi], "-q") == 0) {
             quiet = true;
         } else if (strcmp(argv[argi], "-i") == 0) {
             census_mode = true;
+        } else if (strcmp(argv[argi], "--json") == 0) {
+            json_mode = true;
         } else if (strcmp(argv[argi], "-m") == 0 && argi + 1 < argc) {
             unsigned e;
             if (!riscvlint_parse_ext_name(argv[++argi], &e)) {
@@ -490,6 +647,19 @@ int main(int argc, char **argv)
     if (census_mode && have_forced)
         fprintf(stderr, "%s: -m has no effect with -i; the census reports "
                 "what the binary uses\n", argv[0]);
+    // --json describes the lint scan. The census is a separate report
+    // whose output would interleave with the document, so the two are
+    // refused rather than one of them chosen for the caller.
+    if (census_mode && json_mode) {
+        fprintf(stderr, "%s: --json and -i are separate reports; pick one\n",
+                argv[0]);
+        return 2;
+    }
+    // -q suppresses the per-finding half of the human report, and under
+    // --json that half is the whole document. Nothing to suppress.
+    if (json_mode && quiet)
+        fprintf(stderr, "%s: -q has no effect with --json; the findings are "
+                "the document\n", argv[0]);
     csh handle;
     if (cs_open(CS_ARCH_RISCV, RISCVLINT_CS_MODE, &handle) != CS_ERR_OK) {
         fprintf(stderr, "capstone: cs_open failed\n");
@@ -507,15 +677,24 @@ int main(int argc, char **argv)
     // but a file that could not be read is still a tool failure.
     if (census_mode) return failures ? 2 : 0;
 
-    if (ntitles) {
-        qsort(tally, ntitles, sizeof tally[0], cmp_tally);
-        printf("Optimization opportunities by type:\n");
-        for (size_t i = 0; i < ntitles; i++)
-            printf("%8" PRIu64 "  %s\n", tally[i].count, tally[i].title);
-        printf("\n");
+    // --json already closed each file's document with that file's
+    // totals; there is no cross-file summary to print below them.
+    if (!json_mode) {
+        if (ntitles) {
+            qsort(tally, ntitles, sizeof tally[0], cmp_tally);
+            printf("Optimization opportunities by type:\n");
+            for (size_t i = 0; i < ntitles; i++)
+                printf("%8" PRIu64 "  %s\n", tally[i].count, tally[i].title);
+            printf("\n");
+        }
+        // Only when there were any, so the usual run is unchanged: a
+        // scan that resynchronized past undecodable halfwords is not a
+        // clean sweep of the section, and nothing else said so.
+        if (total_skipped)
+            printf("%" PRIu64 " bytes skipped unlinted\n", total_skipped);
+        printf("%" PRIu64 " optimization opportunities in %" PRIu64
+               " instructions\n", total_findings, total_insns);
     }
-    printf("%" PRIu64 " optimization opportunities in %" PRIu64
-           " instructions\n", total_findings, total_insns);
     // A tool failure outranks a dirty scan: if one of five files could
     // not be read, what the other four reported is not the answer to the
     // question that was asked.

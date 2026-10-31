@@ -54,6 +54,11 @@ integration-test-regen: riscvlint
 driver-test: riscvlint
 	./scripts/driver_test.sh
 
+# The --json document: that it parses, that its totals agree with the
+# human run's, and that the refused flag combinations are refused.
+json-test: riscvlint
+	./scripts/json_test.sh
+
 # Corpus-mining research utilities (see "Mining tools" in README.md);
 # not part of the default build or test targets.
 tools: tools/pairscan tools/defuse tools/candscan
@@ -77,4 +82,4 @@ clean:
 		tools/pairscan tools/defuse tools/candscan *.o
 
 .PHONY: all build clean lib test integration-test integration-test-regen \
-	driver-test tools
+	driver-test json-test tools

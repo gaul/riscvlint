@@ -800,6 +800,43 @@ bool check_c_compressible(riscvlint_state *state, const cs_insn *insn,
 bool check_dead_def(riscvlint_state *state, const cs_insn *insn,
                     riscvlint_finding *finding);
 
+// ---- running every check ----
+//
+// Called once per finding, with `ctx` as given. The finding is valid
+// only for the duration of the call -- `title` points into static
+// storage but the struct itself is reused -- so a consumer that keeps
+// findings copies them.
+//
+// Where a summary answers "how many of each kind", this answers "which
+// instructions, at what address": the form needed to join findings
+// against anything else keyed by address, and the join worth making is
+// an execution profile. How often a compiler emits a suboptimal
+// encoding is a poor proxy for what it costs, and only a profile tells
+// one inside a hot loop from a thousand in cold initialization code.
+// The driver's --json mode is built on this.
+typedef void (*riscvlint_finding_fn)(void *ctx, const riscvlint_finding *f);
+// Decode `len` bytes at `vaddr` and run every check over each
+// instruction, in the order the checks need: each one judges its
+// instruction against the window as it stood *before* it, so the
+// window advances only after the checks have run.
+//
+// The state must already carry this section
+// (riscvlint_state_set_section) and its relocations
+// (riscvlint_state_set_relocs); both are facts about the container,
+// which is the caller's business rather than the scan's.
+//
+// Returns the number of findings. `*instructions` and `*skipped`, when
+// non-NULL, are *incremented* by the instructions linted and by the
+// bytes stepped over without linting, so a caller sweeping several
+// sections accumulates across them. Skipped bytes are halfwords this
+// capstone build could not decode: the scan resynchronizes two bytes at
+// a time past one, and a reader cannot otherwise tell a resynchronized
+// sweep of a data-laden section from a clean one.
+size_t riscvlint_scan(riscvlint_state *state, csh handle,
+                      const uint8_t *code, size_t len, uint64_t vaddr,
+                      riscvlint_finding_fn on_finding, void *ctx,
+                      uint64_t *instructions, uint64_t *skipped);
+
 // ---- ISA census ----
 //
 // A by-extension tally of every instruction decoded: armlint's census

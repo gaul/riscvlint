@@ -741,6 +741,84 @@ faults. The census counts both the same way, because from the
 encodings they are the same thing; the sample addresses are what tells
 them apart.
 
+## `--json`
+
+`riscvlint --json` replaces the human report with the findings as a
+document, one per input file, keyed by absolute address:
+
+```console
+$ ./riscvlint --json corpus/rust/ripgrep--rg
+{"file": "corpus/rust/ripgrep--rg", "arch": "rv64i2p1_m2p0_a2p1_...", "extensions": "declared",
+  "findings": [
+    {"vaddr": 451458, "check": "call pair foldable to jal", "detail": "jal ra, 0xf2e72", "section": ".text", "text": ["auipc ra, 0x85", "jalr -0x510(ra)"], "length": 8, "bytes": "97500800e78000af"},
+    ...
+  ],
+  "instructions": 819303, "skipped": 0, "opportunities": 38295}
+```
+
+`vaddr` is the finding's **absolute** address, and a number rather than
+a hex string so that it composes with arithmetic. That is the point of
+the mode: findings become joinable against anything else keyed by
+address, and the join worth making is an execution profile. How often a
+compiler emits a suboptimal encoding is a poor proxy for what it costs
+-- one inside a hot loop outweighs thousands in cold initialization
+code, and only a profile tells the two apart.
+
+It is [x86lint's](https://github.com/gaul/x86lint) and armlint's shape,
+with the differences RISC-V forces. A finding spans a window of whole
+instructions, so `text` is an array of its disassembled lines rather
+than one string, and `length` is a sum of 2- and 4-byte encodings
+rather than a multiple of four. `bytes` is the window's encoding, and is
+*omitted* rather than truncated for a finding longer than 256 bytes --
+a run of zero stores has no fixed bound, and a consumer must never read
+a short encoding as the whole finding; `length` stays exact either way.
+`function` and `function_offset` appear when the object kept a symbol
+table to attribute against, which a Debian binary has not.
+
+Two fields armlint has no counterpart for. `arch` is the object's
+`Tag_RISCV_arch` string, or `null` where it declares none, and
+`extensions` is how the gate was decided -- `declared`, `forced` (`-m`
+was given), or `unrestricted` (no attributes and no `-m`). These carry
+what the human report's `note:` lines say, and a gated finding means
+nothing without them: a Zcb finding against an object that declares no
+Zcb is the answer to "what would rebuilding buy me", not a defect.
+
+Findings are written as they are found rather than collected first, so
+libxul's 567,706 stream instead of accumulating in memory; the totals
+close the document because the scan only knows them then. Section and
+symbol names are copied from the file verbatim, so a binary whose
+string tables are not UTF-8 yields strings that are not either. Several
+files give several documents in argument order, each reporting its own
+file's share, which is a stream of JSON values rather than one -- `jq`
+reads it unadorned, `json.JSONDecoder().raw_decode` in a loop in
+Python. A file the driver rejects leaves stdout empty rather than half a
+document, and the exit status is unchanged by the mode.
+
+`-i` is a separate report whose output would interleave with the
+document, so the combination is refused rather than chosen for the
+caller; `-q` suppresses the per-finding half of the human report, which
+under `--json` is the whole document, so it warns and does nothing.
+
+The library side is what the mode is built on:
+
+```c
+typedef void (*riscvlint_finding_fn)(void *ctx, const riscvlint_finding *f);
+
+size_t riscvlint_scan(riscvlint_state *state, csh handle,
+                      const uint8_t *code, size_t len, uint64_t vaddr,
+                      riscvlint_finding_fn on_finding, void *ctx,
+                      uint64_t *instructions, uint64_t *skipped);
+```
+
+`riscvlint_scan` runs every check over a prepared state, in the order
+the checks need -- each judges its instruction against the window as it
+stood *before* it -- and calls back once per finding. Where a by-type
+tally answers "how many of each kind", the callback answers "which
+instructions, at what address". A compiler test suite can assert the
+return value is zero over a function it just emitted; `*skipped`
+reports the bytes stepped over without linting, so an incomplete sweep
+is not mistaken for a clean one.
+
 ## Exit status
 
 The grep convention, so riscvlint can gate a test suite and CI can tell
@@ -783,9 +861,10 @@ time and reports subtly wrong output rather than failing.
 
 `make test` runs the unit suite, `make integration-test` the snapshot
 fixtures under `fixtures/`, `make driver-test` the driver's exit
-statuses, and `make tools` the mining utilities. Both shell suites exit
-2 rather than 0 when they cannot find an assembler that targets
-riscv64, so a missing toolchain cannot pass by testing nothing.
+statuses, `make json-test` the `--json` document, and `make tools` the
+mining utilities. Every shell suite exits 2 rather than 0 when it
+cannot find an assembler that targets riscv64, so a missing toolchain
+cannot pass by testing nothing.
 
 ## Mining tools
 
