@@ -278,6 +278,7 @@ unsigned riscvlint_parse_arch(const char *arch)
     if (strstr(arch, "_zbs")) exts |= RISCVLINT_EXT_ZBS;
     if (strstr(arch, "_zcb")) exts |= RISCVLINT_EXT_ZCB;
     if (strstr(arch, "_zfa")) exts |= RISCVLINT_EXT_ZFA;
+    if (strstr(arch, "_zilx")) exts |= RISCVLINT_EXT_ZILX;
     // C is spelled `_c2p0` in the base run and `_zca1p0` once the
     // Zc* split gave it a name of its own; a conforming string carries
     // whichever the assembler wrote, and some carry both.
@@ -1426,6 +1427,9 @@ bool riscvlint_parse_ext_name(const char *name, unsigned *exts)
         { "zcb",   RISCVLINT_EXT_ZCB },
         { "c",     RISCVLINT_EXT_C },
         { "zfa",   RISCVLINT_EXT_ZFA },
+        // Zilx is in no profile -- not RVA20, RVA22, RVA23 or RVB23 --
+        // so it is named on its own and never arrives with one.
+        { "zilx",  RISCVLINT_EXT_ZILX },
         // Every profile from RVA20 up mandates C.
         { "rva20", RISCVLINT_EXT_C },
         { "rva22", RISCVLINT_EXT_ZBA | RISCVLINT_EXT_ZBB | RISCVLINT_EXT_ZBS |
@@ -3288,6 +3292,93 @@ static void cchain_apply(const cchain_step *st, int64_t *val)
     *val = st->w_form ? (int64_t)(int32_t)(uint32_t)sum : (int64_t)sum;
 }
 
+// ---- an address computed for one indexed load ----
+//
+// See riscvlint.h for what Zilx is and why only the unscaled shape is
+// reported.
+
+// The indexed mnemonic for a load kind, or NULL where Zilx has none.
+// Byte loads exist only in scaled form, whose scale factor is 1, so
+// they fold here with identical arithmetic.
+static const char *zilx_name(rv_mem_kind kind)
+{
+    switch (kind) {
+    case RV_MEM_LB:  return "lxsb";
+    case RV_MEM_LBU: return "lxsbu";
+    case RV_MEM_LH:  return "lxh";
+    case RV_MEM_LHU: return "lxhu";
+    case RV_MEM_LW:  return "lxw";
+    case RV_MEM_LWU: return "lxwu";
+    case RV_MEM_LD:  return "lxd";
+    default:         return NULL;   // stores, and the FP loads
+    }
+}
+
+bool check_indexed_load(riscvlint_state *state, const cs_insn *insn,
+                        riscvlint_finding *finding)
+{
+    // Positively present, not merely un-denied -- which is this check
+    // alone among the gated ones. riscvlint_may_use answers true when
+    // an object declares no attributes, because "absent" must not
+    // silence a check on the code it exists for; that rule assumes the
+    // extension is one some target plausibly has. Zilx is in no profile
+    // and in no shipping core, so defaulting to permissive would put
+    // 3,528 findings on the Go objects suggesting an instruction nobody
+    // can execute. It fires when the object declares `_zilx` or when
+    // `-m zilx` asks the what-if, and otherwise not at all.
+    if (!(riscvlint_state_extensions(state) & RISCVLINT_EXT_ZILX))
+        return false;
+    if (insn->size != 2 && insn->size != 4) return false;
+    uint32_t w1;
+    if (!riscvlint_word_at(state, insn->address, &w1)) return false;
+    unsigned rd, rb, ri;
+    if (!rv_decode_add(w1, insn->size, &rd, &rb, &ri)) return false;
+    // x0 anywhere makes this a move rather than an address: `add rd,rs,x0`
+    // has nothing to index by, and a write to x0 computes nothing.
+    if (rd == 0 || rb == 0 || ri == 0) return false;
+    // sp, gp and tp hold what the ABI says they hold and are never dead,
+    // so folding the write away is not on offer. The same rule the
+    // immediate-offset fold applies.
+    if (rd == 2 || rd == 3 || rd == 4) return false;
+
+    uint64_t second = insn->address + insn->size;
+    uint32_t w2;
+    if (!riscvlint_word_at(state, second, &w2)) return false;
+    unsigned len2 = rv_insn_len(w2);
+    rv_mem_kind kind;
+    unsigned data, base;
+    int64_t off;
+    if (!rv_decode_mem(w2, len2, &kind, &data, &base, &off)) return false;
+    if (base != rd || off != 0) return false;
+    const char *name = zilx_name(kind);
+    if (!name) return false;
+
+    if (riscvlint_is_branch_target(state, second)) return false;
+    if (riscvlint_is_relocated(state, insn->address) ||
+        riscvlint_is_relocated(state, second))
+        return false;
+
+    // The fold stops writing rd. A load into the address register kills
+    // it by construction -- `add a0,a0,a1` then `ld a0,0(a0)` -- and
+    // everything else has to be proved, by the same walk and with the
+    // same answer-or-decline the immediate-offset fold uses.
+    if (data != rd &&
+        riscvlint_liveness(state, second + len2, rd) != RISCVLINT_LIVE_DEAD)
+        return false;
+
+    unsigned before = insn->size + len2;
+    finding->title = "address computed for one indexed load";
+    finding->address = insn->address;
+    finding->insn_count = 2;
+    // base+index is symmetric in the unscaled form, so which operand of
+    // the `add` is called the base does not change the address. They are
+    // named in the order the `add` wrote them.
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "%s %s, (%s), %s (%u -> 4 bytes)", name, rv_reg_name(data),
+             rv_reg_name(rb), rv_reg_name(ri), before);
+    return true;
+}
+
 // ---- a bit count spelled out longhand ----
 //
 // See riscvlint.h for what the sequence is and why this is matched as
@@ -3914,6 +4005,7 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_bitcast_through_frame,
     check_fp_pool_to_fli,
     check_swar_popcount,
+    check_indexed_load,
 };
 
 size_t riscvlint_scan(riscvlint_state *state, csh handle,

@@ -1456,11 +1456,12 @@ second instruction writes it is one dominant idiom plus nothing.
 
 # Remaining candidates
 
-None. Twenty-three checks are implemented and everything this file ever
+None. Twenty-four checks are implemented and everything this file ever
 sized is either written or recorded as rejected with the evidence that
-rejected it. The last two did not come from a corpus probe at all: 23
-came from walking armlint's check table against this one, and 24 came
-from a rejection in this file being wrong.
+rejected it. The last three did not come from a corpus probe at all: 23
+came from walking armlint's check table against this one, 24 came from a
+rejection in this file being wrong, and 25 came from a ratification
+plan for an extension that does not exist in hardware yet.
 
 That last one is worth reading as a worked example rather than a
 number. The SWAR popcount was rejected on a bound that was not a bound
@@ -1761,6 +1762,83 @@ is mostly decided by it.
 Measured, so nobody has to re-derive it: of the three tests at the
 final shift, the shift-width test costs 5 sites, the branch-target test
 0, and the liveness proof 1,717.
+
+## 25. An address computed for one indexed load -- 118,569  [implemented]
+
+Not sized from a probe either. It came from the Zilx ratification plan:
+the extension that gives RV64 the addressing mode it has never had, and
+the one this project has been circling since the first corpus run
+without naming it. The base ISA has exactly one addressing mode,
+`imm12(base)`, which is why `a[i]` costs a shift, an add and a load
+where AArch64 writes `ldr x0,[x1,x2,lsl #3]`, and why
+RISCVMergeBaseOffset and RISCVFoldMemOffset exist at all.
+
+Encodings from LLVM's RISCVInstrInfoZilx.td rather than the plan's
+prose, for the reason the `fli` check gives: the assembler is what has
+to accept the suggestion. They reuse the AMO major opcode with funct5
+values that were reserved -- `0b10010` unscaled, `0b11010` scaled,
+`0b11110` scaled with a zero-extended 32-bit index -- and put the index
+in rs1 with the base in rs2, the reverse of a normal load. Worth noting
+for the census: capstone does not decode them, so a binary that
+actually contained Zilx would have those words read as atomics.
+
+### What the check reports -- 118,569, and half of it free
+
+| object | sites |
+|---|---:|
+| libxul | 62,620 |
+| debian-libllvm22 | 51,494 |
+| Go (12 objects, `-m zilx`) | 3,528 |
+| ripgrep | 927 |
+
+**Half saves no space.** In libxul 31,114 of the 62,620 are a
+compressed `c.add` and a compressed load folding to a four-byte `lxd`
+-- four bytes for four. The finding prints `(4 -> 4 bytes)` so a reader
+can tell, and the rewrite still removes an instruction and an address
+dependency; 23,882 save two bytes and 7,624 save four, for 78,260 in
+all. This is the branch-over-jump situation again, where the byte
+column understates what the fold does and is the honest number anyway.
+
+ripgrep's 927 against libxul's 62,620 is not a compiler difference. It
+declares Zba, so its `slli`+`add` pairs are already single `sh*add`
+instructions and the `add`+load shape mostly does not arise.
+
+### The scaled shape, sized and not written -- 30,297
+
+`slli rt,ri,3` + `add rd,rb,rt` + `ld rt2,0(rd)` is what one `lxsd`
+would do, and it is three instructions with an intervening register
+rather than two adjacent ones -- a different match, and not written.
+Sized with the shift required to agree with the access width: 12,984 in
+libxul, 17,313 in debian-libllvm22, 1,796 in go compile, and **0** in
+ripgrep for the reason above.
+
+The shift/width mismatches are worth keeping separately, because they
+are not candidates: 2,468 in libxul and 13,561 in debian-libllvm22
+shift by an amount the load's width does not match, which is a
+`slli`+`add` that is not an array index at all. Reading the triple
+without that condition would overstate the population by 78% on
+libLLVM.
+
+### The gate, and the one place the standing rule does not hold
+
+`-m zilx` is the only extension name here that no profile turns on:
+Zilx is in none of RVA20, RVA22, RVA23 or RVB23 as of LLVM's
+RISCVProfiles.td. So unlike Zcb, Zfa or the bit count there is no "what
+would rebuilding for RVA23 buy me" reading -- it asserts a specific
+target, which is armlint's `-m cssc` position.
+
+It is also the only check that requires its extension to be
+**positively present** rather than merely un-denied, and that is a
+deliberate departure. The standing rule, written down when the Zba
+checks were first gated, is that an object declaring no attributes
+leaves a check unrestricted, because Go emits no `.riscv.attributes`
+and treating "absent" as "no" would silence a check on the code it
+exists for. That rule assumes the extension is one some target
+plausibly has. Zilx is in no profile and no shipping core, so the
+permissive reading put 3,528 findings on the Go objects suggesting an
+instruction nobody can execute -- which is advice, not a finding. The
+check fires on a declared `_zilx` or on `-m zilx`, and otherwise not at
+all, so nothing from it reaches the generated table.
 
 ### 16 and 20. A computation a live register already holds -- 29,595 of 39,274  [implemented]
 

@@ -235,6 +235,7 @@ typedef enum {
     RISCVLINT_EXT_ZCB = 1u << 3,
     RISCVLINT_EXT_C   = 1u << 4,
     RISCVLINT_EXT_ZFA = 1u << 5,
+    RISCVLINT_EXT_ZILX = 1u << 6,
     RISCVLINT_EXT_DECLARED = 1u << 31,
 } riscvlint_ext;
 
@@ -820,6 +821,45 @@ bool check_c_compressible(riscvlint_state *state, const cs_insn *insn,
 
 bool check_dead_def(riscvlint_state *state, const cs_insn *insn,
                     riscvlint_finding *finding);
+
+// ---- an address computed for one indexed load ----
+
+// `add rd,rb,ri` + `lw rt,0(rd)`, which Zilx's indexed loads do in one
+// instruction: `lxw rt,(rb),ri`.
+//
+// Zilx (Indexed Integer Load) is the extension that gives RV64 the
+// addressing mode it has never had. The base ISA has exactly one --
+// `imm12(base)` -- which is why `a[i]` costs a shift, an add and a
+// load where AArch64 writes `ldr x0,[x1,x2,lsl #3]`, and why
+// RISCVMergeBaseOffset and RISCVFoldMemOffset exist at all. Zilx adds
+// base+index and base+(index<<log2(size)) forms, reusing the AMO major
+// opcode with funct5 values that were reserved: 0b10010 unscaled,
+// 0b11010 scaled, 0b11110 scaled with a zero-extended 32-bit index.
+// Taken from LLVM's RISCVInstrInfoZilx.td rather than from the
+// ratification plan's prose, for the reason the `fli` check gives --
+// the assembler is what has to accept the suggestion.
+//
+// This reports the unscaled shape only: two adjacent instructions, an
+// `add` of two registers feeding a zero-offset integer load of the
+// register it wrote. The scaled shape is `slli` + `add` + load and is
+// three instructions with an intervening register, which is a
+// different match; it is sized in TODO.md and not written.
+//
+// Loads only, and integer loads only. Zilx has no indexed store and no
+// indexed floating-point load, so a store or an `flw` through a
+// computed base is not a finding however much it looks like one.
+//
+// Byte loads have no unscaled encoding, but the scaled byte form's
+// scale factor is 1, so `lb`/`lbu` fold to `lxsb`/`lxsbu` and the
+// address arithmetic is identical.
+//
+// Gated on `-m zilx`, which no profile turns on: Zilx is in none of
+// RVA20, RVA22, RVA23 or RVB23 as of LLVM's RISCVProfiles.td, so unlike
+// Zcb or Zfa there is no "what would rebuilding for RVA23 buy me"
+// reading. It asserts a specific target, which is armlint's `-m cssc`
+// position.
+bool check_indexed_load(riscvlint_state *state, const cs_insn *insn,
+                        riscvlint_finding *finding);
 
 // ---- a bit count spelled out longhand ----
 

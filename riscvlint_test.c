@@ -2850,6 +2850,95 @@ static void test_cchain(csh handle)
     CHECK(!riscvlint_cchain_lookup(NULL, 0, NULL, NULL, NULL, NULL));
 }
 
+// An address computed for one indexed load, which Zilx does in one
+// instruction. The encodings are clang's for rv64gc.
+static void test_indexed_load(csh handle)
+{
+    riscvlint_finding f;
+    const unsigned zilx = RISCVLINT_EXT_DECLARED | RISCVLINT_EXT_ZILX;
+
+    // The commonest shape: the load overwrites the address register, so
+    // the computed address dies by construction and no walk is needed.
+    static const uint8_t self[] = {
+        0x33, 0x85, 0xc5, 0x00,     // add a0,a1,a2
+        0x08, 0x61,                 // c.ld a0,0(a0)
+        0x82, 0x80,                 // c.ret
+    };
+    CHECK(run_window_exts(handle, check_indexed_load, self, sizeof self,
+                          0x1000, zilx, &f) == 1);
+    CHECK(f.address == 0x1000 && f.insn_count == 2);
+    CHECK(strstr(f.replacement, "lxd a0, (a1), a2") != NULL);
+    CHECK(strstr(f.replacement, "(6 -> 4 bytes)") != NULL);
+
+    // A byte load, which Zilx spells with the scaled form because its
+    // scale factor is 1. The address register is written again after,
+    // so the walk proves it dead.
+    static const uint8_t bytes[] = {
+        0xb3, 0x86, 0xc5, 0x00,     // add a3,a1,a2
+        0x03, 0xc7, 0x06, 0x00,     // lbu a4,0(a3)
+        0x81, 0x46,                 // c.li a3,0
+        0x82, 0x80,                 // c.ret
+    };
+    CHECK(run_window_exts(handle, check_indexed_load, bytes, sizeof bytes,
+                          0x1000, zilx, &f) == 1);
+    CHECK(strstr(f.replacement, "lxsbu a4, (a1), a2") != NULL);
+
+    // The gate, which is this check's own: Zilx has to be positively
+    // present. An object declaring an arch without it is silent, and so
+    // is one declaring nothing at all -- where every other gated check
+    // would fire, since Zilx is in no profile and no shipping core and
+    // the permissive reading would suggest an instruction nobody can
+    // execute.
+    CHECK(run_window_exts(handle, check_indexed_load, self, sizeof self,
+                          0x1000, RISCVLINT_EXT_DECLARED, NULL) == 0);
+    CHECK(run_window_exts(handle, check_indexed_load, self, sizeof self,
+                          0x1000, 0, NULL) == 0);
+    unsigned m;
+    CHECK(riscvlint_parse_ext_name("zilx", &m) && m == RISCVLINT_EXT_ZILX);
+    CHECK(!(riscvlint_parse_ext_name("rva23", &m) &&
+            (m & RISCVLINT_EXT_ZILX)));
+
+    // Zilx has no indexed store, so a store through the computed base
+    // is not a finding however much it looks like one.
+    static const uint8_t store[] = {
+        0xb3, 0x86, 0xc5, 0x00,     // add a3,a1,a2
+        0x98, 0xe2,                 // c.sd a4,0(a3)
+        0x82, 0x80,                 // c.ret
+    };
+    CHECK(run_window_exts(handle, check_indexed_load, store, sizeof store,
+                          0x1000, zilx, NULL) == 0);
+
+    // Nor an indexed floating-point load.
+    static const uint8_t fp[] = {
+        0xb3, 0x86, 0xc5, 0x00,     // add a3,a1,a2
+        0x88, 0x22,                 // c.fld fa0,0(a3)
+        0x82, 0x80,                 // c.ret
+    };
+    CHECK(run_window_exts(handle, check_indexed_load, fp, sizeof fp,
+                          0x1000, zilx, NULL) == 0);
+
+    // A non-zero offset needs the base+index form *and* a displacement,
+    // which Zilx does not have.
+    static const uint8_t off[] = {
+        0xb3, 0x86, 0xc5, 0x00,     // add a3,a1,a2
+        0x98, 0x66,                 // c.ld a4,8(a3)
+        0x82, 0x80,                 // c.ret
+    };
+    CHECK(run_window_exts(handle, check_indexed_load, off, sizeof off,
+                          0x1000, zilx, NULL) == 0);
+
+    // And the address register read again afterwards: the fold stops
+    // writing it, so the walk has to prove it dead and here it is not.
+    static const uint8_t live[] = {
+        0xb3, 0x86, 0xc5, 0x00,     // add a3,a1,a2
+        0x98, 0x62,                 // c.ld a4,0(a3)
+        0xb6, 0x87,                 // c.mv a5,a3
+        0x82, 0x80,                 // c.ret
+    };
+    CHECK(run_window_exts(handle, check_indexed_load, live, sizeof live,
+                          0x1000, zilx, NULL) == 0);
+}
+
 // A bit count spelled out longhand. The buffer is clang's own output
 // for a 32-bit SWAR popcount of a0 into a5 -- masks hoisted, stages
 // computed in place, the final shift an `srliw` -- with `li a0,0` after
@@ -3316,6 +3405,7 @@ int main(void)
     test_bitcast_through_frame(handle);
     test_cchain(handle);
     test_swar_popcount(handle);
+    test_indexed_load(handle);
     test_sweep();
     test_fli_table();
     test_fp_pool_to_fli(handle);

@@ -3,8 +3,8 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Twenty-three checks are implemented and the ledger's candidate list is
-empty again. [TODO.md](TODO.md) is that ledger: every candidate that was
+Twenty-four checks are implemented and the ledger's candidate list is
+empty. [TODO.md](TODO.md) is that ledger: every candidate that was
 measured, the population it came back with, and the ones rejected on
 that evidence.
 What got written was decided by the corpus rather than by intuition,
@@ -12,10 +12,12 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Twenty-three of them, and the table lists twenty-two: the bit-count
-check reports nothing under any object's own declaration, for the
-reason its entry below gives. Every figure is what the check itself
-reports
+Twenty-four of them, and the table lists twenty-two. Two report nothing
+under any object's own declaration -- the bit count because no baseline
+object declares Zbb, and the indexed load because it is the one check
+that requires its extension to be positively present rather than merely
+un-denied. Both entries below say why. Every figure is what the check
+itself reports
 over the [corpus](#corpus) -- 108,165,211 instructions of three
 toolchains across 31 objects -- rather than what a mining tool
 estimated for it. The two have differed by an order of magnitude every
@@ -631,6 +633,61 @@ except a handful of `jalr ra,0(ra)` that were already two.
   C and Go conventions, and riscvlint cannot tell which it is looking at,
   so both answer "unknown" rather than guessing.
 
+* **address computed for one indexed load** -- `add rd,rb,ri` +
+  `lw rt,0(rd)`, which Zilx's indexed loads do in one instruction:
+  `lxw rt,(rb),ri`.
+
+  Zilx (Indexed Integer Load) is the extension that gives RV64 the
+  addressing mode it has never had. The base ISA has exactly one --
+  `imm12(base)` -- which is why `a[i]` costs a shift, an add and a load
+  where AArch64 writes `ldr x0,[x1,x2,lsl #3]`, and why
+  `RISCVMergeBaseOffset` and `RISCVFoldMemOffset` exist at all. The
+  encodings are taken from LLVM's `RISCVInstrInfoZilx.td` rather than
+  from the [ratification plan][zilx]'s prose, for the reason the `fli`
+  check gives: the assembler is what has to accept the suggestion. They
+  reuse the AMO major opcode with funct5 values that were reserved --
+  `0b10010` unscaled, `0b11010` scaled, `0b11110` scaled with a
+  zero-extended 32-bit index -- and put the index in rs1 with the base
+  in rs2, the reverse of a normal load.
+
+  [zilx]: https://riscv.atlassian.net/wiki/spaces/USXX/pages/2057142278/RISC-V+Indexed+Integer+Load+Zilx+Ratification+Plan
+
+  Population: 62,620 in libxul, 51,494 in `debian-libllvm22`, 3,528
+  across Go and 927 in ripgrep. **Half of it saves no space**: in libxul
+  31,114 of the 62,620 are a compressed `c.add` and a compressed load
+  folding to a four-byte `lxd`, four bytes for four. Those still remove
+  an instruction and an address dependency, and the finding says
+  `(4 -> 4 bytes)` so a reader can tell; 23,882 save two bytes and
+  7,624 save four.
+
+  `-m zilx` is the only extension name here that no profile turns on --
+  Zilx is in none of RVA20, RVA22, RVA23 or RVB23 as of LLVM's
+  `RISCVProfiles.td` -- and this is the only check that requires its
+  extension to be **positively present** rather than merely un-denied.
+  Every other gated check fires on an object that declares no
+  attributes, because treating "absent" as "no" would silence a check on
+  the very code it exists for. That rule assumes the extension is one
+  some target plausibly has. Zilx is in no profile and no shipping core,
+  so the permissive reading would have put 3,528 findings on the Go
+  objects suggesting an instruction nobody can execute. It fires when an
+  object declares `_zilx` or when `-m zilx` asks the what-if, and
+  otherwise not at all -- which is why all four figures above are
+  `-m zilx` figures and none appears in the table.
+
+  Loads only, and integer loads only: Zilx has no indexed store and no
+  indexed floating-point load, so a store or an `fld` through a computed
+  base is not a finding however much it looks like one. Byte loads have
+  no unscaled encoding, but the scaled byte form's scale factor is 1, so
+  `lb`/`lbu` fold to `lxsb`/`lxsbu` with identical arithmetic.
+
+  What is not reported is the *scaled* shape -- `slli rt,ri,3` +
+  `add rd,rb,rt` + `ld`, which one `lxsd` would do. Three instructions
+  with an intervening register is a different match from two adjacent
+  ones, and it is sized rather than written: 12,984 in libxul and 17,313
+  in `debian-libllvm22`. It is also the shape Zba already half-solves,
+  which is why ripgrep has **0** of it -- on a target with Zba the pair
+  is already one `sh3add`.
+
 * **a bit count spelled out longhand** -- twelve instructions and four
   mask constants that compute a population count, which Zbb's `cpop`
   does in one. RV64GC has no bit-counting instruction, so `llvm.ctpop`
@@ -736,7 +793,9 @@ except a handful of `jalr ra,0(ra)` that were already two.
 
 `-m <name>` pins the extensions the checks may assume, and may be
 repeated. Names are either extensions (`zba`, `zbb`, `zbs`, `zcb`,
-`zfa`, `c`) or profiles that bundle them (`rva20`, `rva22`, `rva23`).
+`zfa`, `zilx`, `c`) or profiles that bundle them (`rva20`, `rva22`,
+`rva23`). `zilx` is the one no profile contains, so it only ever
+arrives by being named.
 
 `-m` replaces what the object declares, in both directions, because both
 are useful and neither is expressible if the flag merely adds to the

@@ -1112,7 +1112,8 @@ int main(int argc, char **argv)
 {
     static const char usage[] =
         "usage: %s [-v] [-i] [-c] [--json] "
-        "[-m zba|zbb|zbs|zcb|zfa|c|rva20|rva22|rva23]... <binary>...\n";
+        "[-m zba|zbb|zbs|zcb|zfa|zilx|c|rva20|rva22|rva23]... "
+        "<binary>...\n";
     int argi = 1;
     while (argi < argc && argv[argi][0] == '-' && argv[argi][1]) {
         if (strcmp(argv[argi], "-v") == 0) {
