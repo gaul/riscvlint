@@ -32,8 +32,11 @@ lib: libriscvlint.a
 riscvlint: riscvlint.o main.o
 	$(CC) $(CFLAGS) riscvlint.o main.o $(CAPSTONE_LIBS) -o riscvlint
 
+# -lpthread for the exhaustive decoder sweep, which divides the
+# encoding space across workers; see RISCVLINT_SWEEP in README.md.
 test: riscvlint.o riscvlint_test.o
-	$(CC) $(CFLAGS) riscvlint.o riscvlint_test.o $(CAPSTONE_LIBS) -o riscvlint_test
+	$(CC) $(CFLAGS) riscvlint.o riscvlint_test.o $(CAPSTONE_LIBS) -lpthread \
+		-o riscvlint_test
 	./riscvlint_test
 
 # Snapshot-based integration suite under fixtures/. Each .s is assembled
@@ -67,7 +70,7 @@ gopclntab-test: riscvlint
 
 # Corpus-mining research utilities (see "Mining tools" in README.md);
 # not part of the default build or test targets.
-tools: tools/pairscan tools/defuse tools/candscan
+tools: tools/pairscan tools/defuse tools/candscan tools/tblgen_probe
 
 tools/pairscan: tools/pairscan.c
 	$(CC) $(CFLAGS) $(CAPSTONE_CFLAGS) $< $(CAPSTONE_LIBS) -o $@
@@ -78,6 +81,13 @@ tools/defuse: tools/defuse.c
 tools/candscan: tools/candscan.c
 	$(CC) $(CFLAGS) $(CAPSTONE_CFLAGS) $< $(CAPSTONE_LIBS) -o $@
 
+# The compressibility audit's probe: it links riscvlint itself rather
+# than leaning on capstone's operand model, since what it enumerates is
+# riscvlint's own claims.
+tools/tblgen_probe: tools/tblgen_probe.c riscvlint.o
+	$(CC) $(CFLAGS) $(CAPSTONE_CFLAGS) $< riscvlint.o $(CAPSTONE_LIBS) \
+		-lpthread -o $@
+
 # The default goal: everything that ships, without running the suites.
 build: lib riscvlint
 
@@ -85,7 +95,8 @@ all: lib riscvlint test
 
 clean:
 	rm -f riscvlint riscvlint_test libriscvlint.a \
-		tools/pairscan tools/defuse tools/candscan *.o
+		tools/pairscan tools/defuse tools/candscan tools/tblgen_probe \
+		*.o
 
 .PHONY: all build clean lib test integration-test integration-test-regen \
 	driver-test json-test gopclntab-test tools

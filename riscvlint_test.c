@@ -5,6 +5,7 @@
 #include "riscvlint.h"
 
 #include <inttypes.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2404,6 +2405,232 @@ static void test_c_form(void)
     CHECK(!rv_c_form(0x6588u, 2, f, sizeof f));       // already two bytes
 }
 
+// ---- the exhaustive decoder sweep (RISCVLINT_SWEEP=1) ----
+//
+// riscvlint's checks decode raw encodings; capstone decodes the same
+// bytes from LLVM's tables. Where the two disagree one of them is
+// wrong, and on the properties below it is riscvlint that would be
+// wrong in a way that costs a user something -- check_dead_def deletes
+// an instruction on rv_pure_def's word, so a `pure def` that is not
+// pure is a deleted side effect.
+//
+// Unlike armlint there is no liveness classifier to sweep:
+// riscvlint_liveness reads cs_regs_access directly, with two
+// documented corrections. What is riscvlint's own, and so what this
+// checks, is the raw decoding:
+//
+//   1. rv_insn_len must agree with capstone about how long an
+//      instruction is. A skew here desynchronizes every scan.
+//   2. rv_pure_def's claim is that the instruction's only effect is
+//      writing rd. Capstone must report no *other* register written,
+//      no memory operand, and no control transfer. Capstone reporting
+//      no write at all is its own under-reporting -- counted, not
+//      failed -- because riscvlint corrects for that elsewhere.
+//   3. rv_decode_mem says an instruction accesses memory. Capstone
+//      must agree there is a memory operand.
+//
+// Off by default: the four-byte half is 2^30 decodes. The compressed
+// half is 2^16 and runs unconditionally, because it is where the
+// implicit operands are -- c.jalr writes ra, c.addi4spn reads sp --
+// and it costs milliseconds.
+
+typedef struct {
+    // 64-bit, because the exclusive end of the four-byte space is 2^32,
+    // which a uint32_t holds as 0: the last worker then gets an empty
+    // range and a sixteenth of the space goes unread while the sweep
+    // reports a pass. tools/tblgen_audit.py caught that in the sibling
+    // probe before it was noticed here.
+    uint64_t lo, hi;            // the words this worker takes
+    unsigned size;              // 2 or 4
+    uint64_t decoded;
+    uint64_t len_bad, pure_bad, mem_bad;
+    uint64_t pure_claimed, pure_nowrite;
+    uint32_t first_len, first_pure, first_mem;
+} sweep_job;
+
+// riscvlint.c's own mapping, which is static there. A capstone
+// register id that is not a general one answers 32, which no rd can be.
+static unsigned sweep_gpr(unsigned r)
+{
+    if (r >= RISCV_REG_X0 && r <= RISCV_REG_X31)
+        return (unsigned)(r - RISCV_REG_X0);
+    return 32;
+}
+
+static bool sweep_group(const cs_insn *in, unsigned g)
+{
+    if (!in->detail) return false;
+    for (uint8_t i = 0; i < in->detail->groups_count; i++)
+        if (in->detail->groups[i] == g) return true;
+    return false;
+}
+
+static bool sweep_has_mem(const cs_insn *in)
+{
+    if (!in->detail) return false;
+    const cs_riscv *rv = &in->detail->riscv;
+    for (uint8_t i = 0; i < rv->op_count; i++)
+        if (rv->operands[i].type == RISCV_OP_MEM) return true;
+    return false;
+}
+
+static void sweep_one(csh handle, cs_insn *insn, sweep_job *j, uint32_t w)
+{
+    uint8_t bytes[4];
+    memcpy(bytes, &w, 4);
+    const uint8_t *p = bytes;
+    size_t remain = j->size;
+    uint64_t addr = 0x1000;
+    if (!cs_disasm_iter(handle, &p, &remain, &addr, insn)) return;
+    j->decoded++;
+
+    // 1. The length.
+    if (rv_insn_len(w) != insn->size) {
+        if (!j->len_bad++) j->first_len = w;
+    }
+    if (insn->size != j->size) return;   // capstone read a different width
+
+    // 2. The purity claim.
+    unsigned rd;
+    if (rv_pure_def(w, j->size, &rd)) {
+        j->pure_claimed++;
+        cs_regs rr, rw;
+        uint8_t nr = 0, nw = 0;
+        bool bad = false;
+        if (cs_regs_access(handle, insn, rr, &nr, rw, &nw) == CS_ERR_OK) {
+            unsigned others = 0;
+            for (uint8_t i = 0; i < nw; i++)
+                if (sweep_gpr(rw[i]) != rd) others++;
+            if (others) bad = true;
+            if (!nw) j->pure_nowrite++;
+        }
+        // A pure definition cannot transfer control or touch memory.
+        if (sweep_group(insn, RISCV_GRP_JUMP) ||
+            sweep_group(insn, RISCV_GRP_CALL) ||
+            sweep_group(insn, RISCV_GRP_RET) ||
+            sweep_group(insn, RISCV_GRP_BRANCH_RELATIVE) ||
+            sweep_has_mem(insn))
+            bad = true;
+        if (bad && !j->pure_bad++) j->first_pure = w;
+    }
+
+    // 3. The memory claim.
+    rv_mem_kind kind;
+    unsigned data, base;
+    int64_t off;
+    if (rv_decode_mem(w, j->size, &kind, &data, &base, &off) &&
+        kind != RV_MEM_NONE && !sweep_has_mem(insn)) {
+        if (!j->mem_bad++) j->first_mem = w;
+    }
+}
+
+static void sweep_run(sweep_job *j)
+{
+    csh handle;
+    if (cs_open(CS_ARCH_RISCV, RISCVLINT_CS_MODE, &handle) != CS_ERR_OK)
+        return;
+    cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
+    cs_insn *insn = cs_malloc(handle);
+    if (insn) {
+        for (uint64_t w = j->lo; w < j->hi; w++) {
+            // The low two bits say the length: both set is four bytes.
+            if (j->size == 4 && (w & 3u) != 3u) continue;
+            if (j->size == 2 && (w & 3u) == 3u) continue;
+            sweep_one(handle, insn, j, (uint32_t)w);
+        }
+        cs_free(insn, 1);
+    }
+    cs_close(&handle);
+}
+
+static void *sweep_thread(void *arg)
+{
+    sweep_run(arg);
+    return NULL;
+}
+
+static void sweep_report(const char *what, sweep_job *jobs, unsigned n)
+{
+    sweep_job t;
+    memset(&t, 0, sizeof t);
+    for (unsigned i = 0; i < n; i++) {
+        t.decoded += jobs[i].decoded;
+        t.pure_claimed += jobs[i].pure_claimed;
+        t.pure_nowrite += jobs[i].pure_nowrite;
+        if (jobs[i].len_bad && !t.len_bad) t.first_len = jobs[i].first_len;
+        if (jobs[i].pure_bad && !t.pure_bad) t.first_pure = jobs[i].first_pure;
+        if (jobs[i].mem_bad && !t.mem_bad) t.first_mem = jobs[i].first_mem;
+        t.len_bad += jobs[i].len_bad;
+        t.pure_bad += jobs[i].pure_bad;
+        t.mem_bad += jobs[i].mem_bad;
+    }
+    printf("sweep %s: %" PRIu64 " decoded, %" PRIu64 " pure defs"
+           " (%" PRIu64 " with no capstone write)\n", what, t.decoded,
+           t.pure_claimed, t.pure_nowrite);
+    if (t.len_bad)
+        printf("  FAIL %" PRIu64 " length disagreements, first 0x%08x\n",
+               t.len_bad, t.first_len);
+    if (t.pure_bad)
+        printf("  FAIL %" PRIu64 " impure 'pure defs', first 0x%08x\n",
+               t.pure_bad, t.first_pure);
+    if (t.mem_bad)
+        printf("  FAIL %" PRIu64 " memory claims capstone denies,"
+               " first 0x%08x\n", t.mem_bad, t.first_mem);
+    CHECK(t.len_bad == 0);
+    CHECK(t.pure_bad == 0);
+    CHECK(t.mem_bad == 0);
+}
+
+static void sweep_space(const char *what, unsigned size, uint64_t end,
+                        unsigned nthreads)
+{
+    if (nthreads < 1) nthreads = 1;
+    if (nthreads > 64) nthreads = 64;
+    sweep_job *jobs = calloc(nthreads, sizeof *jobs);
+    pthread_t *tids = calloc(nthreads, sizeof *tids);
+    if (!jobs || !tids) { free(jobs); free(tids); CHECK(false); return; }
+    uint64_t span = end / nthreads;
+    for (unsigned i = 0; i < nthreads; i++) {
+        jobs[i].size = size;
+        jobs[i].lo = i * span;
+        jobs[i].hi = i + 1 == nthreads ? end : (i + 1) * span;
+    }
+    unsigned started = 0;
+    for (unsigned i = 0; i < nthreads; i++)
+        if (pthread_create(&tids[i], NULL, sweep_thread, &jobs[i]) == 0)
+            started++;
+        else
+            break;
+    // A thread that would not start is run here rather than skipped,
+    // so a sweep never reports a clean pass over a range it never read.
+    for (unsigned i = started; i < nthreads; i++) sweep_run(&jobs[i]);
+    for (unsigned i = 0; i < started; i++) pthread_join(tids[i], NULL);
+    sweep_report(what, jobs, nthreads);
+    free(jobs);
+    free(tids);
+}
+
+static void test_sweep(void)
+{
+    // The compressed space always: 2^16 words, and the quadrant with
+    // the implicit sp and ra operands is exactly where a hand decode
+    // goes wrong.
+    sweep_space("compressed (2^16)", 2, 0x10000, 1);
+
+    const char *on = getenv("RISCVLINT_SWEEP");
+    if (!on || !*on || !strcmp(on, "0")) {
+        printf("sweep four-byte: skipped (set RISCVLINT_SWEEP=1)\n");
+        return;
+    }
+    unsigned nthreads = 1;
+    const char *t = getenv("RISCVLINT_SWEEP_THREADS");
+    if (t) {
+        long v = strtol(t, NULL, 10);
+        if (v > 0) nthreads = (unsigned)v;
+    }
+    sweep_space("four-byte (2^32)", 4, 0x100000000ull, nthreads);
+}
+
 // Constant chains. The encodings are clang's for rv64gc; the buffer
 // holds one four-byte chain, one compressed three-step chain, two
 // single-instruction materializations, and the four-byte chain again
@@ -2929,6 +3156,7 @@ int main(void)
     test_zero_store_run(handle);
     test_bitcast_through_frame(handle);
     test_cchain(handle);
+    test_sweep();
     test_fli_table();
     test_fp_pool_to_fli(handle);
     test_census(handle);

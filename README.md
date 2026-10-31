@@ -1152,10 +1152,100 @@ time and reports subtly wrong output rather than failing.
 fixtures under `fixtures/`, `make driver-test` the driver's exit
 statuses and verbosity default, `make json-test` the `--json` document,
 `make gopclntab-test` the Go function-table parser, and `make tools`
-the mining utilities. Every shell suite exits 2 rather
-than 0 when it cannot find a clang that targets riscv64 -- and, for the
-linked fixtures, an lld that can link it -- so a missing toolchain
-cannot pass by testing nothing.
+the mining utilities. Every shell suite exits 2 rather than 0 when it
+cannot find a clang that targets riscv64 -- and, for the linked
+fixtures, an lld that can link it -- so a missing toolchain cannot pass
+by testing nothing.
+
+### The exhaustive decoder sweep
+
+riscvlint's checks decode raw encodings; capstone decodes the same
+bytes from LLVM's tables. Where the two disagree one of them is wrong,
+and on the properties below it is riscvlint that would be wrong in a
+way that costs a user something -- `check_dead_def` deletes an
+instruction on `rv_pure_def`'s word, so a "pure def" that is not pure
+is a deleted side effect.
+
+Unlike armlint there is no liveness classifier to sweep:
+`riscvlint_liveness` reads `cs_regs_access` directly, with two
+documented corrections. What is riscvlint's own is the raw decoding,
+and the sweep checks three claims against capstone over every encoding
+there is:
+
+* `rv_insn_len` must agree about how long an instruction is. A skew
+  here desynchronizes every scan.
+* `rv_pure_def` claims the instruction's only effect is writing rd.
+  Capstone must report no *other* register written, no memory operand,
+  and no control transfer. Capstone reporting no write at all is its
+  own under-reporting, counted rather than failed, because riscvlint
+  corrects for that elsewhere.
+* `rv_decode_mem` says an instruction touches memory. Capstone must
+  agree there is a memory operand.
+
+The compressed half runs in every `make test`: 2^16 words, milliseconds,
+and it is where the implicit operands are -- `c.jalr` writes ra,
+`c.addi4spn` reads sp -- which is where a hand decode goes wrong. The
+four-byte half is opt-in, since it is 2^30 decodes:
+
+```sh
+RISCVLINT_SWEEP=1 RISCVLINT_SWEEP_THREADS="$(nproc)" make test
+```
+
+384,410,780 four-byte encodings decode, 96,507,712 of them claimed as
+pure definitions, and all three properties hold on every one. 24
+seconds of wall time across 16 workers. That is the argument for
+`rv_pure_def` being written as a rule over whole opcode spaces rather
+than a list of mnemonics: the rule is checkable, and checked.
+
+### The compressibility audit
+
+`check_c_compressible` and `check_zcb_compressible` are between them
+59% of the corpus's findings, and both rest on one judgement: would the
+assembler have spelled this four-byte instruction in two? riscvlint
+answers from a hand decode. LLVM answers from its `CompressPat`
+records, which is what its assembler actually applies -- so those are
+the oracle, and `tools/tblgen_audit.py` diffs the two:
+
+```sh
+make tools && tools/tblgen_audit.py --llvm ~/work/llvm-project
+```
+
+```
+LLVM CompressPat records: 147, naming 57 compressed forms
+riscvlint names 48 forms over the whole four-byte space
+
+rules riscvlint declines on purpose:
+  c.nop          riscvlint does not report `nop` at all; see TODO.md
+  c.sspopchk     Zicfiss, which RISCVLINT_CS_MODE does not enable
+  c.sspush       Zicfiss, which RISCVLINT_CS_MODE does not enable
+  c.unimp        a trap, with no cheaper spelling to suggest
+
+rv32-only rules, not a gap for an rv64 tool: c.flw c.flwsp c.fsw c.fswsp c.jal
+
+Every rule LLVM has for rv64, riscvlint models; every form riscvlint names, LLVM has a rule for.
+```
+
+48 modelled, 5 rv32-only, 4 declined: the accounting is exact, and a
+rule that stops being declined has to be fixed or moved rather than
+quietly dropped. The two directions fail differently -- a form LLVM can
+produce that riscvlint never names is a finding quietly missing, which
+no corpus run reveals because the shape simply never reports; a form
+riscvlint names that LLVM has no rule for is advice that will not
+assemble, which is worse.
+
+riscvlint's side is enumerated by `tools/tblgen_probe`, which asks
+`rv_c_form` and `rv_zcb_form` about all 2^30 four-byte words in two
+seconds. Reading the source would not do: the claims live in C control
+flow, not in a table.
+
+It earned its keep on the first run. `c.not` came back as a form
+riscvlint never names -- while TODO.md records `c.not` as most of the
+Zcb residue it actually reports on the corpus. The decoder was right
+and the probe was wrong: the exclusive end of the four-byte space is
+2^32, a `uint32_t` holds that as 0, and the last worker's range was
+therefore empty. A sixteenth of the space went unread while both the
+probe and the sweep reported a clean pass, and `c.not`'s encodings all
+live at 0xfff4_4413 and up.
 
 ## Mining tools
 
@@ -1218,6 +1308,15 @@ the categories built around them have flagless replacements.
   Probes that measured zero stay in the tool. A candidate rejected on
   evidence is worth as much as one accepted, and leaving the probe there
   is what stops the shape being re-derived from intuition later.
+
+* `tools/tblgen_probe` and `tools/tblgen_audit.py` are the
+  compressibility audit, documented under
+  [Building](#the-compressibility-audit): the probe enumerates every
+  compressed form riscvlint's decoders will name, and the script diffs
+  that against LLVM's `CompressPat` records. They are the only tools
+  here that check riscvlint against an oracle rather than measure a
+  corpus, and the only ones whose failure is a defect rather than a
+  number.
 
 * `tools/rank.py` groups `pairscan` output into candidate-check families
   and prints each family's population, because raw frequency ranking
