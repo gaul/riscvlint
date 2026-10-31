@@ -2850,6 +2850,90 @@ static void test_cchain(csh handle)
     CHECK(!riscvlint_cchain_lookup(NULL, 0, NULL, NULL, NULL, NULL));
 }
 
+// A bit count spelled out longhand. The buffer is clang's own output
+// for a 32-bit SWAR popcount of a0 into a5 -- masks hoisted, stages
+// computed in place, the final shift an `srliw` -- with `li a0,0` after
+// it so the source register is provably dead and the rewrite is
+// equivalent.
+static void test_swar_popcount(csh handle)
+{
+    riscvlint_finding f;
+    static const uint8_t pc32[] = {
+        0xb7, 0x55, 0x55, 0x55,     // lui a1,0x55555
+        0x93, 0x85, 0x55, 0x55,     // addi a1,a1,1365   -> 0x55555555
+        0x37, 0x36, 0x33, 0x33,     // lui a2,0x33333
+        0x13, 0x06, 0x36, 0x33,     // addi a2,a2,819    -> 0x33333333
+        0xb7, 0x16, 0x0f, 0x0f,     // lui a3,0xf0f1
+        0x93, 0x86, 0xf6, 0xf0,     // addi a3,a3,-241   -> 0x0f0f0f0f
+        0x37, 0x07, 0x01, 0x01,     // lui a4,0x1010
+        0x13, 0x07, 0x17, 0x10,     // addi a4,a4,257    -> 0x01010101
+        0x13, 0x58, 0x15, 0x00,     // srli a6,a0,0x1
+        0x33, 0x78, 0xb8, 0x00,     // and a6,a6,a1
+        0x33, 0x05, 0x05, 0x41,     // sub a0,a0,a6      stage 1, in place
+        0x33, 0x78, 0xc5, 0x00,     // and a6,a0,a2
+        0x09, 0x81,                 // c.srli a0,a0,0x2
+        0x71, 0x8d,                 // c.and a0,a0,a2
+        0x42, 0x95,                 // c.add a0,a0,a6    stage 2
+        0x13, 0x58, 0x45, 0x00,     // srli a6,a0,0x4
+        0x42, 0x95,                 // c.add a0,a0,a6
+        0x75, 0x8d,                 // c.and a0,a0,a3    stage 3
+        0x33, 0x05, 0xe5, 0x02,     // mul a0,a0,a4
+        0x9b, 0x57, 0x85, 0x01,     // srliw a5,a0,0x18  the finding
+        0x01, 0x45,                 // c.li a0,0         a0 dies here
+        0x82, 0x80,                 // c.ret
+    };
+    CHECK(run_window_exts(handle, check_swar_popcount, pc32, sizeof pc32,
+                          0x1000, RISCVLINT_EXT_DECLARED |
+                          RISCVLINT_EXT_ZBB, &f) == 1);
+    // Reported at the opening shift, not the closing one: that is where
+    // the sequence a reader has to look at begins.
+    CHECK(f.address == 0x1020);
+    CHECK(strstr(f.replacement, "cpopw a5, a0") != NULL);
+    // Twelve instructions, five of them two bytes: 38 bytes for what
+    // `cpopw` does in four. The mask materializations are not counted,
+    // and neither is stage one counted twice where the two halves of
+    // the middle stage both descend from it.
+    CHECK(strstr(f.replacement, "(12 instructions, 38 -> 4 bytes") != NULL);
+
+    // The gate. An object declaring an arch without Zbb says the
+    // instruction is unavailable.
+    CHECK(run_window_exts(handle, check_swar_popcount, pc32, sizeof pc32,
+                          0x1000, RISCVLINT_EXT_DECLARED, NULL) == 0);
+
+    // The source register has to be dead, because the sequence computed
+    // in place and `cpopw a5,a0` would leave a0 holding what it held.
+    // Replacing the `li a0,0` with a use of a0 takes the finding away;
+    // on the corpus this is what 74% of the sequences fail.
+    static uint8_t live[sizeof pc32];
+    memcpy(live, pc32, sizeof pc32);
+    live[sizeof pc32 - 4] = 0x2a;   // c.mv a4,a0 in place of c.li a0,0
+    live[sizeof pc32 - 3] = 0x87;
+    CHECK(run_window_exts(handle, check_swar_popcount, live, sizeof live,
+                          0x1000, RISCVLINT_EXT_DECLARED |
+                          RISCVLINT_EXT_ZBB, NULL) == 0);
+
+    // A wrong final shift is a different computation: the 32-bit form
+    // ends at 24 and nothing else matches.
+    static uint8_t shift[sizeof pc32];
+    memcpy(shift, pc32, sizeof pc32);
+    shift[sizeof pc32 - 6] = 0x55;  // srliw a5,a0,0x10
+    CHECK(run_window_exts(handle, check_swar_popcount, shift, sizeof shift,
+                          0x1000, RISCVLINT_EXT_DECLARED |
+                          RISCVLINT_EXT_ZBB, NULL) == 0);
+
+    // And a wrong mask: 0x55555554 is not 0x55555555, so the sequence
+    // computes something else and nothing is reported.
+    static uint8_t mask[sizeof pc32];
+    memcpy(mask, pc32, sizeof pc32);
+    mask[4] = 0x13;                 // addi a1,a1,1364
+    mask[5] = 0x85;
+    mask[6] = 0x45;
+    mask[7] = 0x55;
+    CHECK(run_window_exts(handle, check_swar_popcount, mask, sizeof mask,
+                          0x1000, RISCVLINT_EXT_DECLARED |
+                          RISCVLINT_EXT_ZBB, NULL) == 0);
+}
+
 // Zfa's fli table, against LLVM's RISCVLoadFPImm::getLoadFPImm. The
 // entry numbers are the ones LLVM's own table yields, so a wrong
 // transcription shows up here rather than as a suggestion the assembler
@@ -3231,6 +3315,7 @@ int main(void)
     test_zero_store_run(handle);
     test_bitcast_through_frame(handle);
     test_cchain(handle);
+    test_swar_popcount(handle);
     test_sweep();
     test_fli_table();
     test_fp_pool_to_fli(handle);

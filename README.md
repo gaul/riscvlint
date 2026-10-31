@@ -3,8 +3,8 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Twenty-two checks are implemented and the ledger's candidate list has
-one entry on it. [TODO.md](TODO.md) is that ledger: every candidate that was
+Twenty-three checks are implemented and the ledger's candidate list is
+empty again. [TODO.md](TODO.md) is that ledger: every candidate that was
 measured, the population it came back with, and the ones rejected on
 that evidence.
 What got written was decided by the corpus rather than by intuition,
@@ -12,7 +12,10 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Twenty-two of them. Every figure below is what the check itself reports
+Twenty-three of them, and the table lists twenty-two: the bit-count
+check reports nothing under any object's own declaration, for the
+reason its entry below gives. Every figure is what the check itself
+reports
 over the [corpus](#corpus) -- 108,165,211 instructions of three
 toolchains across 31 objects -- rather than what a mining tool
 estimated for it. The two have differed by an order of magnitude every
@@ -627,6 +630,48 @@ except a handful of `jalr ra,0(ra)` that were already two.
   what a call may read and what a return exposes both differ between the
   C and Go conventions, and riscvlint cannot tell which it is looking at,
   so both answer "unknown" rather than guessing.
+
+* **a bit count spelled out longhand** -- twelve instructions and four
+  mask constants that compute a population count, which Zbb's `cpop`
+  does in one. RV64GC has no bit-counting instruction, so `llvm.ctpop`
+  is expanded inline into the Hacker's Delight sequence; on a target
+  with Zbb it is `cpop rd,rs`.
+
+  Population: 1,560 sites under `-m rva23` -- 933 in libxul, 595 in
+  Debian's baseline libLLVM 22.1.8, 32 across four smaller Firefox
+  objects -- and **0** under any object's own declaration, in every
+  language. The objects that declare Zbb use `cpop` already
+  (Ubuntu's build of that same libLLVM release does so 2,016 times) and
+  the baseline ones declare no Zbb for the gate to open. So this is the
+  third check whose figure is an answer to "what would rebuilding buy
+  me" rather than a compiler miss, and the only one that reports
+  nothing at all without `-m`.
+
+  It is matched as dataflow, which nothing else here is. Every other
+  check reads adjacent instructions or a table keyed by address, and
+  neither works on this: the scheduler interleaves the four mask
+  materializations with the arithmetic and reorders the independent
+  halves of the middle stage. So each register carries what it is known
+  to hold -- which stage of the expansion, and which register the
+  sequence started from -- and the finding is reported at the final
+  shift, when one register's history reaches all the way back. A
+  missing link anywhere means no finding, so the match is
+  false-negative-safe by construction rather than by a bound.
+
+  What it costs to be sound: **74%**. The sequence computes in place,
+  overwriting the very register the rewrite would name -- `sub a1,a1,a2`
+  is how stage one is spelled -- and `cpop rd,a1` leaves a1 holding
+  what it held where the sequence left it holding a partial sum. So the
+  source has to be dead, and the bounded ABI-agnostic walk proves that
+  for 595 of 2,312 sequences in libLLVM. The same walk, declining for
+  the same reason, is what made move coalescing a rejection.
+
+  Two other things it will not claim. The byte figure counts only the
+  twelve instructions matched and never the mask materializations,
+  since whether those die with the sequence needs liveness this does
+  not have. And the 32-bit and 64-bit forms are told apart by their
+  masks and their final shift together -- `srliw ...,24` against
+  `srli ...,56` -- so a sequence mixing them matches neither.
 
 * **floating-point constant `fli` would have built** --
   `auipc rd,%pcrel_hi(L)` + `fld frd,%pcrel_lo(L)(rd)` where the eight

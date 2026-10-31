@@ -1330,91 +1330,6 @@ instructions it is 0.025%: the compilers emit the atomic directly, and
 what is left is the handful of places they could not. Sized, and too
 small to write.
 
-### SWAR popcount -> Zbb `cpop` -- **reopened at ~3,900; the rejection was wrong by 147x**
-
-Rejected here on a bound, then overturned by the second baseline C++
-object, which is the whole reason that object was added. The figure was
-wrong by two orders of magnitude and the cause was a defect in one of
-this project's own tools, so the whole episode is kept rather than
-quietly replaced.
-
-**What the rejection said.** Without Zbb, `llvm.ctpop` expands to the
-Hacker's Delight sequence, whose four masks a detector would key on.
-The `-c` census counts the chains that build each, and came back with
-53, 706, **27** and 1,475 for libxul. A sequence needs all four, so --
-the argument went -- the smallest column bounds how many can be
-co-located: at most 27. libxul also had zero `cpop` while libllvm20,
-which declares Zbb, had 1,291, so the population looked like a fact
-about which binaries had been collected.
-
-**The bound was not a bound.** riscvlint's `-c` census only matches a
-chain whose steps are **contiguous**, and LLVM's scheduler interleaves
-them. Here is a real 32-bit SWAR popcount, at `debian-libllvm22`
-0x4c92640:
-
-```
-4c92640: lui  a3,0x33333
-4c92644: addi a3,a3,819        # a3 = 0x33333333, counted
-4c92648: sub  a1,a1,a2         # x -= (x>>1) & 0x5555...
-4c9264a: and  a2,a1,a3
-4c9264e: srli a1,a1,0x2
-4c92650: and  a1,a1,a3
-4c92652: lui  a3,0xf0f1        <-- this chain starts here
-4c92656: add  a1,a1,a2
-4c92658: srli a2,a1,0x4
-4c9265c: add  a1,a1,a2
-4c9265e: lui  a2,0x1010
-4c92662: addi a3,a3,-241       <-- and finishes five instructions later
-4c92666: and  a1,a1,a3         #    0x0f0f0f0f, not counted
-```
-
-So the smallest column was the most undercounted rather than the
-binding one, and using it as a bound inverted the error.
-
-**What the masks actually number.** Counted by encoding --
-`lui rd,imm20` is one word per rd, so the count needs no disassembly
-and no adjacency at all -- and, since the census was fixed, by the
-census too:
-
-| | `0x55555` | `0x33333` | `0xf0f1` | `0x1010` |
-|---|---:|---:|---:|---:|
-| libxul (baseline) | 4,007 | 3,983 | **3,972** | 6,647 |
-| debian-libllvm22 (baseline) | 3,097 | 3,113 | 3,109 | 3,158 |
-| ubuntu-libllvm22 (RVA23) | 17 | 9 | 5 | 97 |
-
-libxul's `0x0f0f0f0f` is 3,972, not 27: the census had undercounted it
-**147-fold**, and now reports 3,969. The measurement validates itself
-besides -- the first three masks have no use outside this sequence and
-they agree to within 1%, which a coincidence does not do, while the
-fourth is in excess because `0x01010101` is also the byte broadcast
-every `memchr` uses.
-
-**So libxul does count bits**, about 3,970 times, and "the one baseline
-object does not count bits" was the undercount talking rather than an
-observation. The `libllvm22` pair settles what the alternative is: the
-RVA23 build of that release uses `cpop`/`cpopw` 2,016 times and emits 5
-of these masks, the baseline build emits 3,109 of them and no `cpop` at
-all, and neither calls out to `__popcountdi2`.
-
-**Where that leaves the candidate.** Around 3,900 sites in libxul and
-3,100 in the baseline libllvm22, which would place it above ten of the
-twenty-two shipped checks. The detector it needs now exists in part --
-the `-c` census finds the masks -- but a check has to do more than find
-them: it must prove the twelve-odd instructions between them really are
-the sequence, and nothing else, before suggesting one `cpop`. That is
-a larger fold than anything shipped, where every check rewrites one
-instruction, two, or a short run.
-
-One thing the old entry got wrong in the same breath: the 64-bit masks
-are not absent, they were invisible for a second reason. RISCVMatInt
-joins a 64-bit value's halves with a register-register `add`, which the
-census did not follow until it was taught to, so
-`0x5555555555555555` surfaced as `0x5555555500000000`. It is now
-2,867 chains in libxul against 1,109 that stop at 32 bits, so most of
-this candidate is the 64-bit sequence -- a dozen instructions and four
-64-bit masks to one `cpop`, which is the expensive case and was the
-hidden one.
-
 ### Redundant mask after a zero-extending load -- 1,354
 
 `lbu` already zero-extends, so `andi rd,rd,255` after it is dead. The
@@ -1541,22 +1456,21 @@ second instruction writes it is one dominant idiom plus nothing.
 
 # Remaining candidates
 
-One: the SWAR popcount, which this file rejected and then had to take
-back. Everything else it ever sized is either written or recorded as
-rejected with the evidence that rejected it, and the twenty-second
-check came from somewhere else entirely -- a walk of armlint's check
-table against this one rather than from a corpus probe.
+None. Twenty-three checks are implemented and everything this file ever
+sized is either written or recorded as rejected with the evidence that
+rejected it. The last two did not come from a corpus probe at all: 23
+came from walking armlint's check table against this one, and 24 came
+from a rejection in this file being wrong.
 
-The popcount entry under "Measured and rejected" is kept where it is,
-because how it was got wrong is worth more than the candidate. It was
-rejected on a bound that was not a bound: the `-c` census required a
-constant's materialization to be contiguous, LLVM's scheduler splits
-it, and the smallest of four mask counts -- 27 in libxul -- was taken
-for a limit on how many complete sequences could exist. The true figure
-is 3,972. Two things had to happen before that was visible: a second
-baseline C++ object, since libxul alone made the result look like a
-property of one binary, and a census that tracks chains per register,
-since without it the masks could not be counted at all.
+That last one is worth reading as a worked example rather than a
+number. The SWAR popcount was rejected on a bound that was not a bound
+-- the `-c` census required a constant's materialization to be
+contiguous, LLVM's scheduler splits it, and the smallest of four mask
+counts, 27 in libxul, was taken for a limit on how many complete
+sequences could exist. The true figure is 3,972. Two things had to
+change before that was even visible: a second baseline C++ object,
+since libxul alone made the result look like a property of one binary,
+and a census that tracks chains per register.
 
 Six left this list by being written, and each cost something different.
 18 needed nothing new -- the window already held base, displacement,
@@ -1692,6 +1606,161 @@ rather than shipped unmeasured.
 Non-adjacent pairs are not matched, by the project's standing adjacency
 rule. Neither is the compressed `c.fld` pair, for the same reason as
 the `lui` arm -- it is a different population and has not been sized.
+
+## 24. A bit count spelled out longhand -- 1,560  [implemented]
+
+Rejected on a bound that was not a bound, reopened by a second baseline
+C++ object, and then written. All three steps are kept, because the
+rejection is the most instructive thing in this file.
+
+### How it was rejected, and why that was wrong by 147x
+
+Rejected here on a bound, then overturned by the second baseline C++
+object, which is the whole reason that object was added. The figure was
+wrong by two orders of magnitude and the cause was a defect in one of
+this project's own tools, so the whole episode is kept rather than
+quietly replaced.
+
+**What the rejection said.** Without Zbb, `llvm.ctpop` expands to the
+Hacker's Delight sequence, whose four masks a detector would key on.
+The `-c` census counts the chains that build each, and came back with
+53, 706, **27** and 1,475 for libxul. A sequence needs all four, so --
+the argument went -- the smallest column bounds how many can be
+co-located: at most 27. libxul also had zero `cpop` while libllvm20,
+which declares Zbb, had 1,291, so the population looked like a fact
+about which binaries had been collected.
+
+**The bound was not a bound.** riscvlint's `-c` census only matches a
+chain whose steps are **contiguous**, and LLVM's scheduler interleaves
+them. Here is a real 32-bit SWAR popcount, at `debian-libllvm22`
+0x4c92640:
+
+```
+4c92640: lui  a3,0x33333
+4c92644: addi a3,a3,819        # a3 = 0x33333333, counted
+4c92648: sub  a1,a1,a2         # x -= (x>>1) & 0x5555...
+4c9264a: and  a2,a1,a3
+4c9264e: srli a1,a1,0x2
+4c92650: and  a1,a1,a3
+4c92652: lui  a3,0xf0f1        <-- this chain starts here
+4c92656: add  a1,a1,a2
+4c92658: srli a2,a1,0x4
+4c9265c: add  a1,a1,a2
+4c9265e: lui  a2,0x1010
+4c92662: addi a3,a3,-241       <-- and finishes five instructions later
+4c92666: and  a1,a1,a3         #    0x0f0f0f0f, not counted
+```
+
+So the smallest column was the most undercounted rather than the
+binding one, and using it as a bound inverted the error.
+
+**What the masks actually number.** Counted by encoding --
+`lui rd,imm20` is one word per rd, so the count needs no disassembly
+and no adjacency at all -- and, since the census was fixed, by the
+census too:
+
+| | `0x55555` | `0x33333` | `0xf0f1` | `0x1010` |
+|---|---:|---:|---:|---:|
+| libxul (baseline) | 4,007 | 3,983 | **3,972** | 6,647 |
+| debian-libllvm22 (baseline) | 3,097 | 3,113 | 3,109 | 3,158 |
+| ubuntu-libllvm22 (RVA23) | 17 | 9 | 5 | 97 |
+
+libxul's `0x0f0f0f0f` is 3,972, not 27: the census had undercounted it
+**147-fold**, and now reports 3,969. The measurement validates itself
+besides -- the first three masks have no use outside this sequence and
+they agree to within 1%, which a coincidence does not do, while the
+fourth is in excess because `0x01010101` is also the byte broadcast
+every `memchr` uses.
+
+**So libxul does count bits**, about 3,970 times, and "the one baseline
+object does not count bits" was the undercount talking rather than an
+observation. The `libllvm22` pair settles what the alternative is: the
+RVA23 build of that release uses `cpop`/`cpopw` 2,016 times and emits 5
+of these masks, the baseline build emits 3,109 of them and no `cpop` at
+all, and neither calls out to `__popcountdi2`.
+
+**Where that leaves the candidate.** Around 3,900 sites in libxul and
+3,100 in the baseline libllvm22, which would place it above ten of the
+twenty-two shipped checks. The detector it needs now exists in part --
+the `-c` census finds the masks -- but a check has to do more than find
+them: it must prove the twelve-odd instructions between them really are
+the sequence, and nothing else, before suggesting one `cpop`. That is
+a larger fold than anything shipped, where every check rewrites one
+instruction, two, or a short run.
+
+One thing the old entry got wrong in the same breath: the 64-bit masks
+are not absent, they were invisible for a second reason. RISCVMatInt
+joins a 64-bit value's halves with a register-register `add`, which the
+census did not follow until it was taught to, so
+`0x5555555555555555` surfaced as `0x5555555500000000`. It is now
+2,867 chains in libxul against 1,109 that stop at 32 bits, so most of
+this candidate is the 64-bit sequence -- a dozen instructions and four
+64-bit masks to one `cpop`, which is the expensive case and was the
+hidden one.
+
+### What the check reports -- 1,560 and about 60 KB
+
+Under `-m rva23`: 933 in libxul, 595 in `debian-libllvm22`, and 32
+across four smaller Firefox objects. **0** under any object's own
+declaration, and 0 in every Rust and Go object either way. The objects that declare
+Zbb have no sequences to find -- Ubuntu's build of that libLLVM release
+uses `cpop` 2,016 times -- and the baseline ones declare no Zbb for the
+gate to open. It is the third check whose figure answers "what would
+rebuilding buy me", and the first that reports nothing at all without
+`-m`.
+
+The byte figure is the largest per site of any check here: 38 bytes for
+the 32-bit form and 44 to 50 for the 64-bit one, against four. The mask
+materializations are not counted, so even that is a floor.
+
+### The first check matched as dataflow
+
+Every other check reads adjacent instructions, or a table keyed by
+address, and neither works here. The scheduler interleaves the four
+mask materializations with the arithmetic and reorders the two
+independent halves of the middle stage, so there is no window to read
+and no pair to match. Each register instead carries which stage of the
+expansion it holds and which register the sequence began from, and the
+finding is reported at the final shift, when one register's history
+reaches all the way back to an opening `srli rd,rs,1`.
+
+Three things had to be got right, and two of them were got wrong first.
+
+**The sibling half.** The rule that a write to a register invalidates
+every stage computed *from* it is necessary -- the rewrite names the
+source, so a stage whose source is gone cannot be spelled `cpop
+rd,src`. But the sequence overwrites its own source as a matter of
+course: `sub a1,a1,a2` is stage one. Applying the sweep there took the
+sibling half of the very sequence being matched, because `and a6,a0,a2`
+holds `stage1 & M33` computed from a1 while `srli a1,a1,2` writes a1.
+Stages reached the middle 2,597 times and got past it 51. Sparing the
+sequence's own stages, and recording that the source was clobbered so
+the check can demand it dead instead, took that to 2,448.
+
+**The shared prefix.** The two halves of the middle stage both descend
+from stage one, so adding their instruction counts charges that prefix
+twice -- the first byte figure read 50 where the sequence is 38. Stage
+one's count is carried forward and subtracted at the join.
+
+**The final shift's width.** The 32-bit form on RV64 shifts with plain
+`srli` throughout and finishes with `srliw ...,24`; the 64-bit form
+finishes with `srli ...,56`. Reading only `srli` found nothing at all,
+which is how this check first measured zero.
+
+### What soundness costs: 74%
+
+2,312 sequences in `debian-libllvm22` complete the dataflow and 595
+survive the liveness proof. The sequence computes in place, so `cpop
+rd,src` leaves src holding what it held where the sequence left it
+holding a partial sum; the source must be dead, and the bounded
+ABI-agnostic walk says so a quarter of the time. The walk declines for
+the same reason it declines in move coalescing -- it will not assume a
+calling convention -- and this is the second candidate whose population
+is mostly decided by it.
+
+Measured, so nobody has to re-derive it: of the three tests at the
+final shift, the shift-width test costs 5 sites, the branch-target test
+0, and the liveness proof 1,717.
 
 ### 16 and 20. A computation a live register already holds -- 29,595 of 39,274  [implemented]
 

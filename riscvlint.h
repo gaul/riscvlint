@@ -821,6 +821,52 @@ bool check_c_compressible(riscvlint_state *state, const cs_insn *insn,
 bool check_dead_def(riscvlint_state *state, const cs_insn *insn,
                     riscvlint_finding *finding);
 
+// ---- a bit count spelled out longhand ----
+
+// Twelve instructions and four mask constants that compute a
+// population count, which Zbb's `cpop` does in one.
+//
+// RV64GC has no bit-counting instruction, so `llvm.ctpop` is expanded
+// inline by TargetLowering::expandCTPOP into the Hacker's Delight
+// sequence:
+//
+//     v -= (v >> 1) & 0x5555...        three instructions
+//     v  = (v & 0x3333...) + ((v >> 2) & 0x3333...)   four
+//     v  = (v + (v >> 4)) & 0x0f0f...  three
+//     v  = (v * 0x0101...) >> (len-8)  two
+//
+// plus two instructions apiece to build the four masks. On a target
+// with Zbb it is `cpop rd,rs`.
+//
+// Measured population: 3,976 sites in libxul and 3,109 in Debian's
+// baseline libLLVM 22.1.8 -- and **0** in Ubuntu's build of that same
+// release, which declares Zbb and uses `cpop` 2,016 times instead. Like
+// the Zcb and `fli` checks this is a question about the target rather
+// than a compiler miss, and most of the population is the 64-bit
+// sequence rather than the 32-bit one. See TODO.md.
+//
+// Matched as dataflow, not as a window. Every other check here reads
+// adjacent instructions or a table keyed by address, and neither works
+// on this: the scheduler interleaves the four mask materializations
+// with the arithmetic and with unrelated work, and it reorders the
+// independent halves of the middle stage. So each register carries what
+// it is known to hold -- a stage of the expansion, and which register
+// the whole sequence started from -- and the finding is reported at the
+// final shift, when one register's history reaches all the way back. A
+// missing link anywhere means no finding, so the match is
+// false-negative-safe by construction rather than by a bound.
+//
+// Three things it will not claim. The suggestion names the source
+// register, so the sequence is abandoned the moment anything writes
+// that register -- a stage computed from a value that is gone cannot be
+// rewritten as `cpop` of it. The byte figure counts only the twelve
+// instructions matched, never the mask materializations, since whether
+// those die with the sequence needs liveness this does not have. And
+// the 32-bit and 64-bit forms are kept apart by their masks and their
+// final shift together, so a mixed sequence matches neither.
+bool check_swar_popcount(riscvlint_state *state, const cs_insn *insn,
+                         riscvlint_finding *finding);
+
 // ---- a floating-point constant `fli` would have materialized ----
 
 // Which of Zfa's 32 `fli` entries holds the value whose bit pattern is

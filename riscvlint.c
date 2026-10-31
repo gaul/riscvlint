@@ -1172,6 +1172,39 @@ struct riscvlint_state {
     // path that established it.
     unsigned guarantees[32];
 
+    // ---- the SWAR popcount matcher's state ----
+    //
+    // Two per-register tables, both cleared at a region boundary.
+    //
+    // `cknown`/`cval` is ordinary constant propagation, not the `-c`
+    // census's chain tracking: it holds a value until the register is
+    // *written*, where the census closes a chain when the register is
+    // read. A mask is read many times -- 0x3333... twice in one
+    // sequence -- so closing on the first read would lose it.
+    //
+    // `pckind` is where in the expansion a register's value sits, with
+    // `pcsrc` naming the register the sequence started from and
+    // `pcinsn`/`pcbytes`/`pcstart` accumulating what it has cost so
+    // far. A write to a register clears its own entry and every entry
+    // whose `pcsrc` names it: the rewrite is `cpop rd,src`, so a stage
+    // whose source is gone cannot be spelled that way.
+    struct {
+        bool cknown[32];
+        int64_t cval[32];
+        uint8_t pckind[32];
+        uint8_t pcsrc[32];
+        bool pcwide[32];
+        bool pcclob[32];        // the sequence overwrote its own source
+        // The counts at stage one, which both halves of the middle
+        // stage descend from: adding their totals at the join would
+        // charge that shared prefix twice.
+        uint16_t pcbase[32];
+        uint16_t pcbaseb[32];
+        uint16_t pcinsn[32];
+        uint16_t pcbytes[32];
+        uint64_t pcstart[32];
+    } pc;
+
     // The windowed memory and constant table. See
     // riscvlint_state_observe.
     struct {
@@ -1854,6 +1887,9 @@ void riscvlint_state_drop_window(riscvlint_state *state)
     state->win.nslots = 0;
     memset(state->win.const_live, 0, sizeof state->win.const_live);
     for (int i = 0; i < 32; i++) state->win.comp[i].live = false;
+    // The popcount matcher's tables go with it: a dropped window means
+    // the instructions before this point are not known to have run.
+    memset(&state->pc, 0, sizeof state->pc);
 }
 
 static rvl_slot *slot_for(riscvlint_state *state, unsigned base, int64_t disp,
@@ -1987,6 +2023,11 @@ static bool comp_same(const rvl_comp *a, const rvl_comp *b)
            a->has_imm == b->has_imm && (!a->has_imm || a->imm == b->imm) &&
            !strcmp(a->mn, b->mn);
 }
+
+// Defined with check_swar_popcount, which is the only reader of what
+// it records.
+static void pc_observe(riscvlint_state *state, const cs_insn *insn,
+                       uint32_t w);
 
 void riscvlint_state_observe(riscvlint_state *state, const cs_insn *insn)
 {
@@ -2125,7 +2166,11 @@ void riscvlint_state_observe(riscvlint_state *state, const cs_insn *insn)
         }
     }
 
-    // 3. Constants, after the register invalidation above.
+    // 3. The SWAR popcount matcher, which keeps its own per-register
+    //    tables for the reason pc_observe gives.
+    pc_observe(state, insn, w);
+
+    // 4. Constants, after the register invalidation above.
     unsigned crd;
     int64_t cval;
     if (decode_const(w, insn->size, &crd, &cval)) {
@@ -2134,7 +2179,7 @@ void riscvlint_state_observe(riscvlint_state *state, const cs_insn *insn)
         state->win.const_addr[crd] = insn->address;
     }
 
-    // 4. The computation this instruction performs, after the
+    // 5. The computation this instruction performs, after the
     //    invalidation above and never when the destination is one of
     //    its own sources: `add a0,a0,a1` leaves nothing that can name
     //    the a0 it read, so a later `add rd,a0,a1` computes something
@@ -2179,8 +2224,12 @@ void riscvlint_state_observe(riscvlint_state *state, const cs_insn *insn)
         // libLLVM's 17,132 probe sites. funct3 == 0 is the environment
         // half, which can change anything.
         bool env = RV_OPCODE(w) == 0x73u && ((w >> 12) & 0x7u) == 0;
-        if (rv_ends_region(w, insn->size) || env)
+        if (rv_ends_region(w, insn->size) || env) {
             for (int i = 0; i < 32; i++) state->win.comp[i].live = false;
+            // A call clobbers registers the matcher is tracking stages
+            // in, and an environment instruction can change anything.
+            memset(&state->pc, 0, sizeof state->pc);
+        }
     }
     // 7. A side entry on the next instruction means what follows is not
     //    reached only from here.
@@ -3116,6 +3165,548 @@ bool check_dead_def(riscvlint_state *state, const cs_insn *insn,
     return true;
 }
 
+// ---- constant-chain decoding, shared by -c and the popcount
+//      matcher ----
+
+// One step of a chain: `addi`/`addiw`/`slli` reading a register whose
+// chain is in flight. `reg` is the one read and `dst` the one written,
+// and they need not be the same -- the allocator writes the finished
+// constant somewhere else whenever the partial value is still live,
+// and requiring `rd == rs1` lost 46% of the chains in libLLVM's
+// baseline build. The transform is left to the caller to apply, since
+// which chain this extends is not a property of the instruction.
+//
+// `addi rd,rd,imm` and `c.addi` are the same step; so are `slli` and
+// `c.slli`, which rv_decode_slli already folds together. `addiw` is
+// its own case because it truncates, and that truncation is exactly
+// what RISCVMatInt uses it for.
+typedef struct {
+    unsigned reg;       // the register read: whose chain this extends
+    unsigned dst;       // the register written, which may be another
+    bool shift;         // slli, rather than an addition
+    unsigned shamt;
+    int64_t imm;
+    bool w_form;        // addiw: the result is sign-extended from bit 31
+} cchain_step;
+
+static bool cchain_step_of(uint32_t w, unsigned size, cchain_step *st)
+{
+    unsigned rd, rs1, shamt;
+    int64_t imm;
+    if (rv_decode_slli(w, size, &rd, &rs1, &shamt)) {
+        st->reg = rs1;
+        st->dst = rd;
+        st->shift = true;
+        st->shamt = shamt;
+        return true;
+    }
+    bool w_form;
+    if (size == 4) {
+        unsigned op = RV_OPCODE(w);
+        if ((op != 0x13u && op != 0x1bu) || ((w >> 12) & 0x7u) != 0)
+            return false;
+        w_form = op == 0x1bu;
+        rd = (w >> 7) & 0x1fu;
+        rs1 = (w >> 15) & 0x1fu;
+        imm = sign_extend((uint64_t)(w >> 20) & 0xfffu, 12);
+    } else if (size == 2) {
+        // c.addi is op 01 funct3 000; c.addiw is op 01 funct3 001. Both
+        // read and write the same register, and a zero immediate is a
+        // hint rather than an addition.
+        if ((w & 0xe003u) == 0x0001u) w_form = false;
+        else if ((w & 0xe003u) == 0x2001u) w_form = true;
+        else return false;
+        rd = rs1 = (w >> 7) & 0x1fu;
+        imm = ci_imm6(w);
+        if (rd == 0 || imm == 0) return false;
+    } else {
+        return false;
+    }
+    st->reg = rs1;
+    st->dst = rd;
+    st->shift = false;
+    st->imm = imm;
+    st->w_form = w_form;
+    return true;
+}
+
+// A composition: `add` or `or` of two registers that both hold chains
+// in flight. Unlike a step there is no ambiguity about what this does
+// -- the sum or union of two known constants is a constant whatever
+// else is true -- which is why it may close both sources where the
+// cross-register step has to leave its one open.
+//
+// This is how RISCVMatInt joins the halves of a 64-bit value, and
+// without it a 64-bit constant surfaces as its shifted high half:
+// `0x5555555500000000` appeared 2,867 times in libxul where the value
+// being built was `0x5555555555555555`.
+typedef struct {
+    unsigned dst, a, b;
+    bool is_or;
+} cchain_merge;
+
+static bool cchain_merge_of(uint32_t w, unsigned size, cchain_merge *m)
+{
+    if (size == 4) {
+        if (RV_OPCODE(w) != 0x33u) return false;
+        if (((w >> 25) & 0x7fu) != 0u) return false;    // funct7 0: not M
+        unsigned f3 = (w >> 12) & 0x7u;
+        if (f3 != 0u && f3 != 6u) return false;         // add, or
+        m->is_or = f3 == 6u;
+        m->dst = (w >> 7) & 0x1fu;
+        m->a = (w >> 15) & 0x1fu;
+        m->b = (w >> 20) & 0x1fu;
+        return m->dst != 0 && m->a != 0 && m->b != 0;
+    }
+    if (size != 2) return false;
+    // c.add rd,rs2 -- op 10, funct3 100, bit 12 set.
+    if ((w & 0xf003u) == 0x9002u) {
+        m->dst = m->a = (w >> 7) & 0x1fu;
+        m->b = (w >> 2) & 0x1fu;
+        m->is_or = false;
+        return m->dst != 0 && m->b != 0;
+    }
+    // c.or rd',rs2' -- op 01, funct3 100, bit 12 clear, bits 11:10 set,
+    // bits 6:5 == 10. c.and, c.xor and c.sub share the shape and are
+    // separated by those two bits.
+    if ((w & 0xfc63u) == 0x8c41u) {
+        m->dst = m->a = 8u + ((w >> 7) & 7u);
+        m->b = 8u + ((w >> 2) & 7u);
+        m->is_or = true;
+        return true;
+    }
+    return false;
+}
+
+static void cchain_apply(const cchain_step *st, int64_t *val)
+{
+    if (st->shift) {
+        *val = (int64_t)((uint64_t)*val << st->shamt);
+        return;
+    }
+    uint64_t sum = (uint64_t)*val + (uint64_t)st->imm;
+    *val = st->w_form ? (int64_t)(int32_t)(uint32_t)sum : (int64_t)sum;
+}
+
+// ---- a bit count spelled out longhand ----
+//
+// See riscvlint.h for what the sequence is and why this is matched as
+// dataflow rather than as a window.
+
+// Where in the expansion a register's value sits. The order is the
+// order TargetLowering::expandCTPOP emits, and nothing but a complete
+// walk from PC_SHR1 to PC_MUL produces a finding.
+enum {
+    PC_NONE = 0,
+    PC_SHR1,        // x >> 1
+    PC_AND55,       // (x >> 1) & 0x5555...
+    PC_STAGE1,      // x - ((x >> 1) & 0x5555...)
+    PC_AND33,       // stage1 & 0x3333...
+    PC_SHR2,        // stage1 >> 2
+    PC_AND33S,      // (stage1 >> 2) & 0x3333...
+    PC_STAGE2,      // the sum of those two
+    PC_SHR4,        // stage2 >> 4
+    PC_SUM4,        // stage2 + (stage2 >> 4)
+    PC_STAGE3,      // that & 0x0f0f...
+    PC_MUL,         // stage3 * 0x0101...
+};
+
+// The four masks, in both widths. A sequence may not mix them: the
+// 32-bit form ends in a shift of 24 and the 64-bit form in 56, and the
+// masks and the shift are checked together.
+#define PC_M55_W 0x55555555ll
+#define PC_M33_W 0x33333333ll
+#define PC_M0F_W 0x0f0f0f0fll
+#define PC_M01_W 0x01010101ll
+#define PC_M55_D ((int64_t)0x5555555555555555ull)
+#define PC_M33_D ((int64_t)0x3333333333333333ull)
+#define PC_M0F_D ((int64_t)0x0f0f0f0f0f0f0f0full)
+#define PC_M01_D ((int64_t)0x0101010101010101ull)
+
+// Register-register ALU forms the sequence uses, in both spellings.
+typedef enum { RRR_NONE = 0, RRR_ADD, RRR_SUB, RRR_AND, RRR_MUL } rrr_op;
+
+static rrr_op decode_rrr(uint32_t w, unsigned size, unsigned *rd,
+                         unsigned *rs1, unsigned *rs2)
+{
+    if (size == 4) {
+        if (RV_OPCODE(w) != 0x33u) return RRR_NONE;
+        unsigned f3 = (w >> 12) & 7u, f7 = (w >> 25) & 0x7fu;
+        rrr_op op = RRR_NONE;
+        if (f7 == 0x00u && f3 == 0u) op = RRR_ADD;
+        else if (f7 == 0x20u && f3 == 0u) op = RRR_SUB;
+        else if (f7 == 0x00u && f3 == 7u) op = RRR_AND;
+        else if (f7 == 0x01u && f3 == 0u) op = RRR_MUL;
+        else return RRR_NONE;
+        *rd = (w >> 7) & 0x1fu;
+        *rs1 = (w >> 15) & 0x1fu;
+        *rs2 = (w >> 20) & 0x1fu;
+        return *rd == 0 ? RRR_NONE : op;
+    }
+    if (size != 2) return RRR_NONE;
+    // c.add: op 10, funct4 1001, both registers non-zero -- c.jr and
+    // c.jalr share the funct4 with a zero rs2.
+    if ((w & 0xf003u) == 0x9002u) {
+        *rd = *rs1 = (w >> 7) & 0x1fu;
+        *rs2 = (w >> 2) & 0x1fu;
+        return (*rd && *rs2) ? RRR_ADD : RRR_NONE;
+    }
+    // The C1 misc-ALU register ops, which name x8-x15 only: bits 6:5
+    // pick sub/xor/or/and at bit 12 clear, and subw/addw/mul at bit 12
+    // set. Only sub, and and mul matter here.
+    if ((w & 0xfc63u) == 0x8c01u || (w & 0xfc63u) == 0x8c61u ||
+        (w & 0xfc63u) == 0x9c41u) {
+        *rd = *rs1 = 8u + ((w >> 7) & 7u);
+        *rs2 = 8u + ((w >> 2) & 7u);
+        if ((w & 0xfc63u) == 0x8c01u) return RRR_SUB;
+        if ((w & 0xfc63u) == 0x8c61u) return RRR_AND;
+        return RRR_MUL;
+    }
+    return RRR_NONE;
+}
+
+// Everything a register's popcount entry holds, cleared together.
+static void pc_clear(riscvlint_state *state, unsigned r)
+{
+    state->pc.pckind[r] = PC_NONE;
+    state->pc.pcinsn[r] = 0;
+    state->pc.pcbytes[r] = 0;
+    state->pc.pcclob[r] = false;
+}
+
+// A write to `r` invalidates its own entry and every stage computed
+// *from* r -- the rewrite names the source register, so a stage whose
+// source has been overwritten by something outside the sequence cannot
+// be spelled `cpop rd,src`.
+//
+// The sequence overwriting its own source is the common case and is not
+// this: `sub a1,a1,a2` is how stage one is spelled, and `pcclob`
+// records it so the check can demand the source be dead instead.
+static void pc_kill(riscvlint_state *state, unsigned r)
+{
+    if (r >= 32) return;
+    state->pc.cknown[r] = false;
+    pc_clear(state, r);
+    for (unsigned i = 0; i < 32; i++)
+        if (state->pc.pckind[i] != PC_NONE && state->pc.pcsrc[i] == r)
+            pc_clear(state, i);
+}
+
+// Clearing the destination of an instruction that *is* a stage of a
+// sequence, which is not the same as an unrelated write. pc_kill's
+// sweep over entries whose source this register is would take the
+// sibling half of the very sequence being matched: `srli a1,a1,2`
+// writes a1 while a2 holds `stage1 & M33` computed from a1, and the
+// sweep cost 98% of the population before this existed. The stages it
+// spares already carry `pcclob`, so the check still has to prove the
+// source dead.
+static void pc_clear_dst(riscvlint_state *state, unsigned r)
+{
+    if (r >= 32) return;
+    state->pc.cknown[r] = false;
+    pc_clear(state, r);
+}
+
+// A register's entry, read out before the destination is cleared. Every
+// arm below snapshots first, because the destination is routinely one
+// of the operands and routinely the source register too.
+typedef struct {
+    unsigned kind, src;
+    bool wide, clob;
+    uint16_t insn, bytes;
+    uint16_t base, baseb;       // the counts at stage one
+    uint64_t start;
+} pc_snap;
+
+static pc_snap pc_read(const riscvlint_state *state, unsigned r)
+{
+    pc_snap sn;
+    sn.kind = state->pc.pckind[r];
+    sn.src = state->pc.pcsrc[r];
+    sn.wide = state->pc.pcwide[r];
+    sn.clob = state->pc.pcclob[r];
+    sn.insn = state->pc.pcinsn[r];
+    sn.bytes = state->pc.pcbytes[r];
+    sn.base = state->pc.pcbase[r];
+    sn.baseb = state->pc.pcbaseb[r];
+    sn.start = state->pc.pcstart[r];
+    return sn;
+}
+
+static void pc_write(riscvlint_state *state, unsigned dst, const pc_snap *sn,
+                     unsigned kind, unsigned insn_added, unsigned bytes_added)
+{
+    state->pc.pckind[dst] = (uint8_t)kind;
+    state->pc.pcsrc[dst] = (uint8_t)sn->src;
+    state->pc.pcwide[dst] = sn->wide;
+    // Writing the register the sequence started from is how it is
+    // ordinarily spelled; the check then has to prove that register
+    // dead rather than name it in a rewrite that would change it.
+    state->pc.pcclob[dst] = sn->clob || dst == sn->src;
+    state->pc.pcinsn[dst] = (uint16_t)(sn->insn + insn_added);
+    state->pc.pcbytes[dst] = (uint16_t)(sn->bytes + bytes_added);
+    state->pc.pcbase[dst] = sn->base;
+    state->pc.pcbaseb[dst] = sn->baseb;
+    state->pc.pcstart[dst] = sn->start;
+    // Stage one is the fork: everything after it descends from here,
+    // and the two halves of the middle stage both carry this count.
+    if (kind == PC_STAGE1) {
+        state->pc.pcbase[dst] = state->pc.pcinsn[dst];
+        state->pc.pcbaseb[dst] = state->pc.pcbytes[dst];
+    }
+}
+
+// True when `r` holds the given mask, in the width this sequence is in.
+// `*wide` is decided by the first mask seen and checked against the
+// rest, so a sequence mixing widths matches neither.
+static bool pc_is_mask(const riscvlint_state *state, unsigned r,
+                       int64_t narrow, int64_t full, bool known_wide,
+                       bool *wide)
+{
+    if (r >= 32 || !state->pc.cknown[r]) return false;
+    int64_t v = state->pc.cval[r];
+    if (v == narrow && (!known_wide || !*wide)) { *wide = false; return true; }
+    if (v == full && (!known_wide || *wide)) { *wide = true; return true; }
+    return false;
+}
+
+// `srli` or `srliw`. The 32-bit sequence on RV64 shifts with plain
+// `srli` throughout and finishes with `srliw`, so both spellings have
+// to be read and the width of the final one is what pins the form.
+static bool pc_decode_srl(uint32_t w, unsigned size, unsigned *rd,
+                          unsigned *rs1, unsigned *shamt, bool *word)
+{
+    if (rv_decode_srli(w, size, rd, rs1, shamt)) { *word = false; return true; }
+    if (size != 4 || RV_OPCODE(w) != 0x1bu) return false;
+    if (((w >> 12) & 7u) != 5u) return false;
+    if (((w >> 25) & 0x7fu) != 0u) return false;        // funct7 0: not sraiw
+    *rd = (w >> 7) & 0x1fu;
+    *rs1 = (w >> 15) & 0x1fu;
+    *shamt = (w >> 20) & 0x1fu;
+    *word = true;
+    return true;
+}
+
+// Fold this instruction into the per-register state. Called from
+// riscvlint_state_observe, so a check sees everything up to but not
+// including the instruction under the cursor.
+static void pc_observe(riscvlint_state *state, const cs_insn *insn,
+                       uint32_t w)
+{
+    unsigned size = insn->size;
+    unsigned rd, rs1, rs2, shamt;
+    int64_t val;
+    bool word;
+
+    // Constant propagation first: a mask is read many times, so unlike
+    // the -c census this holds a value until the register is written.
+    cchain_step st;
+    cchain_merge mg;
+    if (decode_const(w, size, &rd, &val)) {
+        pc_kill(state, rd);
+        state->pc.cknown[rd] = true;
+        state->pc.cval[rd] = val;
+        return;
+    }
+    if (cchain_step_of(w, size, &st) && st.dst != 0 &&
+        state->pc.cknown[st.reg]) {
+        int64_t v = state->pc.cval[st.reg];
+        cchain_apply(&st, &v);
+        pc_kill(state, st.dst);
+        state->pc.cknown[st.dst] = true;
+        state->pc.cval[st.dst] = v;
+        return;
+    }
+    if (cchain_merge_of(w, size, &mg) && state->pc.cknown[mg.a] &&
+        state->pc.cknown[mg.b]) {
+        int64_t v = mg.is_or ? (state->pc.cval[mg.a] | state->pc.cval[mg.b])
+                             : (int64_t)((uint64_t)state->pc.cval[mg.a] +
+                                         (uint64_t)state->pc.cval[mg.b]);
+        pc_kill(state, mg.dst);
+        state->pc.cknown[mg.dst] = true;
+        state->pc.cval[mg.dst] = v;
+        return;
+    }
+
+    if (pc_decode_srl(w, size, &rd, &rs1, &shamt, &word)) {
+        if (shamt == 1 && !word) {
+            // Opens a sequence. The destination has to be a different
+            // register, or nothing is left to name the source by.
+            if (rd == rs1) { pc_kill(state, rd); return; }
+            pc_kill(state, rd);
+            state->pc.pckind[rd] = PC_SHR1;
+            state->pc.pcsrc[rd] = (uint8_t)rs1;
+            state->pc.pcwide[rd] = false;
+            state->pc.pcclob[rd] = false;
+            state->pc.pcinsn[rd] = 1;
+            state->pc.pcbytes[rd] = (uint16_t)size;
+            state->pc.pcstart[rd] = insn->address;
+            return;
+        }
+        pc_snap sn = pc_read(state, rs1);
+        unsigned kind = PC_NONE;
+        if (!word && shamt == 2 && sn.kind == PC_STAGE1) kind = PC_SHR2;
+        else if (!word && shamt == 4 && sn.kind == PC_STAGE2) kind = PC_SHR4;
+        if (kind == PC_NONE) { pc_kill(state, rd); return; }
+        pc_clear_dst(state, rd);
+        pc_write(state, rd, &sn, kind, 1, size);
+        return;
+    }
+
+    rrr_op op = decode_rrr(w, size, &rd, &rs1, &rs2);
+    if (op == RRR_NONE) {
+        // Everything else: whatever it writes is no longer a stage.
+        cs_regs rr, rw;
+        uint8_t nr = 0, nw = 0;
+        if (cs_regs_access(state->handle, insn, rr, &nr, rw, &nw) ==
+            CS_ERR_OK) {
+            for (uint8_t i = 0; i < nw; i++) {
+                unsigned n = cs_reg_to_num(rw[i]);
+                if (n < 32) pc_kill(state, n);
+            }
+        } else {
+            for (unsigned i = 0; i < 32; i++) pc_kill(state, i);
+        }
+        return;
+    }
+
+    pc_snap a = pc_read(state, rs1), b = pc_read(state, rs2);
+    if (op == RRR_AND) {
+        // (x >> 1) & M55, stage1 & M33, (stage1 >> 2) & M33, sum4 & M0F.
+        static const struct { unsigned want, give; } arms[] = {
+            { PC_SHR1, PC_AND55 }, { PC_STAGE1, PC_AND33 },
+            { PC_SHR2, PC_AND33S }, { PC_SUM4, PC_STAGE3 },
+        };
+        static const int64_t narrow[] = { PC_M55_W, PC_M33_W, PC_M33_W,
+                                          PC_M0F_W };
+        static const int64_t full[] = { PC_M55_D, PC_M33_D, PC_M33_D,
+                                        PC_M0F_D };
+        for (unsigned i = 0; i < 4; i++) {
+            const pc_snap *sn;
+            unsigned mask;
+            if (a.kind == arms[i].want) { sn = &a; mask = rs2; }
+            else if (b.kind == arms[i].want) { sn = &b; mask = rs1; }
+            else continue;
+            // The first mask decides the width; the rest must match it.
+            bool wide = sn->wide, known = arms[i].want != PC_SHR1;
+            if (!pc_is_mask(state, mask, narrow[i], full[i], known, &wide))
+                continue;
+            pc_snap use = *sn;
+            use.wide = wide;
+            pc_clear_dst(state, rd);
+            pc_write(state, rd, &use, arms[i].give, 1, size);
+            return;
+        }
+        pc_kill(state, rd);
+        return;
+    }
+    if (op == RRR_SUB) {
+        // x - ((x >> 1) & M55), where the left operand has to be the
+        // very register the opening shift read.
+        if (b.kind == PC_AND55 && b.src == rs1) {
+            pc_clear_dst(state, rd);
+            pc_write(state, rd, &b, PC_STAGE1, 1, size);
+            return;
+        }
+        pc_kill(state, rd);
+        return;
+    }
+    if (op == RRR_ADD) {
+        // The two halves of the middle stage. Both descend from stage
+        // one, so their counts share that prefix and adding them whole
+        // would charge it twice.
+        if (((a.kind == PC_AND33 && b.kind == PC_AND33S) ||
+             (a.kind == PC_AND33S && b.kind == PC_AND33)) &&
+            a.src == b.src && a.wide == b.wide && a.base == b.base) {
+            pc_snap j = a;
+            j.insn = (uint16_t)(a.insn + b.insn - a.base);
+            j.bytes = (uint16_t)(a.bytes + b.bytes - a.baseb);
+            j.clob = a.clob || b.clob;
+            j.start = a.start < b.start ? a.start : b.start;
+            pc_clear_dst(state, rd);
+            pc_write(state, rd, &j, PC_STAGE2, 1, size);
+            return;
+        }
+        // stage2 + (stage2 >> 4): the shift was taken *of* stage2, so
+        // the longer count already contains the shorter.
+        if (((a.kind == PC_STAGE2 && b.kind == PC_SHR4) ||
+             (a.kind == PC_SHR4 && b.kind == PC_STAGE2)) &&
+            a.src == b.src && a.wide == b.wide) {
+            const pc_snap *keep = a.insn > b.insn ? &a : &b;
+            pc_snap use = *keep;
+            use.clob = a.clob || b.clob;
+            pc_clear_dst(state, rd);
+            pc_write(state, rd, &use, PC_SUM4, 1, size);
+            return;
+        }
+        pc_kill(state, rd);
+        return;
+    }
+    // RRR_MUL: stage3 * M01.
+    {
+        const pc_snap *sn = NULL;
+        unsigned mask = 0;
+        if (a.kind == PC_STAGE3) { sn = &a; mask = rs2; }
+        else if (b.kind == PC_STAGE3) { sn = &b; mask = rs1; }
+        if (sn) {
+            bool wide = sn->wide;
+            if (pc_is_mask(state, mask, PC_M01_W, PC_M01_D, true, &wide)) {
+                pc_snap use = *sn;
+                pc_clear_dst(state, rd);
+                pc_write(state, rd, &use, PC_MUL, 1, size);
+                return;
+            }
+        }
+        pc_kill(state, rd);
+    }
+}
+
+bool check_swar_popcount(riscvlint_state *state, const cs_insn *insn,
+                         riscvlint_finding *finding)
+{
+    if (!riscvlint_may_use(state, RISCVLINT_EXT_ZBB)) return false;
+    uint32_t w;
+    if (!riscvlint_word_at(state, insn->address, &w)) return false;
+    unsigned rd, rs1, shamt;
+    bool word;
+    if (!pc_decode_srl(w, insn->size, &rd, &rs1, &shamt, &word)) return false;
+    if (state->pc.pckind[rs1] != PC_MUL) return false;
+
+    // The mask width and the final shift have to agree, and so does the
+    // shift's own width: 32 bits ends in `srliw ...,24` and 64 in
+    // `srli ...,56`.
+    bool wide = state->pc.pcwide[rs1];
+    if (wide) {
+        if (word || shamt != 56u) return false;
+    } else {
+        if (!word || shamt != 24u) return false;
+    }
+    // A branch into the middle means the instructions before the target
+    // are not the ones that ran.
+    if (riscvlint_is_branch_target(state, insn->address)) return false;
+
+    unsigned src = state->pc.pcsrc[rs1];
+    // The sequence ordinarily computes in place, overwriting the very
+    // register the rewrite would name. `cpop rd,src` leaves src holding
+    // what it held, where the sequence left it holding a partial sum,
+    // so the rewrite is only equivalent once src is dead.
+    if (state->pc.pcclob[rs1] &&
+        riscvlint_liveness(state, insn->address + insn->size, src) !=
+            RISCVLINT_LIVE_DEAD)
+        return false;
+
+    unsigned ninsn = (unsigned)state->pc.pcinsn[rs1] + 1;
+    unsigned bytes = (unsigned)state->pc.pcbytes[rs1] + insn->size;
+    finding->title = "a bit count spelled out longhand";
+    finding->address = state->pc.pcstart[rs1];
+    finding->insn_count = 1;
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "cpop%s %s, %s (%u instructions, %u -> 4 bytes, plus the masks)",
+             wide ? "" : "w", rv_reg_name(rd), rv_reg_name(src), ninsn,
+             bytes);
+    return true;
+}
+
 // ---- a floating-point constant `fli` would have materialized ----
 
 // Entries 2..31 of Zfa's `fli` table, as the (exponent, 2-bit mantissa)
@@ -3322,6 +3913,7 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_zero_store_run,
     check_bitcast_through_frame,
     check_fp_pool_to_fli,
+    check_swar_popcount,
 };
 
 size_t riscvlint_scan(riscvlint_state *state, csh handle,
@@ -3544,126 +4136,6 @@ static void cchain_note_anchor(riscvlint_cchain *c, uint64_t anchor)
     }
     c->anchor_list[c->anchor_used++] = anchor;
     c->anchors_rebuilt++;
-}
-
-// One step of a chain: `addi`/`addiw`/`slli` reading a register whose
-// chain is in flight. `reg` is the one read and `dst` the one written,
-// and they need not be the same -- the allocator writes the finished
-// constant somewhere else whenever the partial value is still live,
-// and requiring `rd == rs1` lost 46% of the chains in libLLVM's
-// baseline build. The transform is left to the caller to apply, since
-// which chain this extends is not a property of the instruction.
-//
-// `addi rd,rd,imm` and `c.addi` are the same step; so are `slli` and
-// `c.slli`, which rv_decode_slli already folds together. `addiw` is
-// its own case because it truncates, and that truncation is exactly
-// what RISCVMatInt uses it for.
-typedef struct {
-    unsigned reg;       // the register read: whose chain this extends
-    unsigned dst;       // the register written, which may be another
-    bool shift;         // slli, rather than an addition
-    unsigned shamt;
-    int64_t imm;
-    bool w_form;        // addiw: the result is sign-extended from bit 31
-} cchain_step;
-
-static bool cchain_step_of(uint32_t w, unsigned size, cchain_step *st)
-{
-    unsigned rd, rs1, shamt;
-    int64_t imm;
-    if (rv_decode_slli(w, size, &rd, &rs1, &shamt)) {
-        st->reg = rs1;
-        st->dst = rd;
-        st->shift = true;
-        st->shamt = shamt;
-        return true;
-    }
-    bool w_form;
-    if (size == 4) {
-        unsigned op = RV_OPCODE(w);
-        if ((op != 0x13u && op != 0x1bu) || ((w >> 12) & 0x7u) != 0)
-            return false;
-        w_form = op == 0x1bu;
-        rd = (w >> 7) & 0x1fu;
-        rs1 = (w >> 15) & 0x1fu;
-        imm = sign_extend((uint64_t)(w >> 20) & 0xfffu, 12);
-    } else if (size == 2) {
-        // c.addi is op 01 funct3 000; c.addiw is op 01 funct3 001. Both
-        // read and write the same register, and a zero immediate is a
-        // hint rather than an addition.
-        if ((w & 0xe003u) == 0x0001u) w_form = false;
-        else if ((w & 0xe003u) == 0x2001u) w_form = true;
-        else return false;
-        rd = rs1 = (w >> 7) & 0x1fu;
-        imm = ci_imm6(w);
-        if (rd == 0 || imm == 0) return false;
-    } else {
-        return false;
-    }
-    st->reg = rs1;
-    st->dst = rd;
-    st->shift = false;
-    st->imm = imm;
-    st->w_form = w_form;
-    return true;
-}
-
-// A composition: `add` or `or` of two registers that both hold chains
-// in flight. Unlike a step there is no ambiguity about what this does
-// -- the sum or union of two known constants is a constant whatever
-// else is true -- which is why it may close both sources where the
-// cross-register step has to leave its one open.
-//
-// This is how RISCVMatInt joins the halves of a 64-bit value, and
-// without it a 64-bit constant surfaces as its shifted high half:
-// `0x5555555500000000` appeared 2,867 times in libxul where the value
-// being built was `0x5555555555555555`.
-typedef struct {
-    unsigned dst, a, b;
-    bool is_or;
-} cchain_merge;
-
-static bool cchain_merge_of(uint32_t w, unsigned size, cchain_merge *m)
-{
-    if (size == 4) {
-        if (RV_OPCODE(w) != 0x33u) return false;
-        if (((w >> 25) & 0x7fu) != 0u) return false;    // funct7 0: not M
-        unsigned f3 = (w >> 12) & 0x7u;
-        if (f3 != 0u && f3 != 6u) return false;         // add, or
-        m->is_or = f3 == 6u;
-        m->dst = (w >> 7) & 0x1fu;
-        m->a = (w >> 15) & 0x1fu;
-        m->b = (w >> 20) & 0x1fu;
-        return m->dst != 0 && m->a != 0 && m->b != 0;
-    }
-    if (size != 2) return false;
-    // c.add rd,rs2 -- op 10, funct3 100, bit 12 set.
-    if ((w & 0xf003u) == 0x9002u) {
-        m->dst = m->a = (w >> 7) & 0x1fu;
-        m->b = (w >> 2) & 0x1fu;
-        m->is_or = false;
-        return m->dst != 0 && m->b != 0;
-    }
-    // c.or rd',rs2' -- op 01, funct3 100, bit 12 clear, bits 11:10 set,
-    // bits 6:5 == 10. c.and, c.xor and c.sub share the shape and are
-    // separated by those two bits.
-    if ((w & 0xfc63u) == 0x8c41u) {
-        m->dst = m->a = 8u + ((w >> 7) & 7u);
-        m->b = 8u + ((w >> 2) & 7u);
-        m->is_or = true;
-        return true;
-    }
-    return false;
-}
-
-static void cchain_apply(const cchain_step *st, int64_t *val)
-{
-    if (st->shift) {
-        *val = (int64_t)((uint64_t)*val << st->shamt);
-        return;
-    }
-    uint64_t sum = (uint64_t)*val + (uint64_t)st->imm;
-    *val = st->w_form ? (int64_t)(int32_t)(uint32_t)sum : (int64_t)sum;
 }
 
 // Count a finished chain.
