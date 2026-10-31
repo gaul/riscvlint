@@ -1456,9 +1456,9 @@ second instruction writes it is one dominant idiom plus nothing.
 
 # Remaining candidates
 
-None. Twenty-nine checks are implemented and everything this file ever
+None. Thirty checks are implemented and everything this file ever
 sized is either written or recorded as rejected with the evidence that
-rejected it. The last eight did not come from a corpus probe at all: 23
+rejected it. The last nine did not come from a corpus probe at all: 23
 came from walking armlint's check table against this one, 24 came from a
 rejection in this file being wrong, 25, 26 and 27 are the three
 addressing modes of a ratification plan for an extension that does not
@@ -1469,7 +1469,9 @@ them 16,313 sites with no instruction to fold them into; 29 is the one
 entry here whose check was written and then measured at 0, and says why
 it was kept anyway; 30 is the largest thing this file has added since
 the corpus doubled, and it was found by asking what a constant that is
-*not* multiplied by gets used for instead.
+*not* multiplied by gets used for instead; 31 is the base-ISA half of
+30's shape, and records why 30's leftover 273,747 is not a candidate
+for anyone.
 
 That last one is worth reading as a worked example rather than a
 number. The SWAR popcount was rejected on a bound that was not a bound
@@ -3001,6 +3003,127 @@ One oddity fell out of the same count and is recorded for its own sake:
 just proved zero. That is a never-taken branch rather than a missed
 peephole, and at 53 sites across 108 million instructions it is not
 worth a rule.
+
+## 31. A constant loaded for a branch against zero -- 281  [implemented]
+
+`li rc,{0,1}` + `blt`/`bge`/`bltu`/`bgeu` against it, where the
+comparison is already a zero test and x0 serves where the loaded
+register did. `rx <u 1` is `rx == 0`, so that pair is `beqz rx`; `rx <
+1` is `rx <= 0`, which is `bge x0,rx`; against 0 the signed forms are a
+plain substitution of x0 for the constant.
+
+Ten of the sixteen (comparison, constant, operand-position)
+combinations have such a form. Two are settled rather than folded --
+`bltu rx,0` is never taken and `bgeu rx,0` always is, which is a
+dead-branch finding and not this one -- and four are `K,rx` with K of 1,
+where `1 <u rx` and `1 >=u rx` are two-value tests with no zero form.
+Every row was checked by brute force over both signed extremes, 0, 1 and
+values straddling the sign bit rather than reasoned about twice, which
+is cheap insurance on ten hand-derived equivalences.
+
+### This is not entry 30's 273,747, and no check is
+
+Entry 30 recorded 273,747 dependent `li` + ordered-branch pairs as the
+population Zibi's equality-only design leaves behind. That is not a
+candidate, and the reason is worth stating plainly: **no extension gives
+riscv64 an ordered compare-immediate-branch.** Searched rather than
+assumed, across every `.td` in LLVM's RISC-V backend -- which is this
+project's oracle of record for what an assembler will accept, and the
+limit of the claim: an extension LLVM does not model is one this search
+cannot see.
+
+| | |
+|---|---|
+| Zibi | `beqi`/`bnei` only -- `ZibiCond` is `isIntEqualitySetCC` |
+| Xqcibi (Qualcomm) | has the full ordered set, `qc.blti` through `qc.bgeui`, and is `IsRV32` |
+| XCVbi (CORE-V) | `cv.beqimm`/`cv.bneimm`, equality only, and `IsRV32` |
+
+So the ordered half has no one-instruction form at all on a 64-bit
+target, and the 273,747 stays a measurement of what the ISA cannot do
+rather than a backlog item. What *is* foldable is the slice where the
+constant is 0 or 1, because then no immediate is needed -- and that
+needs no extension, which is this entry.
+
+### What the check reports -- 281
+
+| language | objects | sites |
+|---|---:|---:|
+| C++ | 13 | 79 |
+| Rust | 6 | 0 |
+| Go | 12 | 202 |
+| **total** | **31** | **281** |
+
+Per object: 109 in gh, 93 in restic, 28 in ubuntu-libllvm22, 26 in
+libllvm20, 15 in debian-libllvm22, 9 in libxul, 1 in libgkcodecs.
+
+1,050 bytes, from four different deltas: 34 at `(8 -> 2)`, 168 at
+`(8 -> 4)`, 8 at `(6 -> 2)` and 71 at `(6 -> 4)`. The 42 that reach two
+bytes give back the branch's two as well as the `li`'s, because `beqz`
+and `bnez` compress when the register is one of x8-x15 and the
+displacement fits CB format; the `(8 -> 2)` sites save six bytes each,
+the largest single-site saving of any check here. libxul shows both
+halves of that rule at once: `beqz s1` compresses and `beqz s3` does
+not, s3 being x19.
+
+By rewrite, 260 of the 281 are `beqz` and 17 `bnez` -- the two unsigned
+forms, where comparison against 0 or 1 collapses to equality -- against
+2 `blez` and 2 `bgtz`. Every site whose `li` is wide also carries
+check_c_compressible's finding, verified on gh at 109 of 109: two checks
+saying the same instruction is too long for different reasons, and this
+one subsumes the other by removing it rather than shrinking it. The same
+overlap entry 28 has. No site in the corpus becomes `bltz` or `bgez`:
+the 101 shapes that would have (`blt rx,0` and `bge rx,0`) all lose to
+liveness or a branch target. Every Go site loads the constant with a
+wide `li`, and 199 of the 202 are `bltu rx,1` becoming `beqz rx`.
+
+### Where the population goes, and the same lesson a third time
+
+| | sites |
+|---|---:|
+| `li`/`lui` whose immediate alone is 0 or 1 | 3,098,703 |
+| followed by an ordered branch reading it exactly once | 41,929 |
+| -- no zero form exists | 39,596 |
+| -- a form exists | 2,333 |
+| ---- branch reachable from elsewhere | 420 |
+| ---- constant live on a successor | 1,632 |
+| reported | **281** |
+
+94% of the shape has no form, and 39,523 of those 39,596 are one thing:
+K of 1 with the constant as **rs1**.
+
+| combination | sites | |
+|---|---:|---|
+| `bltu 1,rx` | 19,745 | `rx >u 1`, no zero form |
+| `bgeu 1,rx` | 10,868 | `rx <=u 1`, no zero form |
+| `blt 1,rx` | 5,493 | no zero form |
+| `bge 1,rx` | 3,417 | no zero form |
+| `bltu rx,1` | 1,840 | -> `beqz` |
+| `bge 0,rx` | 122 | -> `blez` |
+| `bgeu rx,1` | 107 | -> `bnez` |
+| `bgeu 0,rx` | 87 | -> `beqz` |
+| `bge rx,0` | 74 | -> `bgez` |
+| `bltu rx,0` | 67 | never taken |
+| `bltu 0,rx` | 38 | -> `bnez` |
+| `blt rx,0` | 27 | -> `bltz` |
+| `blt 0,rx` | 27 | -> `bgtz` |
+| `bge rx,1` | 9 | -> `bgtz` |
+| `bgeu rx,0` | 6 | always taken |
+| `blt rx,1` | 2 | -> `blez` |
+
+This is entry 29's lesson for the third time, and the first two were
+warnings about it: an ordered comparison does not commute, so which
+operand holds the constant decides whether a fold exists, and no count
+that reads mnemonics alone can see it. Entry 29 said that about
+division, and said it generalises to "sub, the shifts and the stores";
+the ordered branches belong on that list, and here the blindness is
+worth a factor of eighteen -- 2,333 shapes with a form against 41,929
+read as a family.
+
+The dominant real pattern, `1 >=u rx` and `1 <u rx`, is a test for
+whether a value is at most one or more than one. Neither is a zero test
+and neither has a one-instruction form on any riscv64 target: the best
+either gets is `srli rt,rx,1` + a zero test, which is two instructions
+for two.
 
 # Ranked for C++ and Rust specifically
 

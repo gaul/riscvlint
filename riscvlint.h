@@ -1167,6 +1167,32 @@ bool check_udiv_pow2(riscvlint_state *state, const cs_insn *insn,
 bool check_const_eq_branch(riscvlint_state *state, const cs_insn *insn,
                            riscvlint_finding *finding);
 
+// The ordered half of the same shape, and the half that needs no
+// extension: `li rc,{0,1}` + `blt`/`bge`/`bltu`/`bgeu` against it,
+// where the comparison is already a zero test and x0 serves where the
+// loaded register did. `rx <u 1` is `rx == 0`, so that pair is `beqz
+// rx`; `rx < 1` is `rx <= 0`, which is `bge x0,rx`; against 0 the
+// signed forms are a plain substitution.
+//
+// Ten of the sixteen (comparison, constant, operand-position)
+// combinations have such a form and the table in riscvlint.c says
+// which. Two are settled rather than folded -- `bltu rx,0` is never
+// taken and `bgeu rx,0` always is -- and four are `K,rx` with K of 1,
+// where `1 <u rx` and `1 >=u rx` are genuine two-value tests with no
+// zero form. Every row was checked by brute force over both signed
+// extremes rather than reasoned about twice.
+//
+// Equality against a constant is check_const_eq_branch's and needs
+// Zibi; this needs nothing, which is why the two are separate checks
+// rather than one with a gate inside it.
+//
+// The two unsigned forms become `beqz` or `bnez`, which compress when
+// the register is one of x8-x15 and the displacement fits CB format, so
+// those sites give back the branch's two bytes as well as the `li`'s.
+// The four signed forms have no compressed spelling.
+bool check_const_ord_branch(riscvlint_state *state, const cs_insn *insn,
+                            riscvlint_finding *finding);
+
 // ---- running every check ----
 //
 // Called once per finding, with `ctx` as given. The finding is valid

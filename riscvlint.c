@@ -4575,6 +4575,172 @@ bool check_const_eq_branch(riscvlint_state *state, const cs_insn *insn,
     return true;
 }
 
+// The branch against x0 that an ordered comparison against 0 or 1 is.
+// RV64I has no compare-immediate-and-branch -- that is Zibi's subject,
+// and Zibi is equality-only -- but against these two constants no
+// immediate is needed: the comparison is already a zero test, and x0
+// serves where the loaded register did.
+//
+// Signed against 0 is a plain substitution. Signed against 1
+// reformulates: `rx < 1` is `rx <= 0`, which is `bge x0,rx`, so the
+// comparison flips and the operands swap. Unsigned against 0 or 1
+// collapses to equality, 0 being the only unsigned value below 1.
+//
+// Ten of the sixteen combinations have a form. The two left out are the
+// ones the assembler settles rather than folds -- `bltu rx,0` is never
+// taken and `bgeu rx,0` always is, which is a dead-branch finding and
+// not this one -- and the four `K,rx` rows with K of 1, where `1 < rx`
+// and `1 >= rx` have no zero form. Every row was checked by brute force
+// over both signed extremes, 0, 1 and values straddling the sign bit,
+// rather than reasoned about twice.
+typedef struct {
+    unsigned f3;            // the branch the rewrite uses
+    bool reg_is_rs1;        // and which operand the surviving register takes
+} zero_branch;
+
+static bool zero_branch_form(unsigned f3, int64_t k, bool const_is_rs2,
+                             zero_branch *out)
+{
+    switch (f3) {
+    case 4u:                                            // blt
+        if (k == 0) {
+            out->f3 = 4u; out->reg_is_rs1 = const_is_rs2; return true;
+        }
+        if (k == 1 && const_is_rs2) {                   // rx < 1 == rx <= 0
+            out->f3 = 5u; out->reg_is_rs1 = false; return true;
+        }
+        return false;
+    case 5u:                                            // bge
+        if (k == 0) {
+            out->f3 = 5u; out->reg_is_rs1 = const_is_rs2; return true;
+        }
+        if (k == 1 && const_is_rs2) {                   // rx >= 1 == rx > 0
+            out->f3 = 4u; out->reg_is_rs1 = false; return true;
+        }
+        return false;
+    case 6u:                                            // bltu
+        if (k == 1 && const_is_rs2) {                   // rx <u 1 == rx == 0
+            out->f3 = 0u; out->reg_is_rs1 = true; return true;
+        }
+        if (k == 0 && !const_is_rs2) {                  // 0 <u rx == rx != 0
+            out->f3 = 1u; out->reg_is_rs1 = true; return true;
+        }
+        return false;
+    case 7u:                                            // bgeu
+        if (k == 1 && const_is_rs2) {                   // rx >=u 1 == rx != 0
+            out->f3 = 1u; out->reg_is_rs1 = true; return true;
+        }
+        if (k == 0 && !const_is_rs2) {                  // 0 >=u rx == rx == 0
+            out->f3 = 0u; out->reg_is_rs1 = true; return true;
+        }
+        return false;
+    default:
+        return false;
+    }
+}
+
+// The pseudo each form is spelled as. `bltz`/`bgez` put the register in
+// rs1 and `bgtz`/`blez` in rs2, which is the whole difference between
+// them.
+static const char *zero_branch_name(unsigned f3, bool reg_is_rs1)
+{
+    switch (f3) {
+    case 0u: return "beqz";
+    case 1u: return "bnez";
+    case 4u: return reg_is_rs1 ? "bltz" : "bgtz";
+    default: return reg_is_rs1 ? "bgez" : "blez";
+    }
+}
+
+bool check_const_ord_branch(riscvlint_state *state, const cs_insn *insn,
+                            riscvlint_finding *finding)
+{
+    // No extension gate: the rewrite is another RV64I branch.
+    if (insn->size != 2 && insn->size != 4) return false;
+
+    uint32_t w1;
+    if (!riscvlint_word_at(state, insn->address, &w1)) return false;
+    unsigned rc;
+    int64_t val;
+    if (!decode_const(w1, insn->size, &rc, &val)) return false;
+    if (val != 0 && val != 1) return false;
+    // sp, gp and tp hold what the ABI says they hold rather than a
+    // comparand, as in check_const_eq_branch and check_const_remat.
+    if (rc == 2 || rc == 3 || rc == 4) return false;
+
+    uint64_t second = insn->address + insn->size;
+    uint32_t w2;
+    if (!riscvlint_word_at(state, second, &w2)) return false;
+    unsigned len2 = rv_insn_len(w2);
+    unsigned brs1, brs2, bf3;
+    int64_t off;
+    if (!rv_decode_cond_branch(w2, len2, &brs1, &brs2, &bf3, &off))
+        return false;
+    // The ordered comparisons only. beq and bne against a constant are
+    // check_const_eq_branch's, which needs Zibi to say anything; these
+    // need nothing, which is the whole point of the split.
+    if (bf3 < 4u) return false;
+
+    // Ordered comparison does not commute, so which operand holds the
+    // constant decides the rewrite rather than being a detail. It has to
+    // be exactly one of them: both is a condition reading nothing else,
+    // neither makes the pair unrelated.
+    bool const_is_rs2;
+    unsigned rx;
+    if (brs2 == rc && brs1 != rc) { const_is_rs2 = true;  rx = brs1; }
+    else if (brs1 == rc && brs2 != rc) { const_is_rs2 = false; rx = brs2; }
+    else return false;
+    // x0 as the other operand compares two constants.
+    if (rx == 0) return false;
+
+    zero_branch form;
+    if (!zero_branch_form(bf3, val, const_is_rs2, &form)) return false;
+
+    // Folding deletes the `li`, so the branch must not be reachable from
+    // anywhere that did not run it.
+    if (riscvlint_is_branch_target(state, second)) return false;
+    if (riscvlint_is_relocated(state, insn->address) ||
+        riscvlint_is_relocated(state, second))
+        return false;
+
+    // Dead on both successors, for check_const_eq_branch's reason: a
+    // scan sees the fall-through and not the taken path.
+    uint64_t fallthrough = second + len2;
+    uint64_t taken = second + (uint64_t)off;
+    if (riscvlint_liveness(state, fallthrough, rc) != RISCVLINT_LIVE_DEAD)
+        return false;
+    if (riscvlint_liveness(state, taken, rc) != RISCVLINT_LIVE_DEAD)
+        return false;
+
+    // The two unsigned forms become beqz or bnez, which compress when
+    // the register is one of x8-x15 and the displacement fits CB format
+    // -- so those sites give back the branch's two bytes as well as the
+    // `li`'s. The four signed forms have no compressed spelling and stay
+    // at four. rv_branch_encoded_size decides which, as it does for
+    // check_cond_to_branch.
+    //
+    // It is asked with the displacement as encoded now, which deleting
+    // the `li` does not make optimistic. A forward branch and its target
+    // both shift down by the `li`'s size, leaving the displacement
+    // exactly as it was; a backward one keeps its target and moves
+    // closer to it, so the magnitude shrinks. Either way the current
+    // value is the larger, and a size computed from it can only
+    // understate what the rewrite saves.
+    unsigned nrs1 = form.reg_is_rs1 ? rx : 0u;
+    unsigned nrs2 = form.reg_is_rs1 ? 0u : rx;
+    unsigned after = rv_branch_encoded_size(form.f3, nrs1, nrs2, off);
+    unsigned before = insn->size + len2;
+
+    finding->title = "constant loaded for a branch against zero";
+    finding->address = insn->address;
+    finding->insn_count = 2;
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "%s %s, 0x%" PRIx64 " (%u -> %u bytes)",
+             zero_branch_name(form.f3, form.reg_is_rs1), rv_reg_name(rx),
+             taken, before, after);
+    return true;
+}
+
 // ---- running every check ----
 
 static const riscvlint_check_fn riscvlint_checks[] = {
@@ -4607,6 +4773,7 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_const_mul_to_shadd,
     check_udiv_pow2,
     check_const_eq_branch,
+    check_const_ord_branch,
 };
 
 size_t riscvlint_scan(riscvlint_state *state, csh handle,

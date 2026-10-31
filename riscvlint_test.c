@@ -4205,6 +4205,335 @@ static void test_const_eq_branch(csh handle)
     CHECK(run_zibi(handle, eq, sizeof eq, RISCVLINT_EXT_DECLARED | Z, NULL));
 }
 
+static bool run_ord(csh handle, const uint8_t *bytes, size_t len,
+                    riscvlint_finding *out)
+{
+    static uint8_t buf[256];
+    memcpy(buf, bytes, len);
+    riscvlint_state *state = riscvlint_state_create();
+    if (!state) return false;
+    bool fired = false;
+    if (riscvlint_state_set_section(state, handle, buf, len, 0x1000)) {
+        cs_insn *insn = cs_malloc(handle);
+        const uint8_t *p = buf;
+        size_t remain = len;
+        uint64_t addr = 0x1000;
+        if (insn && cs_disasm_iter(handle, &p, &remain, &addr, insn)) {
+            riscvlint_finding f;
+            memset(&f, 0, sizeof f);
+            fired = check_const_ord_branch(state, insn, &f);
+            if (fired && out) *out = f;
+        }
+        if (insn) cs_free(insn, 1);
+    }
+    riscvlint_state_destroy(state);
+    return fired;
+}
+
+static void test_const_ord_branch(csh handle)
+{
+    riscvlint_finding f;
+
+    // `rx <u 1` is `rx == 0`: beqz, and a4 is one of x8-x15 with a
+    // displacement CB format holds, so the branch compresses too and the
+    // pair goes from six bytes to two.
+    // c.li a5,1 ; bltu a4,a5,.L ; c.li a5,9 ; ret ; c.li a5,8 ; ret
+    static const uint8_t ltu1[] = {
+        0x85, 0x47,                 // c.li a5,1 (2)
+        0x63, 0x64, 0xf7, 0x00,     // bltu a4,a5,.L (4)
+        0xa5, 0x47,                 // c.li a5,9 (2)
+        0x82, 0x80,                 // ret (2)
+        0xa1, 0x47,                 // c.li a5,8 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_ord(handle, ltu1, sizeof ltu1, &f));
+    CHECK(strcmp(f.replacement,
+                 "beqz a4, 0x100a (6 -> 2 bytes)") == 0);
+    CHECK(f.insn_count == 2 && f.address == 0x1000);
+    CHECK(strcmp(f.title,
+                 "constant loaded for a branch against zero") == 0);
+
+    // `rx >=u 1` is `rx != 0`.
+    // c.li a5,1 ; bgeu a4,a5,.L ; c.li a5,9 ; ret ; c.li a5,8 ; ret
+    static const uint8_t geu1[] = {
+        0x85, 0x47,                 // c.li a5,1 (2)
+        0x63, 0x74, 0xf7, 0x00,     // bgeu a4,a5,.L (4)
+        0xa5, 0x47,                 // c.li a5,9 (2)
+        0x82, 0x80,                 // ret (2)
+        0xa1, 0x47,                 // c.li a5,8 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_ord(handle, geu1, sizeof geu1, &f));
+    CHECK(strcmp(f.replacement,
+                 "bnez a4, 0x100a (6 -> 2 bytes)") == 0);
+
+    // `rx < 1` is `rx <= 0`, which is `bge x0,rx` -- the comparison
+    // flips and the operands swap. No compressed form, so four bytes.
+    // c.li a5,1 ; blt a4,a5,.L ; c.li a5,9 ; ret ; c.li a5,8 ; ret
+    static const uint8_t lt1[] = {
+        0x85, 0x47,                 // c.li a5,1 (2)
+        0x63, 0x44, 0xf7, 0x00,     // blt a4,a5,.L (4)
+        0xa5, 0x47,                 // c.li a5,9 (2)
+        0x82, 0x80,                 // ret (2)
+        0xa1, 0x47,                 // c.li a5,8 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_ord(handle, lt1, sizeof lt1, &f));
+    CHECK(strcmp(f.replacement,
+                 "blez a4, 0x100a (6 -> 4 bytes)") == 0);
+
+    // `rx >= 1` is `rx > 0`.
+    // c.li a5,1 ; bge a4,a5,.L ; c.li a5,9 ; ret ; c.li a5,8 ; ret
+    static const uint8_t ge1[] = {
+        0x85, 0x47,                 // c.li a5,1 (2)
+        0x63, 0x54, 0xf7, 0x00,     // bge a4,a5,.L (4)
+        0xa5, 0x47,                 // c.li a5,9 (2)
+        0x82, 0x80,                 // ret (2)
+        0xa1, 0x47,                 // c.li a5,8 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_ord(handle, ge1, sizeof ge1, &f));
+    CHECK(strcmp(f.replacement,
+                 "bgtz a4, 0x100a (6 -> 4 bytes)") == 0);
+
+    // Against 0 the signed forms are a plain substitution of x0.
+    // c.li a5,0 ; blt a4,a5,.L ; c.li a5,9 ; ret ; c.li a5,8 ; ret
+    static const uint8_t lt0[] = {
+        0x81, 0x47,                 // c.li a5,0 (2)
+        0x63, 0x44, 0xf7, 0x00,     // blt a4,a5,.L (4)
+        0xa5, 0x47,                 // c.li a5,9 (2)
+        0x82, 0x80,                 // ret (2)
+        0xa1, 0x47,                 // c.li a5,8 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_ord(handle, lt0, sizeof lt0, &f));
+    CHECK(strcmp(f.replacement,
+                 "bltz a4, 0x100a (6 -> 4 bytes)") == 0);
+
+    // c.li a5,0 ; bge a4,a5,.L ; c.li a5,9 ; ret ; c.li a5,8 ; ret
+    static const uint8_t ge0[] = {
+        0x81, 0x47,                 // c.li a5,0 (2)
+        0x63, 0x54, 0xf7, 0x00,     // bge a4,a5,.L (4)
+        0xa5, 0x47,                 // c.li a5,9 (2)
+        0x82, 0x80,                 // ret (2)
+        0xa1, 0x47,                 // c.li a5,8 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_ord(handle, ge0, sizeof ge0, &f));
+    CHECK(strcmp(f.replacement,
+                 "bgez a4, 0x100a (6 -> 4 bytes)") == 0);
+
+    // With the constant first, `0 <u rx` is `rx != 0`: unsigned
+    // comparison against zero collapses to equality either way round.
+    // c.li a5,0 ; bltu a5,a4,.L ; c.li a5,9 ; ret ; c.li a5,8 ; ret
+    static const uint8_t ltu0r[] = {
+        0x81, 0x47,                 // c.li a5,0 (2)
+        0x63, 0xe4, 0xe7, 0x00,     // bltu a5,a4,.L (4)
+        0xa5, 0x47,                 // c.li a5,9 (2)
+        0x82, 0x80,                 // ret (2)
+        0xa1, 0x47,                 // c.li a5,8 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_ord(handle, ltu0r, sizeof ltu0r, &f));
+    CHECK(strcmp(f.replacement,
+                 "bnez a4, 0x100a (6 -> 2 bytes)") == 0);
+
+    // and `0 >=u rx` is `rx == 0`.
+    // c.li a5,0 ; bgeu a5,a4,.L ; c.li a5,9 ; ret ; c.li a5,8 ; ret
+    static const uint8_t geu0r[] = {
+        0x81, 0x47,                 // c.li a5,0 (2)
+        0x63, 0xf4, 0xe7, 0x00,     // bgeu a5,a4,.L (4)
+        0xa5, 0x47,                 // c.li a5,9 (2)
+        0x82, 0x80,                 // ret (2)
+        0xa1, 0x47,                 // c.li a5,8 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_ord(handle, geu0r, sizeof geu0r, &f));
+    CHECK(strcmp(f.replacement,
+                 "beqz a4, 0x100a (6 -> 2 bytes)") == 0);
+
+    // The signed pair with the constant first keeps its comparison and
+    // leaves the register in rs2, which is what bgtz and blez are.
+    // c.li a5,0 ; blt a5,a4,.L ; c.li a5,9 ; ret ; c.li a5,8 ; ret
+    static const uint8_t lt0r[] = {
+        0x81, 0x47,                 // c.li a5,0 (2)
+        0x63, 0xc4, 0xe7, 0x00,     // blt a5,a4,.L (4)
+        0xa5, 0x47,                 // c.li a5,9 (2)
+        0x82, 0x80,                 // ret (2)
+        0xa1, 0x47,                 // c.li a5,8 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_ord(handle, lt0r, sizeof lt0r, &f));
+    CHECK(strcmp(f.replacement,
+                 "bgtz a4, 0x100a (6 -> 4 bytes)") == 0);
+
+    // c.li a5,0 ; bge a5,a4,.L ; c.li a5,9 ; ret ; c.li a5,8 ; ret
+    static const uint8_t ge0r[] = {
+        0x81, 0x47,                 // c.li a5,0 (2)
+        0x63, 0xd4, 0xe7, 0x00,     // bge a5,a4,.L (4)
+        0xa5, 0x47,                 // c.li a5,9 (2)
+        0x82, 0x80,                 // ret (2)
+        0xa1, 0x47,                 // c.li a5,8 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_ord(handle, ge0r, sizeof ge0r, &f));
+    CHECK(strcmp(f.replacement,
+                 "blez a4, 0x100a (6 -> 4 bytes)") == 0);
+
+    // The same fold on t1, which CB format cannot name: the beqz stays
+    // four bytes and only the `li` is saved.
+    // c.li a5,1 ; bltu t1,a5,.L ; c.li a5,9 ; ret ; c.li a5,8 ; ret
+    static const uint8_t farreg[] = {
+        0x85, 0x47,                 // c.li a5,1 (2)
+        0x63, 0x64, 0xf3, 0x00,     // bltu t1,a5,.L (4)
+        0xa5, 0x47,                 // c.li a5,9 (2)
+        0x82, 0x80,                 // ret (2)
+        0xa1, 0x47,                 // c.li a5,8 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_ord(handle, farreg, sizeof farreg, &f));
+    CHECK(strcmp(f.replacement,
+                 "beqz t1, 0x100a (6 -> 4 bytes)") == 0);
+
+    // `1 >=u rx` is `rx <=u 1`, a two-value test with no zero form.
+    // This is the shape the corpus actually has most of.
+    // c.li a5,1 ; bgeu a5,a4,.L ; c.li a5,9 ; ret ; c.li a5,8 ; ret
+    static const uint8_t geu1r[] = {
+        0x85, 0x47,                 // c.li a5,1 (2)
+        0x63, 0xf4, 0xe7, 0x00,     // bgeu a5,a4,.L (4)
+        0xa5, 0x47,                 // c.li a5,9 (2)
+        0x82, 0x80,                 // ret (2)
+        0xa1, 0x47,                 // c.li a5,8 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_ord(handle, geu1r, sizeof geu1r, NULL));
+
+    // `1 <u rx` is `rx >u 1`, likewise.
+    // The signed pair with K of 1 and the constant first is the same
+    // story: `1 < rx` and `1 >= rx` compare against one, not zero.
+    // Between them these four are 39,523 of the corpus's 39,596
+    // formless shapes, so they are the rejection that matters.
+    // c.li a5,1 ; blt a5,a4,.L ; c.li a5,9 ; ret ; c.li a5,8 ; ret
+    static const uint8_t lt1r[] = {
+        0x85, 0x47,                 // c.li a5,1
+        0x63, 0xc4, 0xe7, 0x00,     // blt a5,a4,.L
+        0xa5, 0x47,                 // c.li a5,9
+        0x82, 0x80,                 // ret
+        0xa1, 0x47,                 // c.li a5,8
+        0x82, 0x80,                 // ret
+    };
+    CHECK(!run_ord(handle, lt1r, sizeof lt1r, NULL));
+
+    // c.li a5,1 ; bge a5,a4,.L ; c.li a5,9 ; ret ; c.li a5,8 ; ret
+    static const uint8_t ge1r[] = {
+        0x85, 0x47,                 // c.li a5,1
+        0x63, 0xd4, 0xe7, 0x00,     // bge a5,a4,.L
+        0xa5, 0x47,                 // c.li a5,9
+        0x82, 0x80,                 // ret
+        0xa1, 0x47,                 // c.li a5,8
+        0x82, 0x80,                 // ret
+    };
+    CHECK(!run_ord(handle, ge1r, sizeof ge1r, NULL));
+    // c.li a5,1 ; bltu a5,a4,.L ; c.li a5,9 ; ret ; c.li a5,8 ; ret
+    static const uint8_t ltu1r[] = {
+        0x85, 0x47,                 // c.li a5,1 (2)
+        0x63, 0xe4, 0xe7, 0x00,     // bltu a5,a4,.L (4)
+        0xa5, 0x47,                 // c.li a5,9 (2)
+        0x82, 0x80,                 // ret (2)
+        0xa1, 0x47,                 // c.li a5,8 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_ord(handle, ltu1r, sizeof ltu1r, NULL));
+
+    // `rx <u 0` is never taken, and that is a dead-branch finding
+    // rather than this one.
+    // c.li a5,0 ; bltu a4,a5,.L ; c.li a5,9 ; ret ; c.li a5,8 ; ret
+    static const uint8_t ltu0[] = {
+        0x81, 0x47,                 // c.li a5,0 (2)
+        0x63, 0x64, 0xf7, 0x00,     // bltu a4,a5,.L (4)
+        0xa5, 0x47,                 // c.li a5,9 (2)
+        0x82, 0x80,                 // ret (2)
+        0xa1, 0x47,                 // c.li a5,8 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_ord(handle, ltu0, sizeof ltu0, NULL));
+
+    // `rx >=u 0` is always taken, likewise.
+    // c.li a5,0 ; bgeu a4,a5,.L ; c.li a5,9 ; ret ; c.li a5,8 ; ret
+    static const uint8_t geu0[] = {
+        0x81, 0x47,                 // c.li a5,0 (2)
+        0x63, 0x74, 0xf7, 0x00,     // bgeu a4,a5,.L (4)
+        0xa5, 0x47,                 // c.li a5,9 (2)
+        0x82, 0x80,                 // ret (2)
+        0xa1, 0x47,                 // c.li a5,8 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_ord(handle, geu0, sizeof geu0, NULL));
+
+    // Two is not 0 or 1, and nothing in the base ISA compares against
+    // it without a register.
+    // c.li a5,2 ; blt a4,a5,.L ; c.li a5,9 ; ret ; c.li a5,8 ; ret
+    static const uint8_t two[] = {
+        0x89, 0x47,                 // c.li a5,2 (2)
+        0x63, 0x44, 0xf7, 0x00,     // blt a4,a5,.L (4)
+        0xa5, 0x47,                 // c.li a5,9 (2)
+        0x82, 0x80,                 // ret (2)
+        0xa1, 0x47,                 // c.li a5,8 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_ord(handle, two, sizeof two, NULL));
+
+    // Equality against a constant is check_const_eq_branch's, and needs
+    // Zibi to say anything at all.
+    // c.li a5,1 ; beq a4,a5,.L ; c.li a5,9 ; ret ; c.li a5,8 ; ret
+    static const uint8_t eqk[] = {
+        0x85, 0x47,                 // c.li a5,1 (2)
+        0x63, 0x04, 0xf7, 0x00,     // beq a4,a5,.L (4)
+        0xa5, 0x47,                 // c.li a5,9 (2)
+        0x82, 0x80,                 // ret (2)
+        0xa1, 0x47,                 // c.li a5,8 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_ord(handle, eqk, sizeof eqk, NULL));
+
+    // The constant read again on the fall-through path.
+    // c.li a5,1 ; bltu a4,a5,.L ; mv a0,a5 ; ret ; c.li a5,8 ; ret
+    static const uint8_t liveft[] = {
+        0x85, 0x47,                 // c.li a5,1 (2)
+        0x63, 0x64, 0xf7, 0x00,     // bltu a4,a5,.L (4)
+        0x3e, 0x85,                 // mv a0,a5 (2)
+        0x82, 0x80,                 // ret (2)
+        0xa1, 0x47,                 // c.li a5,8 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_ord(handle, liveft, sizeof liveft, NULL));
+
+    // ...and on the taken path, which a fall-through-only proof would
+    // miss.
+    // c.li a5,1 ; bltu a4,a5,.L ; c.li a5,9 ; ret ; mv a0,a5 ; ret
+    static const uint8_t livetk[] = {
+        0x85, 0x47,                 // c.li a5,1 (2)
+        0x63, 0x64, 0xf7, 0x00,     // bltu a4,a5,.L (4)
+        0xa5, 0x47,                 // c.li a5,9 (2)
+        0x82, 0x80,                 // ret (2)
+        0x3e, 0x85,                 // mv a0,a5 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_ord(handle, livetk, sizeof livetk, NULL));
+
+    // A branch into the branch.
+    // c.li a5,1 ; bltu a4,a5,.L ; c.li a5,9 ; bnez a3,.T ; c.li a5,8 ; ret
+    static const uint8_t target[] = {
+        0x85, 0x47,                 // c.li a5,1 (2)
+        0x63, 0x64, 0xf7, 0x00,     // bltu a4,a5,.L (4)
+        0xa5, 0x47,                 // c.li a5,9 (2)
+        0xed, 0xfe,                 // bnez a3,.T (2)
+        0xa1, 0x47,                 // c.li a5,8 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_ord(handle, target, sizeof target, NULL));
+}
+
 static void test_census(csh handle)
 {
     static const uint8_t code[] = {
@@ -4379,6 +4708,7 @@ int main(void)
     test_const_mul_to_shadd(handle);
     test_udiv_pow2(handle);
     test_const_eq_branch(handle);
+    test_const_ord_branch(handle);
     test_census(handle);
 
     cs_close(&handle);

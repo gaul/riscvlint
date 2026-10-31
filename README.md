@@ -3,8 +3,8 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Twenty-nine checks are implemented and the ledger's candidate list
-is empty. [TODO.md](TODO.md) is that ledger: every candidate that was
+Thirty checks are implemented and the ledger's candidate list is
+empty. [TODO.md](TODO.md) is that ledger: every candidate that was
 measured, the population it came back with, and the ones rejected on
 that evidence.
 What got written was decided by the corpus rather than by intuition,
@@ -12,7 +12,7 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Twenty-nine of them, and the table lists twenty-three. Six report
+Thirty of them, and the table lists twenty-four. Six report
 nothing over this corpus -- the bit count because no baseline object
 declares Zbb; the three indexed loads and the equality branch because
 those four require their extension to be positively present rather
@@ -57,12 +57,13 @@ the row where no finding does and the arithmetic is uniform instead.
 | dead store to a frame slot | 395 | 1 | 4,172 | 4,568 | 17,160 | all |
 | bit-cast routed through a frame slot | 1,149 | 0 | 10 | 1,159 | 0 | all |
 | li + mul foldable to shNadd | 0 | 0 | 416 | 416 | 1,046 | all |
+| constant loaded for a branch against zero | 79 | 0 | 202 | 281 | 1,050 | all |
 | floating-point constant fli would have built | 0 | 0 | 120 | 120 | 480 | all |
-| **total** | **498,225** | **192,611** | **3,067,239** | **3,758,075** | **8,618,270** | |
+| **total** | **498,304** | **192,611** | **3,067,441** | **3,758,356** | **8,619,320** | |
 
 Do not read the total row as a result. One row is 80% of it, and that
 row is Go's assembler declining to select RVC at all, which is a
-different kind of finding from the twenty-two around it. The second row
+different kind of finding from the twenty-three around it. The second row
 is 6% and belongs to the linker. The `assumed` in the call-pair row is
 the one byte figure that is arithmetic rather than measurement: that
 check prints no size, and every site is eight bytes in and four out
@@ -215,6 +216,52 @@ except a handful of `jalr ra,0(ra)` that were already two.
   vendor extension, and capstone decodes *those*. Their immediate range
   has not been checked against Zibi's, so the figures above are Zibi's
   alone.
+
+* **constant loaded for a branch against zero** -- the ordered half of
+  the shape above, and the half that needs no extension. `li rc,{0,1}` +
+  `blt`/`bge`/`bltu`/`bgeu` against it, where the comparison is already a
+  zero test: `rx <u 1` is `rx == 0`, so that pair is `beqz rx`; `rx < 1`
+  is `rx <= 0`, which is `bge x0,rx`; and against 0 the signed forms are
+  a plain substitution of x0 for the loaded register.
+
+  Ten of the sixteen combinations of comparison, constant and operand
+  position have such a form. Two are settled rather than folded --
+  `bltu rx,0` is never taken, `bgeu rx,0` always is -- and four are
+  `K,rx` with K of 1, where `1 <u rx` and `1 >=u rx` are two-value tests
+  with no zero form. Every row was brute-forced over both signed
+  extremes rather than derived twice.
+
+  Population: **281** sites -- 202 Go, 79 C++, 0 Rust -- worth 1,050
+  bytes. 109 are in gh, 93 in restic, 28 in ubuntu-libllvm22, 26 in
+  libllvm20, 15 in debian-libllvm22, 9 in libxul. 260 become `beqz` and
+  17 `bnez`, the unsigned forms where comparison against 0 or 1 collapses
+  to equality, against 2 `blez` and 2 `bgtz`.
+
+  42 of the 281 save more than the `li`: `beqz` and `bnez` compress when
+  the register is one of x8-x15 and the displacement fits CB format, so
+  those give back the branch's two bytes as well. The 34 at `(8 -> 2)`
+  save six bytes each, the largest single-site saving of any check here.
+  libxul shows both halves of the rule at once -- `beqz s1` compresses
+  and `beqz s3` does not, s3 being x19.
+
+  **This is not the 273,747 the entry above leaves behind, and nothing
+  is.** No extension in LLVM's RISC-V backend gives riscv64 an ordered
+  compare-immediate-branch: Zibi is equality-only by design, and the two
+  with a full ordered set -- Qualcomm's Xqcibi, `qc.blti` through
+  `qc.bgeui`, and CORE-V's XCVbi -- are both `IsRV32`. So the ordered half has no
+  one-instruction form on a 64-bit target at all, and what remains
+  foldable is only the slice where the constant is 0 or 1 and no
+  immediate is needed.
+
+  Of 41,929 shapes where a loaded 0 or 1 feeds an ordered branch, 39,596
+  have no zero form, and 39,523 of those are one thing: K of 1 with the
+  constant as **rs1**. `1 >=u rx` asks whether a value is at most one and
+  `1 <u rx` whether it is more than one; neither is a zero test, and the
+  best either gets is a shift plus a zero test, two instructions for
+  two. Which operand holds the constant decides whether a fold exists,
+  because ordered comparison does not commute -- the same blindness that
+  cost the divide check its apparent population, here worth a factor of
+  eighteen.
 
 * **unsigned divide or remainder by a power of two** -- `li rc,2^k` +
   `divu rd,rx,rc` is a shift: `srli rd,rx,k`. `divuw` divides the low
