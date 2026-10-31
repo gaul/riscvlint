@@ -1986,6 +1986,10 @@ the categories built around them have flagless replacements.
   also prints every Wasm function from the background compile threads,
   which interleaves with and corrupts the JS listing, and `bomb-workers`,
   whose Worker isolates do the same to stdout.
+  `tools/v8_corpus_mine.py` is the dump's `pairscan`: objdump over the
+  converted parts, a set of shape detectors and an abstracted-trigram
+  census per tier, in parallel across the parts. Its output is the
+  JetStream section of TODO.md.
 
 The checks in `riscvlint.c` decode raw encodings rather than reading
 Capstone's operand model, and the reason is not stylistic. Capstone

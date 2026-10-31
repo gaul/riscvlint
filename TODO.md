@@ -1454,11 +1454,176 @@ This is the shape that led to candidate 8, and it is the reason the
 family the number is large and unremarkable, and split on what the
 second instruction writes it is one dominant idiom plus nothing.
 
+## The JetStream corpus -- V8's riscv64 JIT, 37,896,111 instructions
+
+A corpus of a different kind: not what compilers wrote into packages
+but what a JIT wrote into memory. V8 main (5dba721424b, 2026-10-30,
+built without pointer compression, which is riscv64's default) ran
+JetStream 3 on a SpacemiT K3 with its code printers on, and the tools
+under "Mining tools" in README.md turned the listing into 34 ELFs of
+66,216 code objects: 34,688 Sparkplug (BL), 24,698 Maglev (ML), 3,813
+TurboFan (TF), 3,016 regexp (RE) and a few hundred wrappers the dump
+does not name (UN). By instructions that is BL 11.77M, ML 19.65M, TF
+4.41M, RE 2.00M and UN 0.07M. The ELFs carry no relocations -- the
+dump's own relocation table is a sidecar, `code.relocs`, which
+`tools/v8_analyze_findings.py` reads afterwards -- so every check sees
+the bytes the processor executes.
+
+`tools/v8_corpus_mine.py` mined it: objdump over every part, a set of
+shape detectors, and a census of abstracted instruction trigrams per
+tier, so that the shapes nobody thought to ask about rank next to the
+ones somebody did. Its figures are raw-column figures in the sense the
+top of this file uses -- a scan's count before a check's own operand,
+reach, side-entry and liveness conditions -- and each one that becomes
+a check is expected to come in under its estimate. Where the miner
+overlaps a check it agrees: it counts 2,517 `slli 32`+`srli 32` pairs,
+which is to the digit what check 3 reports over this corpus.
+
+| # | opportunity | estimate | where | status |
+|---|---|---:|---|---|
+| 36 | `auipc rd,hi` + `jr lo(rd)` to a target inside `j`'s reach | 1,116,777 | ML 703K, TF 224K, BL 111K, RE 73K | candidate |
+| 37 | a constant built in more instructions than `li` needs | 558,869 | ML 404K, TF 83K, BL 49K, RE 21K | candidate |
+| 38 | an instruction with no architectural effect | 812,586 | ML 764K | candidate |
+| 39 | a conditional branch whose target is an unconditional jump | 177,202 | ML 137K, TF 17K, RE 14K | candidate |
+| 40 | pushes one stack adjustment would do | 81,103 runs | ML 78K | candidate |
+| 41 | `li rt,0` + a store of rt | 43,002 | BL 20K, ML 13K, RE 7K | candidate |
+| 42 | a branch over a constant move that Zbb `max`/`min` does | 31,906 | ML | candidate |
+| 43 | `li rc,0` + `beq`/`bne rx,rc` | 29,089 | TF 25K | candidate |
+| 44 | an immediate operand materialized into a register | 20,743 | ML | candidate |
+| 45 | `slli k` + `srli k`, k >= 53 -> `andi` | 17,097 | BL 12K, ML 5K | candidate |
+| 46 | `and` with a materialized 0xffff -> `zext.h` | 1,499 | ML | candidate |
+
+38's figure is the miner's 1,259,133 less the 431,020 `ebreak` it
+counted alongside them (a trap is an effect) and the 15,527 `nop`,
+which this file already declines to report.
+
+## 36. A far jump that `j` would reach -- 1,116,777
+
+`auipc t6,hi` + `jr lo(t6)`: the jump with +/-2GB of reach, spelled in
+eight bytes through a scratch register, where `j` reaches +/-1MB in
+four. Not one of the 1,116,777 targets is outside that reach, and
+1,099,260 land in the same function. It is candidate 1's shape with x0
+for the link register, which candidate 1 declines on purpose: `jr`
+does not write the auipc's destination, so folding needs that register
+dead where control lands, and check_call_pair_to_jal asks no liveness
+question. A check for this shape has to, and its walk starts at the
+target rather than at the fall-through, since there is none.
+
+V8 emits it from `MacroAssembler::BranchLong`, which spells any jump
+to a label not yet bound this way because the distance is unknown when
+the bytes go out, and `Branch` defaults to `Label::kFar`; the Maglev
+deopt exits and TurboFan's out-of-line code are all forward labels.
+683,166 of the pairs sit under a conditional branch that skips exactly
+them, the inverted-condition spelling check 19 reads when the jump is a
+`j`; a three-part sample puts 55% of those targets inside the branch's
+own +/-4KB, where the three instructions are one, and the rest at
+`bcc`+`j`. Folding the pair first is what lets check 19 see them.
+
+## 37. A constant built in more instructions than `li` needs -- 558,869
+
+A chain of `lui` or `li` followed by `addi`/`addiw`/`slli`/`ori`/`xori`
+on one register, longer than the plain RV64I recurrence needs for the
+value it ends up holding: `lui`+`addiw` for a 32-bit value, otherwise
+the high part recursively, `slli` by its trailing zeros plus twelve,
+and an `addi` for the low twelve bits. 554,655 are six where four
+suffice, and all of those are V8's fixed-length load of a 48-bit
+builtin or code address: `lui`, `addi`, `slli 11`, `ori`, `slli 6`,
+`ori`, the last `ori` by zero when the address ends that way. 402,172
+of them feed a `jalr`: a builtin call is seven instructions on this
+port. 2,292 more are six where three suffice and 1,922 are two or three
+where one or two do.
+
+The sequence is the length it is so that `set_target_address` can
+patch any 48-bit value into it, which is a property of the JIT rather
+than of the constant, and a check reports the constant. In an unlinked
+object the same shape carries HI20/LO12 relocations and its immediates
+are placeholders, which riscvlint_is_relocated already handles and
+leaves the check nothing to say about them; over a linked object it is
+a measurement of the compiler's `li`.
+
+## 38. An instruction with no architectural effect -- 812,586
+
+Three spellings make it up. `lui zero,0x54321`, 425,026: the second
+half of `Assembler::stop()`, which is `ebreak` followed by a `lui` into
+x0 carrying a stop code for the simulator, emitted by `Trap()` after
+every Maglev deferred block -- eight bytes on hardware, which decodes
+neither as anything. `mv sp,sp`, 206,424: `addi sp,sp,0` from
+`MultiPush` and `MultiPop` handed an empty register list around a call.
+`ori t6,t6,0`, 181,136: the last instruction of the fixed load above
+when the low six bits of the address are zero. Check 5 reports a dead
+definition and these are not dead -- `sp` is live and x0 is not a
+register -- so none of it is reported today.
+
+`nop` stays unreported, for the reason given under the compression
+check: alignment padding exists for its width. The forms here have no
+such alibi. The `lui` into x0 is a hint encoding by the ISA's own
+reckoning, and the ones in this corpus are markers the JIT reads back
+through its own disassembler, which is the JIT's business to keep.
+
+## 39 to 46. Eight more shapes from the JetStream corpus
+
+* **39**, a branch whose target is a `j`: jump threading. 177,202, and
+  38,002 more `j` whose target is another `j`. Check 19 reads
+  `bcc L1; j X; L1:`; this is `bcc L; ...; L: j X`, where the branch can
+  be retargeted when X is inside its reach. Many sites are both at once
+  (`bnez a0,L1; j A; L1: j B`).
+* **40**, `addi sp,sp,-8` + `sd r,0(sp)` repeated: 81,103 runs (43,778
+  of two, 16,496 of three, 7,904 of four, 3,122 of five, 9,803 of six
+  or more), almost all Maglev prologues pushing one register at a time
+  when the variadic `Push(r1, r2, ...)` adjusts once. About 162K
+  instructions. Baseline interleaves a load with each push (`ld;
+  addi sp,-8; sd`, 329,280 triples), which a check tolerating an
+  intervening instruction would take as well.
+* **41**, a register loaded with zero and then stored: 43,002, `sd x0`
+  being free. 19,930 in baseline, 12,635 in Maglev.
+* **42**, `li t2,K; blt t2,a5,+8; li a5,K`, Maglev's argument-count
+  clamp in the epilogue: 31,906 sites that are Zbb's `max`. 4,162 more
+  branch over a `mv` (a select, Zicond's `czero` pair) and 892 over an
+  `fsgnj.d`.
+* **43**, `li rc,0` + `beq`/`bne rx,rc`: 29,089 (25,077 in TurboFan),
+  the equality half that 31 covers only for ordered comparisons;
+  against zero no extension is needed, the branch is `beqz`/`bnez`.
+* **44**, `li a3,1; add t2,a2,a3; addw a4,a2,a3`: Maglev's
+  overflow-checked add with a constant operand the register allocator
+  materialized, 20,743 sites where `addi`/`addiw` would do. This file
+  rejected the shape at 942 over the package corpus; the JIT has 22x
+  that.
+* **45**, `slli k`+`srli k` with k >= 53, an `andi`: 17,097 (14,135 at
+  61, which is `andi 7`), against the 2 that rejected it above.
+* **46**, `lui t2,0x10; addiw t2,t2,-1; and a0,t1,t2`: 1,499 `zext.h`.
+
+Not in the table: 188,118 ordered branches against a constant just
+loaded, which no instruction folds (see 31), and 132,364 equality ones,
+which are 30's Zibi shape and need the extension.
+
+### What the corpus says about V8
+
+Four habits of the riscv64 port account for 36, 37, 38 and 40, and are
+CLs rather than checks. `BranchLong` emits `auipc`+`jr` for every
+unbound label where `bcc`+`j` would do, and `j` alone reaches any
+function in this corpus. Short builtin calls are disabled whenever
+pointer compression is off (the `v8_enable_short_builtin_calls` clause
+in `BUILD.gn`), which is riscv64's default, so Maglev and TurboFan call
+every builtin through a six-instruction `li` and baseline through
+`lui; add s6; ld; jalr` -- 940,521 of those, about a quarter of all
+baseline instructions. `Assembler::stop()` spends eight bytes on a
+trap that `ebreak` alone, or `c.ebreak` in two, expresses on hardware.
+And `MultiPush`/`MultiPop` with nothing to push still adjust `sp` by
+zero.
+
+Two things it says about check 9, the extension the producer already
+guarantees: `srai` and `srli` by 32 or more leave a sign- or
+zero-extended word the guarantee table does not record (about 48K more
+findings, almost all Smi untags), and a `lui`+`addi` pair's range is
+not tracked (about 75K, every one a dispatch handle that a later
+`zext.w` re-extends). Both are table entries rather than checks.
+
 # Remaining candidates
 
-None. Thirty-four checks are implemented and everything this file ever
-sized is either written or recorded as rejected with the evidence that
-rejected it. The last thirteen did not come from a corpus probe at all: 23
+Eleven, 36 to 46, all from the JetStream corpus above; over the package
+corpus there are none. Thirty-four checks are implemented and everything
+this file sized over that corpus is either written or recorded as
+rejected with the evidence that rejected it. The last thirteen did not come from a corpus probe at all: 23
 came from walking armlint's check table against this one, 24 came from a
 rejection in this file being wrong, 25, 26 and 27 are the three
 addressing modes of a ratification plan for an extension that does not
