@@ -1227,6 +1227,40 @@ typedef struct {
     unsigned size;       // its encoded bytes, which is what a delete saves
 } rvl_comp;
 
+// The decode cache. Each instruction a section holds would otherwise be
+// decoded three times or more: by riscvlint_state_set_section for the
+// side-entry map, by the scan, and by every liveness walk that passes
+// over it, which on the JetStream dump came to 3.3 decodes for each
+// instruction scanned. Capstone's answer for an address depends only on
+// the bytes from there to the end of the section, so each is decoded
+// once into a slot and copied back out.
+//
+// A section with no more halfwords than the cache has slots is held
+// whole, so set_section's own pass leaves every instruction in it; a
+// larger one shares slots, direct-mapped on the address, and gives up
+// only the decodes it evicts.
+#define DEC_MAX 32768           // slots: about 24 MB, a 64 KiB section
+
+// What a RISC-V decode leaves in cs_detail. Capstone clears exactly
+// this much before each one (RISCV_init_cs_detail) and never writes the
+// rest of the union, so it is all a copy has to carry.
+#define RV_DETAIL_BYTES (offsetof(cs_detail, riscv) + sizeof(cs_riscv))
+
+typedef struct {
+    uint64_t addr;
+    uint32_t gen;               // the section it was decoded in; 0 is none
+    bool ok;                    // capstone could decode it
+    uint8_t len;                // bytes to the next instruction
+    // What riscvlint_liveness needs from it, worked out the first time
+    // a walk reaches it.
+    bool walked;                // the four below are filled in
+    uint8_t kind;               // LIVE_CALL, LIVE_RET, LIVE_UNCOND
+    uint64_t reads, writes;     // bit n for register n, bit 32 for any other
+    uint64_t target;            // relative_target(), 0 for none
+    cs_insn insn;               // all of it but the detail pointer
+    uint8_t detail[RV_DETAIL_BYTES];
+} rvl_dec;
+
 struct riscvlint_state {
     const uint8_t *code;
     size_t size;
@@ -1237,6 +1271,9 @@ struct riscvlint_state {
     csh handle;         // for the liveness walk, which must disassemble
                         // ahead of the caller's own cursor
     cs_insn *probe;
+    rvl_dec *dec;       // the decode cache, dec_cap slots
+    size_t dec_cap;
+    uint32_t dec_gen;   // names the current section in dec[].gen
 
     // Reads data outside the scanned section, for the one check that
     // resolves a pool address. NULL unless a caller offered one; see
@@ -1344,6 +1381,7 @@ void riscvlint_state_destroy(riscvlint_state *state)
 {
     if (!state) return;
     if (state->probe) cs_free(state->probe, 1);
+    free(state->dec);
     free(state->targets);
     free(state->relocs);
     free(state);
@@ -1366,6 +1404,83 @@ static bool has_group(const cs_insn *insn, unsigned g)
     return false;
 }
 
+// Size the cache for a section of `size` bytes -- a slot for each of
+// its halfwords, up to DEC_MAX -- and empty it.
+static bool dec_reserve(riscvlint_state *state, size_t size)
+{
+    size_t want = 1;
+    while (want < DEC_MAX && want < (size + 1) / 2) want *= 2;
+    if (want > state->dec_cap) {
+        rvl_dec *d = calloc(want, sizeof *d);
+        if (!d) return false;
+        free(state->dec);
+        state->dec = d;
+        state->dec_cap = want;
+    }
+    // New code, and perhaps at the same addresses -- a relocatable
+    // object puts every section at 0 -- so nothing decoded before may
+    // be served after.
+    if (++state->dec_gen == 0) {
+        memset(state->dec, 0, state->dec_cap * sizeof *state->dec);
+        state->dec_gen = 1;
+    }
+    return true;
+}
+
+static rvl_dec *dec_slot(const riscvlint_state *state, uint64_t a)
+{
+    return &state->dec[(a >> 1) & (state->dec_cap - 1)];
+}
+
+static bool dec_holds(const riscvlint_state *state, const rvl_dec *d,
+                      uint64_t a)
+{
+    return d->gen == state->dec_gen && d->addr == a;
+}
+
+// Decode the instruction at `a`, which has at least two bytes of the
+// section from it, into `into` and keep it in slot `d`.
+static void dec_fill(riscvlint_state *state, rvl_dec *d, uint64_t a,
+                     cs_insn *into)
+{
+    const uint8_t *p = state->code + (a - state->vaddr);
+    size_t remain = state->size - (size_t)(a - state->vaddr);
+    uint64_t next = a;
+    d->addr = a;
+    d->gen = state->dec_gen;
+    d->walked = false;
+    d->ok = cs_disasm_iter(state->handle, &p, &remain, &next, into);
+    d->len = (uint8_t)(next - a);
+    if (!d->ok) return;
+    d->insn = *into;
+    if (into->detail) memcpy(d->detail, into->detail, RV_DETAIL_BYTES);
+}
+
+// Put what slot `d` holds into `out`, leaving `out` as decoding it
+// there would have: every field of a cs_insn the checks read, and the
+// whole of the detail a decode writes.
+static void dec_copy(cs_insn *out, const rvl_dec *d)
+{
+    cs_detail *detail = out->detail;
+    *out = d->insn;
+    out->detail = detail;
+    if (detail) memcpy(detail, d->detail, RV_DETAIL_BYTES);
+}
+
+// The instruction at `a`, which has at least two bytes of the section
+// from it, in `insn` as cs_disasm_iter would decode it there, from the
+// cache or into it. False where capstone cannot decode it; otherwise
+// `*next` is where the instruction after it starts.
+static bool dec_insn(riscvlint_state *state, uint64_t a, cs_insn *insn,
+                     uint64_t *next)
+{
+    rvl_dec *d = dec_slot(state, a);
+    if (!dec_holds(state, d, a)) dec_fill(state, d, a, insn);
+    else if (d->ok) dec_copy(insn, d);
+    *next = a + d->len;
+    return d->ok;
+}
+
 bool riscvlint_state_set_section(riscvlint_state *state, csh handle,
                                  const uint8_t *code, size_t size,
                                  uint64_t vaddr)
@@ -1386,6 +1501,7 @@ bool riscvlint_state_set_section(riscvlint_state *state, csh handle,
     memset(&state->win, 0, sizeof state->win);
     if (!state->probe) state->probe = cs_malloc(handle);
     if (!state->probe) return false;
+    if (!dec_reserve(state, size)) return false;
 
     size_t nbytes = size / 2 / 8 + 1;
     state->targets = calloc(nbytes, 1);
@@ -1396,16 +1512,28 @@ bool riscvlint_state_set_section(riscvlint_state *state, csh handle,
     // relative transfers and hand back the absolute target, which it
     // does correctly even for the forms whose register access it
     // mis-models.
+    //
+    // A section the cache holds whole is decoded into it here, which is
+    // the only decode the scan and the liveness walk then need.
+    bool keep = (size + 1) / 2 <= state->dec_cap;
     cs_insn *insn = cs_malloc(handle);
     if (!insn) return false;
-    const uint8_t *p = code;
-    size_t remain = size;
     uint64_t addr = vaddr;
-    while (remain >= 2) {
-        if (!cs_disasm_iter(handle, &p, &remain, &addr, insn)) {
-            p += 2; remain -= 2; addr += 2;
+    while (size - (size_t)(addr - vaddr) >= 2) {
+        uint64_t next = addr;
+        bool ok;
+        if (keep) {
+            ok = dec_insn(state, addr, insn, &next);
+        } else {
+            const uint8_t *p = code + (addr - vaddr);
+            size_t remain = size - (size_t)(addr - vaddr);
+            ok = cs_disasm_iter(handle, &p, &remain, &next, insn);
+        }
+        if (!ok) {
+            addr += 2;
             continue;
         }
+        addr = next;
         // BRANCH_RELATIVE only. An indirect `jalr rd,<off>(rs)` is in
         // the JUMP group and carries an immediate too, but that
         // immediate is an offset from a register, not an address --
@@ -1715,9 +1843,57 @@ static uint64_t relative_target(const cs_insn *insn)
     return 0;
 }
 
+enum { LIVE_CALL = 1, LIVE_RET = 2, LIVE_UNCOND = 4 };
+
+// The instruction at `a`, which lies inside the section or at its end,
+// with the fields the walk reads filled in. NULL where fewer than two
+// bytes remain.
+static const rvl_dec *live_decode(riscvlint_state *state, uint64_t a)
+{
+    if (state->size - (size_t)(a - state->vaddr) < 2) return NULL;
+    rvl_dec *d = dec_slot(state, a);
+    if (!dec_holds(state, d, a)) dec_fill(state, d, a, state->probe);
+    else if (d->ok && !d->walked) dec_copy(state->probe, d);
+    if (!d->ok || d->walked) return d;
+
+    const cs_insn *in = state->probe;
+    const char *m = in->mnemonic;
+    cs_regs rr, rw;
+    uint8_t nr = 0, nw = 0;
+    cs_regs_access(state->handle, in, rr, &nr, rw, &nw);
+    // capstone leaves the ra-implicit link aliases writing
+    // nothing and `ret` reading nothing.
+    if ((!strcmp(m, "jal") || !strcmp(m, "jalr")) && nw == 0)
+        rw[nw++] = RISCV_REG_X1;
+    else if (!strcmp(m, "ret") && nr == 0)
+        rr[nr++] = RISCV_REG_X1;
+    d->reads = d->writes = 0;
+    for (int i = 0; i < nr; i++) d->reads |= 1ull << cs_reg_to_num(rr[i]);
+    for (int i = 0; i < nw; i++) d->writes |= 1ull << cs_reg_to_num(rw[i]);
+
+    d->kind = 0;
+    if (insn_in_group(in, RISCV_GRP_CALL) || !strcmp(m, "jal") ||
+        !strcmp(m, "jalr"))
+        d->kind |= LIVE_CALL;
+    if (!strcmp(m, "ret")) d->kind |= LIVE_RET;
+    if (!strcmp(m, "j") || !strcmp(m, "jr") || !strcmp(m, "mret") ||
+        !strcmp(m, "sret"))
+        d->kind |= LIVE_UNCOND;
+    d->target = relative_target(in);
+    d->walked = true;
+    return d;
+}
+
+// Whether a register set in an rvl_dec names register `rd`, as a
+// comparison against cs_reg_to_num would.
+static bool live_names(uint64_t regs, unsigned rd)
+{
+    return rd <= 32 && (regs >> rd & 1);
+}
+
 int riscvlint_liveness(riscvlint_state *state, uint64_t addr, unsigned rd)
 {
-    if (!state->probe) return RISCVLINT_LIVE_UNKNOWN;
+    if (!state->probe || !state->dec) return RISCVLINT_LIVE_UNKNOWN;
     uint64_t queue[LIVE_PATHS], seen[LIVE_PATHS];
     int nq = 0, nseen = 0, budget = LIVE_BUDGET;
     queue[nq++] = addr;
@@ -1733,37 +1909,16 @@ int riscvlint_liveness(riscvlint_state *state, uint64_t addr, unsigned rd)
         if (at < state->vaddr || at >= state->vaddr + state->size)
             return RISCVLINT_LIVE_UNKNOWN;
 
-        const uint8_t *p = state->code + (at - state->vaddr);
-        size_t remain = state->size - (size_t)(at - state->vaddr);
         uint64_t a = at;
         for (;;) {
             if (budget-- <= 0) return RISCVLINT_LIVE_UNKNOWN;
-            if (remain < 2 ||
-                !cs_disasm_iter(state->handle, &p, &remain, &a, state->probe))
-                return RISCVLINT_LIVE_UNKNOWN;
-            const cs_insn *in = state->probe;
-            const char *m = in->mnemonic;
+            const rvl_dec *in = live_decode(state, a);
+            if (!in || !in->ok) return RISCVLINT_LIVE_UNKNOWN;
 
-            cs_regs rr, rw;
-            uint8_t nr = 0, nw = 0;
-            cs_regs_access(state->handle, in, rr, &nr, rw, &nw);
-            // capstone leaves the ra-implicit link aliases writing
-            // nothing and `ret` reading nothing.
-            if ((!strcmp(m, "jal") || !strcmp(m, "jalr")) && nw == 0)
-                rw[nw++] = RISCV_REG_X1;
-            else if (!strcmp(m, "ret") && nr == 0)
-                rr[nr++] = RISCV_REG_X1;
+            if (live_names(in->reads, rd)) return RISCVLINT_LIVE_READ;
+            if (live_names(in->writes, rd)) break;  // redefined before any read
 
-            for (int i = 0; i < nr; i++)
-                if (cs_reg_to_num(rr[i]) == rd) return RISCVLINT_LIVE_READ;
-            bool written = false;
-            for (int i = 0; i < nw; i++)
-                if (cs_reg_to_num(rw[i]) == rd) written = true;
-            if (written) break;                 // redefined before any read
-
-            bool call = insn_in_group(in, RISCV_GRP_CALL) ||
-                        !strcmp(m, "jal") || !strcmp(m, "jalr");
-            if (call) {
+            if (in->kind & LIVE_CALL) {
                 // No shortcut here for the caller-saved temporaries.
                 // That a callee cannot read t0-t6 is a property of the C
                 // ABI, not of the architecture, and riscvlint cannot tell
@@ -1773,7 +1928,7 @@ int riscvlint_liveness(riscvlint_state *state, uint64_t addr, unsigned rd)
                 // into "dead" definitions.
                 return RISCVLINT_LIVE_UNKNOWN;
             }
-            if (!strcmp(m, "ret")) {
+            if (in->kind & LIVE_RET) {
                 // Which registers a return makes observable is an ABI
                 // question -- a0/a1 under the C ABI, a0-a7 under Go's,
                 // plus every callee-saved register the caller expects
@@ -1783,10 +1938,8 @@ int riscvlint_liveness(riscvlint_state *state, uint64_t addr, unsigned rd)
                 // any read, which holds under any convention.
                 return RISCVLINT_LIVE_UNKNOWN;
             }
-            uint64_t t = relative_target(in);
-            bool uncond = !strcmp(m, "j") || !strcmp(m, "jr") ||
-                          !strcmp(m, "mret") || !strcmp(m, "sret");
-            if (uncond) {
+            uint64_t t = in->target;
+            if (in->kind & LIVE_UNCOND) {
                 if (!t) return RISCVLINT_LIVE_UNKNOWN;   // indirect
                 if (nq >= LIVE_PATHS) return RISCVLINT_LIVE_UNKNOWN;
                 queue[nq++] = t;
@@ -1796,6 +1949,7 @@ int riscvlint_liveness(riscvlint_state *state, uint64_t addr, unsigned rd)
                 if (nq >= LIVE_PATHS) return RISCVLINT_LIVE_UNKNOWN;
                 queue[nq++] = t;
             }
+            a += in->len;
         }
     }
     return RISCVLINT_LIVE_DEAD;
@@ -6656,19 +6810,31 @@ size_t riscvlint_scan(riscvlint_state *state, csh handle,
 {
     cs_insn *insn = cs_malloc(handle);
     if (!insn) return 0;
+    // The section set_section decoded is read back from the cache; any
+    // other buffer is decoded here.
+    bool cached = state->dec && code == state->code && len == state->size &&
+                  vaddr == state->vaddr && handle == state->handle;
     size_t found = 0;
-    const uint8_t *p = code;
-    size_t remain = len;
     uint64_t addr = vaddr;
-    while (remain >= 2) {
-        if (!cs_disasm_iter(handle, &p, &remain, &addr, insn)) {
+    while (len - (size_t)(addr - vaddr) >= 2) {
+        uint64_t next = addr;
+        bool ok;
+        if (cached) {
+            ok = dec_insn(state, addr, insn, &next);
+        } else {
+            const uint8_t *p = code + (addr - vaddr);
+            size_t remain = len - (size_t)(addr - vaddr);
+            ok = cs_disasm_iter(handle, &p, &remain, &next, insn);
+        }
+        if (!ok) {
             // Resynchronising past a halfword we could not read means we
             // do not know what it did to memory.
             riscvlint_state_drop_window(state);
-            p += 2; remain -= 2; addr += 2;
+            addr += 2;
             if (skipped) *skipped += 2;
             continue;
         }
+        addr = next;
         if (instructions) (*instructions)++;
         for (size_t i = 0;
              i < sizeof riscvlint_checks / sizeof riscvlint_checks[0]; i++) {
