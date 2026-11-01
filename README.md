@@ -3,8 +3,8 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Forty-three checks are implemented and the ledger's candidate list holds
-two, all from a JIT corpus. [TODO.md](TODO.md) is that ledger:
+Forty-four checks are implemented and the ledger's candidate list holds
+one, from a JIT corpus. [TODO.md](TODO.md) is that ledger:
 every candidate that was measured, the population it came back with,
 and the ones rejected on that evidence.
 What got written was decided by the corpus rather than by intuition,
@@ -12,21 +12,21 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Forty-three of them, and the table lists twenty-seven. The jump pair,
-the constant chain, the no-op, the push run, the zero store, the zero
-branch, the andi pair, the max clamp and the immediate operand have so
-far been measured over the JetStream corpus of TODO.md, which the table
-does not cover. Seven report nothing over this corpus -- the bit count
-because no baseline object declares Zbb; the three indexed loads, the
-equality branch and the compare-exchange loop because those five require
-their extension to be positively present rather than merely un-denied,
-and no object declares Zilx, Zibi or Zacas; and the unsigned divide by a
-power of two because all three toolchains already do that fold
-themselves. Those entries below say why. Every figure is what the check
-itself reports over the [corpus](#corpus) -- 108,165,211 instructions of
-three toolchains across 31 objects -- rather than what a mining tool
-estimated for it. The two have differed by an order of magnitude every
-time both were measured.
+Forty-four of them, and the table lists twenty-seven. The jump pair, the
+constant chain, the no-op, the push run, the zero store, the zero
+branch, the andi pair, the max clamp, the immediate operand and the mask
+have so far been measured over the JetStream corpus of TODO.md, which
+the table does not cover. Seven report nothing over this corpus -- the
+bit count because no baseline object declares Zbb; the three indexed
+loads, the equality branch and the compare-exchange loop because those
+five require their extension to be positively present rather than merely
+un-denied, and no object declares Zilx, Zibi or Zacas; and the unsigned
+divide by a power of two because all three toolchains already do that
+fold themselves. Those entries below say why. Every figure is what the
+check itself reports over the [corpus](#corpus) -- 108,165,211
+instructions of three toolchains across 31 objects -- rather than what a
+mining tool estimated for it. The two have differed by an order of
+magnitude every time both were measured.
 
 The table is generated, not maintained: `scripts/check_table.py` scans
 the corpus and prints it, which is how adding two objects stopped
@@ -934,6 +934,24 @@ except a handful of `jalr ra,0(ra)` that were already two.
   98 whose `addw` overwrites the constant survive. Most of the rest
   subtract a small constant in code the dump does not name, or load
   zero for what is a copy.
+
+* **mask loaded for a zero extension** -- a mask of the low n bits,
+  which `andi` cannot hold and so takes two instructions or more to
+  build, and then only anded with: `zext.h` does the `and` alone at 16
+  bits under Zbb, `zext.w` at 32 under Zba, and at any other width, or
+  without the extension, the shift pair `slli 64-n` + `srli 64-n` does.
+
+  ```
+   2865148: lui t2, 0x10
+   286514c: addiw t2, t2, -1
+   2865150: and a0, s1, t2           -> zext.h a0, s1 (12 -> 4 bytes)
+  ```
+
+  The uses are found by the entry above's walk, and the mask must be
+  dead after the last. The JetStream corpus (TODO.md, entry 46) has
+  1,142, worth 9,024 bytes: 1,100 `zext.h`, 7 `zext.w` and 35 shift
+  pairs, for masks of 12 to 31 bits. V8's `And` with an immediate
+  `andi` cannot hold loads it into a scratch register whatever it is.
 
 * **constant built in more instructions than li needs** -- a chain of
   `lui` or `li` followed by `addi`, `addiw`, `slli`, `ori` or `xori`

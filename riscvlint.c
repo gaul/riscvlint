@@ -6163,15 +6163,19 @@ bool check_branch_to_minmax(riscvlint_state *state, const cs_insn *insn,
 typedef enum {
     IMM_ADDI, IMM_ADDIW, IMM_ANDI, IMM_ORI, IMM_XORI, IMM_SLTI, IMM_SLTIU,
     IMM_SLLI, IMM_SRLI, IMM_SRAI, IMM_SLLIW, IMM_SRLIW, IMM_SRAIW,
+    // An `and` with a mask too wide for andi, check_mask_for_zext's.
+    IMM_ZEXT_H, IMM_ZEXT_W, IMM_MASK_PAIR,
 } imm_kind;
 
 static const char *const imm_names[] = {
     "addi", "addiw", "andi", "ori", "xori", "slti", "sltiu",
     "slli", "srli", "srai", "slliw", "srliw", "sraiw",
+    "zext.h", "zext.w", "slli + srli",
 };
 
 // One register-register operation rewritten with rc's constant as its
-// immediate: `kind rd,rx,imm`.
+// immediate: `kind rd,rx,imm`. The mask pair is `slli rd,rx,imm` +
+// `srli rd,rd,imm`, and the two zero extensions take no immediate.
 typedef struct {
     imm_kind kind;
     unsigned rd, rx;
@@ -6185,8 +6189,13 @@ typedef struct {
 // immediate spelling. Subtraction becomes an addition of -k, and a shift
 // takes k's low five or six bits, which are all a register shift reads.
 // The compressed CA and CR forms are the same operations in place.
-static bool imm_form(uint32_t w, unsigned size, unsigned rc, int64_t k,
-                     imm_use *u)
+//
+// An `and` whose constant andi cannot hold is still one when the
+// constant is a mask of the low n bits: Zbb's `zext.h` at 16, Zba's
+// `zext.w` at 32, and otherwise, or without the extension, the shift
+// pair that keeps n bits.
+static bool imm_form(const riscvlint_state *state, uint32_t w, unsigned size,
+                     unsigned rc, int64_t k, imm_use *u)
 {
     unsigned opc, f3, f7, rd, rs1, rs2;
     if (size == 4) {
@@ -6250,7 +6259,21 @@ static bool imm_form(uint32_t w, unsigned size, unsigned rc, int64_t k,
         return true;
     }
     // What is left has no W form and no funct7 variant.
-    if (word || sub || !fits) return false;
+    if (word || sub) return false;
+    if (!fits) {
+        uint64_t m = (uint64_t)k;
+        if (f3 != 7 || (m & (m + 1)) != 0) return false;
+        unsigned n = 0;
+        while (n < 64 && ((m >> n) & 1u)) n++;
+        if (n == 16 && riscvlint_may_use(state, RISCVLINT_EXT_ZBB))
+            u->kind = IMM_ZEXT_H;
+        else if (n == 32 && riscvlint_may_use(state, RISCVLINT_EXT_ZBA))
+            u->kind = IMM_ZEXT_W;
+        else
+            u->kind = IMM_MASK_PAIR;
+        u->imm = 64 - n;
+        return true;
+    }
     switch (f3) {
     case 2: if (!second) return false; u->kind = IMM_SLTI; return true;
     case 3: if (!second) return false; u->kind = IMM_SLTIU; return true;
@@ -6264,19 +6287,75 @@ static bool imm_form(uint32_t w, unsigned size, unsigned rc, int64_t k,
 // four where the use was four, as check_zero_for_store prices its
 // stores, and for a compressed use the compressed immediate form where
 // one exists -- c.addi, c.addiw and c.andi, each in place -- or four
-// where it does not, since then the rewrite grows that instruction.
+// where it does not, since then the rewrite grows that instruction. The
+// zero extensions are four, sized without Zcb as the zext pair checks
+// size them, and the mask pair eight, or c.slli and c.srli in place of a
+// c.and.
 static unsigned imm_use_size(const imm_use *u, unsigned len)
 {
-    if (len == 4 || u->rd != u->rx) return 4;
+    bool in_place = len == 2 && u->rd == u->rx;
     switch (u->kind) {
-    case IMM_ADDI: return u->imm != 0 && fits6(u->imm) ? 2 : 4;
-    case IMM_ADDIW: return fits6(u->imm) ? 2 : 4;
-    case IMM_ANDI: return rvc_reg(u->rd) && fits6(u->imm) ? 2 : 4;
+    case IMM_ADDI: return in_place && u->imm != 0 && fits6(u->imm) ? 2 : 4;
+    case IMM_ADDIW: return in_place && fits6(u->imm) ? 2 : 4;
+    case IMM_ANDI: return in_place && rvc_reg(u->rd) && fits6(u->imm) ? 2 : 4;
+    case IMM_MASK_PAIR: return in_place ? 4 : 8;
     default: return 4;
     }
 }
 
 #define CONST_WALK 16       // instructions the uses may span
+
+// What a constant's uses come to, for the two checks that delete the
+// constant: the first two uses for the finding text, how many there
+// were, the bytes before and after, the instructions spanned, the
+// address after the last use, and whether that use overwrote rc.
+// `before` and `span` arrive holding the materialization's own.
+typedef struct {
+    imm_use use[2];
+    unsigned nuse, before, after, span;
+    uint64_t end;
+    bool dead;
+} const_uses;
+
+// Every operation reading rc, holding k, that imm_form rewrites -- the
+// mask forms when `masks`, the rest otherwise -- from `at` until
+// anything else might name rc, sixteen instructions at most, with no
+// side entry or transfer among them: check_zero_for_store's walk. A use
+// that overwrites rc ends it with the constant dead.
+static void const_use_walk(riscvlint_state *state, uint64_t at, unsigned rc,
+                           int64_t k, bool masks, const_uses *cu)
+{
+    unsigned seen = cu->span;
+    cu->nuse = 0;
+    cu->after = 0;
+    cu->end = at;
+    cu->dead = false;
+    for (int budget = CONST_WALK; budget > 0; budget--) {
+        if (riscvlint_is_branch_target(state, at)) break;
+        uint32_t w;
+        if (!riscvlint_word_at(state, at, &w)) break;
+        unsigned len = rv_insn_len(w);
+        seen++;
+        imm_use u;
+        if (imm_form(state, w, len, rc, k, &u) &&
+            (u.kind >= IMM_ZEXT_H) == masks) {
+            if (riscvlint_is_relocated(state, at)) break;
+            if (cu->nuse < 2) cu->use[cu->nuse] = u;
+            cu->nuse++;
+            cu->before += len;
+            cu->after += imm_use_size(&u, len);
+            cu->end = at + len;
+            cu->span = seen;
+            if (u.rd == rc) {
+                cu->dead = true;
+                break;
+            }
+        } else if (rv_may_name(w, len, rc) || rv_stops_walk(w, len)) {
+            break;
+        }
+        at += len;
+    }
+}
 
 bool check_const_for_imm(riscvlint_state *state, const cs_insn *insn,
                          riscvlint_finding *finding)
@@ -6292,46 +6371,18 @@ bool check_const_for_imm(riscvlint_state *state, const cs_insn *insn,
     if (rc == 2 || rc == 3 || rc == 4) return false;
     if (riscvlint_is_relocated(state, insn->address)) return false;
 
-    // Every operation that reads rc where its immediate form would take
-    // the constant, before anything else might name rc, with no side
-    // entry or transfer among them -- check_zero_for_store's walk. A use
-    // that overwrites rc ends it with the constant dead.
-    imm_use use[2];
-    unsigned nuse = 0, before = insn->size, after = 0, seen = 1, span = 1;
-    bool dead = false;
-    uint64_t at = insn->address + insn->size, end = at;
-    for (int budget = CONST_WALK; budget > 0; budget--) {
-        if (riscvlint_is_branch_target(state, at)) break;
-        uint32_t w2;
-        if (!riscvlint_word_at(state, at, &w2)) break;
-        unsigned len = rv_insn_len(w2);
-        seen++;
-        imm_use u;
-        if (imm_form(w2, len, rc, k, &u)) {
-            if (riscvlint_is_relocated(state, at)) break;
-            if (nuse < 2) use[nuse] = u;
-            nuse++;
-            before += len;
-            after += imm_use_size(&u, len);
-            end = at + len;
-            span = seen;
-            if (u.rd == rc) {
-                dead = true;
-                break;
-            }
-        } else if (rv_may_name(w2, len, rc) || rv_stops_walk(w2, len)) {
-            break;
-        }
-        at += len;
-    }
-    if (nuse == 0 || after >= before) return false;
-    if (!dead && riscvlint_liveness(state, end, rc) != RISCVLINT_LIVE_DEAD)
+    const_uses cu = { .before = insn->size, .span = 1 };
+    const_use_walk(state, insn->address + insn->size, rc, k, false, &cu);
+    if (cu.nuse == 0 || cu.after >= cu.before) return false;
+    if (!cu.dead &&
+        riscvlint_liveness(state, cu.end, rc) != RISCVLINT_LIVE_DEAD)
         return false;
 
+    unsigned nuse = cu.nuse, before = cu.before, after = cu.after;
     finding->title = "constant loaded for an immediate operand";
     finding->address = insn->address;
-    finding->insn_count = span;
-    const imm_use *a = &use[0], *b = &use[1];
+    finding->insn_count = cu.span;
+    const imm_use *a = &cu.use[0], *b = &cu.use[1];
     if (nuse == 1)
         snprintf(finding->replacement, sizeof finding->replacement,
                  "%s %s, %s, %" PRId64 " (%u -> %u bytes)",
@@ -6348,6 +6399,72 @@ bool check_const_for_imm(riscvlint_state *state, const cs_insn *insn,
         snprintf(finding->replacement, sizeof finding->replacement,
                  "%" PRId64 " for %s in %u operations (%u -> %u bytes)", k,
                  rv_reg_name(rc), nuse, before, after);
+    return true;
+}
+
+// ---- a mask loaded for a zero extension ----
+
+bool check_mask_for_zext(riscvlint_state *state, const cs_insn *insn,
+                         riscvlint_finding *finding)
+{
+    uint32_t w;
+    if (!riscvlint_word_at(state, insn->address, &w)) return false;
+    unsigned rc, r;
+    int64_t k;
+    if (li_chain_step(w, insn->size, 0, &rc, &k) != LI_START) return false;
+    if (rc == 2 || rc == 3 || rc == 4) return false;
+    if (riscvlint_is_relocated(state, insn->address)) return false;
+
+    // The whole chain, as check_long_li follows it: a mask is what the
+    // last step leaves, not what some prefix of it held.
+    unsigned len = 1, bytes = insn->size;
+    uint64_t at = insn->address + insn->size;
+    for (;;) {
+        uint32_t w2;
+        if (!riscvlint_word_at(state, at, &w2)) break;
+        unsigned size2 = rv_insn_len(w2);
+        int64_t next;
+        if (li_chain_step(w2, size2, k, &r, &next) != LI_STEP || r != rc)
+            break;
+        if (riscvlint_is_branch_target(state, at)) break;
+        if (riscvlint_is_relocated(state, at)) return false;
+        k = next;
+        len++;
+        bytes += size2;
+        at += size2;
+    }
+    // A mask andi cannot hold has twelve bits or more, which no single
+    // instruction builds; a narrower one is check_const_for_imm's andi.
+    uint64_t m = (uint64_t)k;
+    if (len < 2 || k < 2048 || (m & (m + 1)) != 0) return false;
+
+    const_uses cu = { .before = bytes, .span = len };
+    const_use_walk(state, at, rc, k, true, &cu);
+    if (cu.nuse == 0 || cu.after >= cu.before) return false;
+    if (!cu.dead &&
+        riscvlint_liveness(state, cu.end, rc) != RISCVLINT_LIVE_DEAD)
+        return false;
+
+    // Every use of one mask takes the same form, so the first names it.
+    const imm_use *a = &cu.use[0];
+    finding->title = "mask loaded for a zero extension";
+    finding->address = insn->address;
+    finding->insn_count = cu.span;
+    if (cu.nuse > 1)
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "%s for %s in %u ands (%u -> %u bytes)", imm_names[a->kind],
+                 rv_reg_name(rc), cu.nuse, cu.before, cu.after);
+    else if (a->kind == IMM_MASK_PAIR)
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "slli %s, %s, %" PRId64 "; srli %s, %s, %" PRId64
+                 " (%u -> %u bytes)",
+                 rv_reg_name(a->rd), rv_reg_name(a->rx), a->imm,
+                 rv_reg_name(a->rd), rv_reg_name(a->rd), a->imm, cu.before,
+                 cu.after);
+    else
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "%s %s, %s (%u -> %u bytes)", imm_names[a->kind],
+                 rv_reg_name(a->rd), rv_reg_name(a->rx), cu.before, cu.after);
     return true;
 }
 
@@ -6397,6 +6514,7 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_slli_srli_to_andi,
     check_branch_to_minmax,
     check_const_for_imm,
+    check_mask_for_zext,
 };
 
 size_t riscvlint_scan(riscvlint_state *state, csh handle,

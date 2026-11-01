@@ -1533,6 +1533,27 @@ bool check_branch_to_minmax(riscvlint_state *state, const cs_insn *insn,
 bool check_const_for_imm(riscvlint_state *state, const cs_insn *insn,
                          riscvlint_finding *finding);
 
+// A mask of the low n bits, built in two instructions or more because
+// andi cannot hold it, and then only anded with: Zbb's `zext.h` does the
+// `and` alone at n = 16 and Zba's `zext.w` at 32, and without the
+// extension or at any other width of twelve bits or more the shift pair
+// `slli rd,rx,64-n` + `srli rd,rd,64-n` does, and the materialization
+// goes:
+//
+//     lui t2,0x10; addiw t2,t2,-1; and a0,t1,t2  ->  zext.h a0,t1
+//
+// The chain is followed as check_long_li follows it, and the uses as
+// check_const_for_imm walks them, sharing its walk; the mask must be
+// dead after the last `and` or overwritten by it. The zero extensions
+// are priced at four bytes, without Zcb, and the pair at eight, or four
+// for c.slli and c.srli where the `and` was a c.and in place.
+//
+// Measured population: 1,142 sites in the JetStream corpus (TODO.md,
+// entry 46), 1,100 of them zext.h; most of the miner's other 0xffff
+// masks are followed by a transfer the liveness walk cannot see past.
+bool check_mask_for_zext(riscvlint_state *state, const cs_insn *insn,
+                         riscvlint_finding *finding);
+
 // ---- running every check ----
 //
 // Called once per finding, with `ctx` as given. The finding is valid

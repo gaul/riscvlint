@@ -6002,6 +6002,76 @@ static void test_const_for_imm(csh handle)
                      NULL) == 0);
 }
 
+// check_mask_for_zext: a low-bit mask built only to be anded with.
+static void test_mask_for_zext(csh handle)
+{
+    riscvlint_finding f;
+    const uint32_t ret = 0x00008067u;
+    const uint32_t lui_t2_16 = 0x000103b7u;      // lui t2,0x10
+    const uint32_t addiw_m1 = 0xfff3839bu;       // addiw t2,t2,-1
+    const uint32_t and_a0 = 0x00737533u;         // and a0,t1,t2
+    const uint32_t li_t2_0 = 0x00000393u;        // li t2,0
+
+    // Maglev's 0xffff: three instructions are one zext.h. The immediate
+    // operand check, which starts at the lui as well, stays quiet.
+    uint32_t v8[] = { lui_t2_16, addiw_m1, and_a0, li_t2_0, ret };
+    CHECK(run_words(handle, check_mask_for_zext, v8, 5, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "zext.h a0, t1 (12 -> 4 bytes)") == 0);
+    CHECK(f.insn_count == 3 && f.address == 0x1000);
+    CHECK(strcmp(f.title, "mask loaded for a zero extension") == 0);
+    CHECK(run_words(handle, check_const_for_imm, v8, 5, 0x1000, NULL) == 0);
+
+    // 0xffffffff in three instructions is zext.w; 0xfffff is the shift
+    // pair keeping twenty bits; and 0xffff without Zbb is that pair too.
+    uint32_t w32[] = { 0x00100393u /* li t2,1 */, 0x02039393u /* slli t2,t2,32 */,
+                       0xfff38393u /* addi t2,t2,-1 */,
+                       0x00757533u /* and a0,a0,t2 */, li_t2_0, ret };
+    CHECK(run_words(handle, check_mask_for_zext, w32, 6, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "zext.w a0, a0 (16 -> 4 bytes)") == 0);
+    uint32_t b20[] = { 0x001003b7u /* lui t2,0x100 */, addiw_m1, and_a0,
+                       li_t2_0, ret };
+    CHECK(run_words(handle, check_mask_for_zext, b20, 5, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement,
+                 "slli a0, t1, 44; srli a0, a0, 44 (12 -> 8 bytes)") == 0);
+    uint8_t bytes[sizeof v8];
+    memcpy(bytes, v8, sizeof v8);
+    CHECK(run_window_exts(handle, check_mask_for_zext, bytes, sizeof bytes,
+                          0x1000, RISCVLINT_EXT_DECLARED | RISCVLINT_EXT_ZBA,
+                          &f) == 1);
+    CHECK(strcmp(f.replacement,
+                 "slli a0, t1, 48; srli a0, a0, 48 (12 -> 8 bytes)") == 0);
+
+    // Two ands of one mask; and an and that overwrites the mask's
+    // register, which needs no liveness proof even before `ret`.
+    uint32_t two[] = { lui_t2_16, addiw_m1, and_a0,
+                       0x007e75b3u /* and a1,t3,t2 */, li_t2_0, ret };
+    CHECK(run_words(handle, check_mask_for_zext, two, 6, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "zext.h for t2 in 2 ands (16 -> 8 bytes)") == 0);
+    CHECK(f.insn_count == 4);
+    uint32_t over[] = { lui_t2_16, addiw_m1, 0x007373b3u /* and t2,t1,t2 */,
+                        ret };
+    CHECK(run_words(handle, check_mask_for_zext, over, 4, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "zext.h t2, t1 (12 -> 4 bytes)") == 0);
+
+    // Not reported: 0xfffe, which is not a mask; the mask read again;
+    // the mask reaching `ret`; an or, which no extension does; and a
+    // chain that goes on past the mask to build 0xffff0.
+    uint32_t notmask[] = { lui_t2_16, 0xffe3839bu /* addiw t2,t2,-2 */, and_a0,
+                           li_t2_0, ret };
+    CHECK(run_words(handle, check_mask_for_zext, notmask, 5, 0x1000, NULL) == 0);
+    uint32_t live[] = { lui_t2_16, addiw_m1, and_a0,
+                        0x00038593u /* mv a1,t2 */, ret };
+    CHECK(run_words(handle, check_mask_for_zext, live, 5, 0x1000, NULL) == 0);
+    uint32_t exit[] = { lui_t2_16, addiw_m1, and_a0, ret };
+    CHECK(run_words(handle, check_mask_for_zext, exit, 4, 0x1000, NULL) == 0);
+    uint32_t orr[] = { lui_t2_16, addiw_m1, 0x00736533u /* or a0,t1,t2 */,
+                       li_t2_0, ret };
+    CHECK(run_words(handle, check_mask_for_zext, orr, 5, 0x1000, NULL) == 0);
+    uint32_t longer[] = { lui_t2_16, addiw_m1, 0x00439393u /* slli t2,t2,4 */,
+                          and_a0, li_t2_0, ret };
+    CHECK(run_words(handle, check_mask_for_zext, longer, 6, 0x1000, NULL) == 0);
+}
+
 int main(void)
 {
     csh handle;
@@ -6046,6 +6116,7 @@ int main(void)
     test_slli_srli_to_andi(handle);
     test_branch_to_minmax(handle);
     test_const_for_imm(handle);
+    test_mask_for_zext(handle);
     test_zero_store_run(handle);
     test_bitcast_through_frame(handle);
     test_cchain(handle);

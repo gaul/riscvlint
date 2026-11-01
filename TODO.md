@@ -1494,7 +1494,7 @@ which is to the digit what check 3 reports over this corpus.
 | 43 | `li rc,0` + `beq`/`bne rx,rc` | 29,089 | TF 25K | **implemented**, 1,658 |
 | 44 | an immediate operand materialized into a register | 20,743 | ML | **implemented**, 1,738 |
 | 45 | `slli k` + `srli k`, k >= 53 -> `andi` | 17,097 | BL 12K, ML 5K | **implemented**, 17,097 |
-| 46 | `and` with a materialized 0xffff -> `zext.h` | 1,499 | ML | candidate |
+| 46 | `and` with a materialized 0xffff -> `zext.h` | 1,499 | ML | **implemented**, 1,142 |
 
 38's figure is the miner's 1,259,133 less the 431,020 `ebreak` it
 counted alongside them (a trap is an effect) and the 15,527 `nop`,
@@ -1763,14 +1763,41 @@ reported in the `addi` and `xori` spelling. 98 are the overflow-checked
 pair, 81 adds and 17 subtracts, where the W operation overwrites the
 constant's own register and no liveness proof is needed.
 
-## 39 and 46. Two more shapes from the JetStream corpus
+## 46. A mask loaded for a zero extension -- 1,142  [implemented]
+
+`lui t2,0x10; addiw t2,t2,-1; and a0,t1,t2` builds 0xffff in two
+instructions to use it once, where Zbb's `zext.h a0,t1` is the `and`
+alone. The check takes any mask of the low n bits too wide for `andi`,
+built by a chain check_long_li would follow and then only anded with:
+`zext.h` at 16 under Zbb, `zext.w` at 32 under Zba, and otherwise the
+shift pair that keeps n bits, which still drops the materialization.
+The uses are 44's walk, which the two checks share, and the mask must be
+dead after the last `and` or overwritten by it. V8's `And` loads any
+immediate `andi` cannot hold into a scratch register, the mask included.
+
+What check_mask_for_zext reports: 1,142 sites worth 9,024 bytes, 846
+Maglev's, 159 TurboFan's, 132 regexp code's and 5 in unnamed code: 1,100
+`zext.h`, one of them two `and`s of one mask, 7 `zext.w`, and 35 shift
+pairs, for masks of 24 bits (18), 28 (10), 15 (3), 12 (2) and 31 (2).
+Against the miner's 1,499, which counted an `and` within three
+instructions of the mask with no liveness condition, the shortfall is
+the liveness walk again: the declined `and`s are mostly followed by a
+transfer, and a `j` to V8's far jump ends the proof as it ends 43's.
+
+Of the 1,608 adjacent `lui`, `addiw`, `and` triples in the corpus, 694
+store the result with `sh` at once, and a halfword store keeps the low
+sixteen bits whatever is above them. Where the result dies there, no
+instruction at all is needed in place of the three.
+That is a dead-bits question rather than a peephole, and this check
+does not ask it.
+
+## 39. One more shape from the JetStream corpus
 
 * **39**, a branch whose target is a `j`: jump threading. 177,202, and
   38,002 more `j` whose target is another `j`. Check 19 reads
   `bcc L1; j X; L1:`; this is `bcc L; ...; L: j X`, where the branch can
   be retargeted when X is inside its reach. Many sites are both at once
   (`bnez a0,L1; j A; L1: j B`).
-* **46**, `lui t2,0x10; addiw t2,t2,-1; and a0,t1,t2`: 1,499 `zext.h`.
 
 Not in the table: 188,118 ordered branches against a constant just
 loaded, which no instruction folds (see 31), and 132,364 equality ones,
@@ -1778,23 +1805,25 @@ which are 30's Zibi shape and need the extension.
 
 ### What the corpus says about V8
 
-Seven habits of the riscv64 port account for 36, 37, 38, 40, 42 and 45,
-each a CL as well as a check's finding. `BranchLong` emits `auipc`+`jr`
-for every unbound label where `bcc`+`j` would do, and `j` alone reaches
-any function in this corpus. Short builtin calls are disabled whenever
-pointer compression is off (the `v8_enable_short_builtin_calls` clause
-in `BUILD.gn`), which is riscv64's default, so Maglev and TurboFan call
-every builtin through a six-instruction `li` and baseline through `lui;
-add s6; ld; jalr` -- 940,521 of those, about a quarter of all baseline
-instructions. `Assembler::stop()` spends eight bytes on a trap that
-`ebreak` alone, or `c.ebreak` in two, expresses on hardware.
-`MultiPush`/`MultiPop` with nothing to push still adjust `sp` by zero.
-Maglev's prologue pushes the context, the function, the argument count
-and a zero for every tagged slot with one `Push()` each, where the
-variadic `Push` beside it adjusts once. `Return` clamps the argument
-count with a branch where Zbb's `max` would do. And `DecodeField` shifts
-a field at bit 0 up and back down where one `andi` would mask it. An
-eighth is behind 44's estimate rather than its findings: Maglev's
+Eight habits of the riscv64 port account for 36, 37, 38, 40, 42, 45 and
+46, each a CL as well as a check's finding. `BranchLong` emits
+`auipc`+`jr` for every unbound label where `bcc`+`j` would do, and `j`
+alone reaches any function in this corpus. Short builtin calls are
+disabled whenever pointer compression is off (the
+`v8_enable_short_builtin_calls` clause in `BUILD.gn`), which is
+riscv64's default, so Maglev and TurboFan call every builtin through a
+six-instruction `li` and baseline through `lui; add s6; ld; jalr` --
+940,521 of those, about a quarter of all baseline instructions.
+`Assembler::stop()` spends eight bytes on a trap that `ebreak` alone, or
+`c.ebreak` in two, expresses on hardware. `MultiPush`/`MultiPop` with
+nothing to push still adjust `sp` by zero. Maglev's prologue pushes the
+context, the function, the argument count and a zero for every tagged
+slot with one `Push()` each, where the variadic `Push` beside it adjusts
+once. `Return` clamps the argument count with a branch where Zbb's `max`
+would do. `DecodeField` shifts a field at bit 0 up and back down where
+one `andi` would mask it, and `And` with a mask too wide for `andi`
+loads the mask rather than using `zext.h`, `zext.w` or a shift pair. A
+ninth is behind 44's estimate rather than its findings: Maglev's
 overflow-checked arithmetic takes a constant right input in a register
 on riscv64 alone.
 
@@ -1807,9 +1836,9 @@ not tracked (about 75K, every one a dispatch handle that a later
 
 # Remaining candidates
 
-Two, 39 and 46, both from the JetStream corpus above; over the package
-corpus there are none. Forty-three checks are implemented, 36 to 38 and
-40 to 45 being the nine from that corpus so far, and
+One, 39, from the JetStream corpus above; over the package corpus there
+are none. Forty-four checks are implemented, 36 to 38 and 40 to 46
+being the ten from that corpus so far, and
 everything this file sized over the package corpus is either written or
 recorded as rejected with the evidence that rejected it. Thirteen of
 the package entries, 23 to 35, did not come from a corpus probe at all:
