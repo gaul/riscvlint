@@ -6836,10 +6836,16 @@ size_t riscvlint_scan(riscvlint_state *state, csh handle,
         }
         addr = next;
         if (instructions) (*instructions)++;
+        riscvlint_finding f;
         for (size_t i = 0;
              i < sizeof riscvlint_checks / sizeof riscvlint_checks[0]; i++) {
-            riscvlint_finding f;
-            memset(&f, 0, sizeof f);
+            // Every check writes its text with snprintf, so an empty
+            // string is as clean as a cleared buffer, and the 96 bytes
+            // are not cleared 45 times an instruction.
+            f.title = NULL;
+            f.address = 0;
+            f.insn_count = 0;
+            f.replacement[0] = '\0';
             if (riscvlint_checks[i](state, insn, &f)) {
                 found++;
                 if (on_finding) on_finding(ctx, &f);
