@@ -413,10 +413,9 @@ def main():
     ap.add_argument('-o', '--output', default='v8code.elf')
     ap.add_argument('--max-sections', type=int, default=2000,
                     help='chunks per ELF before splitting the output. The '
-                         'ELF limit is 65535, but riscvlint attributes each '
-                         'finding by a linear scan of the symbol table, so '
-                         'on a dump with millions of findings small ELFs '
-                         'are what keeps the scan O(findings)')
+                         'ELF limit is 65535; below it, the split only '
+                         'sets how many riscvlint runs the dump divides '
+                         'into, and so how many can run in parallel')
     ap.add_argument('--map',
                     help='also write "name 0xaddr size 0xjitaddr" lines here')
     ap.add_argument('--relocs',

@@ -577,16 +577,47 @@ static const char *go_symbolize(const go_functab *g, uint64_t addr,
     return name;
 }
 
-// Nearest preceding function symbol, for the "<name+0x..>" in a
-// finding. The ELF symbol table first, since it is what a locally built
-// object carries, then Go's own table.
-static const char *symbolize(const uint8_t *base, size_t map_len,
-                             const Elf64_Ehdr *eh, const go_functab *go,
-                             uint64_t addr, uint64_t *delta)
+// ---- function symbols ----
+
+// A function symbol that can name an address, with the range it covers
+// written inclusively, so that a size of 0 -- everything from the
+// symbol up -- needs no case of its own.
+typedef struct {
+    uint64_t value;
+    uint64_t last;      // the last address it covers
+    uint64_t reach;     // the highest `last` here and at every entry before
+    size_t order;       // where the file's own tables list it
+    const char *name;
+} sym_entry;
+
+// The ELF function symbols sorted by address, built once per file, with
+// Go's table behind them for the objects that carry only that. Looking
+// a finding up was a walk of every symbol, which on one part of the
+// JetStream dump is 355,808 findings by 2,004 symbols and was a quarter
+// of the run.
+typedef struct {
+    sym_entry *e;
+    size_t n;
+    const go_functab *go;
+} sym_index;
+
+static int cmp_sym(const void *a, const void *b)
 {
+    const sym_entry *x = a, *y = b;
+    if (x->value != y->value) return x->value < y->value ? -1 : 1;
+    return x->order < y->order ? -1 : x->order > y->order;
+}
+
+// False only when memory runs out.
+static bool sym_index_build(sym_index *ix, const uint8_t *base,
+                            size_t map_len, const Elf64_Ehdr *eh,
+                            const go_functab *go)
+{
+    ix->e = NULL;
+    ix->n = 0;
+    ix->go = go;
+    size_t cap = 0;
     const Elf64_Shdr *sh = (const Elf64_Shdr *)(base + eh->e_shoff);
-    const char *best = NULL;
-    uint64_t best_val = 0;
     for (unsigned i = 0; i < eh->e_shnum; i++) {
         if (sh[i].sh_type != SHT_SYMTAB || sh[i].sh_entsize == 0) continue;
         if (sh[i].sh_link >= eh->e_shnum) continue;
@@ -599,17 +630,66 @@ static const char *symbolize(const uint8_t *base, size_t map_len,
         for (size_t j = 0; j < n; j++) {
             if ((sym[j].st_info & 0xf) != STT_FUNC || sym[j].st_name == 0)
                 continue;
-            if (sym[j].st_value > addr) continue;
-            if (sym[j].st_size && addr >= sym[j].st_value + sym[j].st_size)
-                continue;
-            if (best && sym[j].st_value <= best_val) continue;
-            best = (const char *)(base + str->sh_offset + sym[j].st_name);
-            best_val = sym[j].st_value;
+            uint64_t last = UINT64_MAX;
+            if (sym[j].st_size) {
+                // A size that carries past the top of the address space
+                // covers nothing: no address is both at or above the
+                // symbol and below where the sum wraps to.
+                if (sym[j].st_value + sym[j].st_size < sym[j].st_value)
+                    continue;
+                last = sym[j].st_value + sym[j].st_size - 1;
+            }
+            if (ix->n == cap) {
+                size_t grown = cap ? cap * 2 : 1024;
+                sym_entry *e = realloc(ix->e, grown * sizeof *e);
+                if (!e) {
+                    free(ix->e);
+                    ix->e = NULL;
+                    ix->n = 0;
+                    return false;
+                }
+                ix->e = e;
+                cap = grown;
+            }
+            sym_entry *s = &ix->e[ix->n];
+            s->value = sym[j].st_value;
+            s->last = last;
+            s->order = ix->n;
+            s->name = (const char *)(base + str->sh_offset + sym[j].st_name);
+            ix->n++;
         }
     }
-    if (!best) return go ? go_symbolize(go, addr, delta) : NULL;
-    *delta = addr - best_val;
-    return best;
+    if (ix->n) qsort(ix->e, ix->n, sizeof *ix->e, cmp_sym);
+    for (size_t i = 0; i < ix->n; i++)
+        ix->e[i].reach = i && ix->e[i - 1].reach > ix->e[i].last
+                             ? ix->e[i - 1].reach : ix->e[i].last;
+    return true;
+}
+
+// Nearest preceding function symbol, for the "<name+0x..>" in a
+// finding: the highest-addressed one that covers `addr`, and of two at
+// the same address the one the file lists first. The ELF symbol table
+// first, since it is what a locally built object carries, then Go's own
+// table.
+static const char *symbolize(const sym_index *ix, uint64_t addr,
+                             uint64_t *delta)
+{
+    size_t lo = 0, hi = ix->n;      // to the first entry above addr
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (ix->e[mid].value <= addr) lo = mid + 1;
+        else hi = mid;
+    }
+    const sym_entry *best = NULL;
+    for (size_t i = lo; i-- > 0;) {
+        const sym_entry *s = &ix->e[i];
+        if (best && s->value != best->value) break;
+        if (s->reach < addr) break;     // nothing from here down covers it
+        if (s->last >= addr) best = s;
+    }
+    if (!best) return ix->go ? go_symbolize(ix->go, addr, delta) : NULL;
+    *delta = addr - best->value;
+    return best->name;
 }
 
 // What a finding needs to be printed that the finding itself does not
@@ -618,10 +698,7 @@ static const char *symbolize(const uint8_t *base, size_t map_len,
 typedef struct {
     csh handle;
     const riscvlint_state *state;
-    const uint8_t *base;
-    size_t map_len;
-    const Elf64_Ehdr *eh;
-    const go_functab *go;
+    const sym_index *syms;
     const char *section;    // name of the section being scanned
 } report_ctx;
 
@@ -680,8 +757,7 @@ static void report(void *ctx, const riscvlint_finding *f)
     // summary is keyed by the same name the annotation prints, so the
     // two cannot disagree about where a finding is.
     uint64_t delta = 0;
-    const char *sym = symbolize(c->base, c->map_len, c->eh, c->go,
-                                f->address, &delta);
+    const char *sym = symbolize(c->syms, f->address, &delta);
     if (sym) func_tally_add(sym);
     else func_unattributed++;
 
@@ -773,8 +849,7 @@ static void json_finding(void *ctx, const riscvlint_finding *f)
     putchar('"');
 
     uint64_t delta = 0;
-    const char *sym = symbolize(c->base, c->map_len, c->eh, c->go,
-                                f->address, &delta);
+    const char *sym = symbolize(c->syms, f->address, &delta);
     if (sym) {
         fputs(", \"function\": \"", stdout);
         json_puts(sym);
@@ -845,7 +920,7 @@ typedef struct {
     const uint8_t *base;
     size_t map_len;
     const Elf64_Ehdr *eh;
-    const go_functab *go;
+    const sym_index *syms;
 } anchor_ctx;
 
 // riscvlint_mapped_fn: whether a value addresses something the file
@@ -884,7 +959,7 @@ static uint64_t anchor_of(void *ctx, uint64_t addr)
 {
     const anchor_ctx *a = ctx;
     uint64_t delta = 0;
-    if (!symbolize(a->base, a->map_len, a->eh, a->go, addr, &delta))
+    if (!symbolize(a->syms, addr, &delta))
         return 0;
     return addr - delta;
 }
@@ -894,7 +969,7 @@ static uint64_t anchor_of(void *ctx, uint64_t addr)
 static void scan_section(csh handle, riscvlint_state *state,
                          const uint8_t *code, size_t size, uint64_t vaddr,
                          const uint8_t *base, size_t map_len,
-                         const Elf64_Ehdr *eh, const go_functab *go,
+                         const Elf64_Ehdr *eh, const sym_index *syms,
                          const char *name)
 {
     if (!riscvlint_state_set_section(state, handle, code, size, vaddr))
@@ -920,7 +995,7 @@ static void scan_section(csh handle, riscvlint_state *state,
         free(offs);
     }
 
-    report_ctx ctx = { handle, state, base, map_len, eh, go, name };
+    report_ctx ctx = { handle, state, syms, name };
     riscvlint_scan(state, handle, code, size, vaddr,
                    json_mode ? json_finding : report, &ctx,
                    &total_insns, &total_skipped);
@@ -958,24 +1033,42 @@ static int scan_file(csh handle, const char *path)
         // Read once per file rather than per finding: validating it is
         // a walk of every entry.
         go_functab go = go_read(base, map_len, eh);
+        sym_index syms;
+        if (!sym_index_build(&syms, base, map_len, eh, &go)) {
+            perror(path);
+            munmap((void *)base, map_len);
+            return -1;
+        }
         // The census reads the arch string for its own report and gates
         // nothing on it, so it needs no state and no extension mask.
         riscvlint_state *state = NULL;
         riscvlint_census *census = NULL;
-        anchor_ctx actx = { base, map_len, eh, &go };
+        anchor_ctx actx = { base, map_len, eh, &syms };
         riscvlint_cchain *cchain = NULL;
         if (cchain_mode) {
             cchain = riscvlint_cchain_create();
-            if (!cchain) { munmap((void *)base, map_len); return -1; }
+            if (!cchain) {
+                free(syms.e);
+                munmap((void *)base, map_len);
+                return -1;
+            }
             riscvlint_cchain_set_hooks(cchain, value_is_mapped, &actx,
                                        anchor_of, &actx);
         }
         if (census_mode) {
             census = riscvlint_census_create();
-            if (!census) { munmap((void *)base, map_len); return -1; }
+            if (!census) {
+                free(syms.e);
+                munmap((void *)base, map_len);
+                return -1;
+            }
         } else {
             state = riscvlint_state_create();
-            if (!state) { munmap((void *)base, map_len); return -1; }
+            if (!state) {
+                free(syms.e);
+                munmap((void *)base, map_len);
+                return -1;
+            }
             // Say which extension set is in force whenever it was not
             // simply read from the object. Reporting a Zba finding
             // because nothing said otherwise is a guess, and a guess the
@@ -1067,7 +1160,7 @@ static int scan_file(csh handle, const char *path)
             else
                 scan_section(handle, state, base + sh[i].sh_offset,
                              sh[i].sh_size, sh[i].sh_addr, base, map_len, eh,
-                             &go,
+                             &syms,
                              shstr && sh[i].sh_name < shstr_len
                                  ? shstr + sh[i].sh_name : NULL);
         }
@@ -1096,6 +1189,7 @@ static int scan_file(csh handle, const char *path)
             riscvlint_cchain_print(cchain, path, verbose);
             riscvlint_cchain_destroy(cchain);
         }
+        free(syms.e);
     }
     munmap((void *)base, map_len);
     return rc;

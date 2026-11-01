@@ -2270,8 +2270,10 @@ the categories built around them have flagless replacements.
   `--arch` declares the host's ISA string (in the assembler's spelling,
   `rv64i2p1_..._c2p0_zba1p0...`) so the extension gate reads `declared`
   rather than `unrestricted`. The output is split into ELFs of 2,000
-  sections by default, because the checker attributes each finding by a
-  linear scan of the symbol table and a dump yields millions of them.
+  sections by default, which is the unit the runs divide into. The
+  split was first needed because the checker attributed each finding
+  by a linear scan of the symbol table; it now searches a sorted index,
+  and the ELF limit of 65,535 sections is the only hard one.
 
   `tools/v8_analyze_findings.py` then joins `riscvlint --json` output
   for those ELFs with the two sidecars, attributing by symbol and offset
