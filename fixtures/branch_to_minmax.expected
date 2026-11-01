@@ -1,0 +1,67 @@
+instruction compressible to a base C form at offset: 0x0: -> c.li (4 -> 2 bytes) (1 instructions)
+  li t2, 2
+
+branch over a move foldable to max or min at offset: 0x0: -> li t2, 2; max a5, a5, t2 (12 -> 8 bytes) (3 instructions)
+  li t2, 2
+  blt t2, a5, 0xc
+  li a5, 2
+
+instruction compressible to a base C form at offset: 0x8: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a5, 2
+
+instruction compressible to a base C form at offset: 0xc: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a5, 0(sp)
+
+branch over a move foldable to max or min at offset: 0x10: -> min a0, a0, a1 (8 -> 4 bytes) (2 instructions)
+  blt a0, a1, 0x18
+  mv a0, a1
+
+instruction compressible to a base C form at offset: 0x14: -> c.mv (4 -> 2 bytes) (1 instructions)
+  mv a0, a1
+
+instruction compressible to a base C form at offset: 0x18: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a0, 8(sp)
+
+branch over a move foldable to max or min at offset: 0x1c: -> maxu a2, a2, a3 (8 -> 4 bytes) (2 instructions)
+  bgeu a2, a3, 0x24
+  mv a2, a3
+
+instruction compressible to a base C form at offset: 0x20: -> c.mv (4 -> 2 bytes) (1 instructions)
+  mv a2, a3
+
+instruction compressible to a base C form at offset: 0x24: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a2, 0x10(sp)
+
+branch over a move foldable to max or min at offset: 0x28: -> max a4, a4, zero (8 -> 4 bytes) (2 instructions)
+  bgez a4, 0x30
+  li a4, 0
+
+instruction compressible to a base C form at offset: 0x2c: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a4, 0
+
+instruction compressible to a base C form at offset: 0x30: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a4, 0x18(sp)
+
+instruction compressible to a base C form at offset: 0x38: -> c.mv (4 -> 2 bytes) (1 instructions)
+  mv a0, a2
+
+instruction compressible to a base C form at offset: 0x3c: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a0, 0x20(sp)
+
+instruction compressible to a base C form at offset: 0x40: -> c.li (4 -> 2 bytes) (1 instructions)
+  li t2, 2
+
+instruction compressible to a base C form at offset: 0x48: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a5, 2
+
+instruction compressible to a base C form at offset: 0x4c: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a5, 0x28(sp)
+
+instruction compressible to a base C form at offset: 0x50: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+Optimization opportunities by type:
+      15  instruction compressible to a base C form
+       4  branch over a move foldable to max or min
+
+19 optimization opportunities in 21 instructions

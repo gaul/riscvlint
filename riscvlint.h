@@ -1488,6 +1488,27 @@ bool check_zero_eq_branch(riscvlint_state *state, const cs_insn *insn,
 bool check_slli_srli_to_andi(riscvlint_state *state, const cs_insn *insn,
                              riscvlint_finding *finding);
 
+// An ordered branch over a move into one of the two registers it
+// compared, from the other: `bge rd,rv,1f; mv rd,rv; 1:` keeps rd when
+// it is the greater and takes rv otherwise, which is Zbb's
+// `max rd,rd,rv`. Keeping rd when it is the lesser is `min`, and the
+// unsigned comparisons give `maxu` and `minu`. The move is `mv`, or
+// `li rd,0` with x0 compared, or -- Maglev's argument-count clamp --
+// `li rd,K` after `li rk,K; bcc` comparing rk, where rk holds what the
+// move would copy and stays:
+//
+//     li t2,2; blt t2,a5,1f; li a5,2; 1:  ->  li t2,2; max a5,a5,t2
+//
+// The move must not be a branch target, and with a leading `li` neither
+// may the branch. No liveness is needed: rd ends with the same value on
+// both paths, and nothing else is written. Gated on Zbb permissively,
+// like the other Zb checks.
+//
+// Measured population: 28,292 sites in the JetStream corpus (TODO.md,
+// entry 42), all but 55 of them Maglev's and all but 96 the clamp.
+bool check_branch_to_minmax(riscvlint_state *state, const cs_insn *insn,
+                            riscvlint_finding *finding);
+
 // ---- running every check ----
 //
 // Called once per finding, with `ctx` as given. The finding is valid

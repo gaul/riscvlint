@@ -5825,6 +5825,86 @@ static void test_slli_srli_to_andi(csh handle)
     CHECK(strcmp(f.replacement, "andi a5, a5, 7 (6 -> 4 bytes)") == 0);
 }
 
+// check_branch_to_minmax: an ordered branch over a move between the two
+// registers it compared.
+static void test_branch_to_minmax(csh handle)
+{
+    riscvlint_finding f;
+    const uint32_t ret = 0x00008067u;
+    const uint32_t li_t2_2 = 0x00200393u;        // li t2,2
+    const uint32_t blt_t2_a5 = 0x00f3c463u;      // blt t2,a5,.+8
+    const uint32_t li_a5_2 = 0x00200793u;        // li a5,2
+    const uint32_t mv_a0_a1 = 0x00058513u;       // mv a0,a1
+
+    // Maglev's argument-count clamp: a5 becomes at least 2. One finding,
+    // at the leading li, and none again at the branch.
+    uint32_t clamp[] = { li_t2_2, blt_t2_a5, li_a5_2, ret };
+    CHECK(run_words(handle, check_branch_to_minmax, clamp, 4, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement,
+                 "li t2, 2; max a5, a5, t2 (12 -> 8 bytes)") == 0);
+    CHECK(f.insn_count == 3 && f.address == 0x1000);
+    CHECK(strcmp(f.title, "branch over a move foldable to max or min") == 0);
+
+    // A mv between the two compared registers: rd kept when greater is
+    // max, when lesser min, and the unsigned comparisons give maxu.
+    uint32_t mx[] = { 0x00b55463u /* bge a0,a1,.+8 */, mv_a0_a1, ret };
+    CHECK(run_words(handle, check_branch_to_minmax, mx, 3, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "max a0, a0, a1 (8 -> 4 bytes)") == 0);
+    CHECK(f.insn_count == 2);
+    uint32_t mn[] = { 0x00b54463u /* blt a0,a1,.+8 */, mv_a0_a1, ret };
+    CHECK(run_words(handle, check_branch_to_minmax, mn, 3, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "min a0, a0, a1 (8 -> 4 bytes)") == 0);
+    uint32_t mxu[] = { 0x00a5e463u /* bltu a1,a0,.+8 */, mv_a0_a1, ret };
+    CHECK(run_words(handle, check_branch_to_minmax, mxu, 3, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "maxu a0, a0, a1 (8 -> 4 bytes)") == 0);
+
+    // li rd,0 copies x0: a5 clamped to at least zero.
+    uint32_t zero[] = { 0x00f04463u /* blt zero,a5,.+8 */,
+                        0x00000793u /* li a5,0 */, ret };
+    CHECK(run_words(handle, check_branch_to_minmax, zero, 3, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "max a5, a5, zero (8 -> 4 bytes)") == 0);
+
+    // Not reported: a different constant; a branch skipping more than
+    // the move; equality; a branch comparing another register; a mv from
+    // a third register; a `j` to the move; and a `j` to the branch after
+    // a leading li, which arrives with t2 unknown.
+    uint32_t other_k[] = { li_t2_2, blt_t2_a5, 0x00300793u /* li a5,3 */,
+                           ret };
+    CHECK(run_words(handle, check_branch_to_minmax, other_k, 4, 0x1000,
+                    NULL) == 0);
+    uint32_t longer[] = { li_t2_2, 0x00f3c663u /* blt t2,a5,.+12 */, li_a5_2,
+                          0x02870813u /* addi a6,a4,40 */, ret };
+    CHECK(run_words(handle, check_branch_to_minmax, longer, 5, 0x1000,
+                    NULL) == 0);
+    uint32_t eq[] = { li_t2_2, 0x00f38463u /* beq t2,a5,.+8 */, li_a5_2, ret };
+    CHECK(run_words(handle, check_branch_to_minmax, eq, 4, 0x1000, NULL) == 0);
+    uint32_t third[] = { li_t2_2, 0x00e3c463u /* blt t2,a4,.+8 */, li_a5_2,
+                         ret };
+    CHECK(run_words(handle, check_branch_to_minmax, third, 4, 0x1000,
+                    NULL) == 0);
+    uint32_t src[] = { 0x00b55463u /* bge a0,a1,.+8 */,
+                       0x00060513u /* mv a0,a2 */, ret };
+    CHECK(run_words(handle, check_branch_to_minmax, src, 3, 0x1000, NULL) == 0);
+    uint32_t into_mv[] = { 0x00b55463u /* bge a0,a1,.+8 */, mv_a0_a1, ret,
+                           0xff9ff06fu /* j -8 */ };
+    CHECK(run_words(handle, check_branch_to_minmax, into_mv, 4, 0x1000,
+                    NULL) == 0);
+    uint32_t into_br[] = { li_t2_2, blt_t2_a5, li_a5_2, ret,
+                           0xff5ff06fu /* j -12 */ };
+    CHECK(run_words(handle, check_branch_to_minmax, into_br, 5, 0x1000,
+                    NULL) == 0);
+
+    // Gated on Zbb permissively.
+    uint8_t bytes[sizeof clamp];
+    memcpy(bytes, clamp, sizeof clamp);
+    CHECK(run_window_exts(handle, check_branch_to_minmax, bytes, sizeof bytes,
+                          0x1000, RISCVLINT_EXT_DECLARED | RISCVLINT_EXT_ZBA,
+                          NULL) == 0);
+    CHECK(run_window_exts(handle, check_branch_to_minmax, bytes, sizeof bytes,
+                          0x1000, RISCVLINT_EXT_DECLARED | RISCVLINT_EXT_ZBB,
+                          NULL) == 1);
+}
+
 int main(void)
 {
     csh handle;
@@ -5867,6 +5947,7 @@ int main(void)
     test_zero_for_store(handle);
     test_zero_eq_branch(handle);
     test_slli_srli_to_andi(handle);
+    test_branch_to_minmax(handle);
     test_zero_store_run(handle);
     test_bitcast_through_frame(handle);
     test_cchain(handle);

@@ -1489,7 +1489,7 @@ which is to the digit what check 3 reports over this corpus.
 | 39 | a conditional branch whose target is an unconditional jump | 177,202 | ML 137K, TF 17K, RE 14K | candidate |
 | 40 | pushes one stack adjustment would do | 81,103 runs | ML 78K | **implemented**, 259,684 |
 | 41 | `li rt,0` + a store of rt | 43,002 | BL 20K, ML 13K, RE 7K | **implemented**, 31,052 |
-| 42 | a branch over a constant move that Zbb `max`/`min` does | 31,906 | ML | candidate |
+| 42 | a branch over a constant move that Zbb `max`/`min` does | 31,906 | ML | **implemented**, 28,292 |
 | 43 | `li rc,0` + `beq`/`bne rx,rc` | 29,089 | TF 25K | **implemented**, 1,658 |
 | 44 | an immediate operand materialized into a register | 20,743 | ML | candidate |
 | 45 | `slli k` + `srli k`, k >= 53 -> `andi` | 17,097 | BL 12K, ML 5K | **implemented**, 17,097 |
@@ -1703,17 +1703,42 @@ three bits -- `OsrUrgencyBits`, which baseline decodes at every
 loaded. The `andi` is priced as `c.andi` where both shifts were
 compressed and the mask fits six bits, which no site here is.
 
-## 39, 42, 44 and 46. Four more shapes from the JetStream corpus
+## 42. A branch over a move foldable to max or min -- 28,292  [implemented]
+
+`li t2,K; blt t2,a5,1f; li a5,K; 1:` keeps a5 when it is above K and
+gives it K otherwise: `max a5,a5,t2`, with the first `li` kept and the
+branch and second `li` gone. Maglev's `Return` writes it to drop the
+greater of the actual and formal argument counts --
+`Branch(gt, actual, Operand(formal))` materializes the formal count in
+the scratch register for the comparison, and the `Move` after it loads
+it again -- where `Max` would do. The check takes the general shape, an
+ordered branch over a move into one of the two registers it compared
+from the other, so `mv` and `li rd,0` against x0 are moves as well, and
+the four ordered comparisons give `max`, `min`, `maxu` and `minu` by
+which register the taken branch keeps.
+
+What check_branch_to_minmax reports: 28,292 sites worth 113,168 bytes,
+28,237 Maglev's and 55 TurboFan's. All but 96 are the clamp, K from 1
+to 18, 11,586 of them at 2; the 96 are `mv` forms, 49 `min` and 47
+`max`. The rest of the miner's 31,906 branches over a `li` and 4,162
+over a `mv` move into a register the branch did not compare, every one
+of them in four sample parts. Of the 536 `li`s there, 528 clamp a
+`sext.w` copy -- `sext.w t2,a1; bgez t2,1f; li a1,0`, where a1's upper
+word need not match t2's and `max` would compare the wrong value -- and
+8 are selects, `bltu s10,s11,1f; li s9,1`. A clamp whose a1 is already
+sign-extended, as the `addw` before the one sampled leaves it, is
+`max a1,a1,zero` after all; check 9's guarantee table could prove that,
+and the check does not ask it. All 334 `mv`s are selects,
+which Zicond's `czero` pair would make longer rather than shorter. The
+892 over an `fsgnj.d` have no single instruction.
+
+## 39, 44 and 46. Three more shapes from the JetStream corpus
 
 * **39**, a branch whose target is a `j`: jump threading. 177,202, and
   38,002 more `j` whose target is another `j`. Check 19 reads
   `bcc L1; j X; L1:`; this is `bcc L; ...; L: j X`, where the branch can
   be retargeted when X is inside its reach. Many sites are both at once
   (`bnez a0,L1; j A; L1: j B`).
-* **42**, `li t2,K; blt t2,a5,+8; li a5,K`, Maglev's argument-count
-  clamp in the epilogue: 31,906 sites that are Zbb's `max`. 4,162 more
-  branch over a `mv` (a select, Zicond's `czero` pair) and 892 over an
-  `fsgnj.d`.
 * **44**, `li a3,1; add t2,a2,a3; addw a4,a2,a3`: Maglev's
   overflow-checked add with a constant operand the register allocator
   materialized, 20,743 sites where `addi`/`addiw` would do. This file
@@ -1727,8 +1752,8 @@ which are 30's Zibi shape and need the extension.
 
 ### What the corpus says about V8
 
-Six habits of the riscv64 port account for 36, 37, 38, 40 and 45, each
-a CL as well as a check's finding. `BranchLong` emits `auipc`+`jr`
+Seven habits of the riscv64 port account for 36, 37, 38, 40, 42 and 45,
+each a CL as well as a check's finding. `BranchLong` emits `auipc`+`jr`
 for every unbound label where `bcc`+`j` would do, and `j` alone reaches
 any function in this corpus. Short builtin calls are disabled whenever
 pointer compression is off (the `v8_enable_short_builtin_calls` clause
@@ -1740,8 +1765,9 @@ instructions. `Assembler::stop()` spends eight bytes on a trap that
 `MultiPush`/`MultiPop` with nothing to push still adjust `sp` by zero.
 Maglev's prologue pushes the context, the function, the argument count
 and a zero for every tagged slot with one `Push()` each, where the
-variadic `Push` beside it adjusts once. And `DecodeField` shifts a field
-at bit 0 up and back down where one `andi` would mask it.
+variadic `Push` beside it adjusts once. `Return` clamps the argument
+count with a branch where Zbb's `max` would do. And `DecodeField` shifts
+a field at bit 0 up and back down where one `andi` would mask it.
 
 Two things it says about check 9, the extension the producer already
 guarantees: `srai` and `srli` by 32 or more leave a sign- or
@@ -1752,9 +1778,9 @@ not tracked (about 75K, every one a dispatch handle that a later
 
 # Remaining candidates
 
-Four, 39, 42, 44 and 46, all from the JetStream corpus above; over the
-package corpus there are none. Forty-one checks are implemented, 36 to
-38, 40, 41, 43 and 45 being the seven from that corpus so far, and
+Three, 39, 44 and 46, all from the JetStream corpus above; over the
+package corpus there are none. Forty-two checks are implemented, 36 to
+38, 40 to 43 and 45 being the eight from that corpus so far, and
 everything this file sized over the package corpus is either written or
 recorded as rejected with the evidence that rejected it. Thirteen of
 the package entries, 23 to 35, did not come from a corpus probe at all:

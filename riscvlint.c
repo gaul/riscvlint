@@ -6054,6 +6054,110 @@ bool check_slli_srli_to_andi(riscvlint_state *state, const cs_insn *insn,
     return true;
 }
 
+// ---- a branch over a move foldable to max or min ----
+
+// `mv rd,rs` in either encoding: `addi rd,rs,0`, or `c.mv`, which is
+// `add rd,x0,rs2` in CR format. A source of x0 is `li rd,0`, which is
+// decode_const's.
+static bool rv_decode_mv(uint32_t w, unsigned size, unsigned *rd,
+                         unsigned *rs)
+{
+    if (size == 4) {
+        int64_t imm;
+        if (!rv_decode_addi(w, 4, rd, rs, &imm) || imm != 0) return false;
+        return *rd != 0 && *rs != 0;
+    }
+    if (size != 2 || (w & 0xf003u) != 0x8002u) return false;
+    *rd = (w >> 7) & 0x1fu;
+    *rs = (w >> 2) & 0x1fu;
+    return *rd != 0 && *rs != 0;           // rs2 of x0 is c.jr
+}
+
+bool check_branch_to_minmax(riscvlint_state *state, const cs_insn *insn,
+                            riscvlint_finding *finding)
+{
+    if (!riscvlint_may_use(state, RISCVLINT_EXT_ZBB)) return false;
+    if (insn->size != 2 && insn->size != 4) return false;
+
+    // Two ways in. At a branch, the skipped move names the register it
+    // copies, or is `li rd,0` and copies x0. At a `li rk,K` just before
+    // the branch, the skipped instruction is `li rd,K`, which copies
+    // what rk was given -- Maglev's argument-count clamp.
+    uint32_t w;
+    if (!riscvlint_word_at(state, insn->address, &w)) return false;
+    uint64_t br = insn->address;
+    unsigned lead = 0, rk = 0;
+    int64_t k = 0;
+    if (decode_const(w, insn->size, &rk, &k)) {
+        lead = insn->size;
+        br += lead;
+        if (!riscvlint_word_at(state, br, &w)) return false;
+    }
+    unsigned blen = rv_insn_len(w);
+    unsigned bs1, bs2, f3;
+    int64_t off;
+    if (!rv_decode_cond_branch(w, blen, &bs1, &bs2, &f3, &off)) return false;
+    // Only the ordered comparisons choose between two values.
+    if (f3 < 4u) return false;
+
+    uint64_t mv = br + blen;
+    uint32_t wm;
+    if (!riscvlint_word_at(state, mv, &wm)) return false;
+    unsigned mlen = rv_insn_len(wm);
+    // Taken, the branch skips exactly the move.
+    if (off != (int64_t)(blen + mlen)) return false;
+
+    unsigned rd, rv;
+    int64_t kv;
+    if (lead) {
+        if (!decode_const(wm, mlen, &rd, &kv) || kv != k) return false;
+        rv = rk;
+    } else if (!rv_decode_mv(wm, mlen, &rd, &rv)) {
+        if (!decode_const(wm, mlen, &rd, &kv) || kv != 0) return false;
+        rv = 0;
+    }
+    if (rd == rv) return false;
+
+    // The branch compares exactly the two: rd, which it keeps when
+    // taken, and rv, which the move copies into rd otherwise. Keeping rd
+    // when it is the greater is max, when it is the lesser min, and a
+    // tie gives the same value either way.
+    bool rd_first;
+    if (bs1 == rd && bs2 == rv) rd_first = true;
+    else if (bs1 == rv && bs2 == rd) rd_first = false;
+    else return false;
+    bool ge = f3 == 5u || f3 == 7u, wide = f3 >= 6u;
+    bool is_max = ge == rd_first;
+    const char *name = is_max ? (wide ? "maxu" : "max")
+                              : (wide ? "minu" : "min");
+
+    // A path into the move would arrive without having compared. With a
+    // lead `li` the branch must also be reached only through it, since
+    // rk holding K is what makes the two `li`s one value.
+    if (riscvlint_is_branch_target(state, mv)) return false;
+    if (lead && riscvlint_is_branch_target(state, br)) return false;
+    if (riscvlint_is_relocated(state, br) ||
+        riscvlint_is_relocated(state, mv) ||
+        (lead && riscvlint_is_relocated(state, insn->address)))
+        return false;
+
+    // max and min have no compressed form. The lead `li` stays.
+    unsigned before = lead + blen + mlen, after = lead + 4;
+    finding->title = "branch over a move foldable to max or min";
+    finding->address = insn->address;
+    finding->insn_count = lead ? 3 : 2;
+    if (lead)
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "li %s, %" PRId64 "; %s %s, %s, %s (%u -> %u bytes)",
+                 rv_reg_name(rk), k, name, rv_reg_name(rd), rv_reg_name(rd),
+                 rv_reg_name(rv), before, after);
+    else
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "%s %s, %s, %s (%u -> %u bytes)", name, rv_reg_name(rd),
+                 rv_reg_name(rd), rv_reg_name(rv), before, after);
+    return true;
+}
+
 // ---- running every check ----
 
 static const riscvlint_check_fn riscvlint_checks[] = {
@@ -6098,6 +6202,7 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_zero_for_store,
     check_zero_eq_branch,
     check_slli_srli_to_andi,
+    check_branch_to_minmax,
 };
 
 size_t riscvlint_scan(riscvlint_state *state, csh handle,

@@ -3,8 +3,8 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Forty-one checks are implemented and the ledger's candidate list holds
-four, all from a JIT corpus. [TODO.md](TODO.md) is that ledger:
+Forty-two checks are implemented and the ledger's candidate list holds
+three, all from a JIT corpus. [TODO.md](TODO.md) is that ledger:
 every candidate that was measured, the population it came back with,
 and the ones rejected on that evidence.
 What got written was decided by the corpus rather than by intuition,
@@ -12,16 +12,17 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Forty-one of them, and the table lists twenty-seven. The jump pair, the
-constant chain, the no-op, the push run, the zero store, the zero branch
-and the andi pair have so far been measured over the JetStream corpus of
-TODO.md, which the table does not cover. Seven report nothing over this
-corpus -- the bit count because no baseline object declares Zbb; the
-three indexed loads, the equality branch and the compare-exchange loop
-because those five require their extension to be positively present
-rather than merely un-denied, and no object declares Zilx, Zibi or
-Zacas; and the unsigned divide by a power of two because all three
-toolchains already do that fold themselves. Those entries below say why.
+Forty-two of them, and the table lists twenty-seven. The jump pair, the
+constant chain, the no-op, the push run, the zero store, the zero
+branch, the andi pair and the max clamp have so far been measured over
+the JetStream corpus of TODO.md, which the table does not cover. Seven
+report nothing over this corpus -- the bit count because no baseline
+object declares Zbb; the three indexed loads, the equality branch and
+the compare-exchange loop because those five require their extension to
+be positively present rather than merely un-denied, and no object
+declares Zilx, Zibi or Zacas; and the unsigned divide by a power of two
+because all three toolchains already do that fold themselves. Those
+entries below say why.
 Every figure is what the check itself reports over the
 [corpus](#corpus) -- 108,165,211 instructions of three toolchains across
 31 objects -- rather than what a mining tool estimated for it. The two
@@ -669,6 +670,28 @@ except a handful of `jalr ra,0(ra)` that were already two.
   two and the new target is outside `c.bnez`'s +/-256, so four bytes
   become four. Those last are still reported: an instruction and a taken
   branch go, and the finding says the size did not change.
+
+* **branch over a move foldable to max or min** -- an ordered branch
+  over a move into one of the two registers it compared, from the
+  other: rd is kept when it is the greater and replaced otherwise, which
+  is Zbb's `max rd,rd,rv`, or `min` when it is kept as the lesser, and
+  `maxu` and `minu` for the unsigned comparisons. The move is `mv`, or
+  `li rd,0` with x0 compared, or `li rd,K` after a `li rk,K` that the
+  branch compared, which stays:
+
+  ```
+   2842208: li t2, 1
+   284220c: blt t2, a5, 0x2842214
+   2842210: li a5, 1    -> li t2, 1; max a5, a5, t2 (12 -> 8 bytes)
+  ```
+
+  No liveness is needed, since rd ends with the same value on both
+  paths, but the move must not be a branch target, nor the branch where
+  a `li` leads. Gated on Zbb permissively. The JetStream corpus
+  (TODO.md, entry 42) has 28,292, worth 113,168 bytes, all but 55 of
+  them Maglev's: `Return` clamps the argument count it drops to at least
+  the formal count with a branch against an immediate and a `Move`,
+  which is this shape with the formal count for K.
 
 * **transfer to the instruction that follows it** -- a relative transfer
   whose target is the next instruction. Control arrives there either
