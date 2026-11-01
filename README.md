@@ -3,8 +3,8 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Forty-two checks are implemented and the ledger's candidate list holds
-three, all from a JIT corpus. [TODO.md](TODO.md) is that ledger:
+Forty-three checks are implemented and the ledger's candidate list holds
+two, all from a JIT corpus. [TODO.md](TODO.md) is that ledger:
 every candidate that was measured, the population it came back with,
 and the ones rejected on that evidence.
 What got written was decided by the corpus rather than by intuition,
@@ -12,21 +12,21 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Forty-two of them, and the table lists twenty-seven. The jump pair, the
-constant chain, the no-op, the push run, the zero store, the zero
-branch, the andi pair and the max clamp have so far been measured over
-the JetStream corpus of TODO.md, which the table does not cover. Seven
-report nothing over this corpus -- the bit count because no baseline
-object declares Zbb; the three indexed loads, the equality branch and
-the compare-exchange loop because those five require their extension to
-be positively present rather than merely un-denied, and no object
-declares Zilx, Zibi or Zacas; and the unsigned divide by a power of two
-because all three toolchains already do that fold themselves. Those
-entries below say why.
-Every figure is what the check itself reports over the
-[corpus](#corpus) -- 108,165,211 instructions of three toolchains across
-31 objects -- rather than what a mining tool estimated for it. The two
-have differed by an order of magnitude every time both were measured.
+Forty-three of them, and the table lists twenty-seven. The jump pair,
+the constant chain, the no-op, the push run, the zero store, the zero
+branch, the andi pair, the max clamp and the immediate operand have so
+far been measured over the JetStream corpus of TODO.md, which the table
+does not cover. Seven report nothing over this corpus -- the bit count
+because no baseline object declares Zbb; the three indexed loads, the
+equality branch and the compare-exchange loop because those five require
+their extension to be positively present rather than merely un-denied,
+and no object declares Zilx, Zibi or Zacas; and the unsigned divide by a
+power of two because all three toolchains already do that fold
+themselves. Those entries below say why. Every figure is what the check
+itself reports over the [corpus](#corpus) -- 108,165,211 instructions of
+three toolchains across 31 objects -- rather than what a mining tool
+estimated for it. The two have differed by an order of magnitude every
+time both were measured.
 
 The table is generated, not maintained: `scripts/check_table.py` scans
 the corpus and prints it, which is how adding two objects stopped
@@ -904,6 +904,36 @@ except a handful of `jalr ra,0(ra)` that were already two.
   accumulator is a0, so that a bytecode loading zero and one storing it
   to a register are exactly this pair; 6,584 in regexp code, 4,743 in
   Maglev and 969 in TurboFan.
+
+* **constant loaded for an immediate operand** -- `li rc,K` and then
+  register-register operations reading rc where their immediate forms
+  would take K: `add`, `addw`, `and`, `or` and `xor` with rc on either
+  side, `sub`, `subw`, `slt`, `sltu` and the shifts with rc second.
+
+  ```
+   360bcc: li a1, 1
+   360bd0: add t2, s2, a1
+   360bd4: addw a1, s2, a1
+                 -> addi t2, s2, 1; addiw a1, s2, 1 (12 -> 8 bytes)
+  ```
+
+  The walk is the zero store's -- every such use before anything else
+  might name rc, sixteen instructions at most, no side entry or transfer
+  -- and rc must then be dead, or overwritten by the last use. A
+  compressed use is priced at `c.addi`, `c.addiw` or `c.andi` where its
+  immediate form has one and at four bytes where it does not.
+
+  TODO.md rejected the shape at 942 over the package corpus. The
+  JetStream corpus (TODO.md, entry 44) has 1,738, worth 6,952 bytes,
+  against the miner's 20,743, which are almost all Maglev's
+  overflow-checked arithmetic. riscv64's Maglev takes a constant right
+  input in a register where arm64 and x64 take it as an immediate, but
+  the `bne` that checks for overflow leaves for an eager deopt exit,
+  whose call into the deoptimizer reads whatever registers the frame
+  state names; the liveness walk cannot see a frame state, so only the
+  98 whose `addw` overwrites the constant survive. Most of the rest
+  subtract a small constant in code the dump does not name, or load
+  zero for what is a copy.
 
 * **constant built in more instructions than li needs** -- a chain of
   `lui` or `li` followed by `addi`, `addiw`, `slli`, `ori` or `xori`

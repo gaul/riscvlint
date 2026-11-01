@@ -1,0 +1,87 @@
+instruction compressible to a base C form at offset: 0x0: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a3, 1
+
+constant loaded for an immediate operand at offset: 0x0: -> addi t2, a2, 1; addiw a4, a2, 1 (12 -> 8 bytes) (3 instructions)
+  li a3, 1
+  add t2, a2, a3
+  addw a4, a2, a3
+
+instruction compressible to a base C form at offset: 0xc: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd t2, 0(sp)
+
+instruction compressible to a base C form at offset: 0x10: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a4, 8(sp)
+
+dead register definition at offset: 0x14: -> delete; nothing reads a3 (4 bytes) (1 instructions)
+  li a3, 5
+
+instruction compressible to a base C form at offset: 0x14: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a3, 5
+
+instruction compressible to a base C form at offset: 0x18: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a1, 5
+
+constant loaded for an immediate operand at offset: 0x18: -> addi a0, a0, -5; slli a2, a2, 5 (12 -> 8 bytes) (3 instructions)
+  li a1, 5
+  sub a0, a0, a1
+  sll a2, a2, a1
+
+instruction compressible to a base C form at offset: 0x1c: -> c.sub (4 -> 2 bytes) (1 instructions)
+  sub a0, a0, a1
+
+instruction compressible to a base C form at offset: 0x24: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a0, 0x10(sp)
+
+instruction compressible to a base C form at offset: 0x28: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a2, 0x18(sp)
+
+dead register definition at offset: 0x2c: -> delete; nothing reads a1 (4 bytes) (1 instructions)
+  li a1, 0
+
+instruction compressible to a base C form at offset: 0x2c: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a1, 0
+
+instruction compressible to a base C form at offset: 0x30: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a3, 7
+
+constant loaded for an immediate operand at offset: 0x30: -> andi a3, a2, 7 (8 -> 4 bytes) (2 instructions)
+  li a3, 7
+  and a3, a2, a3
+
+instruction compressible to a base C form at offset: 0x34: -> c.and (4 -> 2 bytes) (1 instructions)
+  and a3, a2, a3
+
+instruction compressible to a base C form at offset: 0x38: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a3, 0x20(sp)
+
+instruction compressible to a base C form at offset: 0x3c: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a1, 5
+
+instruction compressible to a base C form at offset: 0x44: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a0, 0x28(sp)
+
+instruction compressible to a base C form at offset: 0x48: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a1, 0
+
+instruction compressible to a base C form at offset: 0x4c: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a3, 1
+
+instruction compressible to a base C form at offset: 0x54: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a3, 0x30(sp)
+
+instruction compressible to a base C form at offset: 0x58: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd t2, 0x38(sp)
+
+instruction compressible to a base C form at offset: 0x5c: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a3, 0
+
+constant loaded for an immediate operand at offset: 0x60: -> addi a0, a0, 3 (4 -> 2 bytes) (2 instructions)
+  li a5, 3
+  add a0, a0, a5
+
+Optimization opportunities by type:
+      19  instruction compressible to a base C form
+       4  constant loaded for an immediate operand
+       2  dead register definition
+
+25 optimization opportunities in 29 instructions

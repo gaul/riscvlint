@@ -1436,6 +1436,7 @@ check 45.
 
 `li rd,C` then `add`/`and`/`or`/`xor`/`slt`/`sll` reading it, where the
 immediate form of the op would do both. 942 in C++ and Rust, 0 in Go.
+The JetStream corpus estimated 20,743 and check 44 reports 1,738.
 
 ### Address re-materialization -- 39
 
@@ -1491,7 +1492,7 @@ which is to the digit what check 3 reports over this corpus.
 | 41 | `li rt,0` + a store of rt | 43,002 | BL 20K, ML 13K, RE 7K | **implemented**, 31,052 |
 | 42 | a branch over a constant move that Zbb `max`/`min` does | 31,906 | ML | **implemented**, 28,292 |
 | 43 | `li rc,0` + `beq`/`bne rx,rc` | 29,089 | TF 25K | **implemented**, 1,658 |
-| 44 | an immediate operand materialized into a register | 20,743 | ML | candidate |
+| 44 | an immediate operand materialized into a register | 20,743 | ML | **implemented**, 1,738 |
 | 45 | `slli k` + `srli k`, k >= 53 -> `andi` | 17,097 | BL 12K, ML 5K | **implemented**, 17,097 |
 | 46 | `and` with a materialized 0xffff -> `zext.h` | 1,499 | ML | candidate |
 
@@ -1732,18 +1733,43 @@ and the check does not ask it. All 334 `mv`s are selects,
 which Zicond's `czero` pair would make longer rather than shorter. The
 892 over an `fsgnj.d` have no single instruction.
 
-## 39, 44 and 46. Three more shapes from the JetStream corpus
+## 44. A constant loaded for an immediate operand -- 1,738  [implemented]
+
+`li rc,K` and then register-register operations reading rc where their
+immediate forms would take K: `add`, `addw`, `and`, `or` and `xor` with
+rc on either side, `sub`, `subw`, `slt`, `sltu` and the shifts with rc
+second, which become `addi`, `addiw`, `andi`, `ori`, `xori`, `addi -K`,
+`addiw -K`, `slti`, `sltiu` and the immediate shifts. The walk is 41's,
+so a constant read by two operations is one finding, and rc must be dead
+after the last, or overwritten by it. The rejection above sized this
+shape at 942 over the package corpus.
+
+The miner's 20,743 are almost all Maglev's overflow-checked arithmetic,
+`li a3,1; add t2,a2,a3; addw a4,a2,a3; bne t2,a4,deopt`. riscv64's
+`Int32AddWithOverflow` asks for both inputs in registers, where arm64's
+takes a right input that fits an add immediate with `UseAny` and x64's
+any constant -- that is the CL. The check cannot prove those constants
+dead: the `bne` leaves for an eager deopt exit, `auipc`+`jr` to a call into the
+deoptimizer, which reads whatever registers the frame state names, and
+a frame state is not in the instruction stream. Teaching the walk the
+far jump would not change that.
+
+What check_const_for_imm reports: 1,738 sites worth 6,952 bytes, 1,006
+in code the dump does not name, 469 Maglev's and 263 TurboFan's. 993
+subtract a small constant, every one in the unnamed code --
+`li a3,7; sub a3,a4,a3` -- and 625 load zero for what is a copy:
+Maglev's `li s1,0; sub t6,t1,s1` and TurboFan's `li a7,0; xor s1,a0,a7`,
+reported in the `addi` and `xori` spelling. 98 are the overflow-checked
+pair, 81 adds and 17 subtracts, where the W operation overwrites the
+constant's own register and no liveness proof is needed.
+
+## 39 and 46. Two more shapes from the JetStream corpus
 
 * **39**, a branch whose target is a `j`: jump threading. 177,202, and
   38,002 more `j` whose target is another `j`. Check 19 reads
   `bcc L1; j X; L1:`; this is `bcc L; ...; L: j X`, where the branch can
   be retargeted when X is inside its reach. Many sites are both at once
   (`bnez a0,L1; j A; L1: j B`).
-* **44**, `li a3,1; add t2,a2,a3; addw a4,a2,a3`: Maglev's
-  overflow-checked add with a constant operand the register allocator
-  materialized, 20,743 sites where `addi`/`addiw` would do. This file
-  rejected the shape at 942 over the package corpus; the JIT has 22x
-  that.
 * **46**, `lui t2,0x10; addiw t2,t2,-1; and a0,t1,t2`: 1,499 `zext.h`.
 
 Not in the table: 188,118 ordered branches against a constant just
@@ -1767,7 +1793,10 @@ Maglev's prologue pushes the context, the function, the argument count
 and a zero for every tagged slot with one `Push()` each, where the
 variadic `Push` beside it adjusts once. `Return` clamps the argument
 count with a branch where Zbb's `max` would do. And `DecodeField` shifts
-a field at bit 0 up and back down where one `andi` would mask it.
+a field at bit 0 up and back down where one `andi` would mask it. An
+eighth is behind 44's estimate rather than its findings: Maglev's
+overflow-checked arithmetic takes a constant right input in a register
+on riscv64 alone.
 
 Two things it says about check 9, the extension the producer already
 guarantees: `srai` and `srli` by 32 or more leave a sign- or
@@ -1778,9 +1807,9 @@ not tracked (about 75K, every one a dispatch handle that a later
 
 # Remaining candidates
 
-Three, 39, 44 and 46, all from the JetStream corpus above; over the
-package corpus there are none. Forty-two checks are implemented, 36 to
-38, 40 to 43 and 45 being the eight from that corpus so far, and
+Two, 39 and 46, both from the JetStream corpus above; over the package
+corpus there are none. Forty-three checks are implemented, 36 to 38 and
+40 to 45 being the nine from that corpus so far, and
 everything this file sized over the package corpus is either written or
 recorded as rejected with the evidence that rejected it. Thirteen of
 the package entries, 23 to 35, did not come from a corpus probe at all:

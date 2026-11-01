@@ -6158,6 +6158,199 @@ bool check_branch_to_minmax(riscvlint_state *state, const cs_insn *insn,
     return true;
 }
 
+// ---- a constant loaded for an immediate operand ----
+
+typedef enum {
+    IMM_ADDI, IMM_ADDIW, IMM_ANDI, IMM_ORI, IMM_XORI, IMM_SLTI, IMM_SLTIU,
+    IMM_SLLI, IMM_SRLI, IMM_SRAI, IMM_SLLIW, IMM_SRLIW, IMM_SRAIW,
+} imm_kind;
+
+static const char *const imm_names[] = {
+    "addi", "addiw", "andi", "ori", "xori", "slti", "sltiu",
+    "slli", "srli", "srai", "slliw", "srliw", "sraiw",
+};
+
+// One register-register operation rewritten with rc's constant as its
+// immediate: `kind rd,rx,imm`.
+typedef struct {
+    imm_kind kind;
+    unsigned rd, rx;
+    int64_t imm;
+} imm_use;
+
+// Whether `w` reads rc, holding k, in an operand position its immediate
+// form takes, and if so that form. The commutative operations take rc
+// on either side; subtraction, the comparisons and the shifts only as
+// the second operand, since `k - rx`, `k < rx` and `k << rx` have no
+// immediate spelling. Subtraction becomes an addition of -k, and a shift
+// takes k's low five or six bits, which are all a register shift reads.
+// The compressed CA and CR forms are the same operations in place.
+static bool imm_form(uint32_t w, unsigned size, unsigned rc, int64_t k,
+                     imm_use *u)
+{
+    unsigned opc, f3, f7, rd, rs1, rs2;
+    if (size == 4) {
+        opc = RV_OPCODE(w);
+        if (opc != 0x33u && opc != 0x3bu) return false;
+        f3 = (w >> 12) & 0x7u;
+        f7 = w >> 25;
+        rd = (w >> 7) & 0x1fu;
+        rs1 = (w >> 15) & 0x1fu;
+        rs2 = (w >> 20) & 0x1fu;
+    } else if (size == 2 && (w & 0xf003u) == 0x9002u) {        // c.add
+        opc = 0x33u; f3 = 0; f7 = 0;
+        rd = rs1 = (w >> 7) & 0x1fu;
+        rs2 = (w >> 2) & 0x1fu;
+        if (rd == 0 || rs2 == 0) return false;      // c.jalr, c.ebreak
+    } else if (size == 2 && ((w & 0xfc03u) == 0x8c01u ||
+                             (w & 0xfc03u) == 0x9c01u)) {
+        // CA: c.sub, c.xor, c.or, c.and, then c.subw and c.addw. The
+        // word half's other two funct2 values are Zcb's c.mul and a
+        // reserved encoding.
+        static const uint8_t ca_f3[4] = { 0, 4, 6, 7 };
+        unsigned f2 = (w >> 5) & 0x3u;
+        bool word = (w & 0x1000u) != 0;
+        if (word && f2 > 1) return false;
+        opc = word ? 0x3bu : 0x33u;
+        f3 = word ? 0u : ca_f3[f2];
+        f7 = f2 == 0 ? 0x20u : 0u;
+        rd = rs1 = 8u + ((w >> 7) & 0x7u);
+        rs2 = 8u + ((w >> 2) & 0x7u);
+    } else {
+        return false;
+    }
+    if (f7 != 0 && f7 != 0x20u) return false;
+    if (rd == 0 || (rs1 == rc) == (rs2 == rc)) return false;
+    bool second = rs2 == rc;
+    bool fits = k >= -2048 && k <= 2047, nfits = k >= -2047 && k <= 2048;
+    u->rd = rd;
+    u->rx = second ? rs1 : rs2;
+    u->imm = k;
+    bool word = opc == 0x3bu, sub = f7 == 0x20u;
+    switch (f3) {
+    case 0:
+        if (sub) {
+            if (!second || !nfits) return false;
+            u->imm = -k;
+        } else if (!fits) {
+            return false;
+        }
+        u->kind = word ? IMM_ADDIW : IMM_ADDI;
+        return true;
+    case 1:
+        if (!second || sub) return false;
+        u->kind = word ? IMM_SLLIW : IMM_SLLI;
+        u->imm = k & (word ? 31 : 63);
+        return true;
+    case 5:
+        if (!second) return false;
+        u->kind = word ? (sub ? IMM_SRAIW : IMM_SRLIW)
+                       : (sub ? IMM_SRAI : IMM_SRLI);
+        u->imm = k & (word ? 31 : 63);
+        return true;
+    }
+    // What is left has no W form and no funct7 variant.
+    if (word || sub || !fits) return false;
+    switch (f3) {
+    case 2: if (!second) return false; u->kind = IMM_SLTI; return true;
+    case 3: if (!second) return false; u->kind = IMM_SLTIU; return true;
+    case 4: u->kind = IMM_XORI; return true;
+    case 6: u->kind = IMM_ORI; return true;
+    default: u->kind = IMM_ANDI; return true;
+    }
+}
+
+// What the immediate form costs in place of a use `len` bytes long:
+// four where the use was four, as check_zero_for_store prices its
+// stores, and for a compressed use the compressed immediate form where
+// one exists -- c.addi, c.addiw and c.andi, each in place -- or four
+// where it does not, since then the rewrite grows that instruction.
+static unsigned imm_use_size(const imm_use *u, unsigned len)
+{
+    if (len == 4 || u->rd != u->rx) return 4;
+    switch (u->kind) {
+    case IMM_ADDI: return u->imm != 0 && fits6(u->imm) ? 2 : 4;
+    case IMM_ADDIW: return fits6(u->imm) ? 2 : 4;
+    case IMM_ANDI: return rvc_reg(u->rd) && fits6(u->imm) ? 2 : 4;
+    default: return 4;
+    }
+}
+
+#define CONST_WALK 16       // instructions the uses may span
+
+bool check_const_for_imm(riscvlint_state *state, const cs_insn *insn,
+                         riscvlint_finding *finding)
+{
+    if (insn->size != 2 && insn->size != 4) return false;
+    uint32_t w;
+    if (!riscvlint_word_at(state, insn->address, &w)) return false;
+    unsigned rc;
+    int64_t k;
+    if (!decode_const(w, insn->size, &rc, &k)) return false;
+    // sp, gp and tp hold what the ABI says they hold, as in
+    // check_zero_for_store.
+    if (rc == 2 || rc == 3 || rc == 4) return false;
+    if (riscvlint_is_relocated(state, insn->address)) return false;
+
+    // Every operation that reads rc where its immediate form would take
+    // the constant, before anything else might name rc, with no side
+    // entry or transfer among them -- check_zero_for_store's walk. A use
+    // that overwrites rc ends it with the constant dead.
+    imm_use use[2];
+    unsigned nuse = 0, before = insn->size, after = 0, seen = 1, span = 1;
+    bool dead = false;
+    uint64_t at = insn->address + insn->size, end = at;
+    for (int budget = CONST_WALK; budget > 0; budget--) {
+        if (riscvlint_is_branch_target(state, at)) break;
+        uint32_t w2;
+        if (!riscvlint_word_at(state, at, &w2)) break;
+        unsigned len = rv_insn_len(w2);
+        seen++;
+        imm_use u;
+        if (imm_form(w2, len, rc, k, &u)) {
+            if (riscvlint_is_relocated(state, at)) break;
+            if (nuse < 2) use[nuse] = u;
+            nuse++;
+            before += len;
+            after += imm_use_size(&u, len);
+            end = at + len;
+            span = seen;
+            if (u.rd == rc) {
+                dead = true;
+                break;
+            }
+        } else if (rv_may_name(w2, len, rc) || rv_stops_walk(w2, len)) {
+            break;
+        }
+        at += len;
+    }
+    if (nuse == 0 || after >= before) return false;
+    if (!dead && riscvlint_liveness(state, end, rc) != RISCVLINT_LIVE_DEAD)
+        return false;
+
+    finding->title = "constant loaded for an immediate operand";
+    finding->address = insn->address;
+    finding->insn_count = span;
+    const imm_use *a = &use[0], *b = &use[1];
+    if (nuse == 1)
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "%s %s, %s, %" PRId64 " (%u -> %u bytes)",
+                 imm_names[a->kind], rv_reg_name(a->rd), rv_reg_name(a->rx),
+                 a->imm, before, after);
+    else if (nuse == 2)
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "%s %s, %s, %" PRId64 "; %s %s, %s, %" PRId64
+                 " (%u -> %u bytes)",
+                 imm_names[a->kind], rv_reg_name(a->rd), rv_reg_name(a->rx),
+                 a->imm, imm_names[b->kind], rv_reg_name(b->rd),
+                 rv_reg_name(b->rx), b->imm, before, after);
+    else
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "%" PRId64 " for %s in %u operations (%u -> %u bytes)", k,
+                 rv_reg_name(rc), nuse, before, after);
+    return true;
+}
+
 // ---- running every check ----
 
 static const riscvlint_check_fn riscvlint_checks[] = {
@@ -6203,6 +6396,7 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_zero_eq_branch,
     check_slli_srli_to_andi,
     check_branch_to_minmax,
+    check_const_for_imm,
 };
 
 size_t riscvlint_scan(riscvlint_state *state, csh handle,

@@ -1509,6 +1509,30 @@ bool check_slli_srli_to_andi(riscvlint_state *state, const cs_insn *insn,
 bool check_branch_to_minmax(riscvlint_state *state, const cs_insn *insn,
                             riscvlint_finding *finding);
 
+// A constant loaded into a register only for register-register
+// operations whose immediate forms would take it: `li rc,K` and then
+// `add`, `addw`, `and`, `or`, `xor` reading rc on either side, or
+// `sub`, `subw`, `slt`, `sltu` and the shifts reading it second, become
+// `addi`, `addiw`, `andi`, `ori`, `xori`, `addi -K`, `addiw -K`, `slti`,
+// `sltiu` and the immediate shifts, and the `li` goes:
+//
+//     li a3,1; add t2,a2,a3; addw a4,a2,a3  ->  addi t2,a2,1; addiw a4,a2,1
+//
+// The walk is check_zero_for_store's: every such operation before
+// anything else might name rc, up to sixteen instructions with no side
+// entry or transfer among them. rc must then be dead, by the liveness
+// walk, or overwritten by the last use. A compressed use is priced at
+// c.addi, c.addiw or c.andi where its immediate form has one, and at
+// four bytes where it does not; a site that would not shrink is not
+// reported.
+//
+// TODO.md rejected the shape at 942 over the package corpus. Measured
+// population: 1,738 sites in the JetStream corpus (TODO.md, entry 44),
+// of the miner's 20,743: Maglev's overflow-checked arithmetic branches to
+// a deopt exit, whose call may read the constant's register.
+bool check_const_for_imm(riscvlint_state *state, const cs_insn *insn,
+                         riscvlint_finding *finding);
+
 // ---- running every check ----
 //
 // Called once per finding, with `ctx` as given. The finding is valid

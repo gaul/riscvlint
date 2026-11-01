@@ -5905,6 +5905,103 @@ static void test_branch_to_minmax(csh handle)
                           NULL) == 1);
 }
 
+// check_const_for_imm: a constant loaded only for operations whose
+// immediate forms would take it.
+static void test_const_for_imm(csh handle)
+{
+    riscvlint_finding f;
+    const uint32_t ret = 0x00008067u;
+    const uint32_t li_a1_0 = 0x00000593u;        // li a1,0
+    const uint32_t li_a3_0 = 0x00000693u;        // li a3,0
+
+    // Maglev's overflow-checked add of 1: both operations take it, and
+    // the li redefining a3 proves the constant dead.
+    uint32_t v8[] = { 0x00100693u /* li a3,1 */, 0x00d603b3u /* add t2,a2,a3 */,
+                      0x00d6073bu /* addw a4,a2,a3 */, 0x00500693u /* li a3,5 */,
+                      ret };
+    CHECK(run_words(handle, check_const_for_imm, v8, 5, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement,
+                 "addi t2, a2, 1; addiw a4, a2, 1 (12 -> 8 bytes)") == 0);
+    CHECK(f.insn_count == 3 && f.address == 0x1000);
+    CHECK(strcmp(f.title, "constant loaded for an immediate operand") == 0);
+
+    // Subtraction adds the negation; a shift takes the low six bits, or
+    // five for a W shift; a comparison takes the constant second.
+    uint32_t sub[] = { 0x00500593u /* li a1,5 */, 0x40b50533u /* sub a0,a0,a1 */,
+                       li_a1_0, ret };
+    CHECK(run_words(handle, check_const_for_imm, sub, 4, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "addi a0, a0, -5 (8 -> 4 bytes)") == 0);
+    uint32_t sll[] = { 0x04300593u /* li a1,67 */, 0x00b51533u /* sll a0,a0,a1 */,
+                       li_a1_0, ret };
+    CHECK(run_words(handle, check_const_for_imm, sll, 4, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "slli a0, a0, 3 (8 -> 4 bytes)") == 0);
+    uint32_t sllw[] = { 0x02300593u /* li a1,35 */,
+                        0x00b5153bu /* sllw a0,a0,a1 */, li_a1_0, ret };
+    CHECK(run_words(handle, check_const_for_imm, sllw, 4, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "slliw a0, a0, 3 (8 -> 4 bytes)") == 0);
+    uint32_t slt[] = { 0x00a00593u /* li a1,10 */, 0x00b62533u /* slt a0,a2,a1 */,
+                       li_a1_0, ret };
+    CHECK(run_words(handle, check_const_for_imm, slt, 4, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "slti a0, a2, 10 (8 -> 4 bytes)") == 0);
+
+    // -2048 is an addi immediate; its negation is not.
+    uint32_t lo[] = { 0x80000593u /* li a1,-2048 */,
+                      0x00b50533u /* add a0,a0,a1 */, li_a1_0, ret };
+    CHECK(run_words(handle, check_const_for_imm, lo, 4, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "addi a0, a0, -2048 (8 -> 4 bytes)") == 0);
+    uint32_t neg[] = { 0x80000593u /* li a1,-2048 */,
+                       0x40b50533u /* sub a0,a0,a1 */, li_a1_0, ret };
+    CHECK(run_words(handle, check_const_for_imm, neg, 4, 0x1000, NULL) == 0);
+
+    // An operation that overwrites the constant's register ends the walk
+    // with it dead, even where `ret` follows; three uses are summarized.
+    uint32_t over[] = { 0x00700693u /* li a3,7 */, 0x00d676b3u /* and a3,a2,a3 */,
+                        ret };
+    CHECK(run_words(handle, check_const_for_imm, over, 3, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "andi a3, a2, 7 (8 -> 4 bytes)") == 0);
+    uint32_t three[] = { 0x00100693u /* li a3,1 */,
+                         0x00d50533u /* add a0,a0,a3 */,
+                         0x00d585b3u /* add a1,a1,a3 */,
+                         0x00d60633u /* add a2,a2,a3 */, li_a3_0, ret };
+    CHECK(run_words(handle, check_const_for_imm, three, 6, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "1 for a3 in 3 operations (16 -> 12 bytes)") == 0);
+    CHECK(f.insn_count == 4);
+
+    // Not reported: the constant on the side subtraction and comparison
+    // cannot take; read afterwards; reaching `ret`; read by an operation
+    // with no immediate form; and a `j` back to the use.
+    uint32_t rsub[] = { 0x00500593u /* li a1,5 */, 0x40a58533u /* sub a0,a1,a0 */,
+                        li_a1_0, ret };
+    CHECK(run_words(handle, check_const_for_imm, rsub, 4, 0x1000, NULL) == 0);
+    uint32_t rslt[] = { 0x00a00593u /* li a1,10 */,
+                        0x00c5a533u /* slt a0,a1,a2 */, li_a1_0, ret };
+    CHECK(run_words(handle, check_const_for_imm, rslt, 4, 0x1000, NULL) == 0);
+    uint32_t live[] = { 0x00100693u /* li a3,1 */, 0x00d603b3u /* add t2,a2,a3 */,
+                        0x00068513u /* mv a0,a3 */, ret };
+    CHECK(run_words(handle, check_const_for_imm, live, 4, 0x1000, NULL) == 0);
+    uint32_t exit[] = { 0x00100693u /* li a3,1 */,
+                        0x00d603b3u /* add t2,a2,a3 */, ret };
+    CHECK(run_words(handle, check_const_for_imm, exit, 3, 0x1000, NULL) == 0);
+    uint32_t mul[] = { 0x00300693u /* li a3,3 */, 0x02d50533u /* mul a0,a0,a3 */,
+                       li_a3_0, ret };
+    CHECK(run_words(handle, check_const_for_imm, mul, 4, 0x1000, NULL) == 0);
+    uint32_t entry[] = { 0x00100693u /* li a3,1 */,
+                         0x00d603b3u /* add t2,a2,a3 */, li_a3_0, ret,
+                         0xff5ff06fu /* j -12 */ };
+    CHECK(run_words(handle, check_const_for_imm, entry, 5, 0x1000, NULL) == 0);
+
+    // Compressed: c.li a3,1 ; c.add a0,a3 is c.addi a0,1, four bytes down
+    // to two. c.or has no compressed immediate form, so c.li a5,1 ;
+    // c.or a0,a5 would become a four-byte ori and save nothing.
+    uint8_t cadd[] = { 0x85, 0x46, 0x36, 0x95, 0x81, 0x46, 0x82, 0x80 };
+    CHECK(run_window(handle, check_const_for_imm, cadd, sizeof cadd, 0x1000,
+                     &f) == 1);
+    CHECK(strcmp(f.replacement, "addi a0, a0, 1 (4 -> 2 bytes)") == 0);
+    uint8_t cor[] = { 0x85, 0x47, 0x5d, 0x8d, 0x81, 0x47, 0x82, 0x80 };
+    CHECK(run_window(handle, check_const_for_imm, cor, sizeof cor, 0x1000,
+                     NULL) == 0);
+}
+
 int main(void)
 {
     csh handle;
@@ -5948,6 +6045,7 @@ int main(void)
     test_zero_eq_branch(handle);
     test_slli_srli_to_andi(handle);
     test_branch_to_minmax(handle);
+    test_const_for_imm(handle);
     test_zero_store_run(handle);
     test_bitcast_through_frame(handle);
     test_cchain(handle);
