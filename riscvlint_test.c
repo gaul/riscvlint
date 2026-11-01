@@ -5438,6 +5438,84 @@ static void test_jump_pair_to_j(csh handle)
     CHECK(run_words(handle, check_jump_pair_to_j, zero, 6, 0x1000, NULL) == 0);
 }
 
+// check_transfer_to_jump: a transfer retargeted past the jump it lands
+// on, as far as the chain of jumps and the transfer's reach allow.
+static void test_transfer_to_jump(csh handle)
+{
+    riscvlint_finding f;
+    const uint32_t nop = 0x00000013u;
+    const uint32_t ret = 0x00008067u;
+    const uint32_t j8 = 0x0080006fu;             // j .+8
+    const uint32_t beqz12 = 0x00050663u;         // beqz a0,.+12
+    const uint32_t li_t6_0 = 0x00000f93u;        // li t6,0
+    const uint32_t add_a0_t6_a1 = 0x00bf8533u;   // add a0,t6,a1
+
+    // A branch to a `j`: it goes to the j's target instead, four bytes
+    // for four.
+    uint32_t plain[] = { 0x00b51663u /* bne a0,a1,.+12 */, nop, ret, j8, nop,
+                         ret };
+    CHECK(run_words(handle, check_transfer_to_jump, plain, 6, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "bne a0, a1, 0x1014 (4 -> 4 bytes)") == 0);
+    CHECK(f.address == 0x1000 && f.insn_count == 1);
+
+    // Two jumps in a row: the branch skips both, and the first jump is
+    // itself a transfer to a jump.
+    uint32_t chain[] = { beqz12, nop, ret, j8, nop, j8, nop, ret };
+    CHECK(run_words(handle, check_transfer_to_jump, chain, 8, 0x1000, &f) == 2);
+    CHECK(strcmp(f.replacement, "beqz a0, 0x101c (4 -> 4 bytes)") == 0);
+
+    // The second jump goes past the branch's +/-4KB, so the branch stops
+    // at the first; the first jump, reaching +/-1MB, still threads.
+    uint32_t part[] = { beqz12, nop, ret, j8, nop, 0x0000206fu /* j .+8192 */ };
+    CHECK(run_words(handle, check_transfer_to_jump, part, 6, 0x1000, &f) == 2);
+    CHECK(strcmp(f.replacement, "beqz a0, 0x1014 (4 -> 4 bytes)") == 0);
+    uint32_t far[] = { 0x00050463u /* beqz a0,.+8 */, nop,
+                       0x0000206fu /* j .+8192 */ };
+    CHECK(run_words(handle, check_transfer_to_jump, far, 3, 0x1000, NULL) == 0);
+
+    // V8's far jump: skipping it skips the auipc, so t6 has to be dead
+    // where the branch now lands -- here written first, then read first.
+    uint32_t dead[] = { beqz12, nop, ret, enc_auipc(31, 0), enc_jalr(0, 31, 16),
+                        nop, nop, li_t6_0, ret };
+    CHECK(run_words(handle, check_transfer_to_jump, dead, 9, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "beqz a0, 0x101c (4 -> 4 bytes)") == 0);
+    uint32_t read[] = { beqz12, nop, ret, enc_auipc(31, 0), enc_jalr(0, 31, 16),
+                        nop, nop, add_a0_t6_a1, ret };
+    CHECK(run_words(handle, check_transfer_to_jump, read, 9, 0x1000, NULL) == 0);
+
+    // A branch over one jump. Where check_branch_over_jump folds it, the
+    // jump goes and this stands down; where the jump is out of reach,
+    // that check declines and the branch threads through the jump it
+    // lands on.
+    uint32_t over[] = { 0x00051463u /* bnez a0,.+8 */, 0x00c0006fu /* j .+12 */,
+                        j8, nop, ret };
+    CHECK(run_words(handle, check_transfer_to_jump, over, 5, 0x1000, NULL) == 0);
+    uint32_t longj[] = { 0x00051463u /* bnez a0,.+8 */,
+                         0x0000206fu /* j .+8192 */, j8, nop, ret };
+    CHECK(run_words(handle, check_transfer_to_jump, longj, 5, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "bnez a0, 0x1010 (4 -> 4 bytes)") == 0);
+
+    // A call through a jump writes the same link either way.
+    uint32_t call[] = { 0x00c000efu /* jal ra,.+12 */, nop, ret, j8, nop, ret };
+    CHECK(run_words(handle, check_transfer_to_jump, call, 6, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "jal ra, 0x1014 (4 -> 4 bytes)") == 0);
+
+    // A chain back to the next instruction: the branch does nothing and
+    // goes. The call does not, since it still writes ra.
+    uint32_t back[] = { beqz12, nop, ret, 0xff9ff06fu /* j .-8 */ };
+    CHECK(run_words(handle, check_transfer_to_jump, back, 4, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "delete; through the jump at 0x100c it goes "
+                                "where control already goes (4 bytes)") == 0);
+    uint32_t cback[] = { 0x00c000efu /* jal ra,.+12 */, nop, ret,
+                         0xff9ff06fu /* j .-8 */ };
+    CHECK(run_words(handle, check_transfer_to_jump, cback, 4, 0x1000, NULL) == 0);
+
+    // A jump to itself is a loop, not a step on the way anywhere.
+    uint32_t self[] = { 0x00050463u /* beqz a0,.+8 */, nop,
+                        0x0000006fu /* j . */, ret };
+    CHECK(run_words(handle, check_transfer_to_jump, self, 4, 0x1000, NULL) == 0);
+}
+
 // check_long_li: a constant chain longer than the li recurrence needs.
 static void test_long_li(csh handle)
 {
@@ -6117,6 +6195,7 @@ int main(void)
     test_branch_to_minmax(handle);
     test_const_for_imm(handle);
     test_mask_for_zext(handle);
+    test_transfer_to_jump(handle);
     test_zero_store_run(handle);
     test_bitcast_through_frame(handle);
     test_cchain(handle);

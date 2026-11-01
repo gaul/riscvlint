@@ -1,0 +1,57 @@
+transfer to an unconditional jump at offset: 0x0: -> bltu a0, a1, 0x1ac (4 -> 4 bytes) (1 instructions)
+  bltu a0, a1, 6
+
+transfer to an unconditional jump at offset: 0x8: -> bltu a0, a1, 0x1ac (4 -> 4 bytes) (1 instructions)
+  bltu a0, a1, 0xe
+
+transfer to an unconditional jump at offset: 0xe: -> j 0x1ac (2 -> 2 bytes) (1 instructions)
+  j 0x12
+
+transfer to an unconditional jump at offset: 0x14: -> jal ra, 0x1ac (4 -> 4 bytes) (1 instructions)
+  jal 0x1a
+
+transfer to an unconditional jump at offset: 0x1c: -> beqz a0, 0x7e (2 -> 2 bytes) (1 instructions)
+  beqz a0, 0x20
+
+transfer to an unconditional jump at offset: 0x22: -> delete; through the jump at 0x26 it goes where control already goes (2 bytes) (1 instructions)
+  beqz a0, 0x26
+
+conditional branch over an unconditional jump at offset: 0x28: -> bnez a0, 0x7e (4 -> 2 bytes) (2 instructions)
+  beqz a0, 0x2c
+  j 0x7e
+
+instruction compressible to a base C form at offset: 0x46: -> c.beqz (4 -> 2 bytes) (1 instructions)
+  beqz a0, 0x4e
+
+transfer to an unconditional jump at offset: 0x46: -> beqz a0, 0x5a (4 -> 4 bytes) (1 instructions)
+  beqz a0, 0x4e
+
+instruction compressible to a base C form at offset: 0x4a: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+jump pair foldable to j at offset: 0x4e: -> j 0x5a (8 -> 4 bytes) (2 instructions)
+  auipc t6, 0
+  jr 0xc(t6)
+
+instruction compressible to a base C form at offset: 0x5a: -> c.li (4 -> 2 bytes) (1 instructions)
+  li t6, 0
+
+instruction compressible to a base C form at offset: 0x5e: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+instruction compressible to a base C form at offset: 0x62: -> c.beqz (4 -> 2 bytes) (1 instructions)
+  beqz a0, 0x6a
+
+instruction compressible to a base C form at offset: 0x66: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+instruction compressible to a base C form at offset: 0x7a: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+Optimization opportunities by type:
+       7  instruction compressible to a base C form
+       7  transfer to an unconditional jump
+       1  conditional branch over an unconditional jump
+       1  jump pair foldable to j
+
+16 optimization opportunities in 2244 instructions

@@ -1554,6 +1554,39 @@ bool check_const_for_imm(riscvlint_state *state, const cs_insn *insn,
 bool check_mask_for_zext(riscvlint_state *state, const cs_insn *insn,
                          riscvlint_finding *finding);
 
+// A transfer whose target is an unconditional jump: a conditional
+// branch, `j` or `jal` whose target is a `j`, a `c.j` or V8's far jump
+// `auipc rd,hi` + `jr lo(rd)`, and which could go straight to where
+// that jump goes:
+//
+//     bnez a0,L; ...; L: j X  ->  bnez a0,X
+//
+// Jump threading. The chain is followed through up to eight jumps, as
+// far as the transfer reaches: +/-4KB for a branch and +/-1MB for jal.
+// Nothing is removed -- the transfer is retargeted and priced at its own
+// encoding, so the finding reads `(4 -> 4 bytes)` -- but every path
+// through it executes one taken jump fewer. The jump stays: deleting it
+// needs every reference to its label, and a table or another code
+// object can hold one where the branch-target map does not look. A
+// compressed transfer that would have to widen to reach is not
+// reported. Going around a far jump skips its auipc, so the auipc's
+// register must be dead at the new target, as check_jump_pair_to_j
+// asks; `jal rd` writes the same link whatever its target, so a call
+// threads exactly.
+//
+// A transfer to the next instruction is check_transfer_to_next's, and a
+// branch over exactly one jump that check_branch_over_jump folds loses
+// the jump instead of going around it; this stands down for both. Where
+// the chain leads back to the instruction after the transfer, the
+// transfer does nothing, and is reported as one to delete.
+//
+// Measured population: 165,318 sites in the JetStream corpus (TODO.md,
+// entry 39), 105,721 of them Maglev's. 123,073 go around a `j` and
+// 42,245 around a far jump; 9,447 skip two jumps or more. The 28 that
+// delete are `j`s in regexp code, and the check's only bytes.
+bool check_transfer_to_jump(riscvlint_state *state, const cs_insn *insn,
+                            riscvlint_finding *finding);
+
 // ---- running every check ----
 //
 // Called once per finding, with `ctx` as given. The finding is valid

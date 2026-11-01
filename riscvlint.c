@@ -6468,6 +6468,137 @@ bool check_mask_for_zext(riscvlint_state *state, const cs_insn *insn,
     return true;
 }
 
+// ---- a transfer to an unconditional jump ----
+
+// How many jumps a transfer is threaded through before the walk stops.
+// The chains are one or two jumps long; a longer one is a loop of jumps
+// or code nothing here can see the end of.
+#define THREAD_HOPS 8
+
+// The unconditional jump at `at` and where it goes: `j` or `c.j`, or
+// V8's far jump `auipc rd,hi` + `jr lo(rd)`, which also leaves rd
+// holding the auipc's result and so names it in `*wrote`. Zero there
+// means the jump writes nothing.
+static bool thread_jump_at(const riscvlint_state *state, uint64_t at,
+                           uint64_t *dest, unsigned *wrote)
+{
+    uint32_t w;
+    if (!riscvlint_word_at(state, at, &w)) return false;
+    if (riscvlint_is_relocated(state, at)) return false;
+    unsigned size = (w & 3u) == 3u ? 4u : 2u, rd;
+    int64_t off;
+    if (rv_decode_jump(w, size, &rd, &off)) {
+        if (rd != 0) return false;
+        *dest = at + (uint64_t)off;
+        *wrote = 0;
+        return true;
+    }
+    int64_t hi, lo;
+    unsigned rd2, rs1;
+    uint32_t w2;
+    if (size != 4 || !rv_decode_auipc(w, &rd, &hi) || rd == 0) return false;
+    if (!riscvlint_word_at(state, at + 4, &w2) ||
+        riscvlint_is_relocated(state, at + 4))
+        return false;
+    if (!rv_decode_jalr(w2, &rd2, &rs1, &lo) || rd2 != 0 || rs1 != rd)
+        return false;
+    // jalr clears bit 0 of the computed address.
+    *dest = (at + (uint64_t)(hi + lo)) & ~(uint64_t)1;
+    *wrote = rd;
+    return true;
+}
+
+bool check_transfer_to_jump(riscvlint_state *state, const cs_insn *insn,
+                            riscvlint_finding *finding)
+{
+    uint32_t w;
+    if (!riscvlint_word_at(state, insn->address, &w)) return false;
+    unsigned rs1 = 0, rs2 = 0, f3 = 0, rd = 0;
+    int64_t off;
+    bool branch = rv_decode_cond_branch(w, insn->size, &rs1, &rs2, &f3, &off);
+    // `jal rd` writes the same link whatever its target, so a call
+    // through a jump threads exactly as `j` does.
+    if (!branch && !rv_decode_jump(w, insn->size, &rd, &off)) return false;
+    if (riscvlint_is_relocated(state, insn->address)) return false;
+
+    uint64_t next = insn->address + insn->size;
+    uint64_t at = insn->address + (uint64_t)off;
+    // A transfer to the next instruction is check_transfer_to_next's. A
+    // branch over exactly one jump that check_branch_over_jump folds
+    // loses the jump outright, which is better than going around it.
+    if (at == next) return false;
+    riscvlint_finding over;
+    if (branch && check_branch_over_jump(state, insn, &over)) return false;
+
+    // Follow the chain as far as the transfer reaches. Retargeting past a
+    // far jump skips its auipc, so every register the skipped jumps wrote
+    // has to be dead where control now lands, as check_jump_pair_to_j
+    // asks of one.
+    uint64_t dest = 0;
+    uint32_t skipped = 0;
+    unsigned hops = 0;
+    for (unsigned h = 0; h < THREAD_HOPS; h++) {
+        uint64_t to;
+        unsigned wrote;
+        if (!thread_jump_at(state, at, &to, &wrote) || to == at) break;
+        int64_t reach = (int64_t)(to - insn->address);
+        if (branch ? reach < -4096 || reach > 4094 : !rv_jal_reaches(reach))
+            break;
+        // Priced at the transfer's own encoding class, and a compressed
+        // one that would have to widen to reach is not reported: the
+        // finding would cost two bytes to save a jump.
+        if (insn->size == 2 &&
+            (branch ? rv_branch_encoded_size(f3, rs1, rs2, reach) != 2
+                    : reach < -2048 || reach > 2046))
+            break;
+        uint32_t regs = skipped | (wrote ? 1u << wrote : 0u);
+        bool dead = true;
+        for (unsigned r = 1; r < 32 && dead; r++)
+            if ((regs >> r & 1u) &&
+                riscvlint_liveness(state, to, r) != RISCVLINT_LIVE_DEAD)
+                dead = false;
+        if (!dead) break;
+        skipped = regs;
+        dest = to;
+        hops++;
+        at = to;
+    }
+    if (hops == 0) return false;
+
+    finding->title = "transfer to an unconditional jump";
+    finding->address = insn->address;
+    finding->insn_count = 1;
+    // The chain can lead straight back to the next instruction, and then
+    // the transfer does nothing, as check_transfer_to_next's do -- unless
+    // it writes a link register.
+    if (dest == next) {
+        if (rd != 0) return false;
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "delete; through the jump at 0x%" PRIx64
+                 " it goes where control already goes (%u bytes)",
+                 insn->address + (uint64_t)off, insn->size);
+        return true;
+    }
+    if (!branch && rd == 0)
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "j 0x%" PRIx64 " (%u -> %u bytes)", dest, insn->size,
+                 insn->size);
+    else if (!branch)
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "jal %s, 0x%" PRIx64 " (%u -> %u bytes)", rv_reg_name(rd),
+                 dest, insn->size, insn->size);
+    else if (rs2 == 0 && (f3 == 0u || f3 == 1u))
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "%s %s, 0x%" PRIx64 " (%u -> %u bytes)", branch_name(f3, rs2),
+                 rv_reg_name(rs1), dest, insn->size, insn->size);
+    else
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "%s %s, %s, 0x%" PRIx64 " (%u -> %u bytes)",
+                 branch_name(f3, rs2), rv_reg_name(rs1), rv_reg_name(rs2),
+                 dest, insn->size, insn->size);
+    return true;
+}
+
 // ---- running every check ----
 
 static const riscvlint_check_fn riscvlint_checks[] = {
@@ -6515,6 +6646,7 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_branch_to_minmax,
     check_const_for_imm,
     check_mask_for_zext,
+    check_transfer_to_jump,
 };
 
 size_t riscvlint_scan(riscvlint_state *state, csh handle,

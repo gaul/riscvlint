@@ -3,8 +3,8 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Forty-four checks are implemented and the ledger's candidate list holds
-one, from a JIT corpus. [TODO.md](TODO.md) is that ledger:
+Forty-five checks are implemented and the ledger's candidate list is
+empty. [TODO.md](TODO.md) is that ledger:
 every candidate that was measured, the population it came back with,
 and the ones rejected on that evidence.
 What got written was decided by the corpus rather than by intuition,
@@ -12,21 +12,21 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Forty-four of them, and the table lists twenty-seven. The jump pair, the
+Forty-five of them, and the table lists twenty-seven. The jump pair, the
 constant chain, the no-op, the push run, the zero store, the zero
-branch, the andi pair, the max clamp, the immediate operand and the mask
-have so far been measured over the JetStream corpus of TODO.md, which
-the table does not cover. Seven report nothing over this corpus -- the
-bit count because no baseline object declares Zbb; the three indexed
-loads, the equality branch and the compare-exchange loop because those
-five require their extension to be positively present rather than merely
-un-denied, and no object declares Zilx, Zibi or Zacas; and the unsigned
-divide by a power of two because all three toolchains already do that
-fold themselves. Those entries below say why. Every figure is what the
-check itself reports over the [corpus](#corpus) -- 108,165,211
-instructions of three toolchains across 31 objects -- rather than what a
-mining tool estimated for it. The two have differed by an order of
-magnitude every time both were measured.
+branch, the andi pair, the max clamp, the immediate operand, the mask
+and the jump threading have so far been measured over the JetStream
+corpus of TODO.md, which the table does not cover. Seven report nothing
+over this corpus -- the bit count because no baseline object declares
+Zbb; the three indexed loads, the equality branch and the
+compare-exchange loop because those five require their extension to be
+positively present rather than merely un-denied, and no object declares
+Zilx, Zibi or Zacas; and the unsigned divide by a power of two because
+all three toolchains already do that fold themselves. Those entries
+below say why. Every figure is what the check itself reports over the
+[corpus](#corpus) -- 108,165,211 instructions of three toolchains across
+31 objects -- rather than what a mining tool estimated for it. The two
+have differed by an order of magnitude every time both were measured.
 
 The table is generated, not maintained: `scripts/check_table.py` scans
 the corpus and prints it, which is how adding two objects stopped
@@ -711,6 +711,29 @@ except a handful of `jalr ra,0(ra)` that were already two.
   register, which makes it a PC materialization rather than a no-op --
   16 sites, all in Firefox, and the one thing separating this check from
   a wrong one.
+
+* **transfer to an unconditional jump** -- a conditional branch, `j` or
+  `jal` whose target is a `j` or V8's far jump `auipc`+`jr`, and which
+  could go straight to where that jump goes. The chain is followed
+  through up to eight jumps, as far as the transfer reaches:
+
+  ```
+   2841a5c: beq a0, t3, 0x2841a68
+   2841a68: j 0x2841a98            -> beq a0, t3, 0x2841a98 (4 -> 4 bytes)
+  ```
+
+  Nothing is removed: the transfer keeps its encoding, and every path
+  through it executes one taken jump fewer. The jump stays, because
+  deleting it needs every reference to its label, and a table or
+  another code object can hold one. Going around a far jump skips its
+  auipc, so that register must be dead at the new target. A branch over
+  one jump that the branch-over-jump check folds is that check's, and a
+  compressed transfer that would have to widen to reach is not
+  reported. The JetStream corpus (TODO.md, entry 39) has 165,318,
+  105,721 of them Maglev's, and 28 whose chain leads back to the next
+  instruction, which are reported for deletion. The example is
+  Sparkplug's test for undefined or null: the branch taken on undefined
+  lands on the jump that the branch for null skips.
 
 * **instruction with no architectural effect** -- the no-ops that are
   not `nop`: an operation whose result is the value it read (`mv x,x`,

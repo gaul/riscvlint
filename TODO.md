@@ -1487,7 +1487,7 @@ which is to the digit what check 3 reports over this corpus.
 | 36 | `auipc rd,hi` + `jr lo(rd)` to a target inside `j`'s reach | 1,116,777 | ML 703K, TF 224K, BL 111K, RE 73K | **implemented**, 720,121 |
 | 37 | a constant built in more instructions than `li` needs | 558,869 | ML 404K, TF 83K, BL 49K, RE 21K | **implemented**, 562,957 |
 | 38 | an instruction with no architectural effect | 812,586 | ML 764K | **implemented**, 812,586 |
-| 39 | a conditional branch whose target is an unconditional jump | 177,202 | ML 137K, TF 17K, RE 14K | candidate |
+| 39 | a conditional branch whose target is an unconditional jump | 177,202 | ML 137K, TF 17K, RE 14K | **implemented**, 165,318 |
 | 40 | pushes one stack adjustment would do | 81,103 runs | ML 78K | **implemented**, 259,684 |
 | 41 | `li rt,0` + a store of rt | 43,002 | BL 20K, ML 13K, RE 7K | **implemented**, 31,052 |
 | 42 | a branch over a constant move that Zbb `max`/`min` does | 31,906 | ML | **implemented**, 28,292 |
@@ -1791,13 +1791,55 @@ instruction at all is needed in place of the three.
 That is a dead-bits question rather than a peephole, and this check
 does not ask it.
 
-## 39. One more shape from the JetStream corpus
+## 39. A transfer to an unconditional jump -- 165,318  [implemented]
 
-* **39**, a branch whose target is a `j`: jump threading. 177,202, and
-  38,002 more `j` whose target is another `j`. Check 19 reads
-  `bcc L1; j X; L1:`; this is `bcc L; ...; L: j X`, where the branch can
-  be retargeted when X is inside its reach. Many sites are both at once
-  (`bnez a0,L1; j A; L1: j B`).
+`bcc L; ...; L: j X` reaches X by way of L, where `bcc X` would go
+there directly whenever X is inside the branch's +/-4KB: jump
+threading. A `j` to a `j` is the same with +/-1MB of reach, and V8's
+far jump `auipc t6,hi; jr lo(t6)` is a jump to go around as well,
+though going around it skips the auipc, so t6 must be dead where
+control lands, as 36 asks. Check 19 reads `bcc L1; j X; L1:` and
+removes the `j`. Many sites are both shapes at once
+(`bnez a0,L1; j A; L1: j B`), and where 19 folds the branch this
+stands down.
+
+The check retargets and does nothing else. The transfer keeps its
+encoding, so a finding reads `(4 -> 4 bytes)` or `(2 -> 2 bytes)`, and
+what goes is one taken jump from every path through it. The jump at L
+stays: deleting it needs every reference to L, and a jump table or
+another code object can hold one where the branch-target map does not
+look. Counted before the check was written, 41,362 `j`s and 50,830 far
+jumps are reached only by transfers that could all go around them, with
+nothing falling into them -- 572,088 bytes if those references are the
+only ones, 13,094 of the `j`s going with check 19 anyway. That is an
+upper bound, and a different check.
+
+What check_transfer_to_jump reports: 165,318 sites, 105,721 Maglev's,
+29,800 baseline's, 15,845 TurboFan's, 13,700 regexp code's and 252 in
+unnamed code. 120,774 are conditional branches and 44,544 `j`s; no
+`jal` in the corpus calls through a jump. 123,073 go around a `j` first
+and 42,245 around a far jump; 155,871 skip one jump, 8,545 two, 898
+three and 4 four. 13,020 are check 19's shape where that check
+declined. The census before the check found 111,148 retargets around a
+`j` and 61,166 around a far jump outside 19's shape; the `j` half comes
+in at about that plus the 13,020, and the far half falls short by the
+liveness proof, which ends at calls and at the next far jump as it does
+for 36. 28 sites, every one in regexp code, are `j`s whose chain leads
+back to the instruction after them -- `j L; ...; L: j next` -- and are
+reported for deletion: 112 bytes, the check's only bytes.
+
+Two sources are traced. Sparkplug's `JumpIfUndefinedOrNull` binds the
+label its undefined test branches to just before `Jump(target)`, so the
+`beq` lands on a `j` where `JumpIfRoot(..., target)` would go straight
+there; that is every architecture's code, not the port's. And 36,710 of
+Maglev's sites and 5,207 of TurboFan's end on a `jal`, the call each
+deopt exit makes into the shared deopt entry: a branch that leaves for
+an eager deopt does so by way of a `j` (`bnez t6,0x4c354`, then
+`j 0x4cb70`, then the exit, in code.elf.1). What emits that `j` is not
+traced. Maglev already threads jumps through empty blocks and TurboFan
+has `--turbo-jt`, so these are jumps neither pass sees.
+
+## What else the JetStream corpus says
 
 Not in the table: 188,118 ordered branches against a constant just
 loaded, which no instruction folds (see 31), and 132,364 equality ones,
@@ -1836,9 +1878,8 @@ not tracked (about 75K, every one a dispatch handle that a later
 
 # Remaining candidates
 
-One, 39, from the JetStream corpus above; over the package corpus there
-are none. Forty-four checks are implemented, 36 to 38 and 40 to 46
-being the ten from that corpus so far, and
+None. Forty-five checks are implemented, 36 to 46 being the eleven from
+the JetStream corpus above, and
 everything this file sized over the package corpus is either written or
 recorded as rejected with the evidence that rejected it. Thirteen of
 the package entries, 23 to 35, did not come from a corpus probe at all:
