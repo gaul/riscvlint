@@ -7106,7 +7106,7 @@ static void cchain_close_all(riscvlint_cchain *c, cchain_live *live)
 }
 
 void riscvlint_cchain_scan(riscvlint_cchain *c, csh handle,
-                           const riscvlint_state *targets,
+                           riscvlint_state *targets,
                            const uint8_t *code, size_t len, uint64_t vaddr)
 {
     if (!c) return;
@@ -7131,18 +7131,30 @@ void riscvlint_cchain_scan(riscvlint_cchain *c, csh handle,
     cchain_live live[32];
     memset(live, 0, sizeof live);
 
-    const uint8_t *p = code;
-    size_t remain = len;
+    // The section `targets` was set to is read back from its decode
+    // cache, which leaves it warm for the scan that follows.
+    bool cached = targets && targets->dec && code == targets->code &&
+                  len == targets->size && vaddr == targets->vaddr &&
+                  handle == targets->handle;
     uint64_t addr = vaddr;
-    while (remain >= 2) {
-        uint64_t at = addr;
-        if (!cs_disasm_iter(handle, &p, &remain, &addr, insn)) {
+    while (len - (size_t)(addr - vaddr) >= 2) {
+        uint64_t at = addr, next = addr;
+        bool ok;
+        if (cached) {
+            ok = dec_insn(targets, addr, insn, &next);
+        } else {
+            const uint8_t *p = code + (addr - vaddr);
+            size_t remain = len - (size_t)(addr - vaddr);
+            ok = cs_disasm_iter(handle, &p, &remain, &next, insn);
+        }
+        if (!ok) {
             // An unreadable halfword: what follows is not reached from
             // what came before in any way worth tracking.
             cchain_close_all(c, live);
-            p += 2; remain -= 2; addr += 2;
+            addr += 2;
             continue;
         }
+        addr = next;
         uint32_t w = 0;
         memcpy(&w, code + (at - vaddr), insn->size < 4 ? insn->size : 4);
 

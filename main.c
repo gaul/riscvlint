@@ -977,13 +977,17 @@ static uint64_t anchor_of(void *ctx, uint64_t addr)
 
 // ---- scanning ----
 
+// `set` says the state already holds this section, set for -c and
+// read since only by the chain scan, which changes nothing the checks
+// read; setting it again would decode the section a second time.
 static void scan_section(csh handle, riscvlint_state *state,
                          const uint8_t *code, size_t size, uint64_t vaddr,
                          const uint8_t *base, size_t map_len,
                          const Elf64_Ehdr *eh, const sym_index *syms,
-                         const char *name)
+                         bool set, const char *name)
 {
-    if (!riscvlint_state_set_section(state, handle, code, size, vaddr))
+    if (!set &&
+        !riscvlint_state_set_section(state, handle, code, size, vaddr))
         return;
 
     // Relocations against this section make its call immediates
@@ -1147,23 +1151,21 @@ static int scan_file(csh handle, const char *path)
             if (sh[i].sh_offset > map_len ||
                 sh[i].sh_size > map_len - sh[i].sh_offset)
                 continue;
+            bool set = false;
             if (cchain) {
                 // The scan wants the side-entry map to know where a
                 // branch lands, and only the lint state builds one. A
                 // -i -c run has no state, so the chains a target splits
                 // are read as one -- stated in the report rather than
                 // silently absorbed.
-                if (state &&
-                    riscvlint_state_set_section(state, handle,
-                                                base + sh[i].sh_offset,
-                                                sh[i].sh_size, sh[i].sh_addr))
-                    riscvlint_cchain_scan(cchain, handle, state,
-                                          base + sh[i].sh_offset,
-                                          sh[i].sh_size, sh[i].sh_addr);
-                else
-                    riscvlint_cchain_scan(cchain, handle, NULL,
-                                          base + sh[i].sh_offset,
-                                          sh[i].sh_size, sh[i].sh_addr);
+                set = state &&
+                      riscvlint_state_set_section(state, handle,
+                                                  base + sh[i].sh_offset,
+                                                  sh[i].sh_size,
+                                                  sh[i].sh_addr);
+                riscvlint_cchain_scan(cchain, handle, set ? state : NULL,
+                                      base + sh[i].sh_offset,
+                                      sh[i].sh_size, sh[i].sh_addr);
             }
             if (census)
                 riscvlint_census_scan(census, handle, base + sh[i].sh_offset,
@@ -1171,7 +1173,7 @@ static int scan_file(csh handle, const char *path)
             else
                 scan_section(handle, state, base + sh[i].sh_offset,
                              sh[i].sh_size, sh[i].sh_addr, base, map_len, eh,
-                             &syms,
+                             &syms, set,
                              shstr && sh[i].sh_name < shstr_len
                                  ? shstr + sh[i].sh_name : NULL);
         }

@@ -1739,9 +1739,11 @@ void riscvlint_cchain_set_hooks(riscvlint_cchain *c,
 // Walks `len` bytes at `vaddr`, recognizing every chain. `targets`, when
 // non-NULL, is the state whose side-entry map says where a branch lands,
 // so a chain is not read across one; a caller without it loses the few
-// chains a target splits rather than reporting them as one.
+// chains a target splits rather than reporting them as one. Only the
+// state's decode cache is written: what the scan finds afterwards is
+// what it would have found had this not run.
 void riscvlint_cchain_scan(riscvlint_cchain *c, csh handle,
-                           const riscvlint_state *targets,
+                           riscvlint_state *targets,
                            const uint8_t *code, size_t len, uint64_t vaddr);
 void riscvlint_cchain_print(const riscvlint_cchain *c, const char *path,
                             bool samples);
