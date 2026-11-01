@@ -1,0 +1,63 @@
+instruction compressible to a base C form at offset: 0x0: -> c.slli (4 -> 2 bytes) (1 instructions)
+  slli s4, s4, 0x3d
+
+slli + srli foldable to andi at offset: 0x0: -> andi s4, s4, 7 (8 -> 4 bytes) (2 instructions)
+  slli s4, s4, 0x3d
+  srli s4, s4, 0x3d
+
+instruction compressible to a base C form at offset: 0x8: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd s4, 0(sp)
+
+instruction compressible to a base C form at offset: 0xc: -> c.slli (4 -> 2 bytes) (1 instructions)
+  slli a0, a0, 0x35
+
+slli + srli foldable to andi at offset: 0xc: -> andi a0, a0, 2047 (8 -> 4 bytes) (2 instructions)
+  slli a0, a0, 0x35
+  srli a0, a0, 0x35
+
+instruction compressible to a base C form at offset: 0x10: -> c.srli (4 -> 2 bytes) (1 instructions)
+  srli a0, a0, 0x35
+
+instruction compressible to a base C form at offset: 0x14: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a0, 8(sp)
+
+instruction compressible to a base C form at offset: 0x18: -> c.slli (4 -> 2 bytes) (1 instructions)
+  slli a0, a0, 0x34
+
+instruction compressible to a base C form at offset: 0x1c: -> c.srli (4 -> 2 bytes) (1 instructions)
+  srli a0, a0, 0x34
+
+instruction compressible to a base C form at offset: 0x20: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a0, 0x10(sp)
+
+slli + srli foldable to andi at offset: 0x24: -> andi a3, a4, 127 (8 -> 4 bytes) (2 instructions)
+  slli a5, a4, 0x39
+  srli a3, a5, 0x39
+
+instruction compressible to a base C form at offset: 0x2c: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a5, 1
+
+instruction compressible to a base C form at offset: 0x30: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a3, 0x18(sp)
+
+instruction compressible to a base C form at offset: 0x34: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a5, 0x20(sp)
+
+instruction compressible to a base C form at offset: 0x38: -> c.slli (4 -> 2 bytes) (1 instructions)
+  slli a0, a0, 0x3d
+
+instruction compressible to a base C form at offset: 0x3c: -> c.srli (4 -> 2 bytes) (1 instructions)
+  srli a0, a0, 0x3c
+
+instruction compressible to a base C form at offset: 0x40: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a0, 0x28(sp)
+
+slli + srli foldable to andi at offset: 0x44: -> andi a5, a5, 7 (4 -> 2 bytes) (2 instructions)
+  slli a5, a5, 0x3d
+  srli a5, a5, 0x3d
+
+Optimization opportunities by type:
+      14  instruction compressible to a base C form
+       4  slli + srli foldable to andi
+
+18 optimization opportunities in 21 instructions

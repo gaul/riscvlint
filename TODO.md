@@ -1428,7 +1428,9 @@ needing no extension at all. It was 0 in all three corpora and is now 2,
 both of them in uutils and both writing a third register. Compilers emit
 the `andi` directly. Worth recording because the shape looks like it
 should be there and the `zext.w` result invites the generalisation --
-and 2 sites in 73 million instructions is the same answer as 0.
+and 2 sites in 73 million instructions is the same answer as 0. A JIT
+answers differently: the JetStream corpus has 17,097, and they are
+check 45.
 
 ### `li` of a small constant feeding an op with an immediate form -- 942
 
@@ -1490,7 +1492,7 @@ which is to the digit what check 3 reports over this corpus.
 | 42 | a branch over a constant move that Zbb `max`/`min` does | 31,906 | ML | candidate |
 | 43 | `li rc,0` + `beq`/`bne rx,rc` | 29,089 | TF 25K | **implemented**, 1,658 |
 | 44 | an immediate operand materialized into a register | 20,743 | ML | candidate |
-| 45 | `slli k` + `srli k`, k >= 53 -> `andi` | 17,097 | BL 12K, ML 5K | candidate |
+| 45 | `slli k` + `srli k`, k >= 53 -> `andi` | 17,097 | BL 12K, ML 5K | **implemented**, 17,097 |
 | 46 | `and` with a materialized 0xffff -> `zext.h` | 1,499 | ML | candidate |
 
 38's figure is the miner's 1,259,133 less the 431,020 `ebreak` it
@@ -1682,7 +1684,26 @@ in the two immediates, as check_jump_pair_to_j computes it -- would
 raise this check and every other that asks the walk, and is the one
 improvement here that is not a new check.
 
-## 39, 42 and 44 to 46. Five more shapes from the JetStream corpus
+## 45. slli + srli foldable to andi -- 17,097  [implemented]
+
+`slli rd,rs,k` + `srli rd,rd,k` with k of 53 or more: the low 64-k bits,
+eleven or fewer, which `andi rd,rs,2^(64-k)-1` keeps in one RV64I
+instruction. The package corpus has 2, and the rejection above says why
+its compilers never produce more; V8 produces them because `DecodeField`
+is `ExtractBits`, and `ExtractBits` is the shift pair wherever the field
+sits, a field at bit 0 included. Testing for `pos == 0` and a size of
+eleven or less there would take every site in this entry.
+
+What check_slli_srli_to_andi reports: 17,097 sites worth 68,388 bytes,
+the miner's figure to the site, every one written as one register
+shifted in place. 12,011 are baseline's and 5,086 Maglev's. 14,135 keep
+three bits -- `OsrUrgencyBits`, which baseline decodes at every
+`JumpLoop` and Maglev in its deferred OSR attempt -- 2,134 keep seven and
+828 keep ten, Maglev decoding fields of a byte and a word it has just
+loaded. The `andi` is priced as `c.andi` where both shifts were
+compressed and the mask fits six bits, which no site here is.
+
+## 39, 42, 44 and 46. Four more shapes from the JetStream corpus
 
 * **39**, a branch whose target is a `j`: jump threading. 177,202, and
   38,002 more `j` whose target is another `j`. Check 19 reads
@@ -1698,8 +1719,6 @@ improvement here that is not a new check.
   materialized, 20,743 sites where `addi`/`addiw` would do. This file
   rejected the shape at 942 over the package corpus; the JIT has 22x
   that.
-* **45**, `slli k`+`srli k` with k >= 53, an `andi`: 17,097 (14,135 at
-  61, which is `andi 7`), against the 2 that rejected it above.
 * **46**, `lui t2,0x10; addiw t2,t2,-1; and a0,t1,t2`: 1,499 `zext.h`.
 
 Not in the table: 188,118 ordered branches against a constant just
@@ -1708,8 +1727,8 @@ which are 30's Zibi shape and need the extension.
 
 ### What the corpus says about V8
 
-Five habits of the riscv64 port account for 36, 37, 38 and 40, and each
-is a CL as well as a check's finding. `BranchLong` emits `auipc`+`jr`
+Six habits of the riscv64 port account for 36, 37, 38, 40 and 45, each
+a CL as well as a check's finding. `BranchLong` emits `auipc`+`jr`
 for every unbound label where `bcc`+`j` would do, and `j` alone reaches
 any function in this corpus. Short builtin calls are disabled whenever
 pointer compression is off (the `v8_enable_short_builtin_calls` clause
@@ -1719,9 +1738,10 @@ add s6; ld; jalr` -- 940,521 of those, about a quarter of all baseline
 instructions. `Assembler::stop()` spends eight bytes on a trap that
 `ebreak` alone, or `c.ebreak` in two, expresses on hardware.
 `MultiPush`/`MultiPop` with nothing to push still adjust `sp` by zero.
-And Maglev's prologue pushes the context, the function, the argument
-count and a zero for every tagged slot with one `Push()` each, where the
-variadic `Push` beside it adjusts once.
+Maglev's prologue pushes the context, the function, the argument count
+and a zero for every tagged slot with one `Push()` each, where the
+variadic `Push` beside it adjusts once. And `DecodeField` shifts a field
+at bit 0 up and back down where one `andi` would mask it.
 
 Two things it says about check 9, the extension the producer already
 guarantees: `srai` and `srli` by 32 or more leave a sign- or
@@ -1732,14 +1752,14 @@ not tracked (about 75K, every one a dispatch handle that a later
 
 # Remaining candidates
 
-Five, 39, 42 and 44 to 46, all from the JetStream corpus above; over
-the package corpus there are none. Forty checks are implemented, 36 to
-38, 40, 41 and 43 being the six from that corpus so far, and everything
-this file sized over the package corpus is either written or recorded
-as rejected with the evidence that rejected it. Thirteen of the package
-entries, 23 to 35, did not come from a corpus probe at all: 23 came
-from walking armlint's check table against this one, 24 came from a
-rejection in this file being wrong, 25, 26 and 27 are the three
+Four, 39, 42, 44 and 46, all from the JetStream corpus above; over the
+package corpus there are none. Forty-one checks are implemented, 36 to
+38, 40, 41, 43 and 45 being the seven from that corpus so far, and
+everything this file sized over the package corpus is either written or
+recorded as rejected with the evidence that rejected it. Thirteen of
+the package entries, 23 to 35, did not come from a corpus probe at all:
+23 came from walking armlint's check table against this one, 24 came
+from a rejection in this file being wrong, 25, 26 and 27 are the three
 addressing modes of a ratification plan for an extension that does not
 exist in hardware yet, and 28, 29 and 30 all came out of one pair dump
 being re-counted for an unrelated question. 28's own entry records the

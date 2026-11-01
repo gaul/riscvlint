@@ -1470,6 +1470,24 @@ bool check_zero_for_store(riscvlint_state *state, const cs_insn *insn,
 bool check_zero_eq_branch(riscvlint_state *state, const cs_insn *insn,
                           riscvlint_finding *finding);
 
+// `slli rd,rs,k` + `srli rd,rd,k` with k of 53 or more keeps the low
+// 64-k bits, eleven or fewer, which `andi rd,rs,2^(64-k)-1` keeps in one
+// RV64I instruction. The sibling of check_slli_srli_to_zext at 32 and
+// check_slli_srli_to_zexth at 48, and the one of the three that needs no
+// extension. An srli writing a register other than the one the slli
+// wrote is accepted on a liveness proof, as in the zext.h sibling.
+// Priced at the pair's encoding class: `c.andi` where both shifts were
+// compressed and the mask fits six bits, four bytes otherwise.
+//
+// The package corpus has 2, its compilers emitting the andi directly.
+// V8 does not: `DecodeField` is `ExtractBits`, which is always the shift
+// pair, even for a field at bit 0. Measured population: 17,097 sites in
+// the JetStream corpus (TODO.md, entry 45), 14,135 of them keeping
+// three bits -- `OsrUrgencyBits`, decoded at every baseline loop
+// back-edge.
+bool check_slli_srli_to_andi(riscvlint_state *state, const cs_insn *insn,
+                             riscvlint_finding *finding);
+
 // ---- running every check ----
 //
 // Called once per finding, with `ctx` as given. The finding is valid

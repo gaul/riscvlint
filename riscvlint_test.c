@@ -5757,6 +5757,74 @@ static void test_zero_eq_branch(csh handle)
                      0x1000, NULL) == 0);
 }
 
+// check_slli_srli_to_andi: an equal shift pair keeping eleven bits or
+// fewer, which one andi keeps.
+static void test_slli_srli_to_andi(csh handle)
+{
+    riscvlint_finding f;
+    const uint32_t ret = 0x00008067u;
+    const uint32_t slli61 = 0x03d51513u;         // slli a0,a0,61
+    const uint32_t srli61 = 0x03d55513u;         // srli a0,a0,61
+
+    // V8's DecodeField of a three-bit field at bit 0.
+    uint32_t v8[] = { slli61, srli61, ret };
+    CHECK(run_words(handle, check_slli_srli_to_andi, v8, 3, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "andi a0, a0, 7 (8 -> 4 bytes)") == 0);
+    CHECK(f.insn_count == 2 && f.address == 0x1000);
+    CHECK(strcmp(f.title, "slli + srli foldable to andi") == 0);
+
+    // 53 keeps eleven bits, the widest mask andi holds; 52 keeps twelve.
+    uint32_t k53[] = { 0x03551513u /* slli a0,a0,53 */,
+                       0x03555513u /* srli a0,a0,53 */, ret };
+    CHECK(run_words(handle, check_slli_srli_to_andi, k53, 3, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "andi a0, a0, 2047 (8 -> 4 bytes)") == 0);
+    uint32_t k52[] = { 0x03451513u /* slli a0,a0,52 */,
+                       0x03455513u /* srli a0,a0,52 */, ret };
+    CHECK(run_words(handle, check_slli_srli_to_andi, k52, 3, 0x1000, NULL) == 0);
+
+    // The srli writing elsewhere: reported when the shifted value is
+    // overwritten afterwards, not when it is read.
+    uint32_t split[] = { 0x03d71793u /* slli a5,a4,61 */,
+                         0x03d7d693u /* srli a3,a5,61 */,
+                         0x00100793u /* li a5,1 */, ret };
+    CHECK(run_words(handle, check_slli_srli_to_andi, split, 4, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "andi a3, a4, 7 (8 -> 4 bytes)") == 0);
+    uint32_t live[] = { 0x03d71793u /* slli a5,a4,61 */,
+                        0x03d7d693u /* srli a3,a5,61 */,
+                        0x00078513u /* mv a0,a5 */, ret };
+    CHECK(run_words(handle, check_slli_srli_to_andi, live, 4, 0x1000, NULL) == 0);
+
+    // Not reported: unequal amounts, which move the field; srai, which
+    // is a sign extension; an srli of another register; and a `j` back
+    // to the srli, which arrives without the slli.
+    uint32_t moved[] = { slli61, 0x03c55513u /* srli a0,a0,60 */, ret };
+    CHECK(run_words(handle, check_slli_srli_to_andi, moved, 3, 0x1000, NULL) == 0);
+    uint32_t arith[] = { slli61, 0x43d55513u /* srai a0,a0,61 */, ret };
+    CHECK(run_words(handle, check_slli_srli_to_andi, arith, 3, 0x1000, NULL) == 0);
+    uint32_t other[] = { slli61, 0x03d5d513u /* srli a0,a1,61 */, ret };
+    CHECK(run_words(handle, check_slli_srli_to_andi, other, 3, 0x1000, NULL) == 0);
+    uint32_t entry[] = { slli61, srli61, ret, 0xff9ff06fu /* j -8 */ };
+    CHECK(run_words(handle, check_slli_srli_to_andi, entry, 4, 0x1000, NULL) == 0);
+
+    // Compressed: c.slli a5,61 ; c.srli a5,61 is c.andi a5,7, four bytes
+    // down to two. At 58 the mask is 63, past c.andi's six signed bits,
+    // and the andi is four bytes -- an instruction saved, no space. One
+    // four-byte shift prices the andi at four as well.
+    uint8_t rvc[] = { 0xf6, 0x17, 0xf5, 0x93, 0x82, 0x80 };
+    CHECK(run_window(handle, check_slli_srli_to_andi, rvc, sizeof rvc, 0x1000,
+                     &f) == 1);
+    CHECK(strcmp(f.replacement, "andi a5, a5, 7 (4 -> 2 bytes)") == 0);
+    uint8_t wide[] = { 0xea, 0x17, 0xe9, 0x93, 0x82, 0x80 };
+    CHECK(run_window(handle, check_slli_srli_to_andi, wide, sizeof wide,
+                     0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "andi a5, a5, 63 (4 -> 4 bytes)") == 0);
+    uint8_t mixed[] = { 0x93, 0x97, 0xd7, 0x03,  // slli a5,a5,61
+                        0xf5, 0x93, 0x82, 0x80 };
+    CHECK(run_window(handle, check_slli_srli_to_andi, mixed, sizeof mixed,
+                     0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "andi a5, a5, 7 (6 -> 4 bytes)") == 0);
+}
+
 int main(void)
 {
     csh handle;
@@ -5798,6 +5866,7 @@ int main(void)
     test_push_run(handle);
     test_zero_for_store(handle);
     test_zero_eq_branch(handle);
+    test_slli_srli_to_andi(handle);
     test_zero_store_run(handle);
     test_bitcast_through_frame(handle);
     test_cchain(handle);

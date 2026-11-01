@@ -5999,6 +5999,61 @@ bool check_zero_eq_branch(riscvlint_state *state, const cs_insn *insn,
     return true;
 }
 
+// ---- slli + srli foldable to andi ----
+
+bool check_slli_srli_to_andi(riscvlint_state *state, const cs_insn *insn,
+                             riscvlint_finding *finding)
+{
+    // No extension gate: andi is RV64I.
+    if (insn->size != 2 && insn->size != 4) return false;
+
+    uint32_t w1;
+    if (!riscvlint_word_at(state, insn->address, &w1)) return false;
+    unsigned rd1, rs1, sh1;
+    if (!rv_decode_slli(w1, insn->size, &rd1, &rs1, &sh1)) return false;
+    // 53 and above keep eleven bits or fewer, a mask andi's sign-extended
+    // twelve-bit immediate holds; 52 keeps twelve, which it does not.
+    if (sh1 < 53 || rd1 == 0) return false;
+
+    uint64_t second = insn->address + insn->size;
+    uint32_t w2;
+    if (!riscvlint_word_at(state, second, &w2)) return false;
+    unsigned len2 = rv_insn_len(w2);
+    unsigned rd2, srs1, sh2;
+    if (!rv_decode_srli(w2, len2, &rd2, &srs1, &sh2)) return false;
+    // The same amount both ways, or the bits move as well as narrow.
+    if (sh2 != sh1 || rd2 == 0 || srs1 != rd1) return false;
+
+    if (riscvlint_is_branch_target(state, second)) return false;
+    if (riscvlint_is_relocated(state, insn->address) ||
+        riscvlint_is_relocated(state, second))
+        return false;
+
+    // Overwriting the shifted register leaves nothing of the
+    // intermediate to keep alive; writing elsewhere has to be proved, as
+    // in check_slli_srli_to_zexth.
+    if (rd2 != rd1 &&
+        riscvlint_liveness(state, second + len2, rd1) != RISCVLINT_LIVE_DEAD)
+        return false;
+
+    // Priced at the encoding class of the pair, as check_long_li prices
+    // its chain: c.andi where both shifts were compressed and its six-bit
+    // immediate holds the mask, four bytes otherwise. Both compressed
+    // means c.slli and c.srli on one register of x8-x15, which is the
+    // register c.andi needs.
+    unsigned mask = (1u << (64 - sh1)) - 1;
+    unsigned before = insn->size + len2;
+    unsigned after = insn->size == 2 && len2 == 2 && mask <= 31 ? 2 : 4;
+
+    finding->title = "slli + srli foldable to andi";
+    finding->address = insn->address;
+    finding->insn_count = 2;
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "andi %s, %s, %u (%u -> %u bytes)", rv_reg_name(rd2),
+             rv_reg_name(rs1), mask, before, after);
+    return true;
+}
+
 // ---- running every check ----
 
 static const riscvlint_check_fn riscvlint_checks[] = {
@@ -6042,6 +6097,7 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_push_run,
     check_zero_for_store,
     check_zero_eq_branch,
+    check_slli_srli_to_andi,
 };
 
 size_t riscvlint_scan(riscvlint_state *state, csh handle,

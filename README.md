@@ -3,8 +3,8 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Forty checks are implemented and the ledger's candidate list holds
-five, all from a JIT corpus. [TODO.md](TODO.md) is that ledger:
+Forty-one checks are implemented and the ledger's candidate list holds
+four, all from a JIT corpus. [TODO.md](TODO.md) is that ledger:
 every candidate that was measured, the population it came back with,
 and the ones rejected on that evidence.
 What got written was decided by the corpus rather than by intuition,
@@ -12,20 +12,20 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Forty of them, and the table lists twenty-seven. The jump pair, the
-constant chain, the no-op, the push run, the zero store and the zero
-branch have so far been measured over the JetStream corpus of TODO.md,
-which the table does not cover. Seven report nothing over this corpus --
-the bit count because no baseline object declares Zbb; the three indexed
-loads, the equality branch and the compare-exchange loop because those
-five require their extension to be positively present rather than merely
-un-denied, and no object declares Zilx, Zibi or Zacas; and the unsigned
-divide by a power of two because all three toolchains already do that
-fold themselves. Those entries below say why. Every figure is what the
-check itself reports over the [corpus](#corpus) -- 108,165,211
-instructions of three toolchains across 31 objects -- rather than what a
-mining tool estimated for it. The two have differed by an order of
-magnitude every time both were measured.
+Forty-one of them, and the table lists twenty-seven. The jump pair, the
+constant chain, the no-op, the push run, the zero store, the zero branch
+and the andi pair have so far been measured over the JetStream corpus of
+TODO.md, which the table does not cover. Seven report nothing over this
+corpus -- the bit count because no baseline object declares Zbb; the
+three indexed loads, the equality branch and the compare-exchange loop
+because those five require their extension to be positively present
+rather than merely un-denied, and no object declares Zilx, Zibi or
+Zacas; and the unsigned divide by a power of two because all three
+toolchains already do that fold themselves. Those entries below say why.
+Every figure is what the check itself reports over the
+[corpus](#corpus) -- 108,165,211 instructions of three toolchains across
+31 objects -- rather than what a mining tool estimated for it. The two
+have differed by an order of magnitude every time both were measured.
 
 The table is generated, not maintained: `scripts/check_table.py` scans
 the corpus and prints it, which is how adding two objects stopped
@@ -530,6 +530,26 @@ except a handful of `jalr ra,0(ra)` that were already two.
   the shift-add family's 41%, because `c.srli` is CB-format and can name
   only x8-x15. `sext.w` is the same shape with `srai` and a different
   rewrite, which the check rejects rather than folds.
+
+* **slli + srli foldable to andi** -- the same shape at 53 or more:
+  `slli rd,rs,k` + `srli rd,rd,k` keeps the low 64-k bits, eleven or
+  fewer, and `andi rd,rs,2^(64-k)-1` keeps them in one base-ISA
+  instruction.
+
+  ```
+   28417fc: slli s4, s4, 0x3d
+   2841800: srli s4, s4, 0x3d        -> andi s4, s4, 7 (8 -> 4 bytes)
+  ```
+
+  An `srli` writing another register is accepted on a liveness proof, as
+  in the zext.h entry, and the `andi` is priced as `c.andi` where both
+  shifts were compressed and the mask fits six bits. The package corpus
+  has 2, its compilers emitting the `andi`, and TODO.md rejected the
+  shape on that. The JetStream corpus (TODO.md, entry 45) has 17,097,
+  worth 68,388 bytes: 12,011 in baseline and 5,086 in Maglev. V8's
+  `DecodeField` is `ExtractBits`, the shift pair wherever the field
+  sits, and 14,135 of the sites keep three bits -- `OsrUrgencyBits`,
+  decoded at every baseline loop back-edge and in Maglev's OSR code.
 
 * **redundant stack-pointer restore** -- `addi s0,sp,K` in the prologue
   and `addi sp,s0,-K` at the exit. When nothing has written sp in
