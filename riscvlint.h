@@ -353,6 +353,14 @@ int riscvlint_liveness(riscvlint_state *state, uint64_t addr, unsigned rd);
 bool riscvlint_word_at(const riscvlint_state *state, uint64_t addr,
                        uint32_t *out);
 
+// Puts the instruction at `addr` in `insn` (from cs_malloc on the
+// section's handle) as cs_disasm_iter would decode it there, or false
+// if it lies outside the section, fewer than two bytes remain, or
+// capstone cannot decode it. It comes out of the cache the scan decodes
+// into, so a caller printing a finding reads its instructions back
+// rather than decoding them again.
+bool riscvlint_insn_at(riscvlint_state *state, uint64_t addr, cs_insn *insn);
+
 // ---- conditions and branches ----
 //
 // RISC-V has no condition flags, so the shape armlint spells `cmp #0`

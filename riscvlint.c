@@ -1606,6 +1606,16 @@ bool riscvlint_word_at(const riscvlint_state *state, uint64_t addr,
     return true;
 }
 
+bool riscvlint_insn_at(riscvlint_state *state, uint64_t addr, cs_insn *insn)
+{
+    if (!state->dec || addr < state->vaddr ||
+        addr >= state->vaddr + state->size ||
+        state->size - (size_t)(addr - state->vaddr) < 2)
+        return false;
+    uint64_t next;
+    return dec_insn(state, addr, insn, &next);
+}
+
 // ---- checks ----
 
 bool check_call_pair_to_jal(riscvlint_state *state, const cs_insn *insn,

@@ -697,13 +697,13 @@ static const char *symbolize(const sym_index *ix, uint64_t addr,
 // callback's ctx.
 typedef struct {
     csh handle;
-    const riscvlint_state *state;
+    riscvlint_state *state;
     const sym_index *syms;
     const char *section;    // name of the section being scanned
 } report_ctx;
 
-// Walk the instructions a finding covers, disassembled fresh from the
-// file so the report shows exactly what is in it. Each one's text goes
+// Walk the instructions a finding covers, as decoded from the file's
+// own bytes, so the report shows exactly what is in it. Each one's text goes
 // through `line`; its encoding is appended to `bytes` while that has
 // room. Returns how many instructions were decoded and writes their
 // total byte length to `*len`, which is the true length whether or not
@@ -724,10 +724,10 @@ static unsigned walk_finding(const report_ctx *c, const riscvlint_finding *f,
         if (!riscvlint_word_at(c->state, addr, &w)) break;
         uint8_t buf[4];
         memcpy(buf, &w, 4);
-        const uint8_t *p = buf;
-        size_t remain = 4;
-        uint64_t a = addr;
-        if (!cs_disasm_iter(c->handle, &p, &remain, &a, insn)) break;
+        // Capstone reads no more than four bytes of a RISC-V
+        // instruction, so the decode the scan left in the cache is the
+        // one these four would give.
+        if (!riscvlint_insn_at(c->state, addr, insn)) break;
         if (line) line(lctx, i, insn);
         if (len) {
             if (bytes && *len + insn->size <= cap)
@@ -735,7 +735,7 @@ static unsigned walk_finding(const report_ctx *c, const riscvlint_finding *f,
             *len += insn->size;
         }
         n++;
-        addr = a;
+        addr += insn->size;
     }
     cs_free(insn, 1);
     return n;
@@ -803,17 +803,22 @@ static uint64_t json_insns, json_skipped, json_findings;
 // whose string tables are not UTF-8 yields strings that are not either.
 static void json_puts(const char *s)
 {
-    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+    const unsigned char *p = (const unsigned char *)s;
+    for (;;) {
+        // Most of a string needs no escaping, and goes out as one run.
+        const unsigned char *run = p;
+        while (*p >= 0x20 && *p != '"' && *p != '\\') p++;
+        if (p > run) fwrite(run, 1, (size_t)(p - run), stdout);
         switch (*p) {
+        case '\0': return;
         case '"':  fputs("\\\"", stdout); break;
         case '\\': fputs("\\\\", stdout); break;
         case '\n': fputs("\\n", stdout); break;
         case '\r': fputs("\\r", stdout); break;
         case '\t': fputs("\\t", stdout); break;
-        default:
-            if (*p < 0x20) printf("\\u%04x", *p);
-            else putchar(*p);
+        default:   printf("\\u%04x", *p);
         }
+        p++;
     }
 }
 
@@ -866,8 +871,14 @@ static void json_finding(void *ctx, const riscvlint_finding *f)
     walk_finding(c, f, json_line, NULL, bytes, sizeof bytes, &len);
     printf("], \"length\": %zu", len);
     if (len && len <= sizeof bytes) {
+        static const char hex[] = "0123456789abcdef";
+        char digits[2 * JSON_BYTES_MAX];
+        for (size_t i = 0; i < len; i++) {
+            digits[2 * i] = hex[bytes[i] >> 4];
+            digits[2 * i + 1] = hex[bytes[i] & 0xf];
+        }
         fputs(", \"bytes\": \"", stdout);
-        for (size_t i = 0; i < len; i++) printf("%02x", bytes[i]);
+        fwrite(digits, 1, 2 * len, stdout);
         putchar('"');
     }
     putchar('}');
