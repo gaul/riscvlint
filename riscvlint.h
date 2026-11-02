@@ -1854,4 +1854,95 @@ size_t riscvlint_census_extension_count(const riscvlint_census *census,
 // rather than the whole of it.
 const char *riscvlint_census_profile(const riscvlint_census *census);
 
+// ---- macro-op fusion report ----
+//
+// Which adjacent instruction pairs a fusing core would issue as one
+// operation, and which near-adjacent ones it would have if the code had
+// been scheduled or allocated for it. Fusion is a property of a core
+// rather than of the ISA, so the report is per core, and the cores and
+// pairs are transcribed from LLVM rather than from memory or from a
+// paper: llvm/lib/Target/RISCV/RISCVMacroFusion.td defines each pair as
+// a predicate on two instructions, and RISCVProcessors.td says which
+// processors enable which. The three families that enable any are
+//
+//   spacemit-x100        logic+logic (reg-reg, reg-imm, imm-reg),
+//                        mul+add, add+load/store, slli+srli/srai --
+//                        added by SpacemiT (LLVM b10d6a501e0, #178594)
+//   sifive-p400 ... p800 branch over c.mv, lui+addi, auipc+addi
+//   xiangshan-nanhu and  zext.w, shifted zext.w and zext.h as
+//   -kunminghu           slli+srli
+//
+// GCC's riscv-fusion.cc has a similar list and enables less of it: its
+// spacemit-x100 tuning fuses nothing. The definitions without an
+// in-tree processor (Ventana's add+load family, Qualcomm's RV32 Xqci
+// pairs) are left out, since a count nobody's core realizes is not a
+// fact about the binary.
+//
+// Every LLVM pair but add+load/store is a SimpleFusion, and the part of
+// that the .td does not spell out is the register rule: the second
+// instruction reads the first's destination and overwrites it, so the
+// fused operation writes one register. `slli t0,a0,32` + `srli a1,t0,32`
+// is the same arithmetic as the fusible spelling and does not fuse.
+// add+load/store asks the opposite of its add -- a destination that is
+// neither source -- and of its access an offset of zero from that
+// destination.
+//
+// Pairs are taken greedily in address order, as a decoder would: an
+// instruction already fused with the one before it is not available to
+// the one after. A branch landing on the second instruction does not
+// stop the count, because the fall-through path still decodes the pair.
+//
+// Three kinds of near miss are counted alongside, each one rewrite
+// away from fusing and each reported at most once per second
+// instruction:
+//
+//   split   the pair satisfies its predicate but up to seven
+//           instructions sit between the two, none of them a branch
+//           target or a transfer, and either the first can sink or the
+//           second can rise past all of them without changing what any
+//           of them reads or writes. This is what a scheduler that knew
+//           the pair would have done.
+//   rename  the pair is adjacent and dependent and fails only the
+//           same-destination rule, and the first's destination is dead
+//           after the second, so writing the second's destination in
+//           both places costs nothing. Needs the liveness walk.
+//   swap    the second instruction is commutative and reads the first's
+//           result as its second operand. LLVM marks the logic pairs
+//           commutable, but on a SpacemiT K3 a commuted second ran at
+//           1.5 or 2.0 cycles per pair against 1.0 uncommuted, and a
+//           commuted mul+add at 4 against 3, so for spacemit-x100 the
+//           commuted spelling is reported here rather than as fused.
+//
+// The report counts static pairs, not executed ones, so its "fewer
+// macro-ops" is a property of the code layout rather than a speedup.
+// Opaque; NULL is accepted everywhere.
+typedef struct riscvlint_fusion riscvlint_fusion;
+
+riscvlint_fusion *riscvlint_fusion_create(void);
+void riscvlint_fusion_destroy(riscvlint_fusion *f);
+
+// Walks `len` bytes at `vaddr`, one section per call. `state`, when
+// non-NULL, must hold this section (riscvlint_state_set_section); it
+// supplies the side-entry map and the liveness walk the split and
+// rename counts need, and its decode cache, which is read rather than
+// decoding a second time. Without it only the fused and swap counts are
+// taken.
+void riscvlint_fusion_scan(riscvlint_fusion *f, csh handle,
+                           riscvlint_state *state,
+                           const uint8_t *code, size_t len, uint64_t vaddr);
+
+// One block per core: the pairs that fuse and what share of the
+// instructions they absorb, then a row per pair with its fused, split,
+// rename and swap counts. `samples` adds up to four addresses per
+// nonzero cell, the address of the pair's first instruction.
+void riscvlint_fusion_print(const riscvlint_fusion *f, const char *path,
+                            bool samples);
+
+// For the tests. `core` and `pair` are the names the report prints
+// ("spacemit-x100", "mul + add"); `pair` NULL totals the core. `kind`
+// is "fused", "split", "rename" or "swap". Unknown names count 0.
+size_t riscvlint_fusion_instructions(const riscvlint_fusion *f);
+size_t riscvlint_fusion_count(const riscvlint_fusion *f, const char *core,
+                              const char *pair, const char *kind);
+
 #endif  // RISCVLINT_H

@@ -157,10 +157,11 @@ else
         "status $status, $(wc -c < "$WORK/out") bytes"
 fi
 
-# 5. The census and the verbose report are separate reports whose
-#    output would interleave with the document, so both combinations are
-#    refused rather than one of them chosen for the caller.
-for flag in -i -v; do
+# 5. The census, the fusion report and the verbose report are separate
+#    reports whose output would interleave with the document, so those
+#    combinations are refused rather than one of them chosen for the
+#    caller.
+for flag in -i -f -v; do
     set +e
     "$ROOT/riscvlint" --json $flag "$WORK/clean.o" > "$WORK/out" 2> /dev/null
     status=$?

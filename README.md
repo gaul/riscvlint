@@ -1681,6 +1681,137 @@ faults. The census counts both the same way, because from the
 encodings they are the same thing; the sample addresses are what tells
 them apart.
 
+## Macro-op fusion (`-f`)
+
+`riscvlint -f` replaces the lint scan with a fusion report: the
+adjacent instruction pairs a fusing core would issue as one operation,
+and the pairs that would fuse after one small rewrite. Fusion is a
+property of a core rather than of the ISA, so the report has one block
+per core. The cores and pairs come from LLVM, not from memory or from
+the papers: `llvm/lib/Target/RISCV/RISCVMacroFusion.td` defines each
+pair as a predicate on two instructions, and `RISCVProcessors.td` says
+which processors enable which. Three families enable any:
+
+| core | pairs |
+|---|---|
+| `spacemit-x100` | and/or/xor + and/or/xor, + andi/ori/xori, andi/ori/xori + and/or/xor; `mul`+`add`; `add`+load/store; `slli`+`srli`/`srai` (LLVM b10d6a501e0, from SpacemiT) |
+| `sifive-p450` to `p870` | a branch over one `c.mv`; `lui`+`addi`; `auipc`+`addi` |
+| `xiangshan-nanhu`, `-kunminghu` | `slli 32`+`srli 32`, `slli 32`+`srli <32`, `slli 48`+`srli 48` |
+
+GCC's `riscv-fusion.cc` has a similar list but enables less of it. Its
+`spacemit-x100` tuning fuses nothing. LLVM also defines some pairs that
+no in-tree processor enables: Ventana's add+load family, and
+Qualcomm's RV32 Xqci pairs. Those are left out, because a count that no
+core realizes is not a fact about the binary.
+
+The register rule is where an eyeballed pair goes wrong. Every pair
+except add+load/store is a `SimpleFusion`: the second instruction reads
+the first one's destination as its first operand and writes it back,
+so the fused operation writes one register. `slli t0,a0,32` +
+`srli a1,t0,32` computes the same thing as the fusible spelling and
+does not fuse. add+load/store asks the opposite of its add, a
+destination that is neither source, and asks the access for offset 0
+from that destination. Pairs are taken greedily in address order, as a
+decoder takes them: an instruction already fused with the one before it
+cannot also fuse with the one after it.
+
+Three kinds of near miss are counted next to the fused pairs. Each one
+is a single rewrite away from fusing:
+
+* **split**: the pair meets its predicate, but up to seven instructions
+  sit between its halves. None of them is a branch target or a
+  transfer, and either the first half can move down or the second half
+  can move up past all of them without changing what any of them reads
+  or writes. A scheduler that knew about the pair would have made it
+  adjacent.
+* **rename**: the pair is adjacent and dependent and fails only the
+  same-destination rule, and the liveness walk proves the first
+  destination dead after the second instruction.
+* **swap**: the second instruction commutes and reads the first one's
+  result as its second operand.
+
+```console
+$ ./riscvlint -f out/rv/d8
+Fusion report of out/rv/d8: 8477352 instructions
+  spacemit-x100: 13557 pairs fuse, 0.2% fewer macro-ops; near misses 8047 split, 1570 rename, 111 swap
+    pair                      fused      split     rename       swap
+    logic + logic              2964       4575        168         67
+    logic + logic imm           556         78         49          -
+    logic imm + logic           278        325         16         44
+    mul + add                   578        440         41          0
+    add + load/store           4383       1691          -          -
+    slli + srli/srai           4798        938       1296          -
+  sifive-p450/p470/p550/p670/p870: 51101 pairs fuse, 0.6% fewer macro-ops; ...
+```
+
+### What the X100 does on the bench
+
+LLVM's tables say what the vendor told the compiler, not what the
+silicon does. The X100 is the core in the SpacemiT K3, and a K3
+(marchid 0x8000000058000002, mimpid 0x33d8a600, the IDs LLVM's
+`spacemit-x100` entry carries) ran each pair two ways. In a latency
+test, a repeated pair forms a dependency chain. In a throughput test,
+eight chains are interleaved. Each pair was timed against a control
+with the same dependency shape that breaks the fusion predicate,
+usually by giving the second instruction its own destination. Figures
+are cycles per pair from `perf stat`, minimum of three, and
+`tools/fusion_bench.py` reproduces them on any riscv64 host:
+
+| pair | fusible | control | |
+|---|---:|---:|---|
+| `and`+`or` latency | 1.01 | 2.03 | fuses; the same for every logic pair, compressed or not |
+| `and`+`or` throughput | 0.52 | 0.69 | 3.9 instructions per cycle against 3.0 |
+| `and a0,a0,a1` + `or a0,a2,a0` (commuted) | 1.52 | 2.03 | partial |
+| `and a0,a1,a0` + `or a0,a2,a0` (commuted) | 2.03 | 2.03 | no gain |
+| `mul`+`add` latency | 3.01 | 4.01 | fuses, `mulw`+`addw` too; `mul`+`addw` does not |
+| `mul a0,a0,a1` + `add a0,a2,a0` | 4.01 | 4.01 | the commuted add does not fuse |
+| `add t0,a1,a0` + `ld a0,0(t0)` | 3.01 | 4.01 | the add costs nothing |
+| `add t0,a0,a1` + `ld a0,0(t0)` | 7.01 | 4.01 | fused and three cycles *slower* |
+| `slli`+`srli` latency, any amounts | 2.03 | 2.03 | no measurable effect |
+| `slli`+`srli` throughput, also mixed with loads or `nop`s | 0.69 | 0.69 | no measurable effect |
+| `add`+`sd 0` throughput | 1.02 | 1.02 | no measurable effect |
+
+So the report departs from LLVM in one place. LLVM marks the logic
+pairs commutable and counts their commuted spelling as fused. On the
+X100 that spelling is reported as a swap, because swapping the operands
+is free and runs faster. The add+load row matters for pointer-chasing
+code. The fused pair reaches the loaded value three cycles sooner than
+unfused code through the add's second operand, and three cycles later
+through its first. A static report cannot tell which operand arrives
+late, so it counts the pair as fused and says so here. The shift pairs
+and stores are counted because LLVM says they fuse. Nothing above could
+tell what fusing them buys, if anything: perhaps physical registers or
+ROB entries, which these tests do not exhaust.
+
+### Results
+
+Static counts, with "fewer macro-ops" the fused pairs as a share of
+the instructions:
+
+| binary | instructions | x100 fused | x100 near misses | sifive-p fused | xiangshan fused |
+|---|---:|---:|---:|---:|---:|
+| V8 JetStream JIT dump (34 parts) | 37,896,111 | 105,122 (0.28%) | 6,627 | 867,832 (2.29%) | 2,517 |
+| `d8`, clang 21, RVA23 | 8,477,352 | 13,557 (0.16%) | 9,728 | 51,101 (0.60%) | 52 |
+| `libLLVM.so.21.1`, Bianbu | 17,193,468 | 33,445 (0.19%) | 21,743 | 91,625 (0.53%) | 4 |
+| `python3.14`, GCC 15, RVA23 | 984,085 | 1,271 (0.13%) | 1,396 | 8,953 (0.91%) | 0 |
+| `libc.so.6`, GCC 15, RVA23 | 318,238 | 648 (0.20%) | 570 | 6,200 (1.95%) | 0 |
+
+The X100's pairs are rare in all of them. Under 0.3% of the
+instructions would go away, and the two pairs that measurably help,
+logic+logic and mul+add, are under 0.1% everywhere. In the V8 dump,
+79,847 of the 105,122 are add+load, and 75,166 of those are irregexp's
+current-character load, `add s3,s6,s4; lbu s5,0(s3)`. The position,
+which changes every iteration, is the add's second operand, which is
+the fast case in the table above. 4,926 more are add+store, and 19,735
+are `slli 61`+`srli 61`, a `DecodeField` of the OSR urgency bits.
+4,557 of the dump's 5,786 split logic pairs are V8's overflow check
+`sub t5,s1,t3; xor t2,s1,t5; xor t3,s1,t3; and t2,t2,t3`. Swapping the
+two `xor`s would make the pair fuse. SiFive's pairs are
+the common ones, because V8 loads every constant as `lui`+`addi(w)`,
+which is 836,602 adjacent pairs. XiangShan's three are the shift
+spellings of `zext.w` and `zext.h`, and an RVA23 build spells those
+with Zba and Zbb instead.
+
 ## The report (`-v`)
 
 By default riscvlint prints only the summary: the opportunities grouped
@@ -1788,9 +1919,9 @@ reads it unadorned, `json.JSONDecoder().raw_decode` in a loop in
 Python. A file the driver rejects leaves stdout empty rather than half a
 document, and the exit status is unchanged by the mode.
 
-`-i` and `-v` are separate reports whose output would interleave with
-the document, so both combinations are refused rather than chosen for
-the caller. `-q` asks for what `--json` already does and is accepted, so
+`-i`, `-f` and `-v` are separate reports whose output would interleave
+with the document, so those combinations are refused rather than chosen
+for the caller. `-q` asks for what `--json` already does and is accepted, so
 a script that passed it still gets a document.
 
 The library side is what the mode is built on:
@@ -2046,7 +2177,7 @@ which could not be read exits 2 whatever the other four reported: what
 they found is not the answer to the question that was asked. The `-i`
 census is a description of the file rather than a verdict on it and so
 never returns 1 -- nothing in it is a finding -- but a file it could not
-read is still a 2.
+read is still a 2. The `-f` fusion report is the same.
 
 `make driver-test` covers all three; the snapshot suite cannot, because
 it compares stdout and discards the status.
@@ -2396,6 +2527,7 @@ python3 tools/rank.py results/pairsx-all.txt
 * [RISC-V Instruction Set Manual](https://github.com/riscv/riscv-isa-manual) - per-instruction reference
 * [RISC-V Profiles (RVA23)](https://github.com/riscv/riscv-profiles) - the extension set Ubuntu 26.04 targets
 * [RISC-V ELF psABI](https://github.com/riscv-non-isa/riscv-elf-psabi-doc) - relocations and linker relaxation
+* [LLVM RISCVMacroFusion.td](https://github.com/llvm/llvm-project/blob/main/llvm/lib/Target/RISCV/RISCVMacroFusion.td) and [RISCVProcessors.td](https://github.com/llvm/llvm-project/blob/main/llvm/lib/Target/RISCV/RISCVProcessors.td) - the fusion pairs and which cores enable them; the X100's came in [#178594](https://github.com/llvm/llvm-project/pull/178594)
 * [Capstone disassembly framework](https://www.capstone-engine.org/) - library to parse instructions
 * [armlint](https://github.com/gaul/armlint) - AArch64 equivalent, and the source of these tools
 * [x86lint](https://github.com/gaul/x86lint) - x86-64 equivalent

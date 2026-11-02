@@ -1876,6 +1876,54 @@ findings, almost all Smi untags), and a `lui`+`addi` pair's range is
 not tracked (about 75K, every one a dispatch handle that a later
 `zext.w` re-extends). Both are table entries rather than checks.
 
+## Macro-op fusion -- a report, not a check
+
+`-f` counts the pairs a fusing core issues as one operation, per core,
+from LLVM's `RISCVMacroFusion.td` and the processors that enable each
+pair (README.md, "Macro-op fusion"). It is not a check because a fused
+pair is not a defect. Its near misses are as close as it comes: split
+pairs a scheduler could have made adjacent, pairs one destination
+register away from fusing, and commuted pairs one operand swap away.
+None of the three saves a byte, and each matters only on the core
+named.
+
+The X100 rows were checked on the K3 before being trusted, because
+the table is what SpacemiT told LLVM, and the bench disagreed twice.
+LLVM marks logic+logic commutable, but the commuted second runs at 1.5
+or 2.0 cycles per pair against 1.0. So for the X100 that spelling is a
+swap, not a fused pair. And `slli`+`srli`/`srai` and `add`+store show
+no effect on latency, on ALU throughput, or in a mix that leaves the
+ALUs spare. They are still counted, as LLVM's, with that stated. The
+add+load pair has two faces: the add is free when the late operand is
+its second, and costs three cycles more than not fusing when it is its
+first.
+
+What it found, statically:
+
+| binary | instructions | x100 fused | split | rename | swap |
+|---|---:|---:|---:|---:|---:|
+| JetStream JIT dump | 37,896,111 | 105,122 | 5,963 | 535 | 129 |
+| `d8` (clang 21) | 8,477,352 | 13,557 | 8,047 | 1,570 | 111 |
+| `libLLVM.so.21.1` | 17,193,468 | 33,445 | 17,640 | 3,669 | 434 |
+| `python3.14` (GCC 15) | 984,085 | 1,271 | 1,200 | 159 | 37 |
+| `libc.so.6` (GCC 15) | 318,238 | 648 | 553 | 1 | 16 |
+
+Under 0.3% of instructions fuse on the X100 anywhere, and under 0.1%
+in the two pairs the bench says help. In the JIT dump, 75,166 of the
+fused pairs are irregexp's character load, `add s3,s6,s4;
+lbu s5,0(s3)`, which already puts the changing position in the add's
+second operand. The largest near miss is V8's 64-bit overflow check,
+`sub; xor t2; xor t3; and t2,t2,t3`, which accounts for 4,557 of the
+5,963 splits. Swapping its two `xor`s would make the pair fuse, a
+one-line change in V8 with no cost on any other core. The SiFive
+P-series would fuse 2.29% of the dump, almost all of it the
+`lui`+`addi(w)` V8 builds every constant from.
+
+Not modeled: alignment. In a three-instruction loop on the K3, only
+about a quarter of add+load pairs fused, so the decoder evidently
+declines some pairs at a fetch or decode boundary. A static count
+cannot know where those boundaries fall at run time.
+
 # Remaining candidates
 
 None. Forty-five checks are implemented, 36 to 46 being the eleven from

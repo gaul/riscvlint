@@ -7887,3 +7887,634 @@ void riscvlint_census_print(const riscvlint_census *census, const char *path,
         printf("\n");
     }
 }
+
+// ---- macro-op fusion report ----
+
+// The operations the fusion predicates name, normalized from every
+// spelling: `c.and` is AND with rd == rs1, `c.lui` is LUI, `c.li` is
+// ADDI from x0. The compressed forms matter for the same reason they
+// do to the shift-add check -- they carry most of the population -- and
+// a decoder fuses what it has expanded, so LLVM's MachineInstr-level
+// predicates apply to them unchanged.
+enum {
+    FOP_OTHER = 0,
+    FOP_LUI, FOP_AUIPC,
+    FOP_ADDI, FOP_ADDIW, FOP_ADD, FOP_ADDW,
+    FOP_AND, FOP_OR, FOP_XOR, FOP_ANDI, FOP_ORI, FOP_XORI,
+    FOP_MUL, FOP_MULW,
+    FOP_SLLI, FOP_SLLIW, FOP_SRLI, FOP_SRAI, FOP_SRLIW, FOP_SRAIW,
+    FOP_LOAD, FOP_STORE,
+    FOP_BRANCH,         // conditional; imm is the displacement
+    FOP_CMV,            // `c.mv`, which is `add rd,x0,rs2` in CR format
+};
+
+// A register field that is absent, or names something other than a
+// GPR -- a floating-point load's destination, an fsd's data. Never equal
+// to a register number, so no rule can match through it.
+#define FUSE_NOREG 32u
+
+typedef struct {
+    uint8_t op;
+    uint8_t rd, rs1, rs2;   // an access's base is rs1, a store's data rs2
+    int64_t imm;            // shift amount, displacement or immediate
+} fuse_op;
+
+static void fuse_decode(uint32_t w, unsigned size, fuse_op *o)
+{
+    o->op = FOP_OTHER;
+    o->rd = o->rs1 = o->rs2 = FUSE_NOREG;
+    o->imm = 0;
+
+    rv_mem_kind kind;
+    unsigned data, base, rs1, rs2, f3;
+    int64_t off;
+    if (rv_decode_mem(w, size, &kind, &data, &base, &off)) {
+        bool fp = rv_mem_is_fp(kind);
+        if (rv_mem_is_store(kind)) {
+            o->op = FOP_STORE;
+            o->rs2 = fp ? FUSE_NOREG : data;
+        } else {
+            o->op = FOP_LOAD;
+            o->rd = fp ? FUSE_NOREG : data;
+        }
+        o->rs1 = base;
+        o->imm = off;
+        return;
+    }
+    if (rv_decode_cond_branch(w, size, &rs1, &rs2, &f3, &off)) {
+        o->op = FOP_BRANCH;
+        o->rs1 = rs1;
+        o->rs2 = rs2;
+        o->imm = off;
+        return;
+    }
+
+    if (size == 4) {
+        unsigned rd = (w >> 7) & 0x1fu, r1 = (w >> 15) & 0x1fu;
+        unsigned r2 = (w >> 20) & 0x1fu, fn3 = (w >> 12) & 7u, f7 = w >> 25;
+        int64_t imm = (int32_t)w >> 20;
+        o->rd = rd;
+        switch (RV_OPCODE(w)) {
+        case 0x37u:
+        case RV_OP_AUIPC:
+            o->op = RV_OPCODE(w) == 0x37u ? FOP_LUI : FOP_AUIPC;
+            o->imm = (int32_t)(w & 0xfffff000u);
+            return;
+        case 0x13u:                                 // OP-IMM
+            o->rs1 = r1;
+            o->imm = imm;
+            if (fn3 == 0) o->op = FOP_ADDI;
+            else if (fn3 == 4) o->op = FOP_XORI;
+            else if (fn3 == 6) o->op = FOP_ORI;
+            else if (fn3 == 7) o->op = FOP_ANDI;
+            else {
+                // The shifts carry a six-bit shamt under a six-bit
+                // funct6; every other funct6 is a Zbb/Zbs operation.
+                o->imm = (w >> 20) & 0x3fu;
+                if (fn3 == 1 && (w >> 26) == 0) o->op = FOP_SLLI;
+                else if (fn3 == 5 && (w >> 26) == 0) o->op = FOP_SRLI;
+                else if (fn3 == 5 && (w >> 26) == 0x10u) o->op = FOP_SRAI;
+            }
+            return;
+        case 0x1bu:                                 // OP-IMM-32
+            o->rs1 = r1;
+            o->imm = imm;
+            if (fn3 == 0) o->op = FOP_ADDIW;
+            else {
+                o->imm = r2;
+                if (fn3 == 1 && f7 == 0) o->op = FOP_SLLIW;
+                else if (fn3 == 5 && f7 == 0) o->op = FOP_SRLIW;
+                else if (fn3 == 5 && f7 == 0x20u) o->op = FOP_SRAIW;
+            }
+            return;
+        case 0x33u:                                 // OP
+            o->rs1 = r1;
+            o->rs2 = r2;
+            if (f7 == 0)
+                o->op = fn3 == 0 ? FOP_ADD : fn3 == 4 ? FOP_XOR
+                      : fn3 == 6 ? FOP_OR : fn3 == 7 ? FOP_AND : FOP_OTHER;
+            else if (f7 == 1 && fn3 == 0)
+                o->op = FOP_MUL;
+            return;
+        case 0x3bu:                                 // OP-32
+            o->rs1 = r1;
+            o->rs2 = r2;
+            if (fn3 == 0 && f7 == 0) o->op = FOP_ADDW;
+            else if (fn3 == 0 && f7 == 1) o->op = FOP_MULW;
+            return;
+        }
+        o->rd = FUSE_NOREG;
+        return;
+    }
+    if (size != 2) return;
+
+    unsigned q = w & 3u, fn3 = (w >> 13) & 7u;
+    unsigned rd = (w >> 7) & 0x1fu, r2 = (w >> 2) & 0x1fu;
+    unsigned rdp = 8u + ((w >> 7) & 7u), r2p = 8u + ((w >> 2) & 7u);
+    // CI's six-bit immediate, sign-extended, and its unsigned shamt.
+    int64_t ci = (int64_t)((w >> 2) & 0x1fu) - (((w >> 12) & 1u) ? 32 : 0);
+    unsigned shamt = (((w >> 12) & 1u) << 5) | ((w >> 2) & 0x1fu);
+    if (q == 1) {
+        switch (fn3) {
+        case 0:                                     // c.addi; rd 0 is c.nop
+        case 1:                                     // c.addiw
+            if (rd == 0) return;
+            o->op = fn3 == 0 ? FOP_ADDI : FOP_ADDIW;
+            o->rd = o->rs1 = rd;
+            o->imm = ci;
+            return;
+        case 2:                                     // c.li
+            if (rd == 0) return;
+            o->op = FOP_ADDI;
+            o->rd = rd;
+            o->rs1 = 0;
+            o->imm = ci;
+            return;
+        case 3:                     // c.lui; rd 2 is c.addi16sp, never a pair
+            if (rd == 0 || rd == 2 || ci == 0) return;
+            o->op = FOP_LUI;
+            o->rd = rd;
+            o->imm = ci * 4096;
+            return;
+        case 4: {
+            unsigned f2 = (w >> 10) & 3u;
+            o->rd = o->rs1 = rdp;
+            if (f2 != 3) {
+                o->op = f2 == 0 ? FOP_SRLI : f2 == 1 ? FOP_SRAI : FOP_ANDI;
+                o->imm = f2 == 2 ? ci : (int64_t)shamt;
+                return;
+            }
+            // CA: c.sub/xor/or/and, and with bit 12 set c.subw/addw and
+            // Zcb's c.mul, then the Zcb unary forms.
+            unsigned f2b = (w >> 5) & 3u;
+            o->rs2 = r2p;
+            if (((w >> 12) & 1u) == 0)
+                o->op = f2b == 1 ? FOP_XOR : f2b == 2 ? FOP_OR
+                      : f2b == 3 ? FOP_AND : FOP_OTHER;
+            else
+                o->op = f2b == 1 ? FOP_ADDW : f2b == 2 ? FOP_MUL : FOP_OTHER;
+            return;
+        }
+        }
+        return;
+    }
+    if (q == 2 && fn3 == 0 && rd != 0) {            // c.slli
+        o->op = FOP_SLLI;
+        o->rd = o->rs1 = rd;
+        o->imm = shamt;
+        return;
+    }
+    if (q == 2 && fn3 == 4 && rd != 0 && r2 != 0) {
+        o->rd = rd;
+        o->rs2 = r2;
+        if (((w >> 12) & 1u) == 0) {
+            o->op = FOP_CMV;
+            o->rs1 = 0;
+        } else {
+            o->op = FOP_ADD;                        // c.add
+            o->rs1 = rd;
+        }
+        return;
+    }
+    if (q == 0 && fn3 == 0 && (w & 0x1fe0u) != 0) { // c.addi4spn
+        o->op = FOP_ADDI;
+        o->rd = r2p;
+        o->rs1 = 2;
+        o->imm = 1;       // nonzero; its value is never a fusion question
+    }
+}
+
+// The cores, as RISCVProcessors.td groups them by tuning list, and the
+// pairs each fuses, in the order a pair is attributed when two match --
+// the more specific first, so XiangShan's `slli 32` + `srli 32` is a
+// zext.w rather than a shifted one.
+enum { FCORE_X100, FCORE_SIFIVE, FCORE_XIANGSHAN, FCORE_N };
+static const char *const fuse_core_names[FCORE_N] = {
+    "spacemit-x100",
+    "sifive-p450/p470/p550/p670/p870",
+    "xiangshan-nanhu/kunminghu",
+};
+
+enum {
+    FPAIR_LOGIC_RR, FPAIR_LOGIC_RI, FPAIR_LOGIC_IR, FPAIR_MUL_ADD,
+    FPAIR_ADD_MEM, FPAIR_SHIFT,
+    FPAIR_CMOV, FPAIR_LUI_ADDI, FPAIR_AUIPC_ADDI,
+    FPAIR_ZEXTW, FPAIR_SHIFTED_ZEXTW, FPAIR_ZEXTH,
+    FPAIR_N
+};
+
+enum { FKIND_FUSED, FKIND_SPLIT, FKIND_RENAME, FKIND_SWAP, FKIND_N };
+static const char *const fuse_kind_names[FKIND_N] = {
+    "fused", "split", "rename", "swap",
+};
+
+static const struct {
+    const char *name;
+    int core;
+    // Which near-miss columns can be nonzero: a pair without the
+    // same-destination rule has nothing to rename, and only a pair
+    // whose second instruction commutes has anything to swap.
+    bool rename, swap, split;
+} fuse_pairs[FPAIR_N] = {
+    [FPAIR_LOGIC_RR]      = { "logic + logic", FCORE_X100, true, true, true },
+    [FPAIR_LOGIC_RI]      = { "logic + logic imm", FCORE_X100, true, false, true },
+    [FPAIR_LOGIC_IR]      = { "logic imm + logic", FCORE_X100, true, true, true },
+    [FPAIR_MUL_ADD]       = { "mul + add", FCORE_X100, true, true, true },
+    [FPAIR_ADD_MEM]       = { "add + load/store", FCORE_X100, false, false, true },
+    [FPAIR_SHIFT]         = { "slli + srli/srai", FCORE_X100, true, false, true },
+    [FPAIR_CMOV]          = { "branch + c.mv", FCORE_SIFIVE, false, false, false },
+    [FPAIR_LUI_ADDI]      = { "lui + addi", FCORE_SIFIVE, true, false, true },
+    [FPAIR_AUIPC_ADDI]    = { "auipc + addi", FCORE_SIFIVE, true, false, true },
+    [FPAIR_ZEXTW]         = { "slli 32 + srli 32", FCORE_XIANGSHAN, true, false, true },
+    [FPAIR_SHIFTED_ZEXTW] = { "slli 32 + srli <32", FCORE_XIANGSHAN, true, false, true },
+    [FPAIR_ZEXTH]         = { "slli 48 + srli 48", FCORE_XIANGSHAN, true, false, true },
+};
+
+enum { FUSE_NO, FUSE_YES, FUSE_RENAME, FUSE_SWAP };
+
+static bool fop_logic(unsigned op)
+{
+    return op == FOP_AND || op == FOP_OR || op == FOP_XOR;
+}
+
+static bool fop_logic_imm(unsigned op)
+{
+    return op == FOP_ANDI || op == FOP_ORI || op == FOP_XORI;
+}
+
+// How `x` then `y` stand against pair `p`: fusible as written, one
+// destination register away, one operand swap away, or not at all.
+static int fuse_test(int p, const fuse_op *x, unsigned xsize,
+                     const fuse_op *y, unsigned ysize)
+{
+    bool commutes = false;
+    switch (p) {
+    case FPAIR_LOGIC_RR:
+        if (!fop_logic(x->op) || !fop_logic(y->op)) return FUSE_NO;
+        commutes = true;
+        break;
+    case FPAIR_LOGIC_RI:
+        if (!fop_logic(x->op) || !fop_logic_imm(y->op)) return FUSE_NO;
+        break;
+    case FPAIR_LOGIC_IR:
+        if (!fop_logic_imm(x->op) || !fop_logic(y->op)) return FUSE_NO;
+        commutes = true;
+        break;
+    case FPAIR_MUL_ADD:
+        // Same width on both halves: `mul` + `addw` truncates what the
+        // fused multiply-add would not.
+        if (!(x->op == FOP_MUL && y->op == FOP_ADD) &&
+            !(x->op == FOP_MULW && y->op == FOP_ADDW))
+            return FUSE_NO;
+        commutes = true;
+        break;
+    case FPAIR_SHIFT:
+        // A field extract shifts right at least as far as it shifted
+        // left, at one width.
+        if (!(x->op == FOP_SLLI && (y->op == FOP_SRLI || y->op == FOP_SRAI)) &&
+            !(x->op == FOP_SLLIW &&
+              (y->op == FOP_SRLIW || y->op == FOP_SRAIW)))
+            return FUSE_NO;
+        if (x->imm > y->imm) return FUSE_NO;
+        break;
+    case FPAIR_LUI_ADDI:
+        if (x->op != FOP_LUI || (y->op != FOP_ADDI && y->op != FOP_ADDIW))
+            return FUSE_NO;
+        break;
+    case FPAIR_AUIPC_ADDI:
+        if (x->op != FOP_AUIPC || y->op != FOP_ADDI) return FUSE_NO;
+        break;
+    case FPAIR_ZEXTW:
+    case FPAIR_SHIFTED_ZEXTW:
+    case FPAIR_ZEXTH: {
+        int64_t left = p == FPAIR_ZEXTH ? 48 : 32;
+        if (x->op != FOP_SLLI || y->op != FOP_SRLI || x->imm != left)
+            return FUSE_NO;
+        if (p == FPAIR_SHIFTED_ZEXTW ? y->imm > 31 : y->imm != left)
+            return FUSE_NO;
+        break;
+    }
+    case FPAIR_ADD_MEM:
+        // The one LLVM pair that is not a SimpleFusion: the add keeps
+        // its destination apart from both sources, and the access goes
+        // through that destination at offset zero. Nothing is renamed
+        // or swapped into this shape without a spare register.
+        if (x->op != FOP_ADD || (y->op != FOP_LOAD && y->op != FOP_STORE))
+            return FUSE_NO;
+        return x->rd != 0 && x->rd != x->rs1 && x->rd != x->rs2 &&
+               y->rs1 == x->rd && y->imm == 0 ? FUSE_YES : FUSE_NO;
+    case FPAIR_CMOV:
+        // A branch over exactly one two-byte move, to just past it.
+        return x->op == FOP_BRANCH && y->op == FOP_CMV && ysize == 2 &&
+               x->imm == (int64_t)xsize + 2 ? FUSE_YES : FUSE_NO;
+    default:
+        return FUSE_NO;
+    }
+
+    // SimpleFusion's register rule: `y` reads `x`'s destination as its
+    // first operand and writes it back.
+    unsigned d = x->rd;
+    if (d == 0 || d >= FUSE_NOREG) return FUSE_NO;
+    bool first = y->rs1 == d;
+    bool second = !first && commutes && y->rs2 == d;
+    if (!first && !second) return FUSE_NO;
+    unsigned other = first ? y->rs2 : y->rs1;
+    // The addend may not be the destination (LLVM's
+    // CheckNot<CheckSameRegOperand<0, 2>>).
+    if (p == FPAIR_MUL_ADD && other == y->rd) return FUSE_NO;
+    if (y->rd != d) {
+        // Writing y's destination from x as well would clobber y's
+        // other operand before y read it.
+        return first && y->rd != 0 && y->rd < FUSE_NOREG && other != y->rd
+            ? FUSE_RENAME : FUSE_NO;
+    }
+    return first ? FUSE_YES : FUSE_SWAP;
+}
+
+#define FUSE_SAMPLES 4
+// The instructions a split pair may have between its halves. The ring
+// holds the instruction being decoded, the one whose misses are judged
+// behind it, and FUSE_GAP + 1 before that.
+#define FUSE_GAP 7
+#define FUSE_RING (FUSE_GAP + 3)
+
+typedef struct {
+    size_t count;
+    uint64_t samples[FUSE_SAMPLES];
+    unsigned nsamples;
+} fuse_cell;
+
+struct riscvlint_fusion {
+    size_t instructions;
+    fuse_cell cells[FPAIR_N][FKIND_N];
+};
+
+typedef struct {
+    uint64_t addr;
+    uint32_t w;
+    uint8_t size;
+    fuse_op o;
+    bool target;        // something branches here
+    uint8_t fused;      // bit per core: already half of a fused pair
+} fuse_slot;
+
+riscvlint_fusion *riscvlint_fusion_create(void)
+{
+    return calloc(1, sizeof(riscvlint_fusion));
+}
+
+void riscvlint_fusion_destroy(riscvlint_fusion *f)
+{
+    free(f);
+}
+
+static void fuse_bump(riscvlint_fusion *f, int pair, int kind, uint64_t at)
+{
+    fuse_cell *c = &f->cells[pair][kind];
+    c->count++;
+    if (c->nsamples < FUSE_SAMPLES) c->samples[c->nsamples++] = at;
+}
+
+static uint64_t fuse_bit(unsigned r)
+{
+    return r < FUSE_NOREG ? 1ull << r : 0;
+}
+
+// The registers `o` reads, as a mask.
+static uint64_t fuse_sources(const fuse_op *o)
+{
+    return fuse_bit(o->rs1) | fuse_bit(o->rs2);
+}
+
+// The near misses for `b`, the newest-but-one slot, judged once both of
+// its neighbours have had their chance to fuse with it. ring[0] is `b`
+// and ring[k] the k-th instruction before it, `n` of them valid.
+static void fuse_misses(riscvlint_fusion *f, riscvlint_state *state,
+                        fuse_slot *const *ring, unsigned n)
+{
+    const fuse_slot *b = ring[0];
+    uint8_t done = 0;           // cores whose miss for `b` is counted
+    for (int c = 0; c < FCORE_N; c++)
+        if (b->fused & (1u << c)) done |= 1u << c;
+    if (done == (1u << FCORE_N) - 1 || n < 2) return;
+
+    // Adjacent: a swap needs nothing more, a rename needs the first
+    // destination dead afterwards and no branch into the second.
+    const fuse_slot *a = ring[1];
+    for (int p = 0; p < FPAIR_N; p++) {
+        int c = fuse_pairs[p].core;
+        if ((done | a->fused) & (1u << c)) continue;
+        int r = fuse_test(p, &a->o, a->size, &b->o, b->size);
+        if (r == FUSE_SWAP) {
+            fuse_bump(f, p, FKIND_SWAP, a->addr);
+            done |= 1u << c;
+        } else if (r == FUSE_RENAME && state && !b->target &&
+                   riscvlint_liveness(state, b->addr + b->size, a->o.rd) ==
+                       RISCVLINT_LIVE_DEAD) {
+            fuse_bump(f, p, FKIND_RENAME, a->addr);
+            done |= 1u << c;
+        }
+    }
+    if (!state || done == (1u << FCORE_N) - 1) return;
+
+    // Split: walk back from the second instruction, accumulating what
+    // the instructions passed over read and write. The tied register
+    // is the second's rs1 in every pair a split can apply to; once
+    // anything between names it, no earlier instruction is its
+    // producer.
+    unsigned tied = b->o.rs1;
+    if (tied == 0 || tied >= FUSE_NOREG) return;
+    uint64_t reads = 0, writes = 0;
+    bool pure = true;           // everything between is plain ALU work
+    for (unsigned k = 1; k < n && k <= FUSE_GAP + 1; k++) {
+        const fuse_slot *x = ring[k];
+        if (k >= 2) {
+            uint64_t named = reads | writes;
+            bool sink = !(named & fuse_bit(x->o.rd)) &&
+                        !(writes & fuse_sources(&x->o));
+            unsigned brd = b->o.rd;
+            uint64_t others = fuse_sources(&b->o) & ~fuse_bit(tied);
+            bool mem = b->o.op == FOP_LOAD || b->o.op == FOP_STORE;
+            bool hoist = !b->target && !(named & fuse_bit(x->o.rd)) &&
+                         !(writes & others) && !(named & fuse_bit(brd)) &&
+                         (!mem || pure);
+            if (sink || hoist) {
+                for (int p = 0; p < FPAIR_N; p++) {
+                    int c = fuse_pairs[p].core;
+                    if (!fuse_pairs[p].split ||
+                        ((done | x->fused) & (1u << c)))
+                        continue;
+                    if (fuse_test(p, &x->o, x->size, &b->o, b->size) !=
+                        FUSE_YES)
+                        continue;
+                    fuse_bump(f, p, FKIND_SPLIT, x->addr);
+                    done |= 1u << c;
+                }
+            }
+        }
+        // x joins the instructions in between for anything earlier.
+        if (x->target || rv_stops_walk(x->w, x->size)) break;
+        const rvl_dec *d = live_decode(state, x->addr);
+        if (!d || !d->ok) break;
+        reads |= d->reads;
+        writes |= d->writes;
+        unsigned prd;
+        if (!rv_pure_def(x->w, x->size, &prd)) pure = false;
+        if ((reads | writes) & fuse_bit(tied)) break;
+    }
+}
+
+void riscvlint_fusion_scan(riscvlint_fusion *f, csh handle,
+                           riscvlint_state *state,
+                           const uint8_t *code, size_t len, uint64_t vaddr)
+{
+    if (!f) return;
+    cs_insn *insn = cs_malloc(handle);
+    if (!insn) return;
+    // The state is consulted only if it holds this very section; one
+    // set to another would answer for the wrong addresses.
+    if (state && !(state->dec && code == state->code && len == state->size &&
+                   vaddr == state->vaddr && handle == state->handle))
+        state = NULL;
+
+    fuse_slot slots[FUSE_RING];
+    fuse_slot *ring[FUSE_RING];     // ring[0] newest
+    unsigned n = 0;
+    for (unsigned i = 0; i < FUSE_RING; i++) ring[i] = &slots[i];
+
+    uint64_t addr = vaddr;
+    for (;;) {
+        bool more = len - (size_t)(addr - vaddr) >= 2;
+        uint64_t at = addr, next = addr;
+        bool ok = false;
+        if (more) {
+            if (state) {
+                ok = dec_insn(state, addr, insn, &next);
+            } else {
+                const uint8_t *p = code + (addr - vaddr);
+                size_t remain = len - (size_t)(addr - vaddr);
+                ok = cs_disasm_iter(handle, &p, &remain, &next, insn);
+            }
+        }
+        if (!ok) {
+            // The end, or a halfword nothing decodes: the newest
+            // instruction has no successor to fuse with, so its misses
+            // are judged now, and nothing pairs across the gap.
+            if (n >= 1) fuse_misses(f, state, ring, n);
+            n = 0;
+            if (!more) break;
+            addr += 2;
+            continue;
+        }
+        addr = next;
+        f->instructions++;
+
+        // Rotate: the oldest slot becomes the newest.
+        fuse_slot *s = ring[FUSE_RING - 1];
+        memmove(&ring[1], &ring[0], (FUSE_RING - 1) * sizeof ring[0]);
+        ring[0] = s;
+        if (n < FUSE_RING) n++;
+        s->addr = at;
+        s->size = (uint8_t)insn->size;
+        s->w = 0;
+        memcpy(&s->w, code + (at - vaddr), insn->size < 4 ? insn->size : 4);
+        fuse_decode(s->w, s->size, &s->o);
+        s->target = state && riscvlint_is_branch_target(state, at);
+        s->fused = 0;
+
+        if (n >= 2) {
+            fuse_slot *a = ring[1];
+            for (int p = 0; p < FPAIR_N; p++) {
+                int c = fuse_pairs[p].core;
+                if ((a->fused | s->fused) & (1u << c)) continue;
+                if (fuse_test(p, &a->o, a->size, &s->o, s->size) != FUSE_YES)
+                    continue;
+                fuse_bump(f, p, FKIND_FUSED, a->addr);
+                a->fused |= 1u << c;
+                s->fused |= 1u << c;
+            }
+            // ring[1] now knows whether it fused on either side.
+            fuse_misses(f, state, ring + 1, n - 1);
+        }
+    }
+    cs_free(insn, 1);
+}
+
+size_t riscvlint_fusion_instructions(const riscvlint_fusion *f)
+{
+    return f ? f->instructions : 0;
+}
+
+size_t riscvlint_fusion_count(const riscvlint_fusion *f, const char *core,
+                              const char *pair, const char *kind)
+{
+    if (!f || !core || !kind) return 0;
+    int c = -1, k = -1;
+    for (int i = 0; i < FCORE_N; i++)
+        if (!strcmp(core, fuse_core_names[i])) c = i;
+    for (int i = 0; i < FKIND_N; i++)
+        if (!strcmp(kind, fuse_kind_names[i])) k = i;
+    if (c < 0 || k < 0) return 0;
+    size_t total = 0;
+    for (int p = 0; p < FPAIR_N; p++) {
+        if (fuse_pairs[p].core != c) continue;
+        if (pair && strcmp(pair, fuse_pairs[p].name)) continue;
+        total += f->cells[p][k].count;
+    }
+    return total;
+}
+
+void riscvlint_fusion_print(const riscvlint_fusion *f, const char *path,
+                            bool samples)
+{
+    if (!f) return;
+    printf("Fusion report");
+    if (path) printf(" of %s", path);
+    printf(": %zu instructions\n", f->instructions);
+    for (int c = 0; c < FCORE_N; c++) {
+        size_t sum[FKIND_N] = { 0 };
+        for (int p = 0; p < FPAIR_N; p++)
+            if (fuse_pairs[p].core == c)
+                for (int k = 0; k < FKIND_N; k++)
+                    sum[k] += f->cells[p][k].count;
+        // A pair is two instructions issued as one, so each saves one
+        // operation of the static count.
+        printf("  %s: %zu pair%s fuse%s, %.1f%% fewer macro-ops; "
+               "near misses %zu split, %zu rename, %zu swap\n",
+               fuse_core_names[c], sum[FKIND_FUSED],
+               sum[FKIND_FUSED] == 1 ? "" : "s",
+               sum[FKIND_FUSED] == 1 ? "s" : "",
+               f->instructions
+                   ? 100.0 * (double)sum[FKIND_FUSED] / (double)f->instructions
+                   : 0.0,
+               sum[FKIND_SPLIT], sum[FKIND_RENAME], sum[FKIND_SWAP]);
+        printf("    %-20s %10s %10s %10s %10s\n", "pair", "fused", "split",
+               "rename", "swap");
+        for (int p = 0; p < FPAIR_N; p++) {
+            if (fuse_pairs[p].core != c) continue;
+            printf("    %-20s %10zu", fuse_pairs[p].name,
+                   f->cells[p][FKIND_FUSED].count);
+            bool can[FKIND_N] = { true, fuse_pairs[p].split,
+                                  fuse_pairs[p].rename, fuse_pairs[p].swap };
+            for (int k = 1; k < FKIND_N; k++) {
+                if (can[k]) printf(" %10zu", f->cells[p][k].count);
+                else printf(" %10s", "-");
+            }
+            printf("\n");
+        }
+    }
+
+    if (!samples) return;
+    for (int p = 0; p < FPAIR_N; p++) {
+        for (int k = 0; k < FKIND_N; k++) {
+            const fuse_cell *cell = &f->cells[p][k];
+            if (cell->count == 0) continue;
+            printf("    %s %s at", fuse_pairs[p].name, fuse_kind_names[k]);
+            for (unsigned i = 0; i < cell->nsamples; i++)
+                printf("%s 0x%" PRIx64, i == 0 ? "" : ",", cell->samples[i]);
+            if (cell->count > cell->nsamples)
+                printf(" (+%zu more)", cell->count - cell->nsamples);
+            printf("\n");
+        }
+    }
+}

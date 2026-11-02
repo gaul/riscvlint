@@ -6150,6 +6150,99 @@ static void test_mask_for_zext(csh handle)
     CHECK(run_words(handle, check_mask_for_zext, longer, 6, 0x1000, NULL) == 0);
 }
 
+// The fusion report. The encodings are clang's for a block per case,
+// fenced with ebreak.
+static const uint8_t fusion_code[] = {
+    0x33, 0xf5, 0xc5, 0x00,        // and a0,a1,a2
+    0x33, 0x65, 0xd5, 0x00,        // or a0,a0,a3          fused
+    0x73, 0x00, 0x10, 0x00,        // ebreak
+    0x33, 0xf5, 0xc5, 0x00,        // and a0,a1,a2
+    0x33, 0xe5, 0xa6, 0x00,        // or a0,a3,a0          swap
+    0x73, 0x00, 0x10, 0x00,
+    0x33, 0x85, 0xc5, 0x02,        // mul a0,a1,a2
+    0x33, 0x05, 0xd5, 0x00,        // add a0,a0,a3         fused
+    0x73, 0x00, 0x10, 0x00,
+    0xb3, 0x82, 0xc5, 0x00,        // add t0,a1,a2
+    0x83, 0xb6, 0x02, 0x00,        // ld a3,0(t0)          fused
+    0x73, 0x00, 0x10, 0x00,
+    0x37, 0x55, 0x34, 0x12,        // lui a0,0x12345
+    0x13, 0x05, 0x85, 0x67,        // addi a0,a0,1656      fused on SiFive
+    0x73, 0x00, 0x10, 0x00,
+    0x13, 0xc5, 0x15, 0x00,        // xori a0,a1,1
+    0x93, 0x07, 0x18, 0x00,        // addi a5,a6,1
+    0x33, 0x75, 0xc5, 0x00,        // and a0,a0,a2         split
+    0x73, 0x00, 0x10, 0x00,
+    0x33, 0xf3, 0xc5, 0x00,        // and t1,a1,a2
+    0x33, 0x67, 0xd3, 0x00,        // or a4,t1,a3          rename
+    0x13, 0x03, 0x00, 0x00,        // li t1,0
+    0x73, 0x00, 0x10, 0x00,
+    0x02, 0x15,                    // c.slli a0,32
+    0x01, 0x91,                    // c.srli a0,32         fused on both
+};
+
+static void test_fusion(csh handle)
+{
+    static const char x100[] = "spacemit-x100";
+    static const char sifive[] = "sifive-p450/p470/p550/p670/p870";
+    static const char xs[] = "xiangshan-nanhu/kunminghu";
+
+    // Without a state: the fused and swap counts, nothing that needs
+    // the side-entry map or the liveness walk.
+    riscvlint_fusion *f = riscvlint_fusion_create();
+    CHECK(f != NULL);
+    if (!f) return;
+    riscvlint_fusion_scan(f, handle, NULL, fusion_code, sizeof fusion_code,
+                          0x1000);
+    CHECK(riscvlint_fusion_instructions(f) == 25);
+    CHECK(riscvlint_fusion_count(f, x100, NULL, "fused") == 4);
+    CHECK(riscvlint_fusion_count(f, x100, "logic + logic", "fused") == 1);
+    CHECK(riscvlint_fusion_count(f, x100, "logic + logic", "swap") == 1);
+    CHECK(riscvlint_fusion_count(f, x100, "mul + add", "fused") == 1);
+    CHECK(riscvlint_fusion_count(f, x100, "add + load/store", "fused") == 1);
+    // The compressed shift pair is a field extract to the x100 and a
+    // zext.w to XiangShan: one pair, counted once per core.
+    CHECK(riscvlint_fusion_count(f, x100, "slli + srli/srai", "fused") == 1);
+    CHECK(riscvlint_fusion_count(f, xs, "slli 32 + srli 32", "fused") == 1);
+    CHECK(riscvlint_fusion_count(f, xs, NULL, "fused") == 1);
+    CHECK(riscvlint_fusion_count(f, sifive, "lui + addi", "fused") == 1);
+    CHECK(riscvlint_fusion_count(f, sifive, NULL, "fused") == 1);
+    CHECK(riscvlint_fusion_count(f, x100, NULL, "split") == 0);
+    CHECK(riscvlint_fusion_count(f, x100, NULL, "rename") == 0);
+    CHECK(riscvlint_fusion_count(f, "no-such-core", NULL, "fused") == 0);
+    CHECK(riscvlint_fusion_count(f, x100, NULL, "no-such-kind") == 0);
+    riscvlint_fusion_destroy(f);
+
+    // With one: the xori can sink past the addi, and t1 is dead after
+    // the or, so it could have been a4.
+    riscvlint_state *state = riscvlint_state_create();
+    f = riscvlint_fusion_create();
+    CHECK(state && f);
+    if (state && f &&
+        riscvlint_state_set_section(state, handle, fusion_code,
+                                    sizeof fusion_code, 0x1000)) {
+        riscvlint_fusion_scan(f, handle, state, fusion_code,
+                              sizeof fusion_code, 0x1000);
+        CHECK(riscvlint_fusion_count(f, x100, NULL, "fused") == 4);
+        CHECK(riscvlint_fusion_count(f, x100, "logic imm + logic", "split") ==
+              1);
+        CHECK(riscvlint_fusion_count(f, x100, "logic + logic", "rename") == 1);
+        CHECK(riscvlint_fusion_count(f, x100, NULL, "split") == 1);
+        CHECK(riscvlint_fusion_count(f, x100, NULL, "rename") == 1);
+        CHECK(riscvlint_fusion_count(f, sifive, NULL, "split") == 0);
+    } else {
+        CHECK(false);
+    }
+    riscvlint_fusion_destroy(f);
+    riscvlint_state_destroy(state);
+
+    // NULL everywhere.
+    riscvlint_fusion_scan(NULL, handle, NULL, fusion_code,
+                          sizeof fusion_code, 0x1000);
+    riscvlint_fusion_print(NULL, NULL, false);
+    CHECK(riscvlint_fusion_instructions(NULL) == 0);
+    CHECK(riscvlint_fusion_count(NULL, x100, NULL, "fused") == 0);
+}
+
 int main(void)
 {
     csh handle;
@@ -6218,6 +6311,7 @@ int main(void)
     test_decode_not();
     test_not_logic_fold(handle);
     test_census(handle);
+    test_fusion(handle);
 
     cs_close(&handle);
     if (failures) {

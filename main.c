@@ -199,6 +199,11 @@ static bool have_forced;
 // replacement, as armlint's is: it answers a question about the binary
 // that the findings do not.
 static bool cchain_mode;
+// -f: report the instruction pairs a fusing core would issue as one, and
+// the near misses, instead of the lint scan. A replacement like -i, for
+// the same reason: it describes the code for a core rather than
+// proposing rewrites of it, and a pair that fuses is not a finding.
+static bool fusion_mode;
 // --json: the findings as a document keyed by absolute address instead
 // of the human report. It replaces that report rather than adding to
 // it, so the notes and the summary stay off stdout under it.
@@ -1058,6 +1063,7 @@ static int scan_file(csh handle, const char *path)
         // nothing on it, so it needs no state and no extension mask.
         riscvlint_state *state = NULL;
         riscvlint_census *census = NULL;
+        riscvlint_fusion *fusion = NULL;
         anchor_ctx actx = { base, map_len, eh, &syms };
         riscvlint_cchain *cchain = NULL;
         if (cchain_mode) {
@@ -1070,20 +1076,40 @@ static int scan_file(csh handle, const char *path)
             riscvlint_cchain_set_hooks(cchain, value_is_mapped, &actx,
                                        anchor_of, &actx);
         }
+        if (fusion_mode) {
+            fusion = riscvlint_fusion_create();
+            if (!fusion) {
+                riscvlint_cchain_destroy(cchain);
+                free(syms.e);
+                munmap((void *)base, map_len);
+                return -1;
+            }
+        }
         if (census_mode) {
             census = riscvlint_census_create();
             if (!census) {
+                riscvlint_fusion_destroy(fusion);
+                riscvlint_cchain_destroy(cchain);
                 free(syms.e);
                 munmap((void *)base, map_len);
                 return -1;
             }
-        } else {
+        }
+        // The fusion report needs a state for the side-entry map and the
+        // liveness walk, though not the extension notes: it gates
+        // nothing on the arch string.
+        if (!census_mode || fusion_mode) {
             state = riscvlint_state_create();
             if (!state) {
+                riscvlint_census_destroy(census);
+                riscvlint_fusion_destroy(fusion);
+                riscvlint_cchain_destroy(cchain);
                 free(syms.e);
                 munmap((void *)base, map_len);
                 return -1;
             }
+        }
+        if (!census_mode && !fusion_mode) {
             // Say which extension set is in force whenever it was not
             // simply read from the object. Reporting a Zba finding
             // because nothing said otherwise is a guess, and a guess the
@@ -1152,8 +1178,8 @@ static int scan_file(csh handle, const char *path)
                 sh[i].sh_size > map_len - sh[i].sh_offset)
                 continue;
             bool set = false;
-            if (cchain) {
-                // The scan wants the side-entry map to know where a
+            if (cchain || fusion) {
+                // Both scans want the side-entry map to know where a
                 // branch lands, and only the lint state builds one. A
                 // -i -c run has no state, so the chains a target splits
                 // are read as one -- stated in the report rather than
@@ -1163,21 +1189,26 @@ static int scan_file(csh handle, const char *path)
                                                   base + sh[i].sh_offset,
                                                   sh[i].sh_size,
                                                   sh[i].sh_addr);
+            }
+            if (cchain)
                 riscvlint_cchain_scan(cchain, handle, set ? state : NULL,
                                       base + sh[i].sh_offset,
                                       sh[i].sh_size, sh[i].sh_addr);
-            }
+            if (fusion)
+                riscvlint_fusion_scan(fusion, handle, set ? state : NULL,
+                                      base + sh[i].sh_offset,
+                                      sh[i].sh_size, sh[i].sh_addr);
             if (census)
                 riscvlint_census_scan(census, handle, base + sh[i].sh_offset,
                                       sh[i].sh_size, sh[i].sh_addr);
-            else
+            else if (!fusion)
                 scan_section(handle, state, base + sh[i].sh_offset,
                              sh[i].sh_size, sh[i].sh_addr, base, map_len, eh,
                              &syms, set,
                              shstr && sh[i].sh_name < shstr_len
                                  ? shstr + sh[i].sh_name : NULL);
         }
-        if (json_mode && !census) {
+        if (json_mode && !census && !fusion) {
             // The totals close the document because the scan only knows
             // them then. They are this file's share, which is why they
             // are recorded before the next file resets them.
@@ -1195,9 +1226,12 @@ static int scan_file(csh handle, const char *path)
             // per-finding detail: the same thing -v adds to a scan.
             riscvlint_census_print(census, path, arch, verbose);
             riscvlint_census_destroy(census);
-        } else {
-            riscvlint_state_destroy(state);
         }
+        if (fusion) {
+            riscvlint_fusion_print(fusion, path, verbose);
+            riscvlint_fusion_destroy(fusion);
+        }
+        riscvlint_state_destroy(state);
         if (cchain) {
             riscvlint_cchain_print(cchain, path, verbose);
             riscvlint_cchain_destroy(cchain);
@@ -1218,7 +1252,7 @@ static int cmp_tally(const void *a, const void *b)
 int main(int argc, char **argv)
 {
     static const char usage[] =
-        "usage: %s [-v] [-i] [-c] [--json] "
+        "usage: %s [-v] [-i] [-c] [-f] [--json] "
         "[-m zba|zbb|zbs|zcb|zfa|zilx|zibi|zacas|c|rva20|rva22|rva23]... "
         "<binary>...\n";
     int argi = 1;
@@ -1234,6 +1268,8 @@ int main(int argc, char **argv)
             census_mode = true;
         } else if (strcmp(argv[argi], "-c") == 0) {
             cchain_mode = true;
+        } else if (strcmp(argv[argi], "-f") == 0) {
+            fusion_mode = true;
         } else if (strcmp(argv[argi], "--json") == 0) {
             json_mode = true;
         } else if (strcmp(argv[argi], "-m") == 0 && argi + 1 < argc) {
@@ -1262,6 +1298,9 @@ int main(int argc, char **argv)
     if (census_mode && have_forced)
         fprintf(stderr, "%s: -m has no effect with -i; the census reports "
                 "what the binary uses\n", argv[0]);
+    if (fusion_mode && have_forced)
+        fprintf(stderr, "%s: -m has no effect with -f; fusion depends on "
+                "the core, not the extensions\n", argv[0]);
     // --json describes the lint scan. The census is a separate report
     // whose output would interleave with the document, so the two are
     // refused rather than one of them chosen for the caller.
@@ -1276,6 +1315,11 @@ int main(int argc, char **argv)
     // for.
     if (json_mode && verbose) {
         fprintf(stderr, "%s: --json and -v are separate reports; pick one\n",
+                argv[0]);
+        return 2;
+    }
+    if (json_mode && fusion_mode) {
+        fprintf(stderr, "%s: --json and -f are separate reports; pick one\n",
                 argv[0]);
         return 2;
     }
@@ -1299,7 +1343,7 @@ int main(int argc, char **argv)
     // to summarize below it. It is a description of the file rather than
     // a verdict on it, so it never sets the "found something" status --
     // but a file that could not be read is still a tool failure.
-    if (census_mode) return failures ? 2 : 0;
+    if (census_mode || fusion_mode) return failures ? 2 : 0;
 
     // --json already closed each file's document with that file's
     // totals; there is no cross-file summary to print below them.

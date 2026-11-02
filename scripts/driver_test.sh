@@ -74,6 +74,9 @@ expect 2
 # is not a finding there -- but an unreadable one is still a failure.
 expect 0 -q -i "$WORK/dirty.o"
 expect 2 -q -i "$WORK/does-not-exist"
+# The fusion report likewise: a pair that fuses is not a finding.
+expect 0 -f "$WORK/dirty.o"
+expect 2 -f "$WORK/does-not-exist"
 # -q asks for the default and is kept only so the invocations that
 # passed it still work, so it must stay accepted.
 expect 1 -q "$WORK/dirty.o"
