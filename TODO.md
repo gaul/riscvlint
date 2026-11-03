@@ -1495,6 +1495,7 @@ which is to the digit what check 3 reports over this corpus.
 | 44 | an immediate operand materialized into a register | 20,743 | ML | **implemented**, 1,738 |
 | 45 | `slli k` + `srli k`, k >= 53 -> `andi` | 17,097 | BL 12K, ML 5K | **implemented**, 17,097 |
 | 46 | `and` with a materialized 0xffff -> `zext.h` | 1,499 | ML | **implemented**, 1,142 |
+| 47 | a constant `fli` builds, built in an integer register and moved with `fmv` | 1,483 | TF | **implemented**, 312 |
 
 38's figure is the miner's 1,259,133 less the 431,020 `ebreak` it
 counted alongside them (a trap is an effect) and the 15,527 `nop`,
@@ -1839,6 +1840,47 @@ an eager deopt does so by way of a `j` (`bnez t6,0x4c354`, then
 traced. Maglev already threads jumps through empty blocks and TurboFan
 has `--turbo-jt`, so these are jumps neither pass sees.
 
+## 47. A floating-point constant built through an integer register -- 312  [implemented]
+
+`li t3,1023; slli t3,t3,52; fmv.d.x ft6,t3` builds 1.0 in an integer
+register and moves it across, where Zfa's `fli.d ft6,1.0` is one
+instruction. 23 cannot see it: that check asks about `auipc`+`fld`, and
+V8 never loads a floating-point constant into a floating-point register
+from its pool. Its `LoadFPRImmediate` builds every constant in an
+integer register unless `fli` can, and only the overloads taking a
+`float` or a `double` ask whether `fli` can. Maglev calls those, and its
+code in this corpus has 1,467 `fli`. TurboFan passes the bits of its
+Float64 constants instead, so its code has 4,266 `fmv.d.x` and 2 `fli`,
+both `fli.s`, from the Float32 constants it does pass as values.
+Liftoff passes bits for both widths, but the corpus has no Wasm.
+
+The check takes a chain 37 would follow and the move directly after
+it, `fmv.d.x`, or `fmv.w.x` with the low 32 bits, where the value is an
+`fli` entry and the integer register is dead after the move. A pool
+load into the integer register would be the other spelling, and it
+measures zero by construction: no entry takes more than three
+instructions to build, and V8's `li` goes to the pool only for a
+constant that takes four.
+
+What check_fp_int_to_fli reports: 312 sites worth 2,496 bytes, every
+one TurboFan's and every one `li` + `slli`: 1.0 (162), 0.5 (49), the
+canonical NaN (30), 2.0 (17), 0.25 (16), 3.0 (15), -1.0 (10), infinity
+(5), 8.0 (4), 0.0625 (2) and 128.0 (2). None overlaps 37, since every
+chain is as short as `li` makes it.
+
+Straight-line constant propagation over the listing finds 1,483
+`fmv.d.x` of an `fli` value in TurboFan's code, led by the canonical
+NaN (474) and 1.0 (449). 1,479 of them have the shape, adjacent and with
+no side entry, and dropping the liveness condition reports exactly
+those. Refusing only a register the walk proves read reports them all
+too, so not one of the 1,167 the check declines reads its register
+again: the walk returns unknown before it sees the register written, the
+limit 43 and 46 record.
+The shortfall is the proof's, not the shape's.
+
+That is a CL rather than a peephole: TurboFan and Liftoff passing the
+value instead of its bits.
+
 ## What else the JetStream corpus says
 
 Not in the table: 188,118 ordered branches against a constant just
@@ -1847,8 +1889,8 @@ which are 30's Zibi shape and need the extension.
 
 ### What the corpus says about V8
 
-Eight habits of the riscv64 port account for 36, 37, 38, 40, 42, 45 and
-46, each a CL as well as a check's finding. `BranchLong` emits
+Nine habits of the riscv64 port account for 36, 37, 38, 40, 42, 45, 46
+and 47, each a CL as well as a check's finding. `BranchLong` emits
 `auipc`+`jr` for every unbound label where `bcc`+`j` would do, and `j`
 alone reaches any function in this corpus. Short builtin calls are
 disabled whenever pointer compression is off (the
@@ -1864,8 +1906,10 @@ slot with one `Push()` each, where the variadic `Push` beside it adjusts
 once. `Return` clamps the argument count with a branch where Zbb's `max`
 would do. `DecodeField` shifts a field at bit 0 up and back down where
 one `andi` would mask it, and `And` with a mask too wide for `andi`
-loads the mask rather than using `zext.h`, `zext.w` or a shift pair. A
-ninth is behind 44's estimate rather than its findings: Maglev's
+loads the mask rather than using `zext.h`, `zext.w` or a shift pair.
+`LoadFPRImmediate` asks whether `fli` can build a constant only when it
+is handed a `float` or a `double`, and TurboFan hands it the bits. A
+tenth is behind 44's estimate rather than its findings: Maglev's
 overflow-checked arithmetic takes a constant right input in a register
 on riscv64 alone.
 
@@ -1926,7 +1970,7 @@ cannot know where those boundaries fall at run time.
 
 # Remaining candidates
 
-None. Forty-five checks are implemented, 36 to 46 being the eleven from
+None. Forty-six checks are implemented, 36 to 47 being the twelve from
 the JetStream corpus above, and
 everything this file sized over the package corpus is either written or
 recorded as rejected with the evidence that rejected it. Thirteen of

@@ -3,7 +3,7 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Forty-five checks are implemented and the ledger's candidate list is
+Forty-six checks are implemented and the ledger's candidate list is
 empty. [TODO.md](TODO.md) is that ledger:
 every candidate that was measured, the population it came back with,
 and the ones rejected on that evidence.
@@ -12,11 +12,12 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Forty-five of them, and the table lists twenty-seven. The jump pair, the
+Forty-six of them, and the table lists twenty-seven. The jump pair, the
 constant chain, the no-op, the push run, the zero store, the zero
-branch, the andi pair, the max clamp, the immediate operand, the mask
-and the jump threading have so far been measured over the JetStream
-corpus of TODO.md, which the table does not cover. Seven report nothing
+branch, the andi pair, the max clamp, the immediate operand, the mask,
+the jump threading and the floating-point constant built through an
+integer register have so far been measured over the JetStream corpus
+of TODO.md, which the table does not cover. Seven report nothing
 over this corpus -- the bit count because no baseline object declares
 Zbb; the three indexed loads, the equality branch and the
 compare-exchange loop because those five require their extension to be
@@ -1545,6 +1546,27 @@ except a handful of `jalr ra,0(ra)` that were already two.
   for the slot next door. In Go it costs far more: 84 encodable, 14
   reported, because the gc assembler routes pool addresses through `t6`
   and reuses it.
+
+* **floating-point constant built through an integer register** -- the
+  same kind of constant, spelled the way V8 spells it: a chain the
+  constant-chain check would follow, `li t3,1023; slli t3,t3,52`, and
+  directly after it `fmv.d.x ft6,t3`, or `fmv.w.x` moving the low 32
+  bits, where the value is one `fli` builds. The chain and the move go
+  for one `fli`. Nothing may branch into the sequence, and the integer
+  register must be provably dead after the move, since the rewrite
+  stops writing it. A pool load into the integer register would be the
+  other spelling, and it measures zero: no entry takes more than three
+  instructions to build, and V8 pools only a constant `li` takes four
+  for.
+
+  V8's `LoadFPRImmediate` builds every constant this way unless `fli`
+  can, and it asks whether `fli` can only in the overloads that take a
+  `float` or a `double`. Maglev calls those, and its code in the
+  JetStream corpus (TODO.md, entry 47) has 1,467 `fli`. TurboFan passes
+  the bits of its Float64 constants instead, and the check reports 312
+  sites there, 2,496 bytes, every one `li` + `slli`: 1.0 x162, 0.5 x49,
+  the canonical NaN x30, 2.0 x17, then a tail. It has not been measured
+  over the package corpus.
 
 ## Selecting the target
 

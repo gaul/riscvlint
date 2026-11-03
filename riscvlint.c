@@ -5670,6 +5670,85 @@ bool check_long_li(riscvlint_state *state, const cs_insn *insn,
     return true;
 }
 
+// ---- a floating-point constant built through an integer register ----
+
+// fmv.d.x frd,rs1 (`*width` 8) or fmv.w.x frd,rs1 (`*width` 4), the moves
+// from an integer register into a floating-point one.
+static bool rv_decode_fmv_from_x(uint32_t w, unsigned *frd, unsigned *rs1,
+                                 unsigned *width)
+{
+    if ((w & 0xfff0707fu) == 0xf2000053u) *width = 8;
+    else if ((w & 0xfff0707fu) == 0xf0000053u) *width = 4;
+    else return false;
+    *frd = (w >> 7) & 0x1fu;
+    *rs1 = (w >> 15) & 0x1fu;
+    return true;
+}
+
+bool check_fp_int_to_fli(riscvlint_state *state, const cs_insn *insn,
+                         riscvlint_finding *finding)
+{
+    if (!riscvlint_may_use(state, RISCVLINT_EXT_ZFA)) return false;
+    uint32_t w;
+    if (!riscvlint_word_at(state, insn->address, &w)) return false;
+    unsigned rd, r;
+    int64_t val;
+    if (li_chain_step(w, insn->size, 0, &rd, &val) != LI_START) return false;
+    // In an unlinked object the immediates are placeholders waiting on
+    // relocations and the value computed from them is fiction.
+    if (riscvlint_is_relocated(state, insn->address)) return false;
+
+    // The chain check_long_li follows, ending at the first instruction
+    // that is not a step on rd or that another path joins. A pool load
+    // into rd would be the other spelling, and it measures zero: no
+    // entry needs more than three instructions, and V8 pools only what
+    // li takes four for.
+    unsigned len = 1, bytes = insn->size;
+    uint64_t at = insn->address + insn->size;
+    for (;;) {
+        uint32_t w2;
+        if (!riscvlint_word_at(state, at, &w2)) break;
+        unsigned size2 = rv_insn_len(w2);
+        int64_t next;
+        if (li_chain_step(w2, size2, val, &r, &next) != LI_STEP || r != rd)
+            break;
+        if (riscvlint_is_branch_target(state, at)) break;
+        if (riscvlint_is_relocated(state, at)) return false;
+        val = next;
+        len++;
+        bytes += size2;
+        at += size2;
+    }
+
+    // The move must follow at once, with nothing joining in between.
+    uint32_t w3;
+    if (!riscvlint_word_at(state, at, &w3) || rv_insn_len(w3) != 4)
+        return false;
+    unsigned frd, rs1, width;
+    if (!rv_decode_fmv_from_x(w3, &frd, &rs1, &width) || rs1 != rd)
+        return false;
+    if (riscvlint_is_branch_target(state, at) ||
+        riscvlint_is_relocated(state, at))
+        return false;
+    // fmv.w.x moves the low 32 bits and ignores the rest.
+    uint64_t bits = width == 8 ? (uint64_t)val : (uint64_t)val & 0xffffffffu;
+    int entry = rv_fli_entry(bits, width);
+    if (entry < 0) return false;
+    // The rewrite stops writing rd.
+    if (riscvlint_liveness(state, at + 4, rd) != RISCVLINT_LIVE_DEAD)
+        return false;
+
+    char value[32];
+    rv_fli_spell(entry, value, sizeof value);
+    finding->title = "floating-point constant built through an integer register";
+    finding->address = insn->address;
+    finding->insn_count = len + 1;
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "fli.%c %s, %s (%u -> 4 bytes)", width == 8 ? 'd' : 's',
+             rv_freg_name(frd), value, bytes + 4);
+    return true;
+}
+
 // ---- an instruction with no architectural effect ----
 
 // The no-ops that are not `nop`: an integer or floating-point operation
@@ -6811,6 +6890,7 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_const_for_imm,
     check_mask_for_zext,
     check_transfer_to_jump,
+    check_fp_int_to_fli,
 };
 
 size_t riscvlint_scan(riscvlint_state *state, csh handle,

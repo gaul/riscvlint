@@ -1,0 +1,20 @@
+note: fp_int_to_fli.o: -m overrides the arch declared in the object
+floating-point constant built through an integer register at offset: 0x0: -> fli.d ft6, 1.0 (10 -> 4 bytes) (3 instructions)
+  li a0, 0x3ff
+  slli a0, a0, 0x34
+  fmv.d.x ft6, a0
+
+floating-point constant built through an integer register at offset: 0xc: -> fli.s ft0, 1.0 (8 -> 4 bytes) (2 instructions)
+  lui a1, 0x3f800
+  fmv.w.x ft0, a1
+
+floating-point constant built through an integer register at offset: 0x16: -> fli.d ft1, nan (10 -> 4 bytes) (4 instructions)
+  lui a2, 1
+  addi a2, a2, -1
+  slli a2, a2, 0x33
+  fmv.d.x ft1, a2
+
+Optimization opportunities by type:
+       3  floating-point constant built through an integer register
+
+3 optimization opportunities in 26 instructions

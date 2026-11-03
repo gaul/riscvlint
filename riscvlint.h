@@ -1083,6 +1083,30 @@ const char *rv_fli_spell(int entry, char *out, size_t outsz);
 bool check_fp_pool_to_fli(riscvlint_state *state, const cs_insn *insn,
                           riscvlint_finding *finding);
 
+// The same constant built in an integer register and moved across: a
+// chain check_long_li would follow, such as `li t3,1023; slli t3,t3,52`,
+// directly followed by `fmv.d.x frd,t3` -- or `fmv.w.x`, which moves the
+// low 32 bits -- where the value is one Zfa's `fli` builds. The chain and
+// the move go for one `fli`. As for the pool check, nothing may branch
+// into the sequence, nothing in it may be relocated, and the integer
+// register must be provably dead after the move, since the rewrite stops
+// writing it. A pool load into the integer register would be the other
+// spelling, and it measures zero: no entry needs more than three
+// instructions, and V8 pools only a constant `li` takes four for.
+//
+// The pool check cannot see this spelling, and it is the one V8 uses:
+// MacroAssembler::LoadFPRImmediate builds every constant `fli` cannot
+// this way, and only its float and double overloads ask whether `fli`
+// can. Maglev calls those; TurboFan's Float64 constants and Liftoff's
+// call the bit-pattern ones instead.
+//
+// Measured population: 312 sites in the JetStream corpus (TODO.md, entry
+// 47), 2,496 bytes, every one in TurboFan and every one `li` + `slli`:
+// 1.0 x162, 0.5 x49, the canonical NaN x30, 2.0 x17. Maglev's constants
+// in the same corpus are 521 `fli.d` already.
+bool check_fp_int_to_fli(riscvlint_state *state, const cs_insn *insn,
+                         riscvlint_finding *finding);
+
 // `li rd,3` (or 5, or 9) followed by a multiply by it: Zba's
 // `sh1add`/`sh2add`/`sh3add` computes the same product in one
 // instruction, with both operands naming the multiplicand --

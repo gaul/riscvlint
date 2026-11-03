@@ -6150,6 +6150,67 @@ static void test_mask_for_zext(csh handle)
     CHECK(run_words(handle, check_mask_for_zext, longer, 6, 0x1000, NULL) == 0);
 }
 
+static void test_fp_int_to_fli(csh handle)
+{
+    riscvlint_finding f;
+    const uint32_t ret = 0x00008067u;
+    const uint32_t li_1023 = 0x3ff00e13u;        // li t3,1023
+    const uint32_t slli_52 = 0x034e1e13u;        // slli t3,t3,52
+    const uint32_t fmv_ft6 = 0xf20e0353u;        // fmv.d.x ft6,t3
+    const uint32_t li_t3_0 = 0x00000e13u;        // li t3,0
+
+    // TurboFan's 1.0: two instructions build it in t3 and a third moves
+    // it, where fli.d is one.
+    uint32_t one[] = { li_1023, slli_52, fmv_ft6, li_t3_0, ret };
+    CHECK(run_words(handle, check_fp_int_to_fli, one, 5, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "fli.d ft6, 1.0 (12 -> 4 bytes)") == 0);
+    CHECK(f.insn_count == 3 && f.address == 0x1000);
+    CHECK(strcmp(f.title,
+                 "floating-point constant built through an integer register")
+          == 0);
+    // The chain is as short as li makes it, so check_long_li stays quiet.
+    CHECK(run_words(handle, check_long_li, one, 5, 0x1000, NULL) == 0);
+
+    // inf and -1.0, which fli spells by name and with a sign; and a
+    // single built by lui alone, moved with fmv.w.x.
+    uint32_t inf[] = { 0x7ff00e13u /* li t3,2047 */, slli_52,
+                       0xf20e0153u /* fmv.d.x ft2,t3 */, li_t3_0, ret };
+    CHECK(run_words(handle, check_fp_int_to_fli, inf, 5, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "fli.d ft2, inf (12 -> 4 bytes)") == 0);
+    uint32_t neg[] = { 0xbff00e13u /* li t3,-1025 */, slli_52, fmv_ft6,
+                       li_t3_0, ret };
+    CHECK(run_words(handle, check_fp_int_to_fli, neg, 5, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "fli.d ft6, -1.0 (12 -> 4 bytes)") == 0);
+    uint32_t single[] = { 0x3f800e37u /* lui t3,0x3f800 */,
+                          0xf00e0053u /* fmv.w.x ft0,t3 */, li_t3_0, ret };
+    CHECK(run_words(handle, check_fp_int_to_fli, single, 4, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "fli.s ft0, 1.0 (8 -> 4 bytes)") == 0);
+    CHECK(f.insn_count == 2);
+
+    // Not reported: 1024.0, which no entry holds; t3 read after the move;
+    // a move of another register; an instruction between the chain and
+    // the move; and a target that declares no Zfa.
+    uint32_t big[] = { 0x40900e13u /* li t3,1033 */, slli_52, fmv_ft6,
+                       li_t3_0, ret };
+    CHECK(run_words(handle, check_fp_int_to_fli, big, 5, 0x1000, NULL) == 0);
+    uint32_t live[] = { li_1023, slli_52, fmv_ft6,
+                        0x000e0593u /* mv a1,t3 */, ret };
+    CHECK(run_words(handle, check_fp_int_to_fli, live, 5, 0x1000, NULL) == 0);
+    uint32_t other[] = { li_1023, slli_52, 0xf20e8353u /* fmv.d.x ft6,t4 */,
+                         li_t3_0, ret };
+    CHECK(run_words(handle, check_fp_int_to_fli, other, 5, 0x1000, NULL) == 0);
+    uint32_t apart[] = { li_1023, slli_52, 0x00150513u /* addi a0,a0,1 */,
+                         fmv_ft6, li_t3_0, ret };
+    CHECK(run_words(handle, check_fp_int_to_fli, apart, 6, 0x1000, NULL) == 0);
+    uint8_t bytes[sizeof one];
+    memcpy(bytes, one, sizeof one);
+    CHECK(run_window_exts(handle, check_fp_int_to_fli, bytes, sizeof bytes,
+                          0x1000, RISCVLINT_EXT_DECLARED, NULL) == 0);
+    CHECK(run_window_exts(handle, check_fp_int_to_fli, bytes, sizeof bytes,
+                          0x1000, RISCVLINT_EXT_DECLARED | RISCVLINT_EXT_ZFA,
+                          NULL) == 1);
+}
+
 // The fusion report. The encodings are clang's for a block per case,
 // fenced with ebreak.
 static const uint8_t fusion_code[] = {
@@ -6289,6 +6350,7 @@ int main(void)
     test_const_for_imm(handle);
     test_mask_for_zext(handle);
     test_transfer_to_jump(handle);
+    test_fp_int_to_fli(handle);
     test_zero_store_run(handle);
     test_bitcast_through_frame(handle);
     test_cchain(handle);
