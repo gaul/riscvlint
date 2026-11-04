@@ -2447,6 +2447,32 @@ the categories built around them have flagless replacements.
   census per tier, in parallel across the parts. Its output is the
   JetStream section of TODO.md.
 
+* The `tools/sm_*` scripts do the same for SpiderMonkey, which has no
+  code printer to read, so the shell writes the bytes out itself.
+  `tools/sm_code_dump.patch` adds a `JS_CODE_DUMP` hook to a Firefox
+  checkout: every JitCode the linker makes (Baseline, Ion, RegExp, and
+  the trampolines and stubs of kind Other) and every Wasm code segment
+  is appended raw to `<prefix>.<pid>.bin`. `tools/sm_jetstream_dump.sh`
+  runs each JetStream 3 test in its own shell, natively on riscv64 or
+  under `--enable-simulator=riscv64` elsewhere; natively on a SpacemiT K3
+  the whole suite takes six minutes at four jobs. `tools/smdump2elf.py`
+  makes one section per blob, named `ION_`, `BL_`, `RE_`, `TR_` or `WA_`
+  plus the test and an index, since raw bytes carry no function name.
+  The section never has to be split as V8's are: the riscv64 backend emits no
+  compressed instructions and no constant pools, and its veneer pools
+  are code. `--dedupe-startup` keeps one copy of the trampolines and
+  Wasm builtin thunks that every process links first. `tools/sm_analyze.sh`
+  runs the chain over a run directory: riscvlint per part,
+  `tools/sm_analyze_findings.py` for the checks by tier,
+  `tools/sm_census.py` for the words taken by the fixed-shape sequences
+  the assembler emits whatever the operand (the six-instruction
+  patchable `li_ptr`, the eight-instruction `li_constant`, the
+  breakpoint code word, and `auipc` + `jr` veneers, with which veneer
+  slots any branch still targets), and `tools/sm_constants.py` for what
+  each patchable load holds and what reads it. `tools/sm_context.py`
+  disassembles around sample findings and `tools/sm_li_context.py`
+  around sample patchable loads of one tier and use.
+
 The checks in `riscvlint.c` decode raw encodings rather than reading
 Capstone's operand model, and the reason is not stylistic. Capstone
 reports `auipc`'s operand as the raw imm20 field rather than the

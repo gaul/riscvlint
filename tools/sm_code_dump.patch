@@ -1,0 +1,182 @@
+SpiderMonkey JS_CODE_DUMP hook for tools/sm_jetstream_dump.sh.
+
+Apply to a Firefox checkout (git apply tools/sm_code_dump.patch) and build
+an optimized js shell, natively on riscv64 or with
+--enable-simulator=riscv64 elsewhere. With JS_CODE_DUMP=<prefix> set the
+shell appends every code blob it links -- JitCode from Linker::newCode
+(Baseline, Ion, RegExp, and Other for trampolines and stubs) and each
+Wasm module's code segment -- to <prefix>.<pid>.bin, in the record format
+tools/smdump2elf.py documents. Without the variable it does nothing.
+
+Built against mozilla-central 390cc2e14ea7 (2026-10-30).
+
+diff --git a/js/src/jit/JitCodeDump.cpp b/js/src/jit/JitCodeDump.cpp
+new file mode 100644
+index 000000000000..69020026955d
+--- /dev/null
++++ b/js/src/jit/JitCodeDump.cpp
+@@ -0,0 +1,81 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "jit/JitCodeDump.h"
++
++#include <mutex>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include "jit/ExecutableAllocator.h"
++
++namespace js::jit {
++
++static std::mutex gDumpLock;
++static FILE* gDumpFile = nullptr;
++static bool gDumpInitialized = false;
++
++static void CloseDump() {
++  std::lock_guard<std::mutex> guard(gDumpLock);
++  if (gDumpFile) {
++    fclose(gDumpFile);
++    gDumpFile = nullptr;
++  }
++}
++
++void DumpJitCode(const uint8_t* code, size_t length, const char* kind) {
++  std::lock_guard<std::mutex> guard(gDumpLock);
++  if (!gDumpInitialized) {
++    gDumpInitialized = true;
++    const char* prefix = getenv("JS_CODE_DUMP");
++    if (!prefix) {
++      return;
++    }
++    char path[1024];
++    snprintf(path, sizeof(path), "%s.%d.bin", prefix, int(getpid()));
++    gDumpFile = fopen(path, "wb");
++    if (!gDumpFile) {
++      fprintf(stderr, "JS_CODE_DUMP: cannot open %s\n", path);
++      return;
++    }
++    setvbuf(gDumpFile, nullptr, _IOFBF, 1 << 20);
++    atexit(CloseDump);
++  }
++  if (!gDumpFile) {
++    return;
++  }
++  uint8_t header[28] = {'S', 'M', 'J', 'C'};
++  strncpy(reinterpret_cast<char*>(header + 4), kind, 8);
++  uint64_t address = uint64_t(uintptr_t(code));
++  uint64_t size = length;
++  memcpy(header + 12, &address, sizeof(address));
++  memcpy(header + 20, &size, sizeof(size));
++  fwrite(header, sizeof(header), 1, gDumpFile);
++  fwrite(code, 1, length, gDumpFile);
++}
++
++void DumpJitCode(const uint8_t* code, size_t length, CodeKind kind) {
++  const char* name = "Unknown";
++  switch (kind) {
++    case CodeKind::Ion:
++      name = "Ion";
++      break;
++    case CodeKind::Baseline:
++      name = "Baseline";
++      break;
++    case CodeKind::RegExp:
++      name = "RegExp";
++      break;
++    case CodeKind::Other:
++      name = "Other";
++      break;
++    case CodeKind::Count:
++      break;
++  }
++  DumpJitCode(code, length, name);
++}
++
++}  // namespace js::jit
+diff --git a/js/src/jit/JitCodeDump.h b/js/src/jit/JitCodeDump.h
+new file mode 100644
+index 000000000000..ad27108a99f9
+--- /dev/null
++++ b/js/src/jit/JitCodeDump.h
+@@ -0,0 +1,24 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef jit_JitCodeDump_h
++#define jit_JitCodeDump_h
++
++#include <stddef.h>
++#include <stdint.h>
++
++namespace js::jit {
++
++enum class CodeKind : uint8_t;
++
++// Append the bytes of a freshly linked code blob to <JS_CODE_DUMP>.<pid>.bin,
++// one record per blob: "SMJC", the kind (8 bytes, NUL-padded), the address
++// and the length (little-endian uint64 each), then the code. Does nothing
++// unless the JS_CODE_DUMP environment variable is set.
++void DumpJitCode(const uint8_t* code, size_t length, const char* kind);
++void DumpJitCode(const uint8_t* code, size_t length, CodeKind kind);
++
++}  // namespace js::jit
++
++#endif /* jit_JitCodeDump_h */
+diff --git a/js/src/jit/Linker.cpp b/js/src/jit/Linker.cpp
+index 2598cc9d73e8..187bd556f700 100644
+--- a/js/src/jit/Linker.cpp
++++ b/js/src/jit/Linker.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include "jit/Linker.h"
+ 
++#include "jit/JitCodeDump.h"
+ #include "jit/JitZone.h"
+ #include "util/Memory.h"
+ 
+@@ -70,6 +71,7 @@ JitCode* Linker::newCode(JSContext* cx, CodeKind kind) {
+   if (masm.embedsNurseryPointers()) {
+     cx->runtime()->gc.storeBuffer().putWholeCell(code);
+   }
++  DumpJitCode(code->raw(), code->instructionsSize(), kind);
+   return code;
+ }
+ 
+diff --git a/js/src/jit/moz.build b/js/src/jit/moz.build
+index 6239ad9bd81a..c628ae6feb19 100644
+--- a/js/src/jit/moz.build
++++ b/js/src/jit/moz.build
+@@ -55,6 +55,7 @@ UNIFIED_SOURCES += [
+     "IonIC.cpp",
+     "IonOptimizationLevels.cpp",
+     "Jit.cpp",
++    "JitCodeDump.cpp",
+     "JitcodeMap.cpp",
+     "JitContext.cpp",
+     "JitFrames.cpp",
+diff --git a/js/src/wasm/WasmCode.cpp b/js/src/wasm/WasmCode.cpp
+index a10d69a0901e..315acfb6a168 100644
+--- a/js/src/wasm/WasmCode.cpp
++++ b/js/src/wasm/WasmCode.cpp
+@@ -16,6 +16,8 @@
+ 
+ #include "wasm/WasmCode.h"
+ 
++#include "jit/JitCodeDump.h"
++
+ #include "mozilla/Atomics.h"
+ #include "mozilla/BinarySearch.h"
+ #include "mozilla/EnumeratedRange.h"
+@@ -376,6 +378,7 @@ SharedCodeSegment CodeSegment::allocate(const CodeSource& codeSource,
+   if (!codeSource.copyAndLink(*writable, *codeStart)) {
+     return nullptr;
+   }
++  jit::DumpJitCode(*codeStart, codeLength, "Wasm");
+ 
+   // Clear the padding between the end of the code and the end of the
+   // allocation.
