@@ -11,6 +11,8 @@
 #               The backend emits no compressed instructions, so declaring
 #               C would report nearly every instruction as compressible.
 #   JOBS        parallel riscvlint processes (default: the online CPUs)
+#   JAL_VENEERS set to 1 for a shell whose veneers are a single jal, to
+#               pass --jal-veneers to sm_census.py
 #
 # Steps: smdump2elf.py --dedupe-startup -> code.elf.N + code.map;
 # riscvlint --json per ELF in parallel -> code.elf.N.json; riscvlint's own
@@ -25,6 +27,8 @@ tools=$(cd "$(dirname "$0")" && pwd)
 RISCVLINT=${RISCVLINT:-$tools/../riscvlint}
 ARCH=${ARCH:-rv64i2p1_m2p0_a2p1_f2p2_d2p2_zicsr2p0_zifencei2p0_zba1p0_zbb1p0_zbs1p0_zfa1p0_zfhmin1p0_zicond1p0}
 JOBS=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
+census_args=
+[ "${JAL_VENEERS:-0}" = 1 ] && census_args=--jal-veneers
 cd "$dir"
 stamp() { date >> analysis.log; }
 echo "arch: $ARCH" > analysis.log
@@ -50,7 +54,7 @@ stamp
     # shellcheck disable=SC2046
     python3 -I "$tools/sm_analyze_findings.py" code.map analysis $(echo "$parts" | sed 's/$/.json/')
     # shellcheck disable=SC2086
-    python3 -I "$tools/sm_census.py" code.map $parts > census.txt
+    python3 -I "$tools/sm_census.py" $census_args code.map $parts > census.txt
     # shellcheck disable=SC2086
     python3 -I "$tools/sm_constants.py" code.map dump $parts > constants.txt
 } 2>> analysis.log

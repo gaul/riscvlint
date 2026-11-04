@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Count the words SpiderMonkey's fixed-shape riscv64 sequences take, by tier.
 
-  sm_census.py MAP ELF...
+  sm_census.py [--jal-veneers] MAP ELF...
 
 These are sequences the assembler emits whole, whatever their operands,
 so their cost is a share of all code rather than something a peephole
@@ -14,10 +14,13 @@ finds one site at a time:
   auipc+jr         a 32-bit pc-relative jump
 
 The auipc+jr pairs are then split into the veneer pools the branch
-deadline machinery emits -- a guard `j` over a run of pairs -- and the
-rest. A veneer is inserted into its label's jump chain as insurance: if
-the label binds within the branch's own range, Assembler::bind patches
-the branch straight to it and the veneer, patched to the label too, is
+deadline machinery emits -- a guard `j` over a run of veneers -- and the
+rest. A veneer is an auipc+jr pair or, with --jal-veneers for a shell
+whose veneers are a single jal, also one `j`; the option is off by default
+as runs of code jumps then pass for pools too. A veneer is inserted into
+its label's jump chain as insurance: if the label binds within the
+branch's own range, Assembler::bind patches the branch straight to it and
+the veneer, patched to the label too, is
 never reached. So each veneer slot is counted as targeted by a branch in
 its blob or not, and the targeted ones are binned by the distance back
 to their branch, which for a veneer emitted because its branch's
@@ -75,7 +78,8 @@ def branch_sources(words):
 
 
 class Census:
-    def __init__(self):
+    def __init__(self, jal_veneers=False):
+        self.jal_veneers = jal_veneers
         self.total = collections.Counter()
         self.seq = collections.defaultdict(collections.Counter)
         self.pairs = collections.defaultdict(collections.Counter)
@@ -86,25 +90,41 @@ class Census:
     def pool(self, words, tier, i, src, last):
         """Count the pool guarded at words[i]; return the index after it."""
         off = jal_offset(words[i])
+        slots = []
         j = i + 1
-        while is_jr_pair(words, j) and (j - i) * 4 < off:
-            j += 2
+        while (j - i) * 4 < off:
+            if is_jr_pair(words, j):
+                slots.append((j, 2))
+                j += 2
+            elif (self.jal_veneers and j < len(words) and
+                  words[j] & 0xfff == 0x06f):
+                slots.append((j, 1))
+                j += 1
+            else:
+                break
         if off == 4:
             self.slots['guards that jump to the next word'][tier] += 1
-        if j == i + 1 or (j - i) * 4 != off:
+        if not slots or (j - i) * 4 != off:
             return None
         self.slots['pools'][tier] += 1
         self.spacing[tier][min(BINS - 1, (i - last) * 4 // BIN)] += 1
-        for k in range(i + 1, j, 2):
-            self.seq['auipc+jr'][tier] += 1
-            self.pairs['veneer pool'][tier] += 1
+        for k, size in slots:
+            if size == 2:
+                self.seq['auipc+jr'][tier] += 1
+                self.pairs['veneer pool'][tier] += 1
+                to_self = words[k] >> 12 == 0 and words[k + 1] >> 20 == 0
+            else:
+                self.slots['jal veneers'][tier] += 1
+                to_self = jal_offset(words[k]) == 0
+            self.slots['veneer slots'][tier] += 1
+            self.slots['veneer words'][tier] += size
             if src.get(k):
                 self.slots['targeted by a branch'][tier] += 1
                 d = min(abs(k - b) for b in src[k]) * 4
                 self.reach[tier][min(BINS - 1, d // BIN)] += 1
             else:
                 self.slots['targeted by nothing'][tier] += 1
-            if words[k] >> 12 == 0 and words[k + 1] >> 20 == 0:
+            if to_self:
                 self.slots['jumping to itself'][tier] += 1
         return j
 
@@ -144,11 +164,14 @@ def row(label, values, fmt='%12d'):
 
 
 def main():
-    if len(sys.argv) < 3:
+    args = sys.argv[1:]
+    jal_veneers = '--jal-veneers' in args
+    args = [a for a in args if a != '--jal-veneers']
+    if len(args) < 2:
         sys.exit(__doc__.split('\n\n')[1])
-    meta = read_map(sys.argv[1])
-    c = Census()
-    for path in sys.argv[2:]:
+    meta = read_map(args[0])
+    c = Census(jal_veneers)
+    for path in args[1:]:
         data, secs = read_elf(path)
         for addr, size, off in secs:
             c.scan(section_words(data, size, off), meta[addr][0])
@@ -171,7 +194,8 @@ def main():
     row('  pools', [c.slots['pools'][t] for t in TIERS])
     row('  guards that jump to the next word',
         [c.slots['guards that jump to the next word'][t] for t in TIERS])
-    row('  veneer slots', [c.pairs['veneer pool'][t] for t in TIERS])
+    for k in ['veneer slots', 'jal veneers', 'veneer words']:
+        row('  ' + k, [c.slots[k][t] for t in TIERS])
     for k in ['targeted by a branch', 'targeted by nothing',
               'jumping to itself']:
         row('    ' + k, [c.slots[k][t] for t in TIERS])
