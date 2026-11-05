@@ -1980,22 +1980,23 @@ code is one blob per code segment, so a Wasm blob holds a module's
 functions rather than one. Unlike V8's, the backend emits no constant
 pools and no compressed instructions, and the ELFs carry no relocations.
 
-The existing checks report 4,118,517 findings over it. The three entries
+The existing checks report 4,118,517 findings over it. The four entries
 below are shapes none of them reports, found by `pairscan`, `defuse` and
 `tools/sm_corpus_mine.py`, and sized by that last one. Each figure
-carries its entry's own conditions -- side entries, offset range, and a
-liveness walk where the fold needs one -- but it is a miner's figure all
-the same, read from objdump text, so a check is expected to come in
-under it. None has been sized over the package corpus or V8's, which
-were not at hand: they are candidates for a JIT's code first.
+carries its entry's own conditions -- side entries, reach, offset range,
+and a liveness walk where the fold needs one -- but it is a miner's
+figure all the same, read from objdump text, so a check is expected to
+come in under it. None has been sized over the package corpus or V8's,
+which were not at hand: they are candidates for a JIT's code first.
 
 | # | candidate | Ion | BL | WA | RE+TR | sites | bytes |
 |---|---|---:|---:|---:|---:|---:|---:|
 | 48 | releases one stack adjustment would do | 40,599 | 78,538 | 186,474 | 2,114 | 307,725 runs | 1,396,600 |
 | 49 | a release followed by a reservation | 21,630 | 154,493 | 515 | 47 | 176,685 | 1,147,716 |
 | 50 | a copy its only reader could do without | 1,951 | 24,340 | 110,444 | 466 | 137,201 | 548,804 |
+| 51 | a call through a scratch register that `jal` would reach | 0 | 0 | 44,115 | 0 | 44,115 of 203,833 | 176,460 |
 
-Together that is 3,093,120 bytes, 1.2% of the corpus's code. 48 and 49
+Together that is 3,269,580 bytes, 1.2% of the corpus's code. 48 and 49
 meet at 11,314 sites, and there the two add up except in one case: of
 the pairs 49 counts as cancelling, 11,233 follow a run 48 merges, and
 once it has, the release no longer matches the reservation and the pair
@@ -2076,9 +2077,29 @@ reload of a1 from the slot it was pushed to, which is check 14's, and
 copies the top of the stack to s1 and pushes both (`mv s1,a2; push s1;
 push a2`).
 
+## 51. A call through a scratch register that `jal` would reach -- 44,115 of 203,833  [candidate]
+
+Check 1 folds `auipc ra,hi` + `jalr ra,lo(ra)` to `jal ra` and asks no
+liveness question, because the `jalr` overwrites what the `auipc` wrote.
+SpiderMonkey's Wasm calls spell the pair through a scratch register --
+`auipc t4,hi; jalr ra,lo(t4)` -- which check 1 declines on purpose, and
+which check 36 would take if it were a jump. Folding it stops writing
+t4, so t4 must be dead at both places control goes next: the callee and
+the return address.
+
+All 203,833 are Wasm. 124,953 targets are outside `jal`'s +/-1 MiB,
+since a module's code is one segment and a large one; of the 78,880
+within it, the probe's walk finds t4 written before it is read at both
+the target and the return address for 44,115, and stops at a branch or
+transfer first for 34,765 (176,460 bytes for the 44,115). It found no
+site where t4 is read first.
+
+The check is check 1 with check 36's walk run twice, once at each
+destination.
+
 # Remaining candidates
 
-Three, 48 to 50, all from the SpiderMonkey corpus above and none yet
+Four, 48 to 51, all from the SpiderMonkey corpus above and none yet
 written. Forty-six checks are implemented, 36 to 47 being the twelve from
 the JetStream corpus above, and
 everything this file sized over the package corpus is either written or

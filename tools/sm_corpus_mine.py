@@ -6,7 +6,7 @@ usage: sm_corpus_mine.py DIR [-j N] [--parts 1,2] [--objdump PATH]
 
 DIR holds the code.elf.N parts written by smdump2elf.py. Each part is
 disassembled with objdump, as v8_corpus_mine.py does, and run through the
-probes in PROBES, one per candidate entry 48 to 50 of TODO.md; counts are
+probes in PROBES, one per candidate entry 48 to 51 of TODO.md; counts are
 per tier (the ION_/BL_/RE_/TR_/WA_ prefix of the blob's symbol). Each
 probe applies the preconditions its entry states, but it is still a
 mining tool reading objdump text, not the check: treat the
@@ -87,6 +87,22 @@ class Part(vm.Part):
 
     def is_target(self, i):
         return self.insns[i][0] in self.targets
+
+    def fate(self, start, reg):
+        """'dead' if the straight line from start writes reg before reading
+        it, 'live' if it reads it first, None if it leaves the line first."""
+        ins = self.insns
+        j = start
+        while j < len(ins) and j < start + WALK and self.same_func(start, j):
+            mn, ops = ins[j][1], ins[j][2]
+            if reg in reads(mn, ops):
+                return "live"
+            if vm.dest(mn, ops) == reg:
+                return "dead"
+            if mn in CONTROL:
+                return None
+            j += 1
+        return None
 
     def add(self, probe, i, key, nbytes):
         self.hit(probe, i, key)
@@ -188,6 +204,26 @@ class Part(vm.Part):
                     self.add("copy-prop", i, ins[use][1], 4)
                 else:
                     self.hit("copy-prop-not", i, verdict or "unknown")
+
+            # 51: a call through a scratch register that jal would reach.
+            if (mn == "auipc" and len(ops) == 2 and ops[1][0] == "i" and nxt is not None
+                    and nxt[1] == "jalr" and vm.dest(nxt[1], nxt[2]) == "ra"
+                    and not self.is_target(i + 1)):
+                rd = ops[0][1]
+                mem = mem_op(nxt[2])
+                if rd != "ra" and mem and mem[2] == rd:
+                    target = (addr + (imm20(ops[1][1]) << 12) + mem[1]) & ~1
+                    if not -(1 << 20) <= target - addr < (1 << 20):
+                        self.hit("scratch-call", i, "out-of-reach")
+                    else:
+                        ti = self.idx.get(target)
+                        at_target = self.fate(ti, rd) if ti is not None else None
+                        at_return = self.fate(i + 2, rd) if self.same_func(i, i + 2) else None
+                        if at_target == "dead" and at_return == "dead":
+                            self.add("scratch-call", i, "dead", 4)
+                        else:
+                            key = "live" if "live" in (at_target, at_return) else "unknown"
+                            self.hit("scratch-call", i, key)
         return self
 
 
@@ -202,6 +238,7 @@ PROBES = [
     ("release-reserve", "49: addi sp,sp,+a then addi sp,sp,-b (cancel: a == b)"),
     ("copy-prop", "50: mv rd,rs whose one reader could read rs, rd then dead (the reader)"),
     ("copy-prop-not", "50, the moves that do not qualify, by reason"),
+    ("scratch-call", "51: auipc rX + jalr ra,lo(rX) where jal reaches; dead = rX dead at target and return"),
 ]
 
 
