@@ -1980,20 +1980,25 @@ code is one blob per code segment, so a Wasm blob holds a module's
 functions rather than one. Unlike V8's, the backend emits no constant
 pools and no compressed instructions, and the ELFs carry no relocations.
 
-The existing checks report 4,118,517 findings over it. The entry below
-is a shape none of them reports, found by `pairscan`, `defuse` and
-`tools/sm_corpus_mine.py`, and sized by that last one. Its figure
-carries the entry's own conditions -- side entries and offset range --
+The existing checks report 4,118,517 findings over it. The two entries
+below are shapes none of them reports, found by `pairscan`, `defuse` and
+`tools/sm_corpus_mine.py`, and sized by that last one. Each figure
+carries its entry's own conditions -- side entries and offset range --
 but it is a miner's figure all the same, read from objdump text, so a
-check is expected to come in under it. It has not been sized over the
-package corpus or V8's, which were not at hand: it is a candidate for a
-JIT's code first.
+check is expected to come in under it. None has been sized over the
+package corpus or V8's, which were not at hand: they are candidates for
+a JIT's code first.
 
 | # | candidate | Ion | BL | WA | RE+TR | sites | bytes |
 |---|---|---:|---:|---:|---:|---:|---:|
 | 48 | releases one stack adjustment would do | 40,599 | 78,538 | 186,474 | 2,114 | 307,725 runs | 1,396,600 |
+| 49 | a release followed by a reservation | 21,630 | 154,493 | 515 | 47 | 176,685 | 1,147,716 |
 
-That is 1,396,600 bytes, 0.5% of the corpus's code.
+Together that is 2,544,316 bytes, 1.0% of the corpus's code. 48 and 49
+meet at 11,314 sites, and there the two add up except in one case: of
+the pairs 49 counts as cancelling, 11,233 follow a run 48 merges, and
+once it has, the release no longer matches the reservation and the pair
+saves four bytes rather than eight -- 44,932 bytes fewer.
 
 ## 48. Releases one stack adjustment would do -- 307,725 runs  [candidate]
 
@@ -2024,10 +2029,29 @@ one by one.
 The check would be `check_push_run` with the sign reversed and the one
 adjustment at the end of the run instead of the start.
 
+## 49. A release followed by a reservation -- 176,685  [candidate]
+
+`addi sp,sp,+a` immediately followed by `addi sp,sp,-b` is one `addi
+sp,sp,a-b`, or nothing at all when a == b, which is 110,244 of them
+(eight bytes each); the other 66,441 save four. The second must not be a
+side entry. 1,147,716 bytes.
+
+Both check 40 and 48 stop here, since 40 begins a run only at a
+reservation and 48 ends one at it. 154,493 are Baseline popping one
+value and pushing the next -- `ld a2,0(sp); addi sp,sp,8; addi
+sp,sp,-8; sd s1,0(sp)` -- or freeing an IC call's arguments and then
+pushing its result. 11,314 of the pairs begin at the last release of a
+run 48 reports; the table's total says what that costs.
+
+One check could take 40, 48 and 49 together, as runs of adjustments of
+either sign, provided the adjustment that remains goes where no access
+in the run falls below sp. Written as three, the three must not count
+the same `addi` twice.
+
 # Remaining candidates
 
-One, 48, from the SpiderMonkey corpus above and not yet written.
-Forty-six checks are implemented, 36 to 47 being the twelve from
+Two, 48 and 49, both from the SpiderMonkey corpus above and neither yet
+written. Forty-six checks are implemented, 36 to 47 being the twelve from
 the JetStream corpus above, and
 everything this file sized over the package corpus is either written or
 recorded as rejected with the evidence that rejected it. Thirteen of

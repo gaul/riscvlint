@@ -6,7 +6,7 @@ usage: sm_corpus_mine.py DIR [-j N] [--parts 1,2] [--objdump PATH]
 
 DIR holds the code.elf.N parts written by smdump2elf.py. Each part is
 disassembled with objdump, as v8_corpus_mine.py does, and run through the
-probe in PROBES, for candidate entry 48 of TODO.md; counts are
+probes in PROBES, one per candidate entry 48 and 49 of TODO.md; counts are
 per tier (the ION_/BL_/RE_/TR_/WA_ prefix of the blob's symbol). Each
 probe applies the preconditions its entry states, but it is still a
 mining tool reading objdump text, not the check: treat the
@@ -98,9 +98,11 @@ class Part(vm.Part):
         ins = self.insns
         n = len(ins)
         release_end = -1
+        run_last = set()        # the last release of each run 48 reports
         for i in range(n):
             addr, mn, ops, fno = ins[i]
             self.counts[("insns", self.tier(i), "")] += 1
+            nxt = ins[i + 1] if self.same_func(i, i + 1) else None
             k = sp_adjust(mn, ops)
 
             # 48: releases one stack adjustment would do.
@@ -132,6 +134,18 @@ class Part(vm.Part):
                 release_end = last
                 if nadj >= 2 and fits:
                     self.add("release-run", i, "adj%d" % min(nadj, 5), 4 * (nadj - 1))
+                    run_last.add(last)
+
+            # 49: a release followed by a reservation.
+            if k is not None and k > 0 and nxt is not None and not self.is_target(i + 1):
+                k2 = sp_adjust(nxt[1], nxt[2])
+                if k2 is not None and k2 < 0:
+                    # /run-end: the release also ends a run of 48.
+                    end = "/run-end" if i in run_last else ""
+                    if k + k2 == 0:
+                        self.add("release-reserve", i, "cancel" + end, 8)
+                    else:
+                        self.add("release-reserve", i, "net" + end, 4)
         return self
 
 
@@ -143,6 +157,7 @@ def work(args):
 
 PROBES = [
     ("release-run", "48: addi sp,sp,+K runs one release would do (adjustments in the run)"),
+    ("release-reserve", "49: addi sp,sp,+a then addi sp,sp,-b (cancel: a == b)"),
 ]
 
 
