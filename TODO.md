@@ -1980,7 +1980,7 @@ code is one blob per code segment, so a Wasm blob holds a module's
 functions rather than one. Unlike V8's, the backend emits no constant
 pools and no compressed instructions, and the ELFs carry no relocations.
 
-The existing checks report 4,118,517 findings over it. The four entries
+The existing checks report 4,118,517 findings over it. The five entries
 below are shapes none of them reports, found by `pairscan`, `defuse` and
 `tools/sm_corpus_mine.py`, and sized by that last one. Each figure
 carries its entry's own conditions -- side entries, reach, offset range,
@@ -1993,10 +1993,11 @@ which were not at hand: they are candidates for a JIT's code first.
 |---|---|---:|---:|---:|---:|---:|---:|
 | 48 | releases one stack adjustment would do | 40,599 | 78,538 | 186,474 | 2,114 | 307,725 runs | 1,396,600 |
 | 49 | a release followed by a reservation | 21,630 | 154,493 | 515 | 47 | 176,685 | 1,147,716 |
+| 52 | a tail every jump to one label repeats | 7,713 | 1,786 | 346 | 143 | 9,988 labels | 787,776 |
 | 50 | a copy its only reader could do without | 1,951 | 24,340 | 110,444 | 466 | 137,201 | 548,804 |
 | 51 | a call through a scratch register that `jal` would reach | 0 | 0 | 44,115 | 0 | 44,115 of 203,833 | 176,460 |
 
-Together that is 3,269,580 bytes, 1.2% of the corpus's code. 48 and 49
+Together that is 4,057,356 bytes, 1.5% of the corpus's code. 48 and 49
 meet at 11,314 sites, and there the two add up except in one case: of
 the pairs 49 counts as cancelling, 11,233 follow a run 48 merges, and
 once it has, the release no longer matches the reservation and the pair
@@ -2097,9 +2098,38 @@ site where t4 is read first.
 The check is check 1 with check 36's walk run twice, once at each
 destination.
 
+## 52. A tail every jump to one label repeats -- 9,988 labels  [candidate]
+
+Cross-jumping: a label reached only by unconditional jumps, each
+preceded by the same k instructions, can hold those instructions once,
+saving (jumps - 1) x k of them. The probe takes a label only when every
+transfer to it is a `j` or an `auipc` + `jr` veneer (no branch and no
+call), when the instruction before it does not fall through (`j`, `jr`
+or `ret`), and when the k instructions match exactly, register and
+immediate included. A tail may not hold a pc-relative instruction, a
+branch target below its top, or a branch target at the jump itself,
+since a path entering there would run the part of the tail it had
+skipped. 787,776 bytes, 196,944 instructions.
+
+748,512 of the bytes are Ion's, and 734,712 of those are one tail: the
+out-of-line bailout, which pushes the snapshot's offset and jumps to the
+script's shared deopt label -- `li t4,offset; addi sp,sp,-8; sd
+t4,0(sp); j deopt` -- with the same push before 97,559 jumps to 5,720
+labels. That is well short of the stubs there are: Ion code holds
+403,311 of exactly that four-instruction shape, and a label any veneer
+reaches fails the test, since what comes before a veneer is the
+previous veneer. SpiderMonkey could keep the offset in a register and
+push it once at the deopt label for all of them.
+
+General-purpose compilers merge tails themselves (GCC's
+`-fcrossjumping`, LLVM's branch folding), so the package corpus should
+have few, but it has not been measured. The probe also cannot see an
+indirect jump into a label, which a check shares with every other use
+of `mark_branch_targets`.
+
 # Remaining candidates
 
-Four, 48 to 51, all from the SpiderMonkey corpus above and none yet
+Five, 48 to 52, all from the SpiderMonkey corpus above and none yet
 written. Forty-six checks are implemented, 36 to 47 being the twelve from
 the JetStream corpus above, and
 everything this file sized over the package corpus is either written or

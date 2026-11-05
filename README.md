@@ -3,7 +3,7 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Forty-six checks are implemented and the ledger lists four candidates,
+Forty-six checks are implemented and the ledger lists five candidates,
 all from SpiderMonkey's JIT code. [TODO.md](TODO.md) is that ledger:
 every candidate that was measured, the population it came back with,
 and the ones rejected on that evidence.
@@ -2472,7 +2472,7 @@ the categories built around them have flagless replacements.
   each patchable load holds and what reads it. `tools/sm_context.py`
   disassembles around sample findings and `tools/sm_li_context.py`
   around sample patchable loads of one tier and use.
-  `tools/sm_corpus_mine.py` sizes the candidate checks, 48 to 51 in
+  `tools/sm_corpus_mine.py` sizes the candidate checks, 48 to 52 in
   TODO.md, over the parts with one probe each, the way
   `tools/v8_corpus_mine.py` mines V8's. It reads each blob's name with
   readelf, since llvm-objdump labels every blob of a part `<.text>`.

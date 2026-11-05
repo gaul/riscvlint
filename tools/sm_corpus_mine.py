@@ -6,7 +6,7 @@ usage: sm_corpus_mine.py DIR [-j N] [--parts 1,2] [--objdump PATH]
 
 DIR holds the code.elf.N parts written by smdump2elf.py. Each part is
 disassembled with objdump, as v8_corpus_mine.py does, and run through the
-probes in PROBES, one per candidate entry 48 to 51 of TODO.md; counts are
+probes in PROBES, one per candidate entry 48 to 52 of TODO.md; counts are
 per tier (the ION_/BL_/RE_/TR_/WA_ prefix of the blob's symbol). Each
 probe applies the preconditions its entry states, but it is still a
 mining tool reading objdump text, not the check: treat the
@@ -22,6 +22,7 @@ last immediate operand is read as its target here.
 import argparse
 import collections
 import os
+import re
 import subprocess
 import sys
 from multiprocessing import Pool
@@ -33,6 +34,8 @@ import v8_corpus_mine as vm  # noqa: E402
 NO_FALL = {"j", "jr", "ret"}
 TRANSFERS = NO_FALL | {"jal", "jalr", "ebreak", "ecall"}
 CONTROL = TRANSFERS | vm.BRANCHES
+# What a suffix moved to another address would compute differently.
+PC_RELATIVE = {"auipc", "jal"}
 WALK = 32
 
 
@@ -56,6 +59,10 @@ def imm20(v):
     return v - 0x100000 if v >= 0x80000 else v
 
 
+def text(raw):
+    return re.sub(r"^\s*[0-9a-f]+:\s*", "", raw).split("<")[0].strip()
+
+
 class Part(vm.Part):
     def __init__(self, objdump, readelf, path):
         names = {}
@@ -72,18 +79,25 @@ class Part(vm.Part):
         for fno, addr in first.items():
             if addr in names:
                 self.funcs[fno] = names[addr]
+        # preds[target] = [(index of the transfer, index its suffix ends
+        # before, kind)]; kind is "j", "veneer" (auipc + jr), or "other".
+        self.preds = collections.defaultdict(list)
         self.targets = set()
         ins = self.insns
         for i, (addr, mn, ops, fno) in enumerate(ins):
             if (mn in vm.BRANCHES or mn in ("j", "jal")) and ops and ops[-1][0] in ("t", "i"):
                 t = ops[-1][1]
                 self.targets.add(t)
+                kind = "j" if mn == "j" else "other"
+                self.preds[t].append((i, i, kind))
             elif mn == "auipc" and len(ops) == 2 and ops[1][0] == "i" and self.same_func(i, i + 1):
                 m2, o2 = ins[i + 1][1], ins[i + 1][2]
                 mem = mem_op(o2)
                 if m2 in ("jr", "jalr") and mem and mem[2] == ops[0][1]:
                     t = (addr + (imm20(ops[1][1]) << 12) + mem[1]) & ~1
                     self.targets.add(t)
+                    kind = "veneer" if m2 == "jr" else "other"
+                    self.preds[t].append((i + 1, i, kind))
 
     def is_target(self, i):
         return self.insns[i][0] in self.targets
@@ -224,6 +238,59 @@ class Part(vm.Part):
                         else:
                             key = "live" if "live" in (at_target, at_return) else "unknown"
                             self.hit("scratch-call", i, key)
+
+            # 52's context: li rX,imm + a push of rX + j, the shape of a
+            # SpiderMonkey out-of-line bailout.
+            if (mn == "j" and i >= 3 and self.same_func(i, i - 3)
+                    and sp_adjust(ins[i - 2][1], ins[i - 2][2]) == -8
+                    and ins[i - 3][1] == "li" and ins[i - 1][1] == "sd"
+                    and ins[i - 1][2] and ins[i - 1][2][0] == ins[i - 3][2][0]
+                    and ins[i - 1][2][-1] == ("m", 0, "sp")):
+                self.counts[("li-push-j", self.tier(i), "")] += 1
+
+        # 52: a label reached only by jumps that each repeat the same tail.
+        for t, ps in self.preds.items():
+            li = self.idx.get(t)
+            if li is None or len(ps) < 2:
+                continue
+            tier = self.tier(li)
+            if any(kind == "other" for _, _, kind in ps):
+                continue
+            if not (li > 0 and self.same_func(li, li - 1) and ins[li - 1][1] in NO_FALL):
+                continue
+            k = 0
+            while k < 8:
+                seen = None
+                ok = True
+                for _, end, _ in ps:
+                    # Only the top of the tail may be a branch target: a
+                    # branch to the jump, or into the tail below its top,
+                    # would run the part of the tail it skipped once the
+                    # tail is at the label.
+                    q = end - 1 - k
+                    if q < 0 or not self.same_func(end, q) or self.is_target(q + 1):
+                        ok = False
+                        break
+                    mq = ins[q][1]
+                    if mq in CONTROL or mq in PC_RELATIVE:
+                        ok = False
+                        break
+                    s = text(self.raw[q])
+                    if seen is None:
+                        seen = s
+                    elif s != seen:
+                        ok = False
+                        break
+                if not ok:
+                    break
+                k += 1
+            if k:
+                end0 = ps[0][1]
+                shape = " ; ".join(vm.abstract(ins[q][1], ins[q][2], {})
+                                   for q in range(end0 - k, end0))
+                self.counts[("tail-merge/bytes", tier, shape)] += 4 * k * (len(ps) - 1)
+                self.counts[("tail-merge", tier, shape)] += 1
+                self.counts[("tail-merge/jumps", tier, shape)] += len(ps)
         return self
 
 
@@ -239,6 +306,8 @@ PROBES = [
     ("copy-prop", "50: mv rd,rs whose one reader could read rs, rd then dead (the reader)"),
     ("copy-prop-not", "50, the moves that do not qualify, by reason"),
     ("scratch-call", "51: auipc rX + jalr ra,lo(rX) where jal reaches; dead = rX dead at target and return"),
+    ("tail-merge", "52: labels reached only by jumps repeating the same tail (shape of the tail)"),
+    ("li-push-j", "52's context: li rX,imm + addi sp,sp,-8 + sd rX,0(sp) + j"),
 ]
 
 
@@ -277,8 +346,13 @@ def main():
             if d == probe:
                 keys[key][t] += v
         for key in sorted(keys, key=lambda k: -sum(keys[k].values()))[:12]:
+            extra = ""
+            if probe == "tail-merge":
+                extra = "  jumps=%d bytes=%d" % (
+                    sum(v for (d, _, kk), v in counts.items() if d == "tail-merge/jumps" and kk == key),
+                    sum(v for (d, _, kk), v in counts.items() if d == "tail-merge/bytes" and kk == key))
             print("  %-34s %8d  " % (key[:34] or "-", sum(keys[key].values())) +
-                  " ".join("%s=%d" % (t, keys[key][t]) for t in tiers if keys[key][t]))
+                  " ".join("%s=%d" % (t, keys[key][t]) for t in tiers if keys[key][t]) + extra)
         progs = collections.Counter()
         for (d, prog, key), v in counts.items():
             if d == probe + "/prog":
