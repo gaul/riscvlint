@@ -1980,21 +1980,22 @@ code is one blob per code segment, so a Wasm blob holds a module's
 functions rather than one. Unlike V8's, the backend emits no constant
 pools and no compressed instructions, and the ELFs carry no relocations.
 
-The existing checks report 4,118,517 findings over it. The two entries
+The existing checks report 4,118,517 findings over it. The three entries
 below are shapes none of them reports, found by `pairscan`, `defuse` and
 `tools/sm_corpus_mine.py`, and sized by that last one. Each figure
-carries its entry's own conditions -- side entries and offset range --
-but it is a miner's figure all the same, read from objdump text, so a
-check is expected to come in under it. None has been sized over the
-package corpus or V8's, which were not at hand: they are candidates for
-a JIT's code first.
+carries its entry's own conditions -- side entries, offset range, and a
+liveness walk where the fold needs one -- but it is a miner's figure all
+the same, read from objdump text, so a check is expected to come in
+under it. None has been sized over the package corpus or V8's, which
+were not at hand: they are candidates for a JIT's code first.
 
 | # | candidate | Ion | BL | WA | RE+TR | sites | bytes |
 |---|---|---:|---:|---:|---:|---:|---:|
 | 48 | releases one stack adjustment would do | 40,599 | 78,538 | 186,474 | 2,114 | 307,725 runs | 1,396,600 |
 | 49 | a release followed by a reservation | 21,630 | 154,493 | 515 | 47 | 176,685 | 1,147,716 |
+| 50 | a copy its only reader could do without | 1,951 | 24,340 | 110,444 | 466 | 137,201 | 548,804 |
 
-Together that is 2,544,316 bytes, 1.0% of the corpus's code. 48 and 49
+Together that is 3,093,120 bytes, 1.2% of the corpus's code. 48 and 49
 meet at 11,314 sites, and there the two add up except in one case: of
 the pairs 49 counts as cancelling, 11,233 follow a run 48 merges, and
 once it has, the release no longer matches the reservation and the pair
@@ -2048,9 +2049,36 @@ either sign, provided the adjustment that remains goes where no access
 in the run falls below sp. Written as three, the three must not count
 the same `addi` twice.
 
+## 50. A copy its only reader could do without -- 137,201  [candidate]
+
+`mv rd,rs` whose one reader could name rs instead, with rd written
+again before anything else reads it: the move goes and the reader is
+rewritten. This is the forward direction of the move coalescing this
+file rejected below (an operation followed by a move of its result,
+192 of 73,017 in the package corpus); it reads the other way round
+and has not been measured there.
+
+The probe requires rs to stay unwritten up to the reader, the reader not
+to be a branch or transfer, and rd's next access after it to be a
+write, all within 32 instructions of straight line without a side entry
+or a control transfer. 649,807 moves leave that line before the walk
+decides; 296,974 overwrite rs before rd is read; 107,227 are read twice,
+which a check could still take when both readers can name rs; 10,210 are
+never read at all, which are check 5's dead definitions; and 9,023 are
+read by a branch or transfer.
+
+Of the 137,201, 124,494 readers are stores, and 102,753 of those are in
+two Wasm GC programs, Kotlin's 90,382 and Dart's 12,371. Every one
+sampled is the set-up of the same builtin call: `mv a1,t0`, then
+pushes of t0, s1 and a1 (`sd a1,0(sp)` stores what t0 holds), then a
+reload of a1 from the slot it was pushed to, which is check 14's, and
+`mv a0,s4` for the instance. The Baseline ones sampled are `dup`, which
+copies the top of the stack to s1 and pushes both (`mv s1,a2; push s1;
+push a2`).
+
 # Remaining candidates
 
-Two, 48 and 49, both from the SpiderMonkey corpus above and neither yet
+Three, 48 to 50, all from the SpiderMonkey corpus above and none yet
 written. Forty-six checks are implemented, 36 to 47 being the twelve from
 the JetStream corpus above, and
 everything this file sized over the package corpus is either written or

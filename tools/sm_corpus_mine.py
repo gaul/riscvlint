@@ -6,7 +6,7 @@ usage: sm_corpus_mine.py DIR [-j N] [--parts 1,2] [--objdump PATH]
 
 DIR holds the code.elf.N parts written by smdump2elf.py. Each part is
 disassembled with objdump, as v8_corpus_mine.py does, and run through the
-probes in PROBES, one per candidate entry 48 and 49 of TODO.md; counts are
+probes in PROBES, one per candidate entry 48 to 50 of TODO.md; counts are
 per tier (the ION_/BL_/RE_/TR_/WA_ prefix of the blob's symbol). Each
 probe applies the preconditions its entry states, but it is still a
 mining tool reading objdump text, not the check: treat the
@@ -33,6 +33,7 @@ import v8_corpus_mine as vm  # noqa: E402
 NO_FALL = {"j", "jr", "ret"}
 TRANSFERS = NO_FALL | {"jal", "jalr", "ebreak", "ecall"}
 CONTROL = TRANSFERS | vm.BRANCHES
+WALK = 32
 
 
 def sp_adjust(mn, ops):
@@ -146,6 +147,47 @@ class Part(vm.Part):
                         self.add("release-reserve", i, "cancel" + end, 8)
                     else:
                         self.add("release-reserve", i, "net" + end, 4)
+
+            # 50: a copy whose one reader could read the source.
+            if (mn == "mv" and len(ops) == 2 and ops[0][0] == "r" and ops[1][0] == "r"
+                    and ops[0] != ops[1] and ops[1] != ("r", "zero")):
+                rd, rs = ops[0][1], ops[1][1]
+                use, verdict = None, None
+                j = i + 1
+                while j < n and j <= i + WALK and self.same_func(i, j) and not self.is_target(j):
+                    mj, oj = ins[j][1], ins[j][2]
+                    rj, dj = reads(mj, oj), vm.dest(mj, oj)
+                    if use is None:
+                        if rd in rj:
+                            if mj in CONTROL:
+                                verdict = "read-by-transfer"
+                                break
+                            use = j
+                            if dj == rd:
+                                verdict = "dead"
+                                break
+                        elif dj == rd:
+                            verdict = "never-read"
+                            break
+                        elif dj == rs:
+                            verdict = "source-overwritten"
+                            break
+                        elif mj in CONTROL:
+                            break
+                    else:
+                        if rd in rj:
+                            verdict = "read-twice"
+                            break
+                        if dj == rd:
+                            verdict = "dead"
+                            break
+                        if mj in CONTROL:
+                            break
+                    j += 1
+                if verdict == "dead":
+                    self.add("copy-prop", i, ins[use][1], 4)
+                else:
+                    self.hit("copy-prop-not", i, verdict or "unknown")
         return self
 
 
@@ -158,6 +200,8 @@ def work(args):
 PROBES = [
     ("release-run", "48: addi sp,sp,+K runs one release would do (adjustments in the run)"),
     ("release-reserve", "49: addi sp,sp,+a then addi sp,sp,-b (cancel: a == b)"),
+    ("copy-prop", "50: mv rd,rs whose one reader could read rs, rd then dead (the reader)"),
+    ("copy-prop-not", "50, the moves that do not qualify, by reason"),
 ]
 
 
