@@ -1968,9 +1968,66 @@ about a quarter of add+load pairs fused, so the decoder evidently
 declines some pairs at a fetch or decode boundary. A static count
 cannot know where those boundaries fall at run time.
 
+## The SpiderMonkey corpus -- riscv64 JIT, 66,779,491 instructions
+
+The second JIT. A SpiderMonkey shell from Firefox main (390cc2e14ea7,
+2026-11-03) ran JetStream 3 natively on the SpacemiT K3 with
+`tools/sm_code_dump.patch` applied, and `tools/smdump2elf.py` turned the
+75 tests' dumps into 24 ELFs of 92,008 blobs. By instructions, as
+riscvlint counts them: Baseline (BL) 22.73M, Ion 21.06M, Wasm (WA)
+21.81M, regexp (RE) 1.08M, and trampolines and stubs (TR) 0.10M. Wasm
+code is one blob per code segment, so a Wasm blob holds a module's
+functions rather than one. Unlike V8's, the backend emits no constant
+pools and no compressed instructions, and the ELFs carry no relocations.
+
+The existing checks report 4,118,517 findings over it. The entry below
+is a shape none of them reports, found by `pairscan`, `defuse` and
+`tools/sm_corpus_mine.py`, and sized by that last one. Its figure
+carries the entry's own conditions -- side entries and offset range --
+but it is a miner's figure all the same, read from objdump text, so a
+check is expected to come in under it. It has not been sized over the
+package corpus or V8's, which were not at hand: it is a candidate for a
+JIT's code first.
+
+| # | candidate | Ion | BL | WA | RE+TR | sites | bytes |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 48 | releases one stack adjustment would do | 40,599 | 78,538 | 186,474 | 2,114 | 307,725 runs | 1,396,600 |
+
+That is 1,396,600 bytes, 0.5% of the corpus's code.
+
+## 48. Releases one stack adjustment would do -- 307,725 runs  [candidate]
+
+Check 40 read backwards. `ld r,0(sp)` + `addi sp,sp,8`, again and
+again: one `addi sp,sp,+total` at the last release does the same, with
+each sp-relative access before it re-offset by what had been released
+ahead of it. A release can always be delayed -- the memory stays
+reserved longer and nothing is read below sp -- so this is the safe
+direction, where check 40 brings a reservation forward.
+
+The probe starts a run at a release and carries sp-relative accesses and
+anything that neither reads nor writes sp, as check 40 does, for up to
+64 instructions. It ends the run at a side entry, at any control
+transfer, at a reservation, at a load into sp, or at a total one `addi`
+cannot add, and it drops a run with a re-offset access that would leave
+its immediate's range. It finds 268,577 runs of two releases, 37,190 of
+three, 1,877 of four and 81 of five or more: 349,150 `addi`s fewer,
+1,396,600 bytes.
+
+The Wasm runs sampled are function epilogues: `addi sp,sp,N` frees the
+frame, `ld ra` and `ld s0` restore the pair the prologue saved, and
+`addi sp,sp,16` frees them, where `ld ra,N+8(sp); ld s0,N(sp); addi
+sp,sp,N+16` would do. The Ion runs sampled pop s0 and ra one at a time
+(`ld s0,0(sp); addi sp,sp,8; ld ra,0(sp); addi sp,sp,8`), and the
+Baseline ones free a call's arguments and then pop the values under them
+one by one.
+
+The check would be `check_push_run` with the sign reversed and the one
+adjustment at the end of the run instead of the start.
+
 # Remaining candidates
 
-None. Forty-six checks are implemented, 36 to 47 being the twelve from
+One, 48, from the SpiderMonkey corpus above and not yet written.
+Forty-six checks are implemented, 36 to 47 being the twelve from
 the JetStream corpus above, and
 everything this file sized over the package corpus is either written or
 recorded as rejected with the evidence that rejected it. Thirteen of
@@ -2018,7 +2075,7 @@ were finally applied.
 
 What is left is not a shortage of ideas but a shortage of *measured*
 ones. The rejected sections below are the other half of this file and
-the reason the list is empty rather than long.
+the reason the list is short rather than long.
 
 Everything else this file ever sized is written. The last entry, base-C
 compression, was recorded at 384 sites on the strength of the two RVC
