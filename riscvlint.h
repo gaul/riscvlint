@@ -1838,6 +1838,35 @@ bool check_copy_for_reader(riscvlint_state *state, const cs_insn *insn,
 bool check_scratch_call_to_jal(riscvlint_state *state, const cs_insn *insn,
                                riscvlint_finding *finding);
 
+// Cross-jumping: a label reached only by unconditional jumps -- `j`,
+// `c.j`, or an `auipc` + `jr` veneer -- each preceded by the same k
+// instructions, encoding for encoding, can hold those instructions once,
+// just before the label, with every jump going there instead: (jumps -
+// 1) x k instructions fewer. The instruction before the label must not
+// fall through, or the hoisted tail would run on a path that never
+// jumped; a branch or a call to the label disqualifies it the same way.
+// The tail may hold no control transfer and nothing pc-relative, which
+// would compute something else at the label, and no branch target below
+// its top or at the jump itself, since a path entering there would run
+// only part of it. Each jump must still reach the tail's new place. A
+// relocated instruction anywhere in it drops the site. Reported once
+// per label, at the lowest site, spanning that site's tail and jump.
+//
+// This needs what no other check does: every jump into the section by
+// target, and where each instruction starts so that a walk can go
+// backwards through a variable-length encoding. set_section builds
+// both. An indirect jump to the label cannot be seen, which the check
+// shares with every other use of the side-entry map.
+//
+// Measured population: 9,988 labels in the SpiderMonkey corpus (TODO.md,
+// entry 52) by the miner's count, 787,776 bytes, 734,712 of them one
+// tail -- Ion's out-of-line bailout, pushing a snapshot offset before
+// the jump to the script's deopt label. General-purpose compilers merge
+// tails themselves (GCC's -fcrossjumping, LLVM's branch folding); the
+// package corpus figure is in the entry.
+bool check_cross_jump(riscvlint_state *state, const cs_insn *insn,
+                      riscvlint_finding *finding);
+
 // ---- running every check ----
 //
 // Called once per finding, with `ctx` as given. The finding is valid

@@ -1995,7 +1995,7 @@ corpus or V8's: `tools/sm_analyze.sh` over a run directory would.
 |---|---|---:|---:|---:|---:|---:|---:|---|
 | 48 | releases one stack adjustment would do | 40,599 | 78,538 | 186,474 | 2,114 | 307,725 runs | 1,396,600 | **implemented**, 0 in the package corpus |
 | 49 | a release followed by a reservation | 21,630 | 154,493 | 515 | 47 | 176,685 | 1,147,716 | **implemented**, 12 in the package corpus |
-| 52 | a tail every jump to one label repeats | 7,713 | 1,786 | 346 | 143 | 9,988 labels | 787,776 | candidate |
+| 52 | a tail every jump to one label repeats | 7,713 | 1,786 | 346 | 143 | 9,988 labels | 787,776 | **implemented**, 1,584 in the package corpus |
 | 50 | a copy its only reader could do without | 1,951 | 24,340 | 110,444 | 466 | 137,201 | 548,804 | **implemented**, 9,733 in the package corpus |
 | 51 | a call through a scratch register that `jal` would reach | 0 | 0 | 44,115 | 0 | 44,115 of 203,833 | 176,460 | **implemented**, 0 in the package corpus |
 
@@ -2189,7 +2189,7 @@ its two halves. The shape is a JIT's: SpiderMonkey's Wasm backend keeps
 t4 for every far transfer and links through ra. The SpiderMonkey dumps
 were not at hand, so the 44,115 above stays the miner's figure.
 
-## 52. A tail every jump to one label repeats -- 9,988 labels  [candidate]
+## 52. A tail every jump to one label repeats -- 9,988 labels  [implemented]
 
 Cross-jumping: a label reached only by unconditional jumps, each
 preceded by the same k instructions, can hold those instructions once,
@@ -2218,12 +2218,47 @@ have few, but it has not been measured. The probe also cannot see an
 indirect jump into a label, which a check shares with every other use
 of `mark_branch_targets`.
 
+The check is the probe with the two things a per-instruction scan has
+to be given: every unconditional jump in the section by target, and
+where each instruction starts, so that a walk can go backwards through
+a variable-length encoding. set_section's pass now records both, plus
+the targets a branch or a call reaches, which no tail may be hoisted to.
+At a `j`, a `c.j` or a veneer's auipc the check looks its label up,
+and if it is the lowest of two or more jumps there and the label is
+reached by nothing else, walks every site backwards in step: one more
+instruction into the tail while all the sites agree on its encoding and
+it is neither a transfer nor pc-relative nor relocated, and no site's
+current top is a branch target, up to 32 instructions where the probe
+stopped at eight. The veneer's reach is unlimited; a `j` must still
+reach the tail's new place and a `c.j` within 2 KiB. The finding spans
+the lowest site's tail and jump.
+
+What check_cross_jump reports over the package corpus: 1,584 labels,
+35,132 bytes -- C++ 1,035 and 28,956 bytes, Go 430 and 3,602, Rust 119
+and 2,574 -- so the compilers' own tail merging leaves something, and
+what it leaves is the epilogue before a sibling call. GCC emits `addi
+sp,s0,-16; ld ra,8(sp); ld s0,0(sp); addi sp,sp,16` before every `j
+callee` or `tail callee` that leaves a function, after its own
+crossjumping has run, and the two LLVM builds it compiled hold 559 of
+the labels and 21,250 of the bytes: in LLVM 20 one callee is reached by
+103 such jumps, the ten-byte epilogue repeated 103 times where one copy
+before the callee would do, 1,020 bytes for one label, and a second
+label is the same. libxul's 309 are Clang's: the argument moves and
+the restores before a tail call, `mv a0,s0; mv a1,s1; mv a2,s2; ld
+ra..ld s2; addi sp,sp,32; j`, eight instructions before 24 jumps. 1,217
+of the labels have two jumps, 151 three, 94 four; the four-instruction
+tail is the commonest at 216 of LLVM 20's and libxul's 581, and the
+one-instruction tail next at 111. Go's 430 are reloads before a join,
+`ld t0,0xa0(sp); j`, five jumps at most; Rust's 119 are the GCC
+epilogue shape before a `tail` veneer, which the check reads as a jump
+with the tail before its auipc. The SpiderMonkey dumps were not at
+hand, so the 9,988 above stays the miner's figure.
+
 # Remaining candidates
 
-One, 52, from the SpiderMonkey corpus above and not yet written. Fifty
-checks and the two audits of entry 53 are implemented, 36 to 47 being
-the twelve from the JetStream corpus above and 48 to 51 the first four
-from the SpiderMonkey corpus, and
+None. Fifty-one checks and the two audits of entry 53 are implemented,
+36 to 47 being the twelve from the JetStream corpus above and 48 to 52
+the five from the SpiderMonkey corpus, and
 everything this file sized over the package corpus is either written or
 recorded as rejected with the evidence that rejected it. Thirteen of
 the package entries, 23 to 35, did not come from a corpus probe at all:
@@ -2270,7 +2305,7 @@ were finally applied.
 
 What is left is not a shortage of ideas but a shortage of *measured*
 ones. The rejected sections below are the other half of this file and
-the reason the list is short rather than long.
+the reason the list is empty rather than long.
 
 Everything else this file ever sized is written. The last entry, base-C
 compression, was recorded at 384 sites on the strength of the two RVC

@@ -1,0 +1,180 @@
+instruction compressible to a base C form at offset: 0x0: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a0, 1
+
+instruction compressible to a base C form at offset: 0x4: -> c.j (4 -> 2 bytes) (1 instructions)
+  j 0x18
+
+tail every jump to one label repeats at offset: 0x0: -> one copy of the 1-instruction tail before 0x18 for 2 jumps (8 -> 4 bytes) (2 instructions)
+  li a0, 1
+  j 0x18
+
+instruction compressible to a base C form at offset: 0x8: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a0, 1
+
+instruction compressible to a base C form at offset: 0xc: -> c.j (4 -> 2 bytes) (1 instructions)
+  j 0x18
+
+instruction compressible to a base C form at offset: 0x10: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a1, 0
+
+instruction compressible to a base C form at offset: 0x14: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+instruction compressible to a base C form at offset: 0x18: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a2, 0
+
+instruction compressible to a base C form at offset: 0x1c: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+instruction compressible to a base C form at offset: 0x20: -> c.xor (4 -> 2 bytes) (1 instructions)
+  xor a0, a0, a1
+
+instruction compressible to a base C form at offset: 0x24: -> c.add (4 -> 2 bytes) (1 instructions)
+  add a0, a0, a2
+
+instruction compressible to a base C form at offset: 0x28: -> c.j (4 -> 2 bytes) (1 instructions)
+  j 0x4c
+
+tail every jump to one label repeats at offset: 0x20: -> one copy of the 2-instruction tail before 0x4c for 3 jumps (24 -> 8 bytes) (3 instructions)
+  xor a0, a0, a1
+  add a0, a0, a2
+  j 0x4c
+
+instruction compressible to a base C form at offset: 0x2c: -> c.xor (4 -> 2 bytes) (1 instructions)
+  xor a0, a0, a1
+
+instruction compressible to a base C form at offset: 0x30: -> c.add (4 -> 2 bytes) (1 instructions)
+  add a0, a0, a2
+
+instruction compressible to a base C form at offset: 0x34: -> c.j (4 -> 2 bytes) (1 instructions)
+  j 0x4c
+
+instruction compressible to a base C form at offset: 0x38: -> c.xor (4 -> 2 bytes) (1 instructions)
+  xor a0, a0, a1
+
+instruction compressible to a base C form at offset: 0x3c: -> c.add (4 -> 2 bytes) (1 instructions)
+  add a0, a0, a2
+
+instruction compressible to a base C form at offset: 0x40: -> c.j (4 -> 2 bytes) (1 instructions)
+  j 0x4c
+
+instruction compressible to a base C form at offset: 0x44: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a1, 0
+
+instruction compressible to a base C form at offset: 0x48: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+instruction compressible to a base C form at offset: 0x4c: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a2, 0
+
+instruction compressible to a base C form at offset: 0x50: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+instruction compressible to a base C form at offset: 0x54: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a0, 1
+
+instruction compressible to a base C form at offset: 0x58: -> c.j (4 -> 2 bytes) (1 instructions)
+  j 0x6c
+
+instruction compressible to a base C form at offset: 0x5c: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a0, 2
+
+instruction compressible to a base C form at offset: 0x60: -> c.j (4 -> 2 bytes) (1 instructions)
+  j 0x6c
+
+instruction compressible to a base C form at offset: 0x64: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a1, 0
+
+instruction compressible to a base C form at offset: 0x68: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+instruction compressible to a base C form at offset: 0x6c: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a2, 0
+
+instruction compressible to a base C form at offset: 0x70: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+instruction compressible to a base C form at offset: 0x74: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a0, 1
+
+instruction compressible to a base C form at offset: 0x78: -> c.j (4 -> 2 bytes) (1 instructions)
+  j 0x8c
+
+instruction compressible to a base C form at offset: 0x7c: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a0, 1
+
+instruction compressible to a base C form at offset: 0x80: -> c.j (4 -> 2 bytes) (1 instructions)
+  j 0x8c
+
+instruction compressible to a base C form at offset: 0x84: -> c.beqz (4 -> 2 bytes) (1 instructions)
+  beqz a3, 0x8c
+
+instruction compressible to a base C form at offset: 0x88: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+instruction compressible to a base C form at offset: 0x8c: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a2, 0
+
+instruction compressible to a base C form at offset: 0x90: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+instruction compressible to a base C form at offset: 0x94: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a0, 1
+
+instruction compressible to a base C form at offset: 0x98: -> c.j (4 -> 2 bytes) (1 instructions)
+  j 0xa8
+
+instruction compressible to a base C form at offset: 0x9c: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a0, 1
+
+instruction compressible to a base C form at offset: 0xa0: -> c.j (4 -> 2 bytes) (1 instructions)
+  j 0xa8
+
+instruction compressible to a base C form at offset: 0xa4: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a1, 0
+
+instruction compressible to a base C form at offset: 0xa8: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a2, 0
+
+instruction compressible to a base C form at offset: 0xac: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+instruction compressible to a base C form at offset: 0xb0: -> c.xor (4 -> 2 bytes) (1 instructions)
+  xor a0, a0, a1
+
+instruction compressible to a base C form at offset: 0xb4: -> c.add (4 -> 2 bytes) (1 instructions)
+  add a0, a0, a2
+
+instruction compressible to a base C form at offset: 0xb8: -> c.j (4 -> 2 bytes) (1 instructions)
+  j 0xd0
+
+tail every jump to one label repeats at offset: 0xb4: -> one copy of the 1-instruction tail before 0xd0 for 2 jumps (8 -> 4 bytes) (2 instructions)
+  add a0, a0, a2
+  j 0xd0
+
+instruction compressible to a base C form at offset: 0xbc: -> c.xor (4 -> 2 bytes) (1 instructions)
+  xor a0, a0, a1
+
+instruction compressible to a base C form at offset: 0xc0: -> c.add (4 -> 2 bytes) (1 instructions)
+  add a0, a0, a2
+
+instruction compressible to a base C form at offset: 0xc4: -> c.j (4 -> 2 bytes) (1 instructions)
+  j 0xd0
+
+instruction compressible to a base C form at offset: 0xc8: -> c.bnez (4 -> 2 bytes) (1 instructions)
+  bnez a0, 0xc0
+
+instruction compressible to a base C form at offset: 0xcc: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+instruction compressible to a base C form at offset: 0xd0: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a2, 0
+
+instruction compressible to a base C form at offset: 0xd4: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+Optimization opportunities by type:
+      54  instruction compressible to a base C form
+       3  tail every jump to one label repeats
+
+57 optimization opportunities in 54 instructions

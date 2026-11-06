@@ -3,8 +3,8 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Fifty checks and two audits (`-a imm`, `-a const`) are implemented, and
-the ledger lists one candidate, from SpiderMonkey's JIT code.
+Fifty-one checks and two audits (`-a imm`, `-a const`) are implemented,
+and the ledger's candidate list is empty.
 [TODO.md](TODO.md) is that ledger:
 every candidate that was measured, the population it came back with,
 and the ones rejected on that evidence.
@@ -13,14 +13,14 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Fifty of them, and the table lists twenty-nine. The jump pair,
+Fifty-one of them, and the table lists thirty. The jump pair,
 the constant chain, the no-op, the push run, the zero store, the zero
 branch, the andi pair, the max clamp, the immediate operand, the mask,
 the jump threading and the floating-point constant built through an
 integer register have so far been measured over the JetStream corpus
 of TODO.md, which the table does not cover, and the release run, the
-cancelling pair, the needless copy and the scratch-register call were
-sized over the SpiderMonkey corpus there. Nine report nothing
+cancelling pair, the needless copy, the scratch-register call and the
+shared tail were sized over the SpiderMonkey corpus there. Nine report nothing
 over this corpus -- the bit count because no baseline object declares
 Zbb; the three indexed loads, the equality branch and the
 compare-exchange loop because those five require their extension to be
@@ -69,16 +69,17 @@ the row where no finding does and the arithmetic is uniform instead.
 | dead store to a frame slot | 395 | 1 | 4,172 | 4,568 | 17,160 | all |
 | slli + srai foldable to sext.b or sext.h | 0 | 0 | 2,562 | 2,562 | 6,450 | all |
 | not + and/or/xor foldable to andn/orn/xnor | 2 | 1 | 2,518 | 2,521 | 9,152 | all |
+| tail every jump to one label repeats | 1,035 | 119 | 430 | 1,584 | 35,132 | all |
 | bit-cast routed through a frame slot | 1,149 | 0 | 10 | 1,159 | 0 | all |
 | li + mul foldable to shNadd | 0 | 0 | 416 | 416 | 1,046 | all |
 | constant loaded for a branch against zero | 79 | 0 | 202 | 281 | 1,050 | all |
 | floating-point constant fli would have built | 0 | 0 | 120 | 120 | 480 | all |
 | release followed by a reservation | 12 | 0 | 0 | 12 | 42 | all |
-| **total** | **502,625** | **193,639** | **3,086,442** | **3,782,706** | **8,687,026** | |
+| **total** | **503,660** | **193,758** | **3,086,872** | **3,784,290** | **8,722,158** | |
 
 Do not read the total row as a result. One row is 80% of it, and that
 row is Go's assembler declining to select RVC at all, which is a
-different kind of finding from the twenty-eight around it. The second row
+different kind of finding from the twenty-nine around it. The second row
 is 6% and belongs to the linker. The `assumed` in the call-pair row is
 the one byte figure that is arithmetic rather than measurement: that
 check prints no size, and every site is eight bytes in and four out
@@ -841,6 +842,55 @@ except a handful of `jalr ra,0(ra)` that were already two.
   instruction, which are reported for deletion. The example is
   Sparkplug's test for undefined or null: the branch taken on undefined
   lands on the jump that the branch for null skips.
+
+* **tail every jump to one label repeats** -- cross-jumping. A label
+  reached only by unconditional jumps, each preceded by the same k
+  instructions, can hold those instructions once, just before the label,
+  with every jump going there instead: (jumps - 1) x k instructions
+  fewer. Ion's out-of-line bailouts are the shape, each pushing its
+  snapshot's offset and jumping to the script's shared deopt label:
+
+  ```
+   li t4, 29
+   addi sp, sp, -8
+   sd t4, 0(sp)                       -> one copy of the 3-instruction
+   j deopt                               tail before deopt for 17 jumps
+                                         (204 -> 12 bytes)
+  ```
+
+  The jumps are `j`, `c.j`, or an `auipc` + `jr` veneer, whose tail
+  sits before the auipc. The instruction before the label must not fall
+  through, or the hoisted tail would run on a path that never jumped,
+  and a branch or a call to the label disqualifies it the same way. The
+  tail is compared encoding for encoding across every site and may hold
+  no control transfer and nothing pc-relative, which would compute
+  something else at the label; a branch target below its top, or at the
+  jump itself, ends it, since a path entering there would run only part
+  of it. Each jump has to reach the tail's new place -- a `c.j` within
+  2 KiB -- and a relocated instruction anywhere drops the site. The
+  finding is made once per label, at the lowest site, spanning that
+  site's tail and jump.
+
+  This is the one check that needs the section's jumps by target and a
+  map of where each instruction starts, so that a walk can go backwards
+  through a variable-length encoding; both are built when the section
+  is read. An indirect jump to the label cannot be seen, which the
+  check shares with every other use of the side-entry map. The
+  SpiderMonkey corpus (TODO.md, entry 52) has 9,988 such labels by the
+  miner's count, 787,776 bytes, 734,712 of them the bailout tail above,
+  and the check has not yet been run over it. General-purpose compilers
+  merge tails themselves (GCC's `-fcrossjumping`, LLVM's branch
+  folding), and still the package corpus has 1,584 such labels, 35,132
+  bytes: C++ 1,035, Go 430, Rust 119. What they missed is the epilogue
+  before a sibling call. GCC's `addi sp,s0,-16; ld ra,8(sp); ld
+  s0,0(sp); addi sp,sp,16` precedes every `j callee` or `tail callee`
+  out of a function, and in LLVM 20 one callee is reached that way from
+  103 sites, 1,020 bytes for one label; Clang's restores and the moves
+  of the arguments before its tail calls are libxul's shape, eight
+  instructions before 24 jumps. 1,217 of the labels have two jumps, 151
+  three, and the two LLVM builds hold the largest. Go's are reloads
+  before a join, `ld t0,0xa0(sp); j`, and Rust's the same epilogue
+  before a `tail` veneer.
 
 * **instruction with no architectural effect** -- the no-ops that are
   not `nop`: an operation whose result is the value it read (`mv x,x`,
@@ -2766,8 +2816,9 @@ the categories built around them have flagless replacements.
   each patchable load holds and what reads it. `tools/sm_context.py`
   disassembles around sample findings and `tools/sm_li_context.py`
   around sample patchable loads of one tier and use.
-  `tools/sm_corpus_mine.py` sizes the candidate checks, 48 to 52 in
-  TODO.md, over the parts with one probe each, the way
+  `tools/sm_corpus_mine.py` sized the five checks of entries 48 to 52
+  in TODO.md, before they were written, over the parts with one probe
+  each, the way
   `tools/v8_corpus_mine.py` mines V8's. It reads each blob's name with
   readelf, since llvm-objdump labels every blob of a part `<.text>`.
 

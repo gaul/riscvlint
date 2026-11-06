@@ -6966,6 +6966,96 @@ static void test_scratch_call_to_jal(csh handle)
                      0x1000, NULL) == 0);
 }
 
+// check_cross_jump: a label reached only by jumps that each repeat the
+// same tail.
+static void test_cross_jump(csh handle)
+{
+    riscvlint_finding f;
+    const uint32_t li_a0_1 = 0x00100513u;        // li a0,1
+    const uint32_t li_a0_2 = 0x00200513u;        // li a0,2
+    const uint32_t addi5 = 0x00550513u;          // addi a0,a0,5
+    const uint32_t li_a1 = 0x00000593u;          // li a1,0
+    const uint32_t li_a2 = 0x00000613u;          // li a2,0
+    const uint32_t ret = 0x00008067u;
+    const uint32_t j20 = 0x0140006fu;            // j +20
+    const uint32_t j12 = 0x00c0006fu;            // j +12
+    const uint32_t j24 = 0x0180006fu;            // j +24
+
+    // Two jumps to 0x1018, each after `li a0,1`; the `ret` before the
+    // label does not fall through. One copy of the tail at the label.
+    uint32_t two[] = { li_a0_1, j20, li_a0_1, j12, li_a1, ret, li_a2, ret };
+    CHECK(run_words(handle, check_cross_jump, two, 8, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "one copy of the 1-instruction tail before "
+                                "0x1018 for 2 jumps (8 -> 4 bytes)") == 0);
+    CHECK(f.insn_count == 2 && f.address == 0x1000);
+    CHECK(strcmp(f.title, "tail every jump to one label repeats") == 0);
+
+    // A two-instruction tail, and three jumps sharing a one-instruction
+    // tail: the saving is the tail times the jumps less one.
+    uint32_t deep[] = { li_a0_1, addi5, j24, li_a0_1, addi5, j12, li_a1, ret,
+                        li_a2, ret };
+    CHECK(run_words(handle, check_cross_jump, deep, 10, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "one copy of the 2-instruction tail before "
+                                "0x1020 for 2 jumps (16 -> 8 bytes)") == 0);
+    CHECK(f.insn_count == 3 && f.address == 0x1000);
+    uint32_t three[] = { li_a0_1, 0x01c0006fu /* j +28 */, li_a0_1, j20,
+                         li_a0_1, j12, li_a1, ret, li_a2, ret };
+    CHECK(run_words(handle, check_cross_jump, three, 10, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "one copy of the 1-instruction tail before "
+                                "0x1020 for 3 jumps (12 -> 4 bytes)") == 0);
+
+    // Not reported: the tails differ; one jump only; the instruction
+    // before the label falls through; a call also reaches the label; a
+    // branch to the jump itself; a pc-relative instruction in the tail.
+    uint32_t differ[] = { li_a0_1, j20, li_a0_2, j12, li_a1, ret, li_a2, ret };
+    CHECK(run_words(handle, check_cross_jump, differ, 8, 0x1000, NULL) == 0);
+    uint32_t one[] = { li_a0_1, j20, li_a0_1, ret, li_a1, ret, li_a2, ret };
+    CHECK(run_words(handle, check_cross_jump, one, 8, 0x1000, NULL) == 0);
+    uint32_t falls[] = { li_a0_1, j20, li_a0_1, j12, li_a1, li_a1, li_a2, ret };
+    CHECK(run_words(handle, check_cross_jump, falls, 8, 0x1000, NULL) == 0);
+    uint32_t called[] = { li_a0_1, j20, li_a0_1, j12, 0x008000efu /* jal ra,+8 */,
+                          ret, li_a2, ret };
+    CHECK(run_words(handle, check_cross_jump, called, 8, 0x1000, NULL) == 0);
+    uint32_t tojump[] = { li_a0_1, j20, li_a0_1, j12,
+                          0xfe051ae3u /* bnez a0,-12 (to the first j) */, ret,
+                          li_a2, ret };
+    CHECK(run_words(handle, check_cross_jump, tojump, 8, 0x1000, NULL) == 0);
+    uint32_t pcrel[] = { 0x00000517u /* auipc a0,0 */, j20,
+                         0x00000517u, j12, li_a1, ret, li_a2, ret };
+    CHECK(run_words(handle, check_cross_jump, pcrel, 8, 0x1000, NULL) == 0);
+    // A branch into the second site's tail below its top stops the tail
+    // above that instruction: one instruction rather than two.
+    uint32_t into[] = { li_a0_1, addi5, j24, li_a0_1, addi5, j12,
+                        0xfe051ce3u /* bnez a0,-8 (to the second addi) */,
+                        ret, li_a2, ret };
+    CHECK(run_words(handle, check_cross_jump, into, 10, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "one copy of the 1-instruction tail before "
+                                "0x1020 for 2 jumps (8 -> 4 bytes)") == 0);
+    CHECK(f.address == 0x1004);
+
+    // Veneers: `auipc t6` + `jr` to the label counts as a jump, with
+    // the tail before the auipc, and the finding spans both halves.
+    uint32_t veneer[] = { li_a0_1, 0x00000f97u /* auipc t6,0 */,
+                          0x020f8067u /* jr 0x20(t6) -> 0x1024 */,
+                          li_a0_1, 0x00000f97u, 0x014f8067u /* jr 0x14(t6) */,
+                          li_a1, li_a1, ret, li_a2, ret };
+    CHECK(run_words(handle, check_cross_jump, veneer, 11, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "one copy of the 1-instruction tail before "
+                                "0x1024 for 2 jumps (8 -> 4 bytes)") == 0);
+    CHECK(f.insn_count == 3 && f.address == 0x1000);
+
+    // Compressed: c.li a0,1 + c.j twice, to a label after a `ret`.
+    uint8_t rvc[] = { 0x05, 0x45, 0x29, 0xa0,      // c.li a0,1; c.j +10
+                      0x05, 0x45, 0x19, 0xa0,      // c.li a0,1; c.j +6
+                      0x81, 0x45, 0x82, 0x80,      // c.li a1,0; ret
+                      0x01, 0x46, 0x82, 0x80 };    // c.li a2,0; ret
+    CHECK(run_window(handle, check_cross_jump, rvc, sizeof rvc, 0x1000, &f)
+          == 1);
+    CHECK(strcmp(f.replacement, "one copy of the 1-instruction tail before "
+                                "0x100c for 2 jumps (4 -> 2 bytes)") == 0);
+    CHECK(f.insn_count == 2 && f.address == 0x1000);
+}
+
 int main(void)
 {
     csh handle;
@@ -7039,6 +7129,7 @@ int main(void)
     test_release_reserve(handle);
     test_copy_for_reader(handle);
     test_scratch_call_to_jal(handle);
+    test_cross_jump(handle);
     test_census(handle);
     test_fusion(handle);
 

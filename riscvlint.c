@@ -1261,12 +1261,30 @@ typedef struct {
     uint8_t detail[RV_DETAIL_BYTES];
 } rvl_dec;
 
+// One unconditional jump into the section, for check_cross_jump: where
+// it goes and where it is, both as offsets from the section's start,
+// with bit 0 of `site` set for an `auipc` + `jr` veneer, whose site is
+// the auipc. Sorted by target, then site.
+typedef struct {
+    uint32_t target;
+    uint32_t site;
+} rvl_pred;
+
 struct riscvlint_state {
     const uint8_t *code;
     size_t size;
     uint64_t vaddr;
     uint8_t *targets;   // one bit per 2-byte unit
     uint8_t *relocs;    // one bit per 2-byte unit
+    // For check_cross_jump: where an instruction starts, so that a walk
+    // can go backwards through a variable-length encoding; the targets
+    // something other than an unconditional jump reaches -- a branch, a
+    // call -- which no tail may be hoisted to; and every unconditional
+    // jump by target. Both bitmaps are one bit per 2-byte unit.
+    uint8_t *starts;
+    uint8_t *nonjump;
+    rvl_pred *preds;
+    size_t npreds, preds_cap;
     unsigned exts;      // extensions declared by Tag_RISCV_arch
     unsigned audits;    // the -a audits opted into, RISCVLINT_AUDIT_*
     csh handle;         // for the liveness walk, which must disassemble
@@ -1393,6 +1411,9 @@ void riscvlint_state_destroy(riscvlint_state *state)
     free(state->dec);
     free(state->targets);
     free(state->relocs);
+    free(state->starts);
+    free(state->nonjump);
+    free(state->preds);
     free(state);
 }
 
@@ -1490,14 +1511,27 @@ static bool dec_insn(riscvlint_state *state, uint64_t a, cs_insn *insn,
     return d->ok;
 }
 
+static int pred_cmp(const void *a, const void *b)
+{
+    const rvl_pred *x = a, *y = b;
+    if (x->target != y->target) return x->target < y->target ? -1 : 1;
+    if (x->site != y->site) return x->site < y->site ? -1 : 1;
+    return 0;
+}
+
 bool riscvlint_state_set_section(riscvlint_state *state, csh handle,
                                  const uint8_t *code, size_t size,
                                  uint64_t vaddr)
 {
     free(state->targets);
     free(state->relocs);
+    free(state->starts);
+    free(state->nonjump);
     state->targets = NULL;
     state->relocs = NULL;
+    state->starts = NULL;
+    state->nonjump = NULL;
+    state->npreds = 0;
     state->code = code;
     state->size = size;
     state->vaddr = vaddr;
@@ -1517,7 +1551,11 @@ bool riscvlint_state_set_section(riscvlint_state *state, csh handle,
     size_t nbytes = size / 2 / 8 + 1;
     state->targets = calloc(nbytes, 1);
     state->relocs = calloc(nbytes, 1);
-    if (!state->targets || !state->relocs) return false;
+    state->starts = calloc(nbytes, 1);
+    state->nonjump = calloc(nbytes, 1);
+    if (!state->targets || !state->relocs || !state->starts ||
+        !state->nonjump)
+        return false;
 
     // Side-entry map. Capstone is fine for this: it only has to spot
     // relative transfers and hand back the absolute target, which it
@@ -1530,8 +1568,14 @@ bool riscvlint_state_set_section(riscvlint_state *state, csh handle,
     cs_insn *insn = cs_malloc(handle);
     if (!insn) return false;
     uint64_t addr = vaddr;
+    // The auipc just decoded, for the veneer `auipc rx` + `jr lo(rx)`:
+    // its address and register, and the high part it adds.
+    uint64_t auipc_at = 0;
+    unsigned auipc_rd = 0;
+    int64_t auipc_hi = 0;
+    bool preds_ok = true;
     while (size - (size_t)(addr - vaddr) >= 2) {
-        uint64_t next = addr;
+        uint64_t here = addr, next = addr;
         bool ok;
         if (keep) {
             ok = dec_insn(state, addr, insn, &next);
@@ -1542,9 +1586,64 @@ bool riscvlint_state_set_section(riscvlint_state *state, csh handle,
         }
         if (!ok) {
             addr += 2;
+            auipc_rd = 0;
             continue;
         }
         addr = next;
+        bit_set(state->starts, (size_t)(here - vaddr) / 2);
+
+        // The jumps by target, from the raw encoding: `j` and `c.j`, and
+        // the veneer, whose site is its auipc. Any other relative
+        // transfer to an address -- a conditional branch, a call --
+        // marks its target as one no tail can be hoisted to.
+        unsigned len = (unsigned)(next - here);
+        uint32_t w = 0;
+        memcpy(&w, code + (here - vaddr), len >= 4 ? 4 : 2);
+        unsigned jrd, brs1, brs2, bf3;
+        int64_t joff;
+        int64_t t = -1;
+        bool jump = false, veneer = false;
+        if (rv_decode_jump(w, len, &jrd, &joff)) {
+            t = (int64_t)(here - vaddr) + joff;
+            jump = jrd == 0;
+        } else if (rv_decode_cond_branch(w, len, &brs1, &brs2, &bf3, &joff)) {
+            t = (int64_t)(here - vaddr) + joff;
+        } else if (len == 4 && auipc_rd != 0 && auipc_at + 4 == here &&
+                   rv_decode_jalr(w, &jrd, &brs1, &joff) && brs1 == auipc_rd) {
+            t = (((int64_t)auipc_at + auipc_hi + joff) & ~(int64_t)1) -
+                (int64_t)vaddr;
+            jump = jrd == 0;
+            veneer = true;
+        }
+        if (t >= 0 && (uint64_t)t < size) {
+            if (!jump) {
+                bit_set(state->nonjump, (size_t)t / 2);
+            } else if (preds_ok) {
+                if (state->npreds == state->preds_cap) {
+                    size_t cap = state->preds_cap ? 2 * state->preds_cap : 1024;
+                    rvl_pred *p = realloc(state->preds, cap * sizeof *p);
+                    if (!p) {
+                        preds_ok = false;
+                    } else {
+                        state->preds = p;
+                        state->preds_cap = cap;
+                    }
+                }
+                if (preds_ok) {
+                    uint64_t site = veneer ? auipc_at : here;
+                    state->preds[state->npreds].target = (uint32_t)t;
+                    state->preds[state->npreds].site =
+                        (uint32_t)(site - vaddr) | (veneer ? 1u : 0u);
+                    state->npreds++;
+                }
+            }
+        }
+        if (len == 4 && rv_decode_auipc(w, &auipc_rd, &auipc_hi) &&
+            auipc_rd != 0)
+            auipc_at = here;
+        else
+            auipc_rd = 0;
+
         // BRANCH_RELATIVE only. An indirect `jalr rd,<off>(rs)` is in
         // the JUMP group and carries an immediate too, but that
         // immediate is an offset from a register, not an address --
@@ -1555,12 +1654,18 @@ bool riscvlint_state_set_section(riscvlint_state *state, csh handle,
         const cs_riscv *a = &insn->detail->riscv;
         for (int i = 0; i < a->op_count; i++) {
             if (a->operands[i].type != RISCV_OP_IMM) continue;
-            int64_t t = a->operands[i].imm - (int64_t)vaddr;
-            if (t >= 0 && (uint64_t)t < size)
-                bit_set(state->targets, (size_t)t / 2);
+            int64_t t2 = a->operands[i].imm - (int64_t)vaddr;
+            if (t2 >= 0 && (uint64_t)t2 < size)
+                bit_set(state->targets, (size_t)t2 / 2);
         }
     }
     cs_free(insn, 1);
+    // A list that could not be completed would make a label look reached
+    // by fewer jumps than it is, which is the one error the check must
+    // not make; an empty list reports nothing.
+    if (!preds_ok) state->npreds = 0;
+    if (state->npreds > 1)
+        qsort(state->preds, state->npreds, sizeof *state->preds, pred_cmp);
     return true;
 }
 
@@ -7111,6 +7216,185 @@ bool check_scratch_call_to_jal(riscvlint_state *state, const cs_insn *insn,
     return true;
 }
 
+// ---- a tail every jump to one label repeats ----
+
+// The instruction that ends at `a`, from the start map set_section
+// built: the two-byte one at a-2, or else the four-byte one at a-4.
+static bool rv_prev_insn(const riscvlint_state *state, uint64_t a,
+                         uint64_t *prev, unsigned *len)
+{
+    uint32_t w;
+    if (a >= state->vaddr + 2 &&
+        bit_test(state->starts, (size_t)(a - 2 - state->vaddr) / 2) &&
+        riscvlint_word_at(state, a - 2, &w) && rv_insn_len(w) == 2) {
+        *prev = a - 2;
+        *len = 2;
+        return true;
+    }
+    if (a >= state->vaddr + 4 &&
+        bit_test(state->starts, (size_t)(a - 4 - state->vaddr) / 2) &&
+        riscvlint_word_at(state, a - 4, &w) && rv_insn_len(w) == 4) {
+        *prev = a - 4;
+        *len = 4;
+        return true;
+    }
+    return false;
+}
+
+// An instruction after which control never reaches the next one: `j`,
+// `jr` or `ret`, in either width. A call comes back to the next
+// instruction and is not one.
+static bool rv_no_fall_through(uint32_t w, unsigned size)
+{
+    unsigned rd, rs1;
+    int64_t off;
+    if (rv_decode_jump(w, size, &rd, &off)) return rd == 0;
+    if (size == 4) return rv_decode_jalr(w, &rd, &rs1, &off) && rd == 0;
+    // c.jr: op 10, funct3 100, bit 12 clear, rs2 zero, rs1 not.
+    return size == 2 && (w & 0xf003u) == 0x8002u &&
+           ((w >> 2) & 0x1fu) == 0 && ((w >> 7) & 0x1fu) != 0;
+}
+
+#define CROSS_TAIL 32       // instructions a tail may hold
+
+bool check_cross_jump(riscvlint_state *state, const cs_insn *insn,
+                      riscvlint_finding *finding)
+{
+    if (insn->size != 2 && insn->size != 4) return false;
+    if (!state->preds || !state->starts || !state->nonjump) return false;
+    uint32_t w;
+    if (!riscvlint_word_at(state, insn->address, &w)) return false;
+    if (riscvlint_is_relocated(state, insn->address)) return false;
+
+    // The site: a `j` or `c.j`, or the auipc of an `auipc rx` + `jr
+    // lo(rx)` veneer, whose jr must not be a side entry or relocated.
+    unsigned rd, rs1;
+    int64_t off, hi;
+    uint64_t label;
+    unsigned jump_insns = 1;
+    if (rv_decode_jump(w, insn->size, &rd, &off)) {
+        if (rd != 0) return false;
+        label = insn->address + (uint64_t)off;
+    } else if (insn->size == 4 && rv_decode_auipc(w, &rd, &hi) && rd != 0) {
+        uint32_t w2;
+        unsigned rd2;
+        if (!riscvlint_word_at(state, insn->address + 4, &w2)) return false;
+        if (!rv_decode_jalr(w2, &rd2, &rs1, &off) || rd2 != 0 || rs1 != rd)
+            return false;
+        if (riscvlint_is_branch_target(state, insn->address + 4) ||
+            riscvlint_is_relocated(state, insn->address + 4))
+            return false;
+        label = (uint64_t)(((int64_t)insn->address + hi + off) & ~(int64_t)1);
+        jump_insns = 2;
+    } else {
+        return false;
+    }
+    if (label < state->vaddr || label >= state->vaddr + state->size)
+        return false;
+    uint32_t loff = (uint32_t)(label - state->vaddr);
+    // A branch or a call also reaches the label: a tail hoisted there
+    // would run on a path that never had it.
+    if (bit_test(state->nonjump, loff / 2)) return false;
+
+    // The jumps to this label sit together in the sorted list. The
+    // finding is made once, from the lowest site.
+    size_t lo = 0, up = state->npreds;
+    while (lo < up) {
+        size_t mid = (lo + up) / 2;
+        if (state->preds[mid].target < loff) lo = mid + 1;
+        else up = mid;
+    }
+    size_t first = lo, n = 0;
+    while (first + n < state->npreds && state->preds[first + n].target == loff)
+        n++;
+    if (n < 2) return false;
+    if ((state->preds[first].site & ~1u) !=
+        (uint32_t)(insn->address - state->vaddr))
+        return false;
+
+    // The instruction before the label must not fall through, or the
+    // tail placed there would run on the path that never jumped.
+    uint64_t before;
+    unsigned blen;
+    uint32_t bw;
+    if (!rv_prev_insn(state, label, &before, &blen) ||
+        !riscvlint_word_at(state, before, &bw) || !rv_no_fall_through(bw, blen))
+        return false;
+
+    // Walk every site backwards in step. Each step takes one more
+    // instruction into the tail when all the sites agree on it, encoding
+    // for encoding; a control transfer or a pc-relative instruction,
+    // which would compute something else at the label, ends the tail,
+    // and so does a side entry at the current top -- a branch into the
+    // tail below its top, or to the jump itself, would run only part of
+    // it once the tail is at the label. Only the finished tail's top may
+    // be a target.
+    uint64_t *tops = malloc(n * sizeof *tops);
+    if (!tops) return false;
+    for (size_t i = 0; i < n; i++)
+        tops[i] = state->vaddr + (state->preds[first + i].site & ~1u);
+    unsigned k = 0, tail_bytes = 0;
+    while (k < CROSS_TAIL) {
+        unsigned len0 = 0;
+        uint32_t w0 = 0;
+        bool ok = true;
+        for (size_t i = 0; i < n && ok; i++) {
+            uint64_t q;
+            unsigned len;
+            uint32_t wq;
+            if (riscvlint_is_branch_target(state, tops[i]) ||
+                !rv_prev_insn(state, tops[i], &q, &len) ||
+                !riscvlint_word_at(state, q, &wq) ||
+                riscvlint_is_relocated(state, q)) {
+                ok = false;
+                break;
+            }
+            if (len == 2) wq &= 0xffffu;
+            if (rv_stops_walk(wq, len) || (len == 4 && RV_OPCODE(wq) == 0x17u)) {
+                ok = false;
+                break;
+            }
+            if (i == 0) {
+                len0 = len;
+                w0 = wq;
+            } else if (len != len0 || wq != w0) {
+                ok = false;
+            }
+        }
+        if (!ok) break;
+        for (size_t i = 0; i < n; i++) tops[i] -= len0;
+        k++;
+        tail_bytes += len0;
+    }
+    uint64_t top0 = tops[0];
+    free(tops);
+    if (k == 0) return false;
+
+    // Every jump must still reach the tail's new place, just before the
+    // label: a `c.j` within 2 KiB, a `j` within a megabyte, a veneer
+    // anywhere.
+    for (size_t i = 0; i < n; i++) {
+        uint32_t site = state->preds[first + i].site;
+        if (site & 1u) continue;
+        uint64_t s = state->vaddr + site;
+        uint32_t ws;
+        if (!riscvlint_word_at(state, s, &ws)) return false;
+        int64_t d = (int64_t)(label - tail_bytes) - (int64_t)s;
+        if (rv_insn_len(ws) == 2 ? d < -2048 || d > 2046 : !rv_jal_reaches(d))
+            return false;
+    }
+
+    unsigned bytes = (unsigned)n * tail_bytes;
+    finding->title = "tail every jump to one label repeats";
+    finding->address = top0;
+    finding->insn_count = k + jump_insns;
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "one copy of the %u-instruction tail before 0x%" PRIx64
+             " for %u jumps (%u -> %u bytes)", k, label, (unsigned)n, bytes,
+             tail_bytes);
+    return true;
+}
+
 // ---- a copy its only reader could do without ----
 
 // Where `w` reads integer registers through its own encoding: each
@@ -7729,6 +8013,7 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_fp_int_to_fli,
     check_copy_for_reader,
     check_scratch_call_to_jal,
+    check_cross_jump,
     check_imm_misfit_audit,
     check_const_audit,
 };
