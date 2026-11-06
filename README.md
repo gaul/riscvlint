@@ -1637,9 +1637,10 @@ field:
   under `-m zibi`: without the extension the branch has no immediate
   form to miss, RV64I having no compare-immediate-and-branch at all;
 * a load or store through a base computed from the constant -- `lui` +
-  `add` and then the access, or `addi` and then the access -- against
-  the access's own 12-bit offset, tallied as the byte offset the access
-  would carry.
+  `add` or `lui` + `sub` and then the access, or `addi` and then the
+  access -- against the access's own 12-bit offset, tallied as the byte
+  offset the access would carry: `lui t,1; sub t,s0,t; sd a5,2040(t)`
+  is the frame slot at -2056, one step past the field.
 
 The constant is `li`, `lui`, or the chain the constant-chain check
 follows, and the consumer follows it directly. The operand rules are
@@ -1726,9 +1727,16 @@ only cite from a miner.
 The summary's third table tallies the audit by value, with the form
 that takes each constant as its hint.
 
-Neither audit has been run over the corpus yet; what they will show is
-bounded by the ledger's figures above, and TODO.md's entry 53 says
-where to record it.
+Over the corpus the two audits report 657,596 misfits and 685,744
+constants with a form; TODO.md's entry 53 has the tables. The constant
+audit's branch class, 461,307 sites under `-m zibi`, is entry 30's
+in-range shape count to within seven sites, measured by the tool itself
+this time, and the fold reports 177,581 of it. The misfit audit's answer
+to the Zibi question is that imm5 covers 59% of the corpus's equality
+comparisons against a constant, one more bit would reach 69%, and a
+12-bit immediate 87%; the leading out-of-range constants are LLVM's
+`DenseMap` empty key, rustc's enum niche and SpiderMonkey's shifted
+JS::Value tags, none of which a renumbering reaches.
 
 ## ISA census (`-i`)
 

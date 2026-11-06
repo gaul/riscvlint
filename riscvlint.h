@@ -1664,10 +1664,11 @@ bool check_mask_for_zext(riscvlint_state *state, const cs_insn *insn,
 // `zext.h`, `zext.w` or the shift pair takes it; `beq` and `bne` against
 // Zibi's `beqi`/`bnei` imm5, only where Zibi is positively present,
 // since without it the branch has no immediate form to miss; and a load
-// or store through a base computed from the constant -- `lui`+`add` and
-// then the access, or `addi` and then the access -- against the
-// access's own 12-bit offset, the constant tallied as the byte offset
-// `K + off` the access would carry.
+// or store through a base computed from the constant -- `lui`+`add` or
+// `lui`+`sub` and then the access, or `addi` and then the access --
+// against the access's own 12-bit offset, the constant tallied as the
+// byte offset `K + off` (`off - K` for the subtraction) the access
+// would carry.
 //
 // The operand rules are the sibling folds' own (check_const_for_imm,
 // check_const_eq_branch, check_base_add_to_offset): the constant in an

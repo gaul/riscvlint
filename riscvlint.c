@@ -7088,12 +7088,17 @@ static bool audit_classify(riscvlint_state *state, const cs_insn *insn,
         bool second = rs2 == rc;
         unsigned rx = second ? rs1 : rs2;
         if (rx == 0) return false;
-        // An `add` whose sum is the next instruction's base is an
-        // address, and its constant an offset.
-        if (f3 == 0 && !word && !sub && rd != 2 && rd != 3 && rd != 4) {
+        // An `add` or `sub` whose result is the next instruction's base
+        // is an address, and its constant an offset -- negated for the
+        // subtraction, which is how GCC reaches a frame slot below
+        // -2048: `lui t,1; sub t,s0,t; sd a5,2040(t)` is the slot at
+        // -2056, one step past the field, and not an addition of 4096.
+        if (f3 == 0 && !word && (!sub || second) &&
+            rd != 2 && rd != 3 && rd != 4) {
             uint32_t w3;
+            int64_t kb = sub ? (int64_t)(0u - (uint64_t)k) : k;
             if (riscvlint_word_at(state, at + size2, &w3) &&
-                audit_mem_site(state, at + size2, w3, rd, rx, k, len + 1, s))
+                audit_mem_site(state, at + size2, w3, rd, rx, kb, len + 1, s))
                 return true;
         }
         if (f3 == 1 || f3 == 5) return false;           // a shift never misses

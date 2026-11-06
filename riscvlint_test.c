@@ -6568,6 +6568,31 @@ static void test_imm_audits(csh handle)
     CHECK(f.insn_count == 3);
     CHECK(!run_audit(handle, check_const_audit, farld, sizeof farld, 0, BOTH,
                      NULL));
+    // A subtracted constant is a base too, with the sign flipped: GCC's
+    // frame slot one step below -2048, and a fitting one for the form.
+    static const uint8_t subslot[] = {
+        0x05, 0x67,                 // c.lui a4,1 (2)
+        0x33, 0x07, 0xe4, 0x40,     // sub a4,s0,a4 (4)
+        0x23, 0x3c, 0xf7, 0x7e,     // sd a5,2040(a4) (4)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_audit(handle, check_imm_misfit_audit, subslot, sizeof subslot,
+                    0, BOTH, &f));
+    CHECK(f.audit_kind == RISCVLINT_AUDIT_MEM && !f.audit_fit &&
+          f.audit_value == -2056 && f.audit_width == 'd');
+    CHECK(f.insn_count == 3);
+    CHECK(riscvlint_audit_reachable(RISCVLINT_AUDIT_MEM, -2056));
+    static const uint8_t subfit[] = {
+        0x21, 0x47,                 // c.li a4,8 (2)
+        0x33, 0x07, 0xe4, 0x40,     // sub a4,s0,a4 (4)
+        0x1c, 0x63,                 // c.ld a5,0(a4) (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_audit(handle, check_const_audit, subfit, sizeof subfit, 0,
+                    BOTH, &f));
+    CHECK(strcmp(f.replacement, "ld a5, -8(s0)") == 0);
+    CHECK(f.audit_kind == RISCVLINT_AUDIT_MEM && f.audit_fit &&
+          f.audit_value == -8);
     // A store of the base through itself reads it for the value too.
     static const uint8_t sdself[] = {
         0x93, 0x07, 0x05, 0x01,     // addi a5,a0,16 (4)

@@ -4170,7 +4170,7 @@ form is four. Both stand, as the shNadd and base-C overlap does -- Zcb
 shrinks the instruction and Zbb removes it, and the second subsumes the
 first.
 
-## 53. The immediate audits, `-a imm` and `-a const` -- unmeasured  [implemented]
+## 53. The immediate audits, `-a imm` and `-a const` -- 657,596 and 685,744  [implemented]
 
 Not a check: a report about the code that proposes no rewrite, which is
 armlint's `-a` class, and the two of its three audits that have a
@@ -4181,7 +4181,7 @@ constant the consumer's form would have held, with no liveness proof.
 Both are tallied by value in the summary. README.md's "Audits" section
 has the consumer classes, the operand rules and the tables.
 
-### Why it was written without a population
+### Why it was written before it was measured
 
 Every other entry here was sized before it was written. This one was
 asked for three times by entries that already existed, each recording
@@ -4214,8 +4214,12 @@ throwaway.
   right, which is a question about the extension rather than the code.
 * The load/store class has no register-offset addressing mode to
   audit; its shape is a base computed from the constant -- `lui`+`add`,
-  or `addi` -- and then the access, tallied as the byte offset the
-  access would carry, under check_base_add_to_offset's operand rules.
+  `lui`+`sub`, or `addi` -- and then the access, tallied as the byte
+  offset the access would carry, under check_base_add_to_offset's
+  operand rules. The subtraction was added after the first corpus run,
+  which put 42,481 sites of "4096" at the top of the add/sub table;
+  every one was `lui t,1; sub t,s0,t` and then a frame-slot access, a
+  slot one step below -2048 rather than an addition of a page.
 * The shifts are left out of the arithmetic class: a shift amount is
   read modulo the width and never misses.
 
@@ -4236,12 +4240,119 @@ so it is not rediscovered.
 
 ### Population
 
-Not measured at the time of writing. The audits need no liveness
-proof, so their counts are bounded below by the folds' and above by
-the shape counts the entries above recorded: at least 177,581 and at
-most 461,300 for `-a const`'s branch class under `-m zibi`, and
-238,018 for `-a imm`'s. Run `riscvlint -a imm -a const` over the
-corpus, with and without `-m zibi`, and record the tables here.
+Run over the 31 objects with `-a imm -a const -m zibi`. `-m zibi` adds
+the branch class and changes nothing else about the audits, so one run
+gives both the with- and the without-Zibi figures.
+
+| audit | class | C++ | Rust | Go | sites |
+|---|---|---:|---:|---:|---:|
+| `-a imm` | add/sub imm12 | 63,009 | 2,630 | 21,985 | 87,624 |
+| | logic imm12 | 51,206 | 695 | 6,195 | 58,096 |
+| | branch imm5 (`-m zibi`) | 235,635 | 4,830 | 76,986 | 317,451 |
+| | ld/st offset | 111,455 | 11,269 | 71,701 | 194,425 |
+| | all | 461,305 | 19,424 | 176,867 | **657,596** |
+| `-a const` | add/sub imm12 | 7,133 | 345 | 185 | 7,663 |
+| | logic imm12 | 4,588 | 49 | 3,317 | 7,954 |
+| | branch imm5 (`-m zibi`) | 418,104 | 16,700 | 26,503 | 461,307 |
+| | ld/st offset | 167,122 | 10,570 | 31,128 | 208,820 |
+| | all | 596,947 | 27,664 | 61,133 | **685,744** |
+
+libxul holds 184,737 of the misfits and 248,493 of the constants; the
+three LLVM builds 82,731 to 91,248 and 98,107 to 125,328 each; Go's
+`compile` and `gh` lead the rest at 51,908 and 54,627 misfits.
+
+#### What the run confirmed
+
+The constant audit's branch class, 461,307, is entry 30's 461,300
+in-range shapes to within seven sites, measured by the tool rather than
+a pair dump, and the check reports 177,581 of them: the two-sided
+liveness proof costs 61.5%, the figure entry 30 gave. The misfit
+audit's branch class is 317,451 against the probe's 238,018, and the
+difference is mostly the chains: 103,202 of the constants lie beyond 12
+bits and were built by `lui`, which a probe counting `li` tokens never
+saw.
+
+The constant audit's add/sub class is 7,663 where check_const_for_imm's
+rejection figure over this corpus was 942, and its load/store class
+208,820 where check_base_add_to_offset reports 9,190: the fold's
+deadness proof hides 23 of every 24 sites of that shape. 35,993 of the
+208,820 are offset zero, which is two idioms -- `mv rt,rs` and then an
+access through rt, a copy made for a call argument that the access
+uses too, and `addi s0,sp,K` and then a spill through s0, the
+frame-pointer prologue, which on four objects was 4% to 12% of the
+class. Both are what the operand rules admit, and neither is a
+constant anyone renumbers; the table says so by its values.
+
+#### Zibi's immediate, measured
+
+| band of the out-of-range constant | C++ | Rust | Go | sites |
+|---|---:|---:|---:|---:|
+| 32..63 | 55,473 | 1,446 | 14,062 | 70,981 |
+| -63..-2 | 3,393 | 101 | 231 | 3,725 |
+| 64..2047 | 102,606 | 1,893 | 34,598 | 139,097 |
+| -2048..-64 | 421 | 8 | 17 | 446 |
+| above 2047 | 23,225 | 1,272 | 27,980 | 52,477 |
+| below -2048 | 50,517 | 110 | 98 | 50,725 |
+
+Of 778,758 equality comparisons against a constant, imm5 covers
+461,307, 59.2%. One more bit would add 74,706 and reach 68.8%; a 12-bit
+immediate, which the B-type encoding has no field for, would reach
+86.7%. The in-range distribution is steep -- 1 is 189,505 sites, 2 is
+58,067, 3 is 26,087 and -1 is 24,779 -- so most of what imm5 covers it
+covers with its first two bits.
+
+The leading out-of-range values have owners. -4096 is 16,490 sites,
+every one in the three LLVM builds: `DenseMapInfo` for pointers shifts
+-1 by `Log2MaxAlign`, which is 12, for its empty key, and a `beq`
+against it is the empty-bucket test. INT64_MIN is 9,350 sites, 9,268 of
+them libxul's, and INT64_MIN + 1 is 3,289 more, all libxul's: the same
+constant armlint's `-a imm` finds under `cmp` in the same object and
+attributes to the niche rustc gives the dataless variants of an enum
+carrying a `Vec` or a `String`. 0xfff9800000000000, 6,990 sites, all
+libxul's, is `JSVAL_TAG_UNDEFINED` shifted into place, `value ==
+undefined`, and 0xfffa000000000000, 2,439, is `null`. 50 and 37 are
+6,626 and 5,485 sites led by libxul; 32 is 5,531 spread over the LLVM
+builds.
+
+#### The misfit tables
+
+Within one step: 179,444 sites over 3,421 distinct values, 74,706 of
+them the two branch bands above. The load/store class contributes
+97,782: 68,651 offsets in 2048..4096, fields just past the reach of the
+field -- 2064 the most common at 1,058 sites, and Go holding 19,171 --
+and 29,131 in -4096..-2049, frame slots just below it, 25,290 of them
+C++'s from the `lui t,1; sub t,s0,t` spelling and spread over 277
+values. The add/sub class keeps 3,551, 2,061 of them a genuine addition
+of 4096, and the logic class 3,405, led by masks of 4096, 3072, -4096
+and 2048.
+
+Beyond one step: 478,152 sites over 38,544 values. libxul's JS::Value
+tags lead the logic class -- 0xfffe000000000000 is `SHIFTED_TAG_OBJECT`
+at 4,599 sites, the `xor` that unboxes an object; 0xfffb000000000000 is
+`SHIFTED_TAG_STRING` at 3,606; the int32 and boolean tags follow at 831
+and 769 -- with -65536 (4,772, nearly all the LLVM builds') and the
+sign bit (4,259) between them. The load/store class's far offsets are
+LLVM's largest objects and Go's runtime structures: 500736 is 2,406
+sites in the two libllvm22 builds, 412424 is 1,086 in libllvm20,
+125808 and 134520..134552 are `gh`'s, 10976 and 10992 are `compile`'s.
+The add/sub class beyond reach is 84,073 sites, 66,753 of them above
+4096 and spread over 10,435 values: sizes, strides and addresses, not a
+renumbering list.
+
+#### What the first run got wrong
+
+The first pass put 42,481 sites of "4096" at the top of the add/sub
+misfit table, 36,103 of them C++'s and some 17,000 in each of two LLVM
+builds. Every one sampled was `lui t,1; sub t,s0,t` and then a load or
+store through t: a frame slot between -2049 and -4096, reached by
+subtracting a page from the frame pointer because `addi` cannot. The
+classifier read only `add` as a base computation. It now reads `sub`
+too, with the constant negated, which moved 49,155 sites into the
+load/store class at their real offsets -- 40,420 of them that shape --
+and left 2,061 additions of 4096. A table whose top row is one idiom in
+disguise is the thing this entry exists to avoid, and the lesson is
+entry 29's: the direction of the operand decides what the constant
+*is*.
 
 # Ranked for C++ and Rust specifically
 
