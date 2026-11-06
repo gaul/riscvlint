@@ -53,6 +53,10 @@ instruction compressible to a base C form at offset: 0x28: -> c.mv (4 -> 2 bytes
 instruction compressible to a base C form at offset: 0x2c: -> c.mv (4 -> 2 bytes) (1 instructions)
   mv a5, a4
 
+copy its only reader could do without at offset: 0x2c: -> delete; add at 0x30 names a4 (8 -> 4 bytes) (2 instructions)
+  mv a5, a4
+  add a5, a5, a4
+
 instruction compressible to a base C form at offset: 0x30: -> c.add (4 -> 2 bytes) (1 instructions)
   add a5, a5, a4
 
@@ -151,5 +155,6 @@ Optimization opportunities by type:
       11  dead register definition
        2  instruction with no architectural effect
        1  constant built in more instructions than li needs
+       1  copy its only reader could do without
 
-49 optimization opportunities in 50 instructions
+50 optimization opportunities in 50 instructions

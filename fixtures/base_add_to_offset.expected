@@ -20,6 +20,10 @@ base add foldable into memory offset at offset: 0x14: -> ld a3, 8(a4) (4 -> 2 by
   mv a5, a4
   ld a3, 8(a5)
 
+copy its only reader could do without at offset: 0x14: -> delete; ld at 0x16 names a4 (4 -> 2 bytes) (2 instructions)
+  mv a5, a4
+  ld a3, 8(a5)
+
 dead register definition at offset: 0x18: -> delete; nothing reads a5 (2 bytes) (1 instructions)
   li a5, 0
 
@@ -63,5 +67,6 @@ Optimization opportunities by type:
       10  dead register definition
        7  base add foldable into memory offset
        1  computation a live register already holds
+       1  copy its only reader could do without
 
-18 optimization opportunities in 49 instructions
+19 optimization opportunities in 49 instructions

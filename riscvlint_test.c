@@ -6794,6 +6794,107 @@ static void test_release_reserve(csh handle)
     CHECK(n1 == 0 && n2 == 1 && f.address == 0x1004);
 }
 
+// check_copy_for_reader: `mv rd,rs` whose one reader could name rs.
+static void test_copy_for_reader(csh handle)
+{
+    riscvlint_finding f;
+    const uint32_t mv_a1_t0 = 0x00028593u;       // mv a1,t0
+    const uint32_t sd_a1 = 0x00b13023u;          // sd a1,0(sp)
+    const uint32_t li_a1 = 0x00000593u;          // li a1,0
+    const uint32_t ret = 0x00008067u;
+
+    // The Wasm shape: a copy, then a store of the copy, then the copy's
+    // register written again. The store names t0 and the copy goes.
+    uint32_t store[] = { mv_a1_t0, sd_a1, li_a1, ret };
+    CHECK(run_words(handle, check_copy_for_reader, store, 4, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "delete; sd at 0x1004 names t0 (8 -> 4 bytes)")
+          == 0);
+    CHECK(f.insn_count == 2 && f.address == 0x1000);
+    CHECK(strcmp(f.title, "copy its only reader could do without") == 0);
+
+    // A reader that writes rd itself needs no proof after it; one that
+    // reads rd twice is still one reader; an instruction between the
+    // copy and the reader that touches neither register is allowed.
+    uint32_t rmw[] = { 0x00058513u /* mv a0,a1 */, 0x00550513u /* addi a0,a0,5 */,
+                       ret };
+    CHECK(run_words(handle, check_copy_for_reader, rmw, 3, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement,
+                 "delete; addi at 0x1004 names a1 (8 -> 4 bytes)") == 0);
+    uint32_t twice[] = { mv_a1_t0, 0x00b58633u /* add a2,a1,a1 */, li_a1, ret };
+    CHECK(run_words(handle, check_copy_for_reader, twice, 4, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "delete; add at 0x1004 names t0 (8 -> 4 bytes)")
+          == 0);
+    uint32_t apart[] = { mv_a1_t0, 0x00000613u /* li a2,0 */, sd_a1, li_a1, ret };
+    CHECK(run_words(handle, check_copy_for_reader, apart, 5, 0x1000, &f) == 1);
+    CHECK(f.insn_count == 3 && strstr(f.replacement, "sd at 0x1008") != NULL);
+
+    // Not reported: rd read twice; rs written before the reader; rd never
+    // read (the dead-definition check's); the reader is a branch; a
+    // transfer comes first; the reader is a side entry; a copy into sp;
+    // and rd's fate after the reader unknown, since `ret` may expose it.
+    uint32_t again[] = { mv_a1_t0, sd_a1, 0x00b13423u /* sd a1,8(sp) */, li_a1,
+                         ret };
+    CHECK(run_words(handle, check_copy_for_reader, again, 5, 0x1000, NULL) == 0);
+    uint32_t src[] = { mv_a1_t0, 0x00000293u /* li t0,0 */, sd_a1, li_a1, ret };
+    CHECK(run_words(handle, check_copy_for_reader, src, 5, 0x1000, NULL) == 0);
+    uint32_t dead[] = { mv_a1_t0, li_a1, ret };
+    CHECK(run_words(handle, check_copy_for_reader, dead, 3, 0x1000, NULL) == 0);
+    uint32_t branch[] = { mv_a1_t0, 0x00c58463u /* beq a1,a2,+8 */, li_a1, ret };
+    CHECK(run_words(handle, check_copy_for_reader, branch, 4, 0x1000, NULL) == 0);
+    uint32_t leave[] = { mv_a1_t0, ret };
+    CHECK(run_words(handle, check_copy_for_reader, leave, 2, 0x1000, NULL) == 0);
+    uint32_t entry[] = { mv_a1_t0, sd_a1, li_a1, ret, 0xff5ff06fu /* j -12 */ };
+    CHECK(run_words(handle, check_copy_for_reader, entry, 5, 0x1000, NULL) == 0);
+    uint32_t tosp[] = { 0x00050113u /* mv sp,a0 */, 0x00a13023u /* sd a0,0(sp) */,
+                        0x00000513u /* li a0,0 */, ret };
+    CHECK(run_words(handle, check_copy_for_reader, tosp, 4, 0x1000, NULL) == 0);
+    uint32_t live[] = { mv_a1_t0, sd_a1, ret };
+    CHECK(run_words(handle, check_copy_for_reader, live, 3, 0x1000, NULL) == 0);
+
+    // Compressed readers. c.sdsp names any register in its five-bit
+    // field, so it stays two bytes; c.sd's three-bit field cannot name
+    // t0 and c.addi's field is both source and destination, so those
+    // readers take four bytes, which is the whole saving when the copy
+    // was two bytes itself and half of it when the copy was four.
+    uint8_t sdsp[] = { 0x96, 0x85, 0x2e, 0xe0, 0x93, 0x05, 0x00, 0x00,
+                       0x82, 0x80 };
+    CHECK(run_window(handle, check_copy_for_reader, sdsp, sizeof sdsp, 0x1000,
+                     &f) == 1);
+    CHECK(strcmp(f.replacement, "delete; sd at 0x1002 names t0 (4 -> 2 bytes)")
+          == 0);
+    uint8_t cadd[] = { 0x96, 0x85, 0x2e, 0x96, 0x93, 0x05, 0x00, 0x00,
+                       0x82, 0x80 };                        // c.add a2,a1
+    CHECK(run_window(handle, check_copy_for_reader, cadd, sizeof cadd, 0x1000,
+                     &f) == 1);
+    CHECK(strcmp(f.replacement, "delete; add at 0x1002 names t0 (4 -> 2 bytes)")
+          == 0);
+    uint8_t csd[] = { 0x96, 0x85, 0x0c, 0xe1, 0x93, 0x05, 0x00, 0x00,
+                      0x82, 0x80 };                         // c.sd a1,0(a0)
+    CHECK(run_window(handle, check_copy_for_reader, csd, sizeof csd, 0x1000,
+                     NULL) == 0);
+    uint8_t csd4[] = { 0x93, 0x85, 0x02, 0x00, 0x0c, 0xe1, 0x93, 0x05, 0x00,
+                       0x00, 0x82, 0x80 };
+    CHECK(run_window(handle, check_copy_for_reader, csd4, sizeof csd4, 0x1000,
+                     &f) == 1);
+    CHECK(strcmp(f.replacement, "delete; sd at 0x1004 names t0 (6 -> 4 bytes)")
+          == 0);
+    uint8_t caddi[] = { 0x2e, 0x85, 0x15, 0x05, 0x82, 0x80 };   // c.mv a0,a1; c.addi a0,5
+    CHECK(run_window(handle, check_copy_for_reader, caddi, sizeof caddi, 0x1000,
+                     NULL) == 0);
+    uint8_t caddi4[] = { 0x13, 0x85, 0x05, 0x00, 0x15, 0x05, 0x82, 0x80 };
+    CHECK(run_window(handle, check_copy_for_reader, caddi4, sizeof caddi4,
+                     0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement,
+                 "delete; addi at 0x1004 names a1 (6 -> 4 bytes)") == 0);
+    // sp as the source: a five-bit field names it, a three-bit one cannot.
+    uint8_t spld[] = { 0x93, 0x05, 0x01, 0x00, 0x90, 0x61, 0x93, 0x05, 0x00,
+                       0x00, 0x82, 0x80 };      // mv a1,sp; c.ld a2,0(a1)
+    CHECK(run_window(handle, check_copy_for_reader, spld, sizeof spld, 0x1000,
+                     &f) == 1);
+    CHECK(strcmp(f.replacement, "delete; ld at 0x1004 names sp (6 -> 4 bytes)")
+          == 0);
+}
+
 int main(void)
 {
     csh handle;
@@ -6865,6 +6966,7 @@ int main(void)
     test_imm_audits(handle);
     test_release_run(handle);
     test_release_reserve(handle);
+    test_copy_for_reader(handle);
     test_census(handle);
     test_fusion(handle);
 

@@ -3,8 +3,8 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Forty-eight checks and two audits (`-a imm`, `-a const`) are implemented,
-and the ledger lists three candidates, all from SpiderMonkey's JIT code.
+Forty-nine checks and two audits (`-a imm`, `-a const`) are implemented,
+and the ledger lists two candidates, both from SpiderMonkey's JIT code.
 [TODO.md](TODO.md) is that ledger:
 every candidate that was measured, the population it came back with,
 and the ones rejected on that evidence.
@@ -13,13 +13,14 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Forty-eight of them, and the table lists twenty-eight. The jump pair,
+Forty-nine of them, and the table lists twenty-nine. The jump pair,
 the constant chain, the no-op, the push run, the zero store, the zero
 branch, the andi pair, the max clamp, the immediate operand, the mask,
 the jump threading and the floating-point constant built through an
 integer register have so far been measured over the JetStream corpus
-of TODO.md, which the table does not cover, and the release run and
-the cancelling pair were sized over the SpiderMonkey corpus there. Eight report nothing
+of TODO.md, which the table does not cover, and the release run, the
+cancelling pair and the needless copy were sized over the SpiderMonkey
+corpus there. Eight report nothing
 over this corpus -- the bit count because no baseline object declares
 Zbb; the three indexed loads, the equality branch and the
 compare-exchange loop because those five require their extension to be
@@ -54,6 +55,7 @@ the row where no finding does and the arithmetic is uniform instead.
 | slli + srli foldable to zext.w | 2 | 52 | 18,071 | 18,125 | 50,178 | all |
 | slli + add foldable to shNadd | 73 | 165 | 13,180 | 13,418 | 23,842 | all |
 | redundant sign or zero extension | 8,285 | 333 | 1,593 | 10,211 | 25,078 | all |
+| copy its only reader could do without | 4,307 | 1,027 | 4,399 | 9,733 | 22,428 | all |
 | conditional branch over an unconditional jump | 9,031 | 340 | 331 | 9,702 | 28,072 | all |
 | load of a just-stored value | 5,244 | 267 | 4,041 | 9,552 | 8,200 | all |
 | slli + srli foldable to zext.h | 0 | 0 | 9,522 | 9,522 | 29,634 | all |
@@ -71,11 +73,11 @@ the row where no finding does and the arithmetic is uniform instead.
 | constant loaded for a branch against zero | 79 | 0 | 202 | 281 | 1,050 | all |
 | floating-point constant fli would have built | 0 | 0 | 120 | 120 | 480 | all |
 | release followed by a reservation | 12 | 0 | 0 | 12 | 42 | all |
-| **total** | **498,318** | **192,612** | **3,082,043** | **3,772,973** | **8,664,598** | |
+| **total** | **502,625** | **193,639** | **3,086,442** | **3,782,706** | **8,687,026** | |
 
 Do not read the total row as a result. One row is 80% of it, and that
 row is Go's assembler declining to select RVC at all, which is a
-different kind of finding from the twenty-seven around it. The second row
+different kind of finding from the twenty-eight around it. The second row
 is 6% and belongs to the linker. The `assumed` in the call-pair row is
 the one byte figure that is arithmetic rather than measurement: that
 check prints no size, and every site is eight bytes in and four out
@@ -1357,6 +1359,48 @@ except a handful of `jalr ra,0(ra)` that were already two.
   what a call may read and what a return exposes both differ between the
   C and Go conventions, and riscvlint cannot tell which it is looking at,
   so both answer "unknown" rather than guessing.
+
+* **copy its only reader could do without** -- `mv rd,rs` whose one
+  reader could name rs instead, with rd gone after that reader: the copy
+  is deleted and the reader rewritten. SpiderMonkey's Wasm GC code sets
+  up one builtin call this way, a copy of t0 stored where t0 itself could
+  have been:
+
+  ```
+   mv a1, t0
+   sd a1, 0(sp)                       -> delete; sd at 0x4 names t0
+   ld a1, 8(sp)                          (8 -> 4 bytes)
+  ```
+
+  The reader is the first instruction on the straight line after the
+  copy that reads rd, within 32 instructions, with no side entry before
+  or at it, nothing writing rd on the way (that copy is dead, which is
+  the dead-definition check's) or rs (the reader could no longer name
+  it), and no transfer; a reader that is itself a branch or transfer is
+  declined. After the reader the copy's value has to be gone: rd
+  written by the reader itself, or dead on every path from it by the
+  same liveness walk the dead-definition check runs, so that the reader
+  was the only one. And the reader has to read rd through a register
+  field of its own encoding -- `ret` reads ra and the sp-based forms
+  read sp with no field to change -- where a compressed three-bit field
+  can only name x8-x15 and a compressed read-modify-write field cannot
+  change its source alone, so in either case the reader takes its
+  four-byte form and the saving is the copy less the widening.
+
+  This is the forward direction of the move coalescing TODO.md rejected
+  for the package corpus (an operation followed by a move of its
+  result), read the other way round. The SpiderMonkey corpus (TODO.md,
+  entry 50) has 137,201 by the miner's count, 124,494 of whose readers
+  are stores, and the check has not yet been run over it. Over the
+  package corpus it reports 9,733 sites, 22,428 bytes: C++ 4,307, Go
+  4,399, Rust 1,027. The largest shape, 3,698, is a copy of sp stored
+  -- `mv a2,sp` and later `sd a2,0x68(sp)`, where `sd sp,0x68(sp)` is a
+  legal instruction -- and another 771 are vector loads and stores
+  through a copy of sp and 417 a `sub` from one. Go contributes 1,923
+  loads through a copy of its g register, `mv t1,s11; ld t1,0x180(t1)`,
+  and 729 `mv t0,a0; neg t0,t0`. libxul holds 2,653 and the Debian LLVM
+  22 build 1,353 against the Ubuntu build's 96; of Rust's, 1,024 are in
+  coreutils.
 
 * **address computed for one indexed load** -- `add rd,rb,ri` +
   `lw rt,0(rd)`, which Zilx's indexed loads do in one instruction:

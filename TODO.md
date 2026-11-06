@@ -1996,7 +1996,7 @@ corpus or V8's: `tools/sm_analyze.sh` over a run directory would.
 | 48 | releases one stack adjustment would do | 40,599 | 78,538 | 186,474 | 2,114 | 307,725 runs | 1,396,600 | **implemented**, 0 in the package corpus |
 | 49 | a release followed by a reservation | 21,630 | 154,493 | 515 | 47 | 176,685 | 1,147,716 | **implemented**, 12 in the package corpus |
 | 52 | a tail every jump to one label repeats | 7,713 | 1,786 | 346 | 143 | 9,988 labels | 787,776 | candidate |
-| 50 | a copy its only reader could do without | 1,951 | 24,340 | 110,444 | 466 | 137,201 | 548,804 | candidate |
+| 50 | a copy its only reader could do without | 1,951 | 24,340 | 110,444 | 466 | 137,201 | 548,804 | **implemented**, 9,733 in the package corpus |
 | 51 | a call through a scratch register that `jal` would reach | 0 | 0 | 44,115 | 0 | 44,115 of 203,833 | 176,460 | candidate |
 
 Together that is 4,057,356 bytes, 1.5% of the corpus's code. 48 and 49
@@ -2094,7 +2094,7 @@ other). GCC could hoist the area to the frame, which is what
 Go never move sp between calls. The SpiderMonkey dumps were not at
 hand, so the 176,685 above stays the miner's figure.
 
-## 50. A copy its only reader could do without -- 137,201  [candidate]
+## 50. A copy its only reader could do without -- 137,201  [implemented]
 
 `mv rd,rs` whose one reader could name rs instead, with rd written
 again before anything else reads it: the move goes and the reader is
@@ -2120,6 +2120,35 @@ reload of a1 from the slot it was pushed to, which is check 14's, and
 `mv a0,s4` for the instance. The Baseline ones sampled are `dup`, which
 copies the top of the stack to s1 and pushes both (`mv s1,a2; push s1;
 push a2`).
+
+The check is the probe with two things the probe could not ask. For
+rd's fate after the reader it runs the liveness walk of check 5 rather
+than reading the straight line, so a reader followed by a branch is
+decided by every path from it, and a reader that writes rd itself needs
+no walk. And for whether the reader *can* name rs it reads the reader's
+own encoding: capstone says which registers an instruction reads, not
+through which field, and the field is the question -- a compressed
+three-bit field names only x8-x15, a compressed read-modify-write field
+(`c.addi rd,K`, `c.add rd,rs2`) cannot change its source alone, and an
+implicit read (`ret` of ra, the sp-based forms of sp) has no field at
+all. The first two widen the reader to four bytes, which the finding
+prices; the third is declined. Copies into sp, gp and tp are left alone.
+
+What check_copy_for_reader reports over the package corpus: 9,733
+sites, 22,428 bytes -- C++ 4,307, Go 4,399, Rust 1,027 -- the first of
+the SpiderMonkey entries to find a compiler's code at all. 3,698 are a
+copy of sp that is then stored: `mv a2,sp` and, after the other
+arguments are set up, `sd a2,0x68(sp)`, where `sd sp,0x68(sp)` is a
+legal instruction that GCC and LLVM do not emit, apparently because sp
+is not an allocatable register to their copy propagation. 771 more are
+vector loads and stores through a copy of sp (`mv a0,sp; vse64.v
+v8,(a0)`), 417 a `sub` from one. Go's 4,399 are in every object: 1,923
+are `mv t1,s11; ld t1,0x180(t1)`, a load through a copy of the g
+register where `ld t1,0x180(s11)` would do, and 729 are `mv t0,a0; neg
+t0,t0` for `neg t0,a0`. libxul holds 2,653, the Debian LLVM 22 build
+1,353 against the Ubuntu build's 96 and LLVM 20's 113, and 1,024 of
+Rust's 1,027 are rust-coreutils. The SpiderMonkey dumps were not at
+hand, so the 137,201 above stays the miner's figure.
 
 ## 51. A call through a scratch register that `jal` would reach -- 44,115 of 203,833  [candidate]
 
@@ -2172,10 +2201,10 @@ of `mark_branch_targets`.
 
 # Remaining candidates
 
-Three, 50 to 52, all from the SpiderMonkey corpus above and none yet
-written. Forty-eight checks and the two audits of entry 53 are
+Two, 51 and 52, both from the SpiderMonkey corpus above and neither yet
+written. Forty-nine checks and the two audits of entry 53 are
 implemented, 36 to 47 being the twelve from the JetStream corpus above
-and 48 and 49 the first two from the SpiderMonkey corpus, and
+and 48 to 50 the first three from the SpiderMonkey corpus, and
 everything this file sized over the package corpus is either written or
 recorded as rejected with the evidence that rejected it. Thirteen of
 the package entries, 23 to 35, did not come from a corpus probe at all:

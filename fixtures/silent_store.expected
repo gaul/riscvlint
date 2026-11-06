@@ -19,6 +19,10 @@ store of a value the slot already holds at offset: 0x26: -> delete; 60(sp) alrea
 dead store to a frame slot at offset: 0x2a: -> delete; 64(sp) is overwritten at 0x2e (2 bytes) (1 instructions)
   sd a0, 0x40(sp)
 
+copy its only reader could do without at offset: 0x44: -> delete; sd at 0x46 names a1 (4 -> 2 bytes) (2 instructions)
+  mv a0, a1
+  sd a0, 0x60(sp)
+
 call pair foldable to jal at offset: 0x50: -> jal ra, 0x76 (2 instructions)
   auipc ra, 0
   jalr 0x26(ra)
@@ -29,7 +33,8 @@ transfer to the instruction that follows it at offset: 0x5c: -> delete; the bran
 Optimization opportunities by type:
        6  store of a value the slot already holds
        1  call pair foldable to jal
+       1  copy its only reader could do without
        1  dead store to a frame slot
        1  transfer to the instruction that follows it
 
-9 optimization opportunities in 54 instructions
+10 optimization opportunities in 54 instructions

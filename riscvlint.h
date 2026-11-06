@@ -1793,6 +1793,32 @@ bool check_const_audit(riscvlint_state *state, const cs_insn *insn,
 bool check_transfer_to_jump(riscvlint_state *state, const cs_insn *insn,
                             riscvlint_finding *finding);
 
+// `mv rd,rs` whose one reader could name rs instead: the copy goes and
+// the reader is rewritten. The reader is the first instruction on the
+// straight line after the copy that reads rd, within 32 instructions,
+// with no side entry before or at it, nothing writing rd (the copy would
+// be dead, which is check_dead_def's) or rs (the reader could no longer
+// name it), and no transfer; it may not itself be a branch or transfer.
+// After the reader the copy's value must be gone -- rd written by the
+// reader, or dead on every path from it by the liveness walk -- so that
+// the reader was the only one. The reader must read rd through a
+// register field of its own encoding, not implicitly as `ret` reads ra:
+// a three-bit compressed field needs rs in x8-x15, and a compressed
+// read-modify-write field cannot change its source alone, so in either
+// case the reader takes its four-byte form and the saving is the copy
+// less the widening. Copies into sp, gp and tp are left alone.
+//
+// This is the forward direction of the move coalescing TODO.md rejected
+// (an operation followed by a move of its result, 192 of 73,017 in the
+// package corpus), read the other way round.
+//
+// Measured population: 137,201 sites in the SpiderMonkey corpus
+// (TODO.md, entry 50) by the miner's count, 124,494 of whose readers
+// are stores, most of them the set-up of one Wasm GC builtin call. The
+// package corpus figure is in the entry.
+bool check_copy_for_reader(riscvlint_state *state, const cs_insn *insn,
+                           riscvlint_finding *finding);
+
 // ---- running every check ----
 //
 // Called once per finding, with `ctx` as given. The finding is valid

@@ -7053,6 +7053,214 @@ bool check_transfer_to_jump(riscvlint_state *state, const cs_insn *insn,
     return true;
 }
 
+// ---- a copy its only reader could do without ----
+
+// Where `w` reads integer registers through its own encoding: each
+// register field that is read, as a shift and a width -- 5 bits, or 3
+// for the compressed forms that name x8-x15 -- and whether that field is
+// also the instruction's destination, as in the compressed
+// read-modify-write forms `c.addi rd,K` and `c.add rd,rs2`, where one
+// field names both. Fills `f`, which has room for three, and returns
+// how many; 0 for an instruction that reads no integer register through
+// a field; -1 for one whose reads this does not place -- a transfer, a
+// branch, a system instruction, or a format outside the base integer,
+// floating-point and compressed sets.
+//
+// This is the one question capstone's register model cannot answer for
+// the rewrite: it says that an instruction reads a register, and the
+// rewrite has to know through which field, since a compressed field of
+// three bits can only name x8-x15 and a read-modify-write field cannot
+// have its source changed on its own.
+typedef struct {
+    unsigned shift, width;
+    bool rw;
+} rv_read_field;
+
+static int rv_gpr_read_fields(uint32_t w, unsigned size, rv_read_field *f)
+{
+    int n = 0;
+    if (size == 4) {
+        unsigned f7 = w >> 25;
+        switch (RV_OPCODE(w)) {
+        case 0x03u: case 0x07u: case 0x13u: case 0x1bu: case 0x27u:
+            // Loads, OP-IMM in both widths, floating-point stores: rs1.
+            // A shift's amount sits in the rs2 field and is not a
+            // register.
+            f[n++] = (rv_read_field){ 15, 5, false };
+            return n;
+        case 0x23u: case 0x2fu: case 0x33u: case 0x3bu:
+            // Stores, atomics, OP in both widths: rs1 and rs2.
+            f[n++] = (rv_read_field){ 15, 5, false };
+            f[n++] = (rv_read_field){ 20, 5, false };
+            return n;
+        case 0x53u:
+            // OP-FP reads an integer register only in the conversions
+            // and moves from one: fcvt.s.*, fcvt.d.*, fmv.w.x, fmv.d.x.
+            if (f7 == 0x68u || f7 == 0x69u || f7 == 0x78u || f7 == 0x79u) {
+                f[n++] = (rv_read_field){ 15, 5, false };
+                return n;
+            }
+            return 0;
+        case 0x37u: case 0x17u:                 // lui, auipc
+            return 0;
+        default:
+            return -1;
+        }
+    }
+    if (size != 2) return -1;
+    unsigned q = w & 3u, f3 = (w >> 13) & 7u;
+    if (q == 0) {
+        switch (f3) {
+        case 0:                                 // c.addi4spn reads sp
+            return 0;
+        case 1: case 2: case 3:                 // c.fld, c.lw, c.ld: rs1'
+            f[n++] = (rv_read_field){ 7, 3, false };
+            return n;
+        case 4: {                               // Zcb's byte and halfword
+            unsigned k = (w >> 10) & 7u;        // accesses
+            if (k > 3) return -1;
+            f[n++] = (rv_read_field){ 7, 3, false };
+            if (k >= 2) f[n++] = (rv_read_field){ 2, 3, false };   // c.sb, c.sh
+            return n;
+        }
+        case 5:                                 // c.fsd: rs1'
+            f[n++] = (rv_read_field){ 7, 3, false };
+            return n;
+        default:                                // c.sw, c.sd: rs1', rs2'
+            f[n++] = (rv_read_field){ 7, 3, false };
+            f[n++] = (rv_read_field){ 2, 3, false };
+            return n;
+        }
+    }
+    if (q == 1) {
+        switch (f3) {
+        case 0: case 1:                         // c.addi, c.addiw
+            f[n++] = (rv_read_field){ 7, 5, true };
+            return n;
+        case 2: case 3:                         // c.li, c.lui, c.addi16sp
+            return 0;
+        case 4:
+            // c.srli, c.srai, c.andi and the CA forms all read and write
+            // rd'; the CA forms read rs2' too, except Zcb's unary ones
+            // (c.zext.b and its kin), whose rs2' field spells the
+            // operation.
+            f[n++] = (rv_read_field){ 7, 3, true };
+            if (((w >> 10) & 3u) == 3u &&
+                !(((w >> 12) & 1u) && ((w >> 5) & 3u) == 3u))
+                f[n++] = (rv_read_field){ 2, 3, false };
+            return n;
+        default:                                // c.j, c.beqz, c.bnez
+            return -1;
+        }
+    }
+    switch (f3) {                               // q == 2
+    case 0:                                     // c.slli
+        f[n++] = (rv_read_field){ 7, 5, true };
+        return n;
+    case 1: case 2: case 3:                     // c.fldsp, c.lwsp, c.ldsp
+        return 0;                               // read sp
+    case 4: {
+        unsigned rs2 = (w >> 2) & 0x1fu;
+        if (rs2 == 0) return -1;                // c.jr, c.jalr, c.ebreak
+        if ((w >> 12) & 1u) f[n++] = (rv_read_field){ 7, 5, true };   // c.add
+        f[n++] = (rv_read_field){ 2, 5, false };                      // rs2
+        return n;
+    }
+    case 5:                                     // c.fsdsp reads sp
+        return 0;
+    default:                                    // c.swsp, c.sdsp: rs2
+        f[n++] = (rv_read_field){ 2, 5, false };
+        return n;
+    }
+}
+
+#define COPY_WALK 32        // instructions the reader may be away
+
+bool check_copy_for_reader(riscvlint_state *state, const cs_insn *insn,
+                           riscvlint_finding *finding)
+{
+    if (insn->size != 2 && insn->size != 4) return false;
+    if (!state->dec || !state->probe) return false;
+    uint32_t w;
+    if (!riscvlint_word_at(state, insn->address, &w)) return false;
+    unsigned rd, rs;
+    if (!rv_decode_mv(w, insn->size, &rd, &rs) || rd == rs) return false;
+    // sp, gp and tp are established by convention, and a copy into one
+    // of them is not a value on its way to a reader.
+    if (rd == 2 || rd == 3 || rd == 4) return false;
+    if (riscvlint_is_relocated(state, insn->address)) return false;
+
+    // The straight line from the copy to its reader: nothing may write
+    // rd before it, which would make the copy dead rather than needless;
+    // nothing may write rs, which the reader is to name instead; and
+    // nothing may arrive from elsewhere with an rd of its own.
+    uint64_t at = insn->address + insn->size;
+    uint64_t end = state->vaddr + state->size;
+    unsigned span = 1;
+    const rvl_dec *reader = NULL;
+    uint32_t rw = 0;
+    for (int budget = COPY_WALK; budget > 0 && at < end; budget--) {
+        if (riscvlint_is_branch_target(state, at)) return false;
+        const rvl_dec *d = live_decode(state, at);
+        if (!d || !d->ok) return false;
+        if (!riscvlint_word_at(state, at, &rw)) return false;
+        if (riscvlint_is_relocated(state, at)) return false;
+        span++;
+        if (live_names(d->reads, rd)) {
+            // A reader that is itself a transfer or a branch leaves the
+            // line before rd's fate can be asked, and ebreak reads
+            // everything.
+            if (rv_stops_walk(rw, d->len)) return false;
+            reader = d;
+            break;
+        }
+        if (live_names(d->writes, rd) || live_names(d->writes, rs))
+            return false;
+        if (rv_stops_walk(rw, d->len)) return false;
+        at += d->len;
+    }
+    if (!reader) return false;
+
+    // After the reader the copy's value must be gone: rd written by the
+    // reader itself, or provably dead on every path from it.
+    if (!live_names(reader->writes, rd) &&
+        riscvlint_liveness(state, at + reader->len, rd) != RISCVLINT_LIVE_DEAD)
+        return false;
+
+    // The reader must read rd through a field that can name rs. An
+    // implicit read -- `ret` of ra, the sp-based forms of sp -- has no
+    // field to change. A three-bit field needs rs in x8-x15, and a
+    // read-modify-write field cannot change its source alone; either
+    // way the reader takes its four-byte form, which costs two bytes
+    // of what the copy saves.
+    rv_read_field fields[3];
+    int nf = rv_gpr_read_fields(rw, reader->len, fields);
+    if (nf <= 0) return false;
+    unsigned hits = 0;
+    bool widen = false;
+    for (int i = 0; i < nf; i++) {
+        unsigned v = (rw >> fields[i].shift) & ((1u << fields[i].width) - 1);
+        unsigned reg = fields[i].width == 3 ? 8u + v : v;
+        if (reg != rd) continue;
+        hits++;
+        if (fields[i].rw || (fields[i].width == 3 && !rvc_reg(rs)))
+            widen = true;
+    }
+    if (hits == 0) return false;
+
+    unsigned bytes = insn->size + reader->len;
+    unsigned after = widen ? 4 : reader->len;
+    if (after >= bytes) return false;
+
+    finding->title = "copy its only reader could do without";
+    finding->address = insn->address;
+    finding->insn_count = span;
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "delete; %s at 0x%" PRIx64 " names %s (%u -> %u bytes)",
+             reader->insn.mnemonic, at, rv_reg_name(rs), bytes, after);
+    return true;
+}
+
 // ---- the immediate audits (-a imm, -a const) ----
 
 // One consumer of a materialized constant, as the two audits read it.
@@ -7461,6 +7669,7 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_mask_for_zext,
     check_transfer_to_jump,
     check_fp_int_to_fli,
+    check_copy_for_reader,
     check_imm_misfit_audit,
     check_const_audit,
 };
