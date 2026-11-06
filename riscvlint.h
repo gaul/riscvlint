@@ -1466,7 +1466,8 @@ bool check_not_logic_fold(riscvlint_state *state, const cs_insn *insn,
 // Measured population: 1,116,777 pairs in the JetStream corpus
 // (TODO.md, entry 36), every one inside j's reach; V8 spells every
 // jump to a not-yet-bound label this way. The package corpus has
-// none: compilers spell a far jump `j` or `tail`.
+// 2,031, 1,973 of them Rust's `tail` calls, which the linker left as
+// `auipc t1` + `jr` where `j` would reach.
 bool check_jump_pair_to_j(riscvlint_state *state, const cs_insn *insn,
                           riscvlint_finding *finding);
 
@@ -1530,7 +1531,7 @@ bool check_no_effect(riscvlint_state *state, const cs_insn *insn,
 // entry 40), 2,093,116 bytes: Maglev's prologue pushes each register and
 // each zeroed slot with its own Push(), and baseline loads each value
 // just before pushing it, which the run tolerates. Compilers allocate a
-// frame once.
+// frame once; the package corpus has 12, Go's rt0_go in each binary.
 bool check_push_run(riscvlint_state *state, const cs_insn *insn,
                     riscvlint_finding *finding);
 

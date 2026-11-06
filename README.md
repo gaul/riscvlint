@@ -13,14 +13,17 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Fifty-one of them, and the table lists thirty. The jump pair,
-the constant chain, the no-op, the push run, the zero store, the zero
+Fifty-one of them, and the table lists the forty-two that report
+something over the corpus. Twelve of those -- the jump pair, the
+constant chain, the no-op, the push run, the zero store, the zero
 branch, the andi pair, the max clamp, the immediate operand, the mask,
 the jump threading and the floating-point constant built through an
-integer register have so far been measured over the JetStream corpus
-of TODO.md, which the table does not cover, and the release run, the
-cancelling pair, the needless copy, the scratch-register call and the
-shared tail were sized over the SpiderMonkey corpus there. Nine report nothing
+integer register -- were written for the JetStream corpus of TODO.md
+and measured there first, and the release run, the cancelling pair, the
+needless copy, the scratch-register call and the shared tail were sized
+over the SpiderMonkey corpus there; their rows here are what they
+report over this corpus, and their entries in the ledger say what that
+is. Nine report nothing
 over this corpus -- the bit count because no baseline object declares
 Zbb; the three indexed loads, the equality branch and the
 compare-exchange loop because those five require their extension to be
@@ -60,6 +63,7 @@ the row where no finding does and the arithmetic is uniform instead.
 | conditional branch over an unconditional jump | 9,031 | 340 | 331 | 9,702 | 28,072 | all |
 | load of a just-stored value | 5,244 | 267 | 4,041 | 9,552 | 8,200 | all |
 | slli + srli foldable to zext.h | 0 | 0 | 9,522 | 9,522 | 29,634 | all |
+| transfer to an unconditional jump | 7,221 | 301 | 1,824 | 9,346 | 0 | all |
 | base add foldable into memory offset | 5,768 | 429 | 2,993 | 9,190 | 26,216 | all |
 | redundant reload | 3,631 | 231 | 4,408 | 8,270 | 10,878 | all |
 | run of zero stores one wider store would do | 5,942 | 143 | 1,292 | 7,377 | 37,928 | all |
@@ -67,20 +71,31 @@ the row where no finding does and the arithmetic is uniform instead.
 | comparison a branch could have made | 6,880 | 42 | 0 | 6,922 | 17,422 | all |
 | transfer to the instruction that follows it | 4,299 | 831 | 20 | 5,150 | 10,354 | all |
 | dead store to a frame slot | 395 | 1 | 4,172 | 4,568 | 17,160 | all |
+| branch over a move foldable to max or min | 0 | 5 | 3,459 | 3,464 | 9,964 | all |
+| constant built in more instructions than li needs | 2,836 | 17 | 60 | 2,913 | 4,090 | all |
 | slli + srai foldable to sext.b or sext.h | 0 | 0 | 2,562 | 2,562 | 6,450 | all |
 | not + and/or/xor foldable to andn/orn/xnor | 2 | 1 | 2,518 | 2,521 | 9,152 | all |
+| constant loaded for an immediate operand | 2,267 | 209 | 0 | 2,476 | 7,784 | all |
+| jump pair foldable to j | 46 | 1,973 | 12 | 2,031 | 8,124 | all |
 | tail every jump to one label repeats | 1,035 | 119 | 430 | 1,584 | 35,132 | all |
+| instruction with no architectural effect | 1,223 | 63 | 282 | 1,568 | 4,394 | all |
+| mask loaded for a zero extension | 567 | 0 | 700 | 1,267 | 3,740 | all |
 | bit-cast routed through a frame slot | 1,149 | 0 | 10 | 1,159 | 0 | all |
+| zero loaded for a store | 8 | 0 | 944 | 952 | 2,192 | all |
 | li + mul foldable to shNadd | 0 | 0 | 416 | 416 | 1,046 | all |
 | constant loaded for a branch against zero | 79 | 0 | 202 | 281 | 1,050 | all |
+| floating-point constant built through an integer register | 0 | 0 | 205 | 205 | 1,672 | all |
 | floating-point constant fli would have built | 0 | 0 | 120 | 120 | 480 | all |
 | release followed by a reservation | 12 | 0 | 0 | 12 | 42 | all |
-| **total** | **503,660** | **193,758** | **3,086,872** | **3,784,290** | **8,722,158** | |
+| pushes one stack adjustment would do | 0 | 0 | 12 | 12 | 28 | all |
+| zero loaded for an equality branch | 9 | 0 | 0 | 9 | 24 | all |
+| slli + srli foldable to andi | 0 | 1 | 0 | 1 | 4 | all |
+| **total** | **517,837** | **196,327** | **3,094,370** | **3,808,534** | **8,764,174** | |
 
-Do not read the total row as a result. One row is 80% of it, and that
+Do not read the total row as a result. One row is 79% of it, and that
 row is Go's assembler declining to select RVC at all, which is a
-different kind of finding from the twenty-nine around it. The second row
-is 6% and belongs to the linker. The `assumed` in the call-pair row is
+different kind of finding from the forty-one around it. The second row
+is 8% and belongs to the linker. The `assumed` in the call-pair row is
 the one byte figure that is arithmetic rather than measurement: that
 check prints no size, and every site is eight bytes in and four out
 except a handful of `jalr ra,0(ra)` that were already two.
@@ -135,8 +150,11 @@ except a handful of `jalr ra,0(ra)` that were already two.
   115,518 in baseline, 40,284 in regexp code and 2,433 in wrappers,
   2.88 MB of its 151.6 MB. The rest lose to the walk, which answers
   UNKNOWN rather than DEAD where an indirect jump or a call comes
-  before any write to the register. The package corpus has none:
-  compilers spell a far jump `j` or `tail`. 683,166 of the pairs sit
+  before any write to the register. The package corpus has 2,031, and
+  1,973 of them are Rust's: `tail callee` is spelled `auipc t1` + `jr`
+  and left that way by the linker where `j` would reach, the same
+  unrelaxed pairs the call pair reports; Go's 12 are the linker's
+  `-tramp0` trampolines. 683,166 of the pairs sit
   under a conditional branch that skips exactly them, which once the
   pair is a `j` is the shape the branch-over-jump entry below reads, so
   the two compose.
@@ -659,8 +677,9 @@ except a handful of `jalr ra,0(ra)` that were already two.
   The JetStream corpus (TODO.md, entry 40) has 259,684 runs, worth
   2,093,116 bytes or 1.4% of its code: 129,227 in baseline, 127,370 in
   Maglev, 3,020 in regexp code. 148,192 are two adjustments and 19,383
-  are six or more. Compilers allocate a frame once, so the package
-  corpus is not expected to have any.
+  are six or more. Compilers allocate a frame once; the package corpus
+  has 12, one per Go binary, in the runtime's `rt0_go` entry, which
+  pushes ra and then reserves the rest of its frame.
 
 * **releases one stack adjustment would do** -- the push run read
   backwards: values popped one at a time, `ld r,0(sp)` + `addi sp,sp,8`
@@ -1763,8 +1782,10 @@ except a handful of `jalr ra,0(ra)` that were already two.
   JetStream corpus (TODO.md, entry 47) has 1,467 `fli`. TurboFan passes
   the bits of its Float64 constants instead, and the check reports 312
   sites there, 2,496 bytes, every one `li` + `slli`: 1.0 x162, 0.5 x49,
-  the canonical NaN x30, 2.0 x17, then a tail. It has not been measured
-  over the package corpus.
+  the canonical NaN x30, 2.0 x17, then a tail. Over the package corpus
+  it reports 205, all in Go binaries, 1,672 bytes: Go's assembler too
+  builds a floating-point constant in an integer register and moves it
+  across.
 
 ## Selecting the target
 
