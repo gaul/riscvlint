@@ -3,8 +3,8 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Forty-seven checks and two audits (`-a imm`, `-a const`) are implemented,
-and the ledger lists four candidates, all from SpiderMonkey's JIT code.
+Forty-eight checks and two audits (`-a imm`, `-a const`) are implemented,
+and the ledger lists three candidates, all from SpiderMonkey's JIT code.
 [TODO.md](TODO.md) is that ledger:
 every candidate that was measured, the population it came back with,
 and the ones rejected on that evidence.
@@ -13,13 +13,13 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Forty-seven of them, and the table lists twenty-seven. The jump pair,
+Forty-eight of them, and the table lists twenty-eight. The jump pair,
 the constant chain, the no-op, the push run, the zero store, the zero
 branch, the andi pair, the max clamp, the immediate operand, the mask,
 the jump threading and the floating-point constant built through an
 integer register have so far been measured over the JetStream corpus
-of TODO.md, which the table does not cover, and the release run was
-sized over the SpiderMonkey corpus there. Eight report nothing
+of TODO.md, which the table does not cover, and the release run and
+the cancelling pair were sized over the SpiderMonkey corpus there. Eight report nothing
 over this corpus -- the bit count because no baseline object declares
 Zbb; the three indexed loads, the equality branch and the
 compare-exchange loop because those five require their extension to be
@@ -70,11 +70,12 @@ the row where no finding does and the arithmetic is uniform instead.
 | li + mul foldable to shNadd | 0 | 0 | 416 | 416 | 1,046 | all |
 | constant loaded for a branch against zero | 79 | 0 | 202 | 281 | 1,050 | all |
 | floating-point constant fli would have built | 0 | 0 | 120 | 120 | 480 | all |
-| **total** | **498,306** | **192,612** | **3,082,043** | **3,772,961** | **8,664,556** | |
+| release followed by a reservation | 12 | 0 | 0 | 12 | 42 | all |
+| **total** | **498,318** | **192,612** | **3,082,043** | **3,772,973** | **8,664,598** | |
 
 Do not read the total row as a result. One row is 80% of it, and that
 row is Go's assembler declining to select RVC at all, which is a
-different kind of finding from the twenty-six around it. The second row
+different kind of finding from the twenty-seven around it. The second row
 is 6% and belongs to the linker. The `assumed` in the call-pair row is
 the one byte figure that is arithmetic rather than measurement: that
 check prints no size, and every site is eight bytes in and four out
@@ -659,6 +660,38 @@ except a handful of `jalr ra,0(ra)` that were already two.
   `addi`, freed in two steps -- `addi sp,sp,0x7f0` then `addi
   sp,sp,0x680` in libmozsqlite3 -- which the check declines because the
   total is what one `addi` cannot add.
+
+* **release followed by a reservation** -- `addi sp,sp,+a` directly
+  followed by `addi sp,sp,-b`, which is one `addi sp,sp,a-b`, or
+  nothing at all when the two cancel: nothing between them could see
+  sp's intermediate value. SpiderMonkey's Baseline tier pops one value
+  and pushes the next this way:
+
+  ```
+   ld a2, 0(sp)
+   addi sp, sp, 8                     -> delete both; the adjustments
+   addi sp, sp, -8                       cancel (8 bytes)
+   sd s1, 0(sp)
+  ```
+
+  The reservation must not be a side entry, which would arrive with sp
+  unreleased. The pair is the seam between the two runs above -- the
+  push run begins only at a reservation and the release run ends at
+  one, so neither takes the pair -- and each run may hold one of its
+  halves. No adjustment is counted twice: a release that ends a run the
+  release-run check reported is left to it, and a reservation that
+  begins a run the push-run check would report is left to that, which
+  the check asks of the push run itself before it reports.
+
+  The SpiderMonkey corpus (TODO.md, entry 49) has 176,685 pairs by the
+  miner's count, 110,244 of them cancelling, 1,147,716 bytes, and the
+  check has not yet been run over it. Over the package corpus it
+  reports 12 pairs, 42 bytes, six in each of the two LLVM 20 and 22
+  builds and none anywhere else: GCC freeing the stack-argument area of
+  one call and reserving the next call's directly after, `addi
+  sp,sp,16` + `addi sp,sp,-16` after a `jal`, nine of them cancelling.
+  Compilers otherwise place sp once per frame, and the JIT shape --
+  an interpreter's push and pop spelled out -- does not occur.
 
 * **comparison a branch could have made** -- `slt`/`sltu`/`xor`/`sub`
   writing a condition into a register, then `beqz`/`bnez` testing it,

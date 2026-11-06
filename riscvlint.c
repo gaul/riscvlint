@@ -1307,8 +1307,12 @@ struct riscvlint_state {
     uint64_t push_end;
 
     // And for check_release_run: the address after the last release of
-    // the run it has already judged.
+    // the run it has already judged, and the address of the last
+    // release of the run it most recently reported, which
+    // check_release_reserve leaves to it -- that addi is counted once,
+    // by the run. UINT64_MAX is none, since a section may begin at 0.
     uint64_t release_end;
+    uint64_t release_last;
 
     // The address of an `add` that a deeper Zilx fold has already
     // claimed -- check_scaled_indexed_load's triple or
@@ -1502,6 +1506,7 @@ bool riscvlint_state_set_section(riscvlint_state *state, csh handle,
     state->zrun_end = 0;
     state->push_end = 0;
     state->release_end = 0;
+    state->release_last = UINT64_MAX;
     state->zilx_folded = UINT64_MAX;
     memset(state->guarantees, 0, sizeof state->guarantees);
     memset(&state->win, 0, sizeof state->win);
@@ -6157,6 +6162,7 @@ bool check_release_run(riscvlint_state *state, const cs_insn *insn,
     unsigned nadj = 1, bytes = insn->size, seen = 1, span = 1;
     int64_t total = k;
     uint64_t at = insn->address + insn->size, end = at;
+    uint64_t last = insn->address;      // the last release so far
     for (int budget = PUSH_WALK; budget > 0; budget--) {
         // A side entry would arrive expecting sp where the run had it.
         if (riscvlint_is_branch_target(state, at)) break;
@@ -6177,6 +6183,7 @@ bool check_release_run(riscvlint_state *state, const cs_insn *insn,
             bytes += pending + len;
             pending = 0;
             committed = nacc;
+            last = at;
             at += len;
             end = at;
             span = seen;
@@ -6221,12 +6228,79 @@ bool check_release_run(riscvlint_state *state, const cs_insn *insn,
     }
     if (after >= bytes) return false;
 
+    state->release_last = last;
     finding->title = "releases one stack adjustment would do";
     finding->address = insn->address;
     finding->insn_count = span;
     snprintf(finding->replacement, sizeof finding->replacement,
              "one addi sp, sp, %" PRId64 " for %u adjustments (%u -> %u "
              "bytes)", total, nadj, bytes, after);
+    return true;
+}
+
+// ---- a release followed by a reservation ----
+
+// `addi sp,sp,+a` directly followed by `addi sp,sp,-b` is one
+// `addi sp,sp,a-b`, or nothing at all when a == b: nothing between the
+// two could see sp's intermediate value. The reservation must not be a
+// side entry, which would arrive with sp unreleased.
+//
+// The pair is the seam between the two runs. The push run begins only
+// at a reservation and the release run ends at one, so neither takes
+// the pair, but each may hold one of its halves, and no addi may be
+// counted twice. A release that ends a run check_release_run reported
+// is left to it, since that run was reported first; a reservation that
+// begins a run check_push_run would report is left to that, asked of
+// the check itself over a probe that carries only the address and size
+// it reads, with its watermark put back for the real call one
+// instruction on.
+bool check_release_reserve(riscvlint_state *state, const cs_insn *insn,
+                           riscvlint_finding *finding)
+{
+    if (insn->size != 2 && insn->size != 4) return false;
+    uint32_t w;
+    if (!riscvlint_word_at(state, insn->address, &w)) return false;
+    int64_t a;
+    if (!rv_decode_sp_adjust(w, insn->size, &a) || a <= 0) return false;
+    uint64_t second = insn->address + insn->size;
+    uint32_t w2;
+    if (!riscvlint_word_at(state, second, &w2)) return false;
+    unsigned len2 = rv_insn_len(w2);
+    int64_t b;
+    if (!rv_decode_sp_adjust(w2, len2, &b) || b >= 0) return false;
+    if (riscvlint_is_branch_target(state, second)) return false;
+    if (riscvlint_is_relocated(state, insn->address) ||
+        riscvlint_is_relocated(state, second))
+        return false;
+    if (insn->address == state->release_last) return false;
+
+    cs_insn probe;
+    memset(&probe, 0, sizeof probe);
+    probe.address = second;
+    probe.size = (uint16_t)len2;
+    riscvlint_finding scratch;
+    uint64_t mark = state->push_end;
+    bool run = check_push_run(state, &probe, &scratch);
+    state->push_end = mark;
+    if (run) return false;
+
+    int64_t net = a + b;
+    unsigned bytes = insn->size + len2;
+    unsigned after = net == 0
+                         ? 0
+                         : sp_adjust_bytes(net, insn->size == 2 && len2 == 2);
+    if (after >= bytes) return false;
+
+    finding->title = "release followed by a reservation";
+    finding->address = insn->address;
+    finding->insn_count = 2;
+    if (net == 0)
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "delete both; the adjustments cancel (%u bytes)", bytes);
+    else
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "one addi sp, sp, %" PRId64 " (%u -> %u bytes)", net, bytes,
+                 after);
     return true;
 }
 
@@ -7378,6 +7452,7 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_no_effect,
     check_push_run,
     check_release_run,
+    check_release_reserve,
     check_zero_for_store,
     check_zero_eq_branch,
     check_slli_srli_to_andi,

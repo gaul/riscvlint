@@ -1560,6 +1560,26 @@ bool check_push_run(riscvlint_state *state, const cs_insn *insn,
 bool check_release_run(riscvlint_state *state, const cs_insn *insn,
                        riscvlint_finding *finding);
 
+// `addi sp,sp,+a` directly followed by `addi sp,sp,-b`: one
+// `addi sp,sp,a-b`, or nothing at all when a == b, since nothing between
+// the two could see sp's intermediate value. The reservation must not be
+// a side entry, which would arrive with sp unreleased, and neither half
+// may be relocated. Priced at the pair's own encoding class.
+//
+// The pair is the seam between the push run and the release run: the
+// first begins only at a reservation and the second ends at one, so
+// neither takes the pair, but each may hold one of its halves. No addi
+// is counted twice: a release that ends a run check_release_run
+// reported is left to it, and a reservation that begins a run
+// check_push_run would report is left to that.
+//
+// Measured population: the SpiderMonkey corpus (TODO.md, entry 49) has
+// 176,685 pairs by the miner's count, 110,244 of them cancelling --
+// Baseline popping one value and pushing the next -- 1,147,716 bytes.
+// The package corpus figure is in the entry.
+bool check_release_reserve(riscvlint_state *state, const cs_insn *insn,
+                           riscvlint_finding *finding);
+
 // A register loaded with zero only to be stored: `li rt,0` and then
 // integer stores of rt, each of which could store x0 instead, and the
 // `li` go. The stores are every one of rt that follows before anything

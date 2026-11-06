@@ -6688,6 +6688,112 @@ static void test_release_run(csh handle)
     CHECK(run_words(handle, check_release_run, pushes, 5, 0x1000, NULL) == 0);
 }
 
+// Two checks over one buffer in one state, in registry order, for the
+// pairs that divide a site between them. Returns what each reported.
+static void run_pair(csh handle, riscvlint_check_fn first,
+                     riscvlint_check_fn second, const uint8_t *code,
+                     size_t len, uint64_t vaddr, int *n1, int *n2,
+                     riscvlint_finding *out2)
+{
+    static uint8_t buf[256];
+    memcpy(buf, code, len);
+    *n1 = *n2 = 0;
+    riscvlint_state *state = riscvlint_state_create();
+    if (!state) return;
+    if (riscvlint_state_set_section(state, handle, buf, len, vaddr)) {
+        cs_insn *insn = cs_malloc(handle);
+        const uint8_t *p = buf;
+        size_t remain = len;
+        uint64_t addr = vaddr;
+        while (insn && remain >= 2 &&
+               cs_disasm_iter(handle, &p, &remain, &addr, insn)) {
+            riscvlint_finding f;
+            memset(&f, 0, sizeof f);
+            if (first(state, insn, &f)) (*n1)++;
+            memset(&f, 0, sizeof f);
+            if (second(state, insn, &f)) {
+                if (out2 && !*n2) *out2 = f;
+                (*n2)++;
+            }
+            riscvlint_state_observe(state, insn);
+        }
+        if (insn) cs_free(insn, 1);
+    }
+    riscvlint_state_destroy(state);
+}
+
+// check_release_reserve: `addi sp,sp,+a` directly followed by
+// `addi sp,sp,-b`.
+static void test_release_reserve(csh handle)
+{
+    riscvlint_finding f;
+    int n1, n2;
+    const uint32_t pop8 = 0x00810113u;           // addi sp,sp,8
+    const uint32_t pop16 = 0x01010113u;          // addi sp,sp,16
+    const uint32_t push8 = 0xff810113u;          // addi sp,sp,-8
+    const uint32_t ld_a0 = 0x00013503u;          // ld a0,0(sp)
+    const uint32_t sd_a0 = 0x00a13023u;          // sd a0,0(sp)
+    const uint32_t sd_a1 = 0x00b13023u;          // sd a1,0(sp)
+    const uint32_t ret = 0x00008067u;
+
+    // Baseline popping one value and pushing the next: the two
+    // adjustments cancel.
+    uint32_t cancel[] = { 0x00013603u /* ld a2,0(sp) */, pop8, push8,
+                          0x00913023u /* sd s1,0(sp) */, ret };
+    CHECK(run_words(handle, check_release_reserve, cancel, 5, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "delete both; the adjustments cancel (8 bytes)")
+          == 0);
+    CHECK(f.insn_count == 2 && f.address == 0x1004);
+    CHECK(strcmp(f.title, "release followed by a reservation") == 0);
+
+    // Unequal: one addi by the difference.
+    uint32_t net[] = { pop16, push8, ret };
+    CHECK(run_words(handle, check_release_reserve, net, 3, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "one addi sp, sp, 8 (8 -> 4 bytes)") == 0);
+
+    // Compressed: c.addi sp,8 + c.addi sp,-8 cancel in four bytes;
+    // c.addi16sp 32 + c.addi sp,-8 is c.addi sp,24.
+    uint8_t rvc[] = { 0x21, 0x01, 0x61, 0x11, 0x82, 0x80 };
+    CHECK(run_window(handle, check_release_reserve, rvc, sizeof rvc, 0x1000,
+                     &f) == 1);
+    CHECK(strcmp(f.replacement, "delete both; the adjustments cancel (4 bytes)")
+          == 0);
+    uint8_t rvcnet[] = { 0x05, 0x61, 0x61, 0x11, 0x82, 0x80 };
+    CHECK(run_window(handle, check_release_reserve, rvcnet, sizeof rvcnet,
+                     0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "one addi sp, sp, 24 (4 -> 2 bytes)") == 0);
+
+    // Not reported: the reservation is a side entry; an instruction
+    // between the two; two releases or two reservations.
+    uint32_t entry[] = { pop8, push8, ret, 0xff9ff06fu /* j -8 */ };
+    CHECK(run_words(handle, check_release_reserve, entry, 4, 0x1000, NULL) == 0);
+    uint32_t apart[] = { pop8, ld_a0, push8, ret };
+    CHECK(run_words(handle, check_release_reserve, apart, 4, 0x1000, NULL) == 0);
+    uint32_t same[] = { pop8, pop8, push8, push8, ret };
+    CHECK(run_words(handle, check_release_reserve, same, 5, 0x1000, NULL) == 0);
+
+    // The seam with the runs. A reservation that begins a push run is
+    // that run's: the pair stands down and the run reports. A release
+    // that ends a release run is that run's, the same way.
+    uint32_t pushes[] = { pop8, push8, sd_a0, push8, sd_a1, ret };
+    uint8_t bytes[sizeof pushes];
+    memcpy(bytes, pushes, sizeof pushes);
+    run_pair(handle, check_push_run, check_release_reserve, bytes,
+             sizeof bytes, 0x1000, &n1, &n2, NULL);
+    CHECK(n1 == 1 && n2 == 0);
+    uint32_t pops[] = { pop8, ld_a0, pop8, push8, ret };
+    memcpy(bytes, pops, sizeof pops);
+    run_pair(handle, check_release_run, check_release_reserve, bytes,
+             sizeof pops, 0x1000, &n1, &n2, NULL);
+    CHECK(n1 == 1 && n2 == 0);
+    // Without the run -- one release only -- the pair is reported.
+    uint32_t lone[] = { ld_a0, pop8, push8, ret };
+    memcpy(bytes, lone, sizeof lone);
+    run_pair(handle, check_release_run, check_release_reserve, bytes,
+             sizeof lone, 0x1000, &n1, &n2, &f);
+    CHECK(n1 == 0 && n2 == 1 && f.address == 0x1004);
+}
+
 int main(void)
 {
     csh handle;
@@ -6758,6 +6864,7 @@ int main(void)
     test_not_logic_fold(handle);
     test_imm_audits(handle);
     test_release_run(handle);
+    test_release_reserve(handle);
     test_census(handle);
     test_fusion(handle);
 

@@ -1994,7 +1994,7 @@ corpus or V8's: `tools/sm_analyze.sh` over a run directory would.
 | # | candidate | Ion | BL | WA | RE+TR | sites | bytes | check |
 |---|---|---:|---:|---:|---:|---:|---:|---|
 | 48 | releases one stack adjustment would do | 40,599 | 78,538 | 186,474 | 2,114 | 307,725 runs | 1,396,600 | **implemented**, 0 in the package corpus |
-| 49 | a release followed by a reservation | 21,630 | 154,493 | 515 | 47 | 176,685 | 1,147,716 | candidate |
+| 49 | a release followed by a reservation | 21,630 | 154,493 | 515 | 47 | 176,685 | 1,147,716 | **implemented**, 12 in the package corpus |
 | 52 | a tail every jump to one label repeats | 7,713 | 1,786 | 346 | 143 | 9,988 labels | 787,776 | candidate |
 | 50 | a copy its only reader could do without | 1,951 | 24,340 | 110,444 | 466 | 137,201 | 548,804 | candidate |
 | 51 | a call through a scratch register that `jal` would reach | 0 | 0 | 44,115 | 0 | 44,115 of 203,833 | 176,460 | candidate |
@@ -2055,7 +2055,7 @@ SpiderMonkey dumps were not at hand for this run, so the 307,725 above
 stays the miner's figure until `tools/sm_analyze.sh` is run over a dump
 directory with this check in the binary.
 
-## 49. A release followed by a reservation -- 176,685  [candidate]
+## 49. A release followed by a reservation -- 176,685  [implemented]
 
 `addi sp,sp,+a` immediately followed by `addi sp,sp,-b` is one `addi
 sp,sp,a-b`, or nothing at all when a == b, which is 110,244 of them
@@ -2072,7 +2072,27 @@ run 48 reports; the table's total says what that costs.
 One check could take 40, 48 and 49 together, as runs of adjustments of
 either sign, provided the adjustment that remains goes where no access
 in the run falls below sp. Written as three, the three must not count
-the same `addi` twice.
+the same `addi` twice, and check_release_reserve is the one that stands
+down: a release that is the last of a run 48 reported is left to 48,
+which the state records as it reports, and a reservation that would
+begin a run 40 reports is left to 40, which the pair asks of
+check_push_run itself over a probe before reporting. The run saves
+more than the pair's half would, and is what the miner's table above
+already discounted. Priced at the pair's encoding class: a cancelling
+pair is its own bytes, an unequal one is the pair less one addi.
+
+What check_release_reserve reports over the package corpus: 12 pairs,
+42 bytes, six in each of the two LLVM 22 and 20 builds and none in the
+other 29 objects. Every one is GCC's outgoing-argument area: a call
+with stack-passed arguments is followed by `addi sp,sp,16` freeing
+them, and the next such call reserves its own area directly after,
+`addi sp,sp,-16` nine times and a larger area three times
+(`ModuloScheduleExpander::generatePhis` at 0x4c8220c in LLVM 20 is the
+cancelling shape, `addi sp,sp,16; addi sp,sp,-48` at 0x6719f9c the
+other). GCC could hoist the area to the frame, which is what
+`-maccumulate-outgoing-args` does on the targets that have it. Rust and
+Go never move sp between calls. The SpiderMonkey dumps were not at
+hand, so the 176,685 above stays the miner's figure.
 
 ## 50. A copy its only reader could do without -- 137,201  [candidate]
 
@@ -2152,10 +2172,10 @@ of `mark_branch_targets`.
 
 # Remaining candidates
 
-Four, 49 to 52, all from the SpiderMonkey corpus above and none yet
-written. Forty-seven checks and the two audits of entry 53 are
+Three, 50 to 52, all from the SpiderMonkey corpus above and none yet
+written. Forty-eight checks and the two audits of entry 53 are
 implemented, 36 to 47 being the twelve from the JetStream corpus above
-and 48 the first from the SpiderMonkey corpus, and
+and 48 and 49 the first two from the SpiderMonkey corpus, and
 everything this file sized over the package corpus is either written or
 recorded as rejected with the evidence that rejected it. Thirteen of
 the package entries, 23 to 35, did not come from a corpus probe at all:
