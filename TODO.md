@@ -2130,8 +2130,8 @@ of `mark_branch_targets`.
 # Remaining candidates
 
 Five, 48 to 52, all from the SpiderMonkey corpus above and none yet
-written. Forty-six checks are implemented, 36 to 47 being the twelve from
-the JetStream corpus above, and
+written. Forty-six checks and the two audits of entry 53 are implemented,
+36 to 47 being the twelve from the JetStream corpus above, and
 everything this file sized over the package corpus is either written or
 recorded as rejected with the evidence that rejected it. Thirteen of
 the package entries, 23 to 35, did not come from a corpus probe at all:
@@ -4169,6 +4169,79 @@ check_zcb_compressible's finding: `c.not` is two bytes where the wide
 form is four. Both stand, as the shNadd and base-C overlap does -- Zcb
 shrinks the instruction and Zbb removes it, and the second subsumes the
 first.
+
+## 53. The immediate audits, `-a imm` and `-a const` -- unmeasured  [implemented]
+
+Not a check: a report about the code that proposes no rewrite, which is
+armlint's `-a` class, and the two of its three audits that have a
+RISC-V shape. `-a imm` reports a materialized constant whose consumer
+has an immediate form the value misses -- `lui a5,1; add a0,a1,a5`,
+4096 being one past `addi`'s reach -- and `-a const` its twin, the
+constant the consumer's form would have held, with no liveness proof.
+Both are tallied by value in the summary. README.md's "Audits" section
+has the consumer classes, the operand rules and the tables.
+
+### Why it was written without a population
+
+Every other entry here was sized before it was written. This one was
+asked for three times by entries that already existed, each recording
+a figure the tool could not produce itself:
+
+| entry | what it recorded | what it could not say |
+|---|---|---|
+| 30 | 238,018 `li`+`beq`/`bne` with a constant outside Zibi's imm5 | which values: one bit short of the field, or tags and hashes nothing reaches |
+| 44 | the fold proves 1,738 of the miner's 20,743 Maglev shapes | the population behind the liveness proof, as riscvlint's own figure |
+| 46 | 1,142 masks of 1,608 adjacent `lui`+`addiw`+`and` triples | the same |
+
+Each is a question the `-a const` or `-a imm` table answers, and each
+was answered from a miner or a one-off probe rather than by the tool.
+The audits are the generalisation of those probes, under the folds' own
+operand rules, so that the next such question is a flag rather than a
+throwaway.
+
+### What is different from armlint's
+
+* No bitmask immediates. The logical class is a range test, the hint is
+  the range, and armlint's bit-flip hints have no counterpart. A mask of
+  the low n bits counts as fitting, since `zext.h`, `zext.w` or the
+  shift pair takes it -- the mask check's own forms.
+* No shifted add immediate, so "within one step" is a magnitude bound:
+  4096 for a 12-bit field or offset, 63 for Zibi's imm5. The only
+  encodable neighbour of a misfit is the field's edge.
+* The branch class exists only under `-m zibi`. RV64I has no
+  compare-immediate-and-branch, so without the extension there is no
+  form to miss; with it the table measures whether imm5 was sized
+  right, which is a question about the extension rather than the code.
+* The load/store class has no register-offset addressing mode to
+  audit; its shape is a base computed from the constant -- `lui`+`add`,
+  or `addi` -- and then the access, tallied as the byte offset the
+  access would carry, under check_base_add_to_offset's operand rules.
+* The shifts are left out of the arithmetic class: a shift amount is
+  read modulo the width and never misses.
+
+### Not written: the compressed rung
+
+RISC-V has a second encoding step AArch64 does not. Past the 12-bit
+field a constant costs an instruction; past the compressed forms'
+fields it costs two bytes per site. A `ld` at offset 256 through an
+x8-x15 register is two bytes dearer than one at 248, which is `c.ld`'s
+reach, and `addi rd,rd,32` two bytes dearer than 31, `c.addi`'s. The
+compression check reports what compresses; a third audit would report
+what one renumbering step away would, which is a worklist AArch64
+cannot have. It is not written here because it is a different audit --
+its review item is a struct layout or a loop step, not an immediate --
+and because it is meaningless for Go, whose assembler compresses
+nothing, so it needs gating on the object compressing at all. Recorded
+so it is not rediscovered.
+
+### Population
+
+Not measured at the time of writing. The audits need no liveness
+proof, so their counts are bounded below by the folds' and above by
+the shape counts the entries above recorded: at least 177,581 and at
+most 461,300 for `-a const`'s branch class under `-m zibi`, and
+238,018 for `-a imm`'s. Run `riscvlint -a imm -a const` over the
+corpus, with and without `-m zibi`, and record the tables here.
 
 # Ranked for C++ and Rust specifically
 

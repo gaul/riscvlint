@@ -6304,6 +6304,282 @@ static void test_fusion(csh handle)
     CHECK(riscvlint_fusion_count(NULL, x100, NULL, "fused") == 0);
 }
 
+// ---- the immediate audits ----
+
+// Runs one check over `bytes` at 0x1000 with the extension set and the
+// audits given, as run_zibi does, for a check named by the caller: the
+// audits and the folds they shadow are compared on the same buffers.
+static bool run_audit(csh handle, riscvlint_check_fn fn, const uint8_t *bytes,
+                      size_t len, unsigned exts, unsigned audits,
+                      riscvlint_finding *out)
+{
+    static uint8_t buf[256];
+    memcpy(buf, bytes, len);
+    riscvlint_state *state = riscvlint_state_create();
+    if (!state) return false;
+    bool fired = false;
+    riscvlint_state_set_extensions(state, exts);
+    riscvlint_state_set_audits(state, audits);
+    if (riscvlint_state_set_section(state, handle, buf, len, 0x1000)) {
+        cs_insn *insn = cs_malloc(handle);
+        const uint8_t *p = buf;
+        size_t remain = len;
+        uint64_t addr = 0x1000;
+        if (insn && cs_disasm_iter(handle, &p, &remain, &addr, insn)) {
+            riscvlint_finding f;
+            memset(&f, 0, sizeof f);
+            fired = fn(state, insn, &f);
+            if (fired && out) *out = f;
+        }
+        if (insn) cs_free(insn, 1);
+    }
+    riscvlint_state_destroy(state);
+    return fired;
+}
+
+static void test_imm_audits(csh handle)
+{
+    riscvlint_finding f;
+    const unsigned IMM = RISCVLINT_AUDIT_IMM, CONST = RISCVLINT_AUDIT_CONST;
+    const unsigned BOTH = IMM | CONST;
+    const unsigned Z = RISCVLINT_EXT_ZIBI;
+    unsigned a;
+
+    CHECK(riscvlint_parse_audit_name("imm", &a) && a == IMM);
+    CHECK(riscvlint_parse_audit_name("const", &a) && a == CONST);
+    CHECK(!riscvlint_parse_audit_name("pac", &a));
+    CHECK(strcmp(riscvlint_audit_kind_name(RISCVLINT_AUDIT_MEM),
+                 "ld/st offset") == 0);
+    CHECK(riscvlint_audit_reachable(RISCVLINT_AUDIT_ARITH, 4096));
+    CHECK(!riscvlint_audit_reachable(RISCVLINT_AUDIT_ARITH, 4097));
+    CHECK(riscvlint_audit_reachable(RISCVLINT_AUDIT_BRANCH, -63));
+    CHECK(!riscvlint_audit_reachable(RISCVLINT_AUDIT_BRANCH, 64));
+    CHECK(!riscvlint_audit_reachable(RISCVLINT_AUDIT_LOGIC, 65536));
+
+    // Encodings from llvm-mc -triple=riscv64 -mattr=+c -show-encoding.
+
+    // lui a5,1 then add a0,a1,a5: 4096 is one past addi's reach, a misfit
+    // of the add/sub form within one step. Not a constant that fits, and
+    // nothing at all without the flag.
+    static const uint8_t add4096[] = {
+        0x85, 0x67,                 // c.lui a5,1 (2)
+        0x33, 0x85, 0xf5, 0x00,     // add a0,a1,a5 (4)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_audit(handle, check_imm_misfit_audit, add4096, sizeof add4096,
+                    0, BOTH, &f));
+    CHECK(strcmp(f.title, "constant with no add/sub/slt immediate form "
+                          "(imm audit)") == 0);
+    CHECK(f.audit_kind == RISCVLINT_AUDIT_ARITH && f.audit_width == 'x');
+    CHECK(!f.audit_fit && f.audit_value == 4096);
+    CHECK(f.insn_count == 2 && f.address == 0x1000);
+    CHECK(strncmp(f.replacement, "4096; addi/slti", 15) == 0);
+    CHECK(!run_audit(handle, check_const_audit, add4096, sizeof add4096, 0,
+                     BOTH, NULL));
+    CHECK(!run_audit(handle, check_imm_misfit_audit, add4096, sizeof add4096,
+                     0, CONST, NULL));
+    CHECK(!run_audit(handle, check_imm_misfit_audit, add4096, sizeof add4096,
+                     0, 0, NULL));
+
+    // li a5,5 then add a0,a1,a5 then ret: addi a0,a1,5 was available. The
+    // fold cannot prove a5 dead at the ret; the audit asks for no proof.
+    static const uint8_t add5[] = {
+        0x95, 0x47,                 // c.li a5,5 (2)
+        0x33, 0x85, 0xf5, 0x00,     // add a0,a1,a5 (4)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_audit(handle, check_const_for_imm, add5, sizeof add5, 0, BOTH,
+                     NULL));
+    CHECK(run_audit(handle, check_const_audit, add5, sizeof add5, 0, BOTH,
+                    &f));
+    CHECK(strcmp(f.title, "constant an add/sub/slt immediate would hold "
+                          "(const audit)") == 0);
+    CHECK(strcmp(f.replacement, "addi a0, a1, 5") == 0);
+    CHECK(f.audit_kind == RISCVLINT_AUDIT_ARITH && f.audit_fit &&
+          f.audit_value == 5);
+    CHECK(f.insn_count == 2);
+    CHECK(!run_audit(handle, check_imm_misfit_audit, add5, sizeof add5, 0,
+                     BOTH, NULL));
+
+    // A subtrahend is addi of its negation; a minuend has no form at all,
+    // which is not a misfit either.
+    static const uint8_t sub5[] = {
+        0x95, 0x47,                 // c.li a5,5 (2)
+        0x33, 0x85, 0xf5, 0x40,     // sub a0,a1,a5 (4)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_audit(handle, check_const_audit, sub5, sizeof sub5, 0, BOTH,
+                    &f));
+    CHECK(strcmp(f.replacement, "addi a0, a1, -5") == 0);
+    static const uint8_t subk[] = {
+        0x95, 0x47,                 // c.li a5,5 (2)
+        0x33, 0x85, 0xb7, 0x40,     // sub a0,a5,a1 (4)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_audit(handle, check_const_audit, subk, sizeof subk, 0, BOTH,
+                     NULL));
+    CHECK(!run_audit(handle, check_imm_misfit_audit, subk, sizeof subk, 0,
+                     BOTH, NULL));
+    // Both operands the constant: nothing to judge.
+    static const uint8_t dbl[] = {
+        0x95, 0x47,                 // c.li a5,5 (2)
+        0x33, 0x85, 0xf7, 0x00,     // add a0,a5,a5 (4)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_audit(handle, check_const_audit, dbl, sizeof dbl, 0, BOTH,
+                     NULL));
+    CHECK(!run_audit(handle, check_imm_misfit_audit, dbl, sizeof dbl, 0, BOTH,
+                     NULL));
+
+    // Zero under add is a copy and fits; zero under and is an identity
+    // and is skipped.
+    static const uint8_t add0[] = {
+        0x81, 0x47,                 // c.li a5,0 (2)
+        0x33, 0x85, 0xf5, 0x00,     // add a0,a1,a5 (4)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_audit(handle, check_const_audit, add0, sizeof add0, 0, BOTH,
+                    &f));
+    CHECK(f.audit_value == 0 && strcmp(f.replacement, "addi a0, a1, 0") == 0);
+    static const uint8_t and0[] = {
+        0x81, 0x47,                 // c.li a5,0 (2)
+        0x33, 0xf5, 0xf5, 0x00,     // and a0,a1,a5 (4)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_audit(handle, check_const_audit, and0, sizeof and0, 0, BOTH,
+                     NULL));
+    CHECK(!run_audit(handle, check_imm_misfit_audit, and0, sizeof and0, 0,
+                     BOTH, NULL));
+
+    // A mask of the low sixteen bits, built in two instructions, counts as
+    // fitting: zext.h takes it under Zbb and the shift pair without.
+    static const uint8_t mask16[] = {
+        0xc1, 0x67,                 // c.lui a5,16 (2)
+        0xfd, 0x37,                 // c.addiw a5,a5,-1 (2)
+        0x33, 0xf5, 0xf5, 0x00,     // and a0,a1,a5 (4)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_audit(handle, check_const_audit, mask16, sizeof mask16, 0, BOTH,
+                    &f));
+    CHECK(strcmp(f.title, "constant an and/or/xor immediate would hold "
+                          "(const audit)") == 0);
+    CHECK(f.audit_kind == RISCVLINT_AUDIT_LOGIC && f.audit_fit &&
+          f.audit_value == 0xffff);
+    CHECK(f.insn_count == 3);
+    CHECK(strcmp(f.replacement, "zext.h a0, a1") == 0);
+    CHECK(run_audit(handle, check_const_audit, mask16, sizeof mask16,
+                    RISCVLINT_EXT_DECLARED | RISCVLINT_EXT_C, BOTH, &f));
+    CHECK(strcmp(f.replacement, "slli a0, a1, 48; srli a0, a0, 48") == 0);
+    CHECK(!run_audit(handle, check_imm_misfit_audit, mask16, sizeof mask16,
+                     0, BOTH, NULL));
+
+    // A single bit above andi's reach has no form: a misfit beyond one
+    // step, with the hex spelling in the hint.
+    static const uint8_t bit16[] = {
+        0xc1, 0x67,                 // c.lui a5,16 (2)
+        0x33, 0xf5, 0xf5, 0x00,     // and a0,a1,a5 (4)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_audit(handle, check_imm_misfit_audit, bit16, sizeof bit16, 0,
+                    BOTH, &f));
+    CHECK(strcmp(f.title, "constant with no and/or/xor immediate form "
+                          "(imm audit)") == 0);
+    CHECK(f.audit_kind == RISCVLINT_AUDIT_LOGIC && !f.audit_fit &&
+          f.audit_value == 65536);
+    CHECK(strncmp(f.replacement, "65536; 0x10000; ", 16) == 0);
+    CHECK(!run_audit(handle, check_const_audit, bit16, sizeof bit16, 0, BOTH,
+                     NULL));
+
+    // The branch class exists only under Zibi. 17 fits imm5 and 40 is one
+    // step past it; the fold is silent on both buffers, which end in rets.
+    static const uint8_t beq17[] = {
+        0xc5, 0x47,                 // c.li a5,17 (2)
+        0x63, 0x04, 0xf7, 0x00,     // beq a4,a5,.L (4)
+        0x85, 0x47,                 // c.li a5,1 (2)
+        0x82, 0x80,                 // ret (2)
+        0x89, 0x47,                 // .L: c.li a5,2 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_audit(handle, check_const_audit, beq17, sizeof beq17, 0, BOTH,
+                     NULL));
+    CHECK(run_audit(handle, check_const_audit, beq17, sizeof beq17, Z, BOTH,
+                    &f));
+    CHECK(strcmp(f.title, "constant beqi/bnei would hold (const audit)") == 0);
+    CHECK(strcmp(f.replacement, "beqi a4, 17, 0x100a") == 0);
+    CHECK(f.audit_kind == RISCVLINT_AUDIT_BRANCH && f.audit_fit &&
+          f.audit_value == 17);
+    static const uint8_t beq40[] = {
+        0x93, 0x07, 0x80, 0x02,     // li a5,40 (4)
+        0x63, 0x04, 0xf7, 0x00,     // beq a4,a5,.L (4)
+        0x85, 0x47,                 // c.li a5,1 (2)
+        0x82, 0x80,                 // ret (2)
+        0x89, 0x47,                 // .L: c.li a5,2 (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_audit(handle, check_imm_misfit_audit, beq40, sizeof beq40, 0,
+                     BOTH, NULL));
+    CHECK(run_audit(handle, check_imm_misfit_audit, beq40, sizeof beq40, Z,
+                    BOTH, &f));
+    CHECK(strcmp(f.title, "constant outside beqi/bnei's immediate "
+                          "(imm audit)") == 0);
+    CHECK(f.audit_kind == RISCVLINT_AUDIT_BRANCH && !f.audit_fit &&
+          f.audit_value == 40);
+    CHECK(!run_audit(handle, check_const_audit, beq40, sizeof beq40, Z, BOTH,
+                     NULL));
+
+    // An access through a computed base, both spellings. addi then ld with
+    // a sum that fits is the fold's shape, reported here without its
+    // proof; a sum past 2047 is a misfit; lui + add + ld is always one.
+    static const uint8_t ld24[] = {
+        0x93, 0x07, 0x05, 0x01,     // addi a5,a0,16 (4)
+        0x8c, 0x67,                 // c.ld a1,8(a5) (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_audit(handle, check_base_add_to_offset, ld24, sizeof ld24, 0,
+                     BOTH, NULL));
+    CHECK(run_audit(handle, check_const_audit, ld24, sizeof ld24, 0, BOTH,
+                    &f));
+    CHECK(strcmp(f.title, "offset an immediate-offset access would hold "
+                          "(const audit)") == 0);
+    CHECK(strcmp(f.replacement, "ld a1, 24(a0)") == 0);
+    CHECK(f.audit_kind == RISCVLINT_AUDIT_MEM && f.audit_width == 'd');
+    CHECK(f.audit_fit && f.audit_value == 24 && f.insn_count == 2);
+    static const uint8_t ld2056[] = {
+        0x93, 0x07, 0x85, 0x7f,     // addi a5,a0,2040 (4)
+        0x8c, 0x6b,                 // c.ld a1,16(a5) (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_audit(handle, check_imm_misfit_audit, ld2056, sizeof ld2056, 0,
+                    BOTH, &f));
+    CHECK(strcmp(f.title, "offset with no immediate-offset form "
+                          "(imm audit)") == 0);
+    CHECK(!f.audit_fit && f.audit_value == 2056 && f.audit_width == 'd');
+    CHECK(riscvlint_audit_reachable(RISCVLINT_AUDIT_MEM, 2056));
+    static const uint8_t farld[] = {
+        0x85, 0x67,                 // c.lui a5,1 (2)
+        0xaa, 0x97,                 // c.add a5,a0 (2)
+        0x8c, 0x63,                 // c.ld a1,0(a5) (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(run_audit(handle, check_imm_misfit_audit, farld, sizeof farld, 0,
+                    BOTH, &f));
+    CHECK(f.audit_kind == RISCVLINT_AUDIT_MEM && !f.audit_fit &&
+          f.audit_value == 4096);
+    CHECK(f.insn_count == 3);
+    CHECK(!run_audit(handle, check_const_audit, farld, sizeof farld, 0, BOTH,
+                     NULL));
+    // A store of the base through itself reads it for the value too.
+    static const uint8_t sdself[] = {
+        0x93, 0x07, 0x05, 0x01,     // addi a5,a0,16 (4)
+        0x9c, 0xe3,                 // c.sd a5,0(a5) (2)
+        0x82, 0x80,                 // ret (2)
+    };
+    CHECK(!run_audit(handle, check_const_audit, sdself, sizeof sdself, 0,
+                     BOTH, NULL));
+    CHECK(!run_audit(handle, check_imm_misfit_audit, sdself, sizeof sdself, 0,
+                     BOTH, NULL));
+}
+
 int main(void)
 {
     csh handle;
@@ -6372,6 +6648,7 @@ int main(void)
     test_cas_loop_to_amocas(handle);
     test_decode_not();
     test_not_logic_fold(handle);
+    test_imm_audits(handle);
     test_census(handle);
     test_fusion(handle);
 

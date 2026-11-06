@@ -1268,6 +1268,7 @@ struct riscvlint_state {
     uint8_t *targets;   // one bit per 2-byte unit
     uint8_t *relocs;    // one bit per 2-byte unit
     unsigned exts;      // extensions declared by Tag_RISCV_arch
+    unsigned audits;    // the -a audits opted into, RISCVLINT_AUDIT_*
     csh handle;         // for the liveness walk, which must disassemble
                         // ahead of the caller's own cursor
     cs_insn *probe;
@@ -1567,6 +1568,16 @@ void riscvlint_state_set_extensions(riscvlint_state *state, unsigned exts)
     state->exts = exts;
 }
 
+void riscvlint_state_set_audits(riscvlint_state *state, unsigned audits)
+{
+    state->audits = audits;
+}
+
+unsigned riscvlint_state_audits(const riscvlint_state *state)
+{
+    return state->audits;
+}
+
 void riscvlint_state_set_image(riscvlint_state *state, riscvlint_read_fn read,
                                void *ctx)
 {
@@ -1711,6 +1722,19 @@ bool riscvlint_parse_ext_name(const char *name, unsigned *exts)
             *exts = table[i].exts;
             return true;
         }
+    }
+    return false;
+}
+
+bool riscvlint_parse_audit_name(const char *name, unsigned *audits)
+{
+    if (strcmp(name, "imm") == 0) {
+        *audits = RISCVLINT_AUDIT_IMM;
+        return true;
+    }
+    if (strcmp(name, "const") == 0) {
+        *audits = RISCVLINT_AUDIT_CONST;
+        return true;
     }
     return false;
 }
@@ -6842,6 +6866,358 @@ bool check_transfer_to_jump(riscvlint_state *state, const cs_insn *insn,
     return true;
 }
 
+// ---- the immediate audits (-a imm, -a const) ----
+
+// One consumer of a materialized constant, as the two audits read it.
+typedef struct {
+    unsigned kind;          // RISCVLINT_AUDIT_*
+    char width;
+    bool fit;
+    int64_t value;          // the constant as the consumer reads it
+    unsigned span;          // instructions, materialization through consumer
+    char form[80];          // the immediate form, when it fits
+} audit_site;
+
+static const char *const audit_kind_names[] = {
+    "", "add/sub imm12", "logic imm12", "branch imm5", "ld/st offset",
+};
+
+const char *riscvlint_audit_kind_name(unsigned kind)
+{
+    return kind < sizeof audit_kind_names / sizeof audit_kind_names[0]
+               ? audit_kind_names[kind] : "?";
+}
+
+static bool audit_fits12(int64_t v) { return v >= -2048 && v <= 2047; }
+
+static char audit_mem_width(rv_mem_kind k)
+{
+    switch (k) {
+    case RV_MEM_LB: case RV_MEM_LBU: case RV_MEM_SB: return 'b';
+    case RV_MEM_LH: case RV_MEM_LHU: case RV_MEM_SH: return 'h';
+    case RV_MEM_LW: case RV_MEM_LWU: case RV_MEM_SW:
+    case RV_MEM_FLW: case RV_MEM_FSW: return 'w';
+    default: return 'd';
+    }
+}
+
+bool riscvlint_audit_reachable(unsigned kind, int64_t value)
+{
+    switch (kind) {
+    case RISCVLINT_AUDIT_BRANCH: return value >= -63 && value <= 63;
+    default:                     return value >= -4096 && value <= 4096;
+    }
+}
+
+void riscvlint_audit_hint(unsigned kind, bool fit, int64_t value, char *buf,
+                          size_t cap)
+{
+    const char *s;
+    if (!fit) {
+        switch (kind) {
+        case RISCVLINT_AUDIT_ARITH:
+            s = "addi/slti immediates cover -2048..2047; sub -2047..2048";
+            break;
+        case RISCVLINT_AUDIT_LOGIC:
+            // The hex is the readable spelling of a mask.
+            snprintf(buf, cap, "0x%" PRIx64 "; andi/ori/xori cover "
+                     "-2048..2047; low-bit masks zext", (uint64_t)value);
+            return;
+        case RISCVLINT_AUDIT_BRANCH:
+            s = "beqi/bnei immediates cover 1..31 and -1";
+            break;
+        default:
+            s = "immediate offsets cover -2048..2047";
+            break;
+        }
+    } else {
+        switch (kind) {
+        case RISCVLINT_AUDIT_ARITH:
+            s = value == 0 ? "zero: mv, or x0 as the operand"
+                           : "addi/addiw/slti immediate";
+            break;
+        case RISCVLINT_AUDIT_LOGIC:
+            s = audit_fits12(value)
+                    ? "andi/ori/xori immediate"
+                    : "mask of the low bits: zext.h, zext.w or a shift pair";
+            break;
+        case RISCVLINT_AUDIT_BRANCH:
+            s = "beqi/bnei imm5";
+            break;
+        default:
+            s = "immediate offset";
+            break;
+        }
+    }
+    snprintf(buf, cap, "%s", s);
+}
+
+// The register-register consumers the audits judge -- add, addw, sub,
+// subw, and, or, xor, slt, sltu -- in the four-byte and compressed
+// spellings: imm_form's decode half without its fit tests, since the
+// audit wants to know about the constants imm_form refuses.
+static bool audit_rr(uint32_t w, unsigned size, bool *word, bool *sub,
+                     unsigned *f3, unsigned *rd, unsigned *rs1, unsigned *rs2)
+{
+    unsigned opc, f7;
+    if (size == 4) {
+        opc = RV_OPCODE(w);
+        if (opc != 0x33u && opc != 0x3bu) return false;
+        *f3 = (w >> 12) & 0x7u;
+        f7 = w >> 25;
+        *rd = (w >> 7) & 0x1fu;
+        *rs1 = (w >> 15) & 0x1fu;
+        *rs2 = (w >> 20) & 0x1fu;
+    } else if (size == 2 && (w & 0xf003u) == 0x9002u) {            // c.add
+        opc = 0x33u; *f3 = 0; f7 = 0;
+        *rd = *rs1 = (w >> 7) & 0x1fu;
+        *rs2 = (w >> 2) & 0x1fu;
+        if (*rd == 0 || *rs2 == 0) return false;        // c.jalr, c.ebreak
+    } else if (size == 2 && ((w & 0xfc03u) == 0x8c01u ||
+                             (w & 0xfc03u) == 0x9c01u)) {
+        // CA: c.sub, c.xor, c.or, c.and; then c.subw and c.addw.
+        static const uint8_t ca_f3[4] = { 0, 4, 6, 7 };
+        unsigned f2 = (w >> 5) & 0x3u;
+        bool wd = (w & 0x1000u) != 0;
+        if (wd && f2 > 1) return false;
+        opc = wd ? 0x3bu : 0x33u;
+        *f3 = wd ? 0u : ca_f3[f2];
+        f7 = f2 == 0 ? 0x20u : 0u;
+        *rd = *rs1 = 8u + ((w >> 7) & 0x7u);
+        *rs2 = 8u + ((w >> 2) & 0x7u);
+    } else {
+        return false;
+    }
+    if (f7 != 0 && f7 != 0x20u) return false;           // M, Zb
+    *word = opc == 0x3bu;
+    *sub = f7 == 0x20u;
+    if (*word && *f3 != 0) return false;                // the W shifts
+    if (*sub && *f3 != 0) return false;                 // sra
+    return true;
+}
+
+// The access a computed base feeds: `w2` at `at` must be a load or store
+// whose base is `rt`, which holds `rs + k`. Fills the MEM site from the
+// byte offset the access would carry against rs.
+static bool audit_mem_site(const riscvlint_state *state, uint64_t at,
+                           uint32_t w2, unsigned rt, unsigned rs, int64_t k,
+                           unsigned span, audit_site *s)
+{
+    unsigned len2 = rv_insn_len(w2);
+    rv_mem_kind kind;
+    unsigned data, base;
+    int64_t off;
+    if (!rv_decode_mem(w2, len2, &kind, &data, &base, &off)) return false;
+    if (base != rt) return false;
+    // A store whose data register is the computed base reads it for the
+    // value too, so there is no form of the access without the add.
+    if (rv_mem_is_store(kind) && !rv_mem_is_fp(kind) && data == rt)
+        return false;
+    // In an unlinked object the offset is a %lo placeholder.
+    if (riscvlint_is_relocated(state, at)) return false;
+    s->kind = RISCVLINT_AUDIT_MEM;
+    s->width = audit_mem_width(kind);
+    s->value = k + off;
+    s->fit = audit_fits12(s->value);
+    s->span = span + 1;
+    if (s->fit)
+        snprintf(s->form, sizeof s->form, "%s %s, %" PRId64 "(%s)",
+                 rv_mem_name(kind),
+                 rv_mem_is_fp(kind) ? rv_freg_name(data) : rv_reg_name(data),
+                 s->value, rv_reg_name(rs));
+    return true;
+}
+
+// Read the instruction under the cursor as a materialized constant, or
+// a base computation, and what follows as its consumer, under the
+// operand rules of the fold that owns each shape. False where the
+// instruction is neither, or the consumer is not one the audits judge.
+static bool audit_classify(riscvlint_state *state, const cs_insn *insn,
+                           audit_site *s)
+{
+    if (insn->size != 2 && insn->size != 4) return false;
+    uint32_t w;
+    if (!riscvlint_word_at(state, insn->address, &w)) return false;
+    if (riscvlint_is_relocated(state, insn->address)) return false;
+    memset(s, 0, sizeof *s);
+
+    // `addi rt,rs,K` and then an access through rt:
+    // check_base_add_to_offset's shape, the offset being K plus the
+    // access's own. x0 as the source makes this `li`, a constant for the
+    // chain below rather than a base; sp, gp and tp are never a computed
+    // base, as the fold has it.
+    unsigned rt, rs;
+    int64_t k;
+    if (rv_decode_base_add(w, insn->size, &rt, &rs, &k) && rs != 0) {
+        if (rt == 0 || rt == 2 || rt == 3 || rt == 4) return false;
+        uint64_t at = insn->address + insn->size;
+        uint32_t w2;
+        if (!riscvlint_word_at(state, at, &w2)) return false;
+        return audit_mem_site(state, at, w2, rt, rs, k, 1, s);
+    }
+
+    // A constant, with the whole chain building it, as check_mask_for_zext
+    // follows one: the value is what the last step leaves.
+    unsigned rc, r;
+    if (li_chain_step(w, insn->size, 0, &rc, &k) != LI_START) return false;
+    if (rc == 2 || rc == 3 || rc == 4) return false;
+    unsigned len = 1;
+    uint64_t at = insn->address + insn->size;
+    for (;;) {
+        uint32_t w2;
+        if (!riscvlint_word_at(state, at, &w2)) return false;
+        unsigned size2 = rv_insn_len(w2);
+        int64_t next;
+        if (li_chain_step(w2, size2, k, &r, &next) != LI_STEP || r != rc) break;
+        if (riscvlint_is_branch_target(state, at)) break;
+        if (riscvlint_is_relocated(state, at)) return false;
+        k = next;
+        len++;
+        at += size2;
+    }
+    uint32_t w2;
+    if (!riscvlint_word_at(state, at, &w2)) return false;
+    unsigned size2 = rv_insn_len(w2);
+
+    bool word, sub;
+    unsigned f3, rd, rs1, rs2;
+    if (audit_rr(w2, size2, &word, &sub, &f3, &rd, &rs1, &rs2)) {
+        // Exactly one operand is the constant, and the other is a value:
+        // `add rd,rc,rc` doubles the constant and `add rd,x0,rc` copies it.
+        if (rd == 0 || (rs1 == rc) == (rs2 == rc)) return false;
+        bool second = rs2 == rc;
+        unsigned rx = second ? rs1 : rs2;
+        if (rx == 0) return false;
+        // An `add` whose sum is the next instruction's base is an
+        // address, and its constant an offset.
+        if (f3 == 0 && !word && !sub && rd != 2 && rd != 3 && rd != 4) {
+            uint32_t w3;
+            if (riscvlint_word_at(state, at + size2, &w3) &&
+                audit_mem_site(state, at + size2, w3, rd, rx, k, len + 1, s))
+                return true;
+        }
+        if (f3 == 1 || f3 == 5) return false;           // a shift never misses
+        // `k - rx` and `k < rx` have no immediate spelling at all, which is
+        // not a misfit: there is no field to miss.
+        if ((sub || f3 == 2 || f3 == 3) && !second) return false;
+        if (f3 == 0 || f3 == 2 || f3 == 3) {
+            s->kind = RISCVLINT_AUDIT_ARITH;
+            s->fit = sub ? k >= -2047 && k <= 2048 : audit_fits12(k);
+        } else {
+            if (k == 0 || k == -1) return false;        // identities
+            s->kind = RISCVLINT_AUDIT_LOGIC;
+            uint64_t m = (uint64_t)k;
+            s->fit = audit_fits12(k) || (f3 == 7 && (m & (m + 1)) == 0);
+        }
+        s->width = word ? 'w' : 'x';
+        s->value = k;
+        s->span = len + 1;
+        if (s->fit) {
+            // imm_form applies the same operand rules and so agrees; it
+            // is asked for the rendering, which is the fold's own.
+            imm_use u;
+            if (!imm_form(state, w2, size2, rc, k, &u)) return false;
+            if (u.kind == IMM_MASK_PAIR)
+                snprintf(s->form, sizeof s->form,
+                         "slli %s, %s, %" PRId64 "; srli %s, %s, %" PRId64,
+                         rv_reg_name(u.rd), rv_reg_name(u.rx), u.imm,
+                         rv_reg_name(u.rd), rv_reg_name(u.rd), u.imm);
+            else if (u.kind == IMM_ZEXT_H || u.kind == IMM_ZEXT_W)
+                snprintf(s->form, sizeof s->form, "%s %s, %s",
+                         imm_names[u.kind], rv_reg_name(u.rd),
+                         rv_reg_name(u.rx));
+            else
+                snprintf(s->form, sizeof s->form, "%s %s, %s, %" PRId64,
+                         imm_names[u.kind], rv_reg_name(u.rd),
+                         rv_reg_name(u.rx), u.imm);
+        }
+        return true;
+    }
+
+    // beq/bne against the constant, where Zibi gives the branch an
+    // immediate to miss. Positively present, as check_const_eq_branch
+    // wants it: without the extension there is no form to judge against.
+    unsigned brs1, brs2, bf3;
+    int64_t off;
+    if (rv_decode_cond_branch(w2, size2, &brs1, &brs2, &bf3, &off)) {
+        if (!(riscvlint_state_extensions(state) & RISCVLINT_EXT_ZIBI))
+            return false;
+        if (bf3 != 0u && bf3 != 1u) return false;
+        if ((brs1 == rc) == (brs2 == rc)) return false;
+        unsigned rx = brs1 == rc ? brs2 : brs1;
+        if (rx == 0 || k == 0) return false;            // beqz owns zero
+        // In an unlinked object the displacement is a placeholder, and
+        // the form would name a target that is fiction.
+        if (riscvlint_is_relocated(state, at)) return false;
+        s->kind = RISCVLINT_AUDIT_BRANCH;
+        s->width = 'x';
+        s->value = k;
+        s->fit = zibi_immediate(k);
+        s->span = len + 1;
+        if (s->fit)
+            snprintf(s->form, sizeof s->form,
+                     "%s %s, %" PRId64 ", 0x%" PRIx64,
+                     bf3 == 0u ? "beqi" : "bnei", rv_reg_name(rx), k,
+                     at + (uint64_t)off);
+        return true;
+    }
+    return false;
+}
+
+static const char *const audit_misfit_titles[] = {
+    NULL,
+    "constant with no add/sub/slt immediate form (imm audit)",
+    "constant with no and/or/xor immediate form (imm audit)",
+    "constant outside beqi/bnei's immediate (imm audit)",
+    "offset with no immediate-offset form (imm audit)",
+};
+
+static const char *const audit_const_titles[] = {
+    NULL,
+    "constant an add/sub/slt immediate would hold (const audit)",
+    "constant an and/or/xor immediate would hold (const audit)",
+    "constant beqi/bnei would hold (const audit)",
+    "offset an immediate-offset access would hold (const audit)",
+};
+
+static void audit_fill(riscvlint_finding *finding, const cs_insn *insn,
+                       const audit_site *s)
+{
+    finding->address = insn->address;
+    finding->insn_count = s->span;
+    finding->audit_kind = s->kind;
+    finding->audit_width = s->width;
+    finding->audit_fit = s->fit;
+    finding->audit_value = s->value;
+}
+
+bool check_imm_misfit_audit(riscvlint_state *state, const cs_insn *insn,
+                            riscvlint_finding *finding)
+{
+    if (!(riscvlint_state_audits(state) & RISCVLINT_AUDIT_IMM)) return false;
+    audit_site s;
+    if (!audit_classify(state, insn, &s) || s.fit) return false;
+    audit_fill(finding, insn, &s);
+    finding->title = audit_misfit_titles[s.kind];
+    char hint[80];
+    riscvlint_audit_hint(s.kind, false, s.value, hint, sizeof hint);
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "%" PRId64 "; %s", s.value, hint);
+    return true;
+}
+
+bool check_const_audit(riscvlint_state *state, const cs_insn *insn,
+                       riscvlint_finding *finding)
+{
+    if (!(riscvlint_state_audits(state) & RISCVLINT_AUDIT_CONST)) return false;
+    audit_site s;
+    if (!audit_classify(state, insn, &s) || !s.fit) return false;
+    audit_fill(finding, insn, &s);
+    finding->title = audit_const_titles[s.kind];
+    snprintf(finding->replacement, sizeof finding->replacement, "%s", s.form);
+    return true;
+}
+
 // ---- running every check ----
 
 static const riscvlint_check_fn riscvlint_checks[] = {
@@ -6891,6 +7267,8 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_mask_for_zext,
     check_transfer_to_jump,
     check_fp_int_to_fli,
+    check_imm_misfit_audit,
+    check_const_audit,
 };
 
 size_t riscvlint_scan(riscvlint_state *state, csh handle,
@@ -6936,6 +7314,7 @@ size_t riscvlint_scan(riscvlint_state *state, csh handle,
             f.address = 0;
             f.insn_count = 0;
             f.replacement[0] = '\0';
+            f.audit_kind = 0;
             if (riscvlint_checks[i](state, insn, &f)) {
                 found++;
                 if (on_finding) on_finding(ctx, &f);

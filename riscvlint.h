@@ -326,6 +326,63 @@ bool riscvlint_may_use(const riscvlint_state *state, unsigned ext);
 // build it is also the largest thing -m has to say.
 bool riscvlint_parse_ext_name(const char *name, unsigned *exts);
 
+// ---- audits (-a) ----
+//
+// A different kind of flag from -m. `-m` asserts what the target can
+// run, so that a rewrite may use it; `-a` opts into a report about the
+// code that proposes no rewrite. Every audit finding is a review item:
+// nothing at the site can be respelled, and the finding names what to
+// look at instead -- a constant, an offset. armlint's `-a` class, with
+// the two of its audits that have a RISC-V shape; its PAC audit has
+// none, there being no pointer authentication here.
+//
+// Audit findings count toward the total and the exit status like any
+// other, so a test suite that gates on a clean run should not pass -a;
+// the tables are for reading.
+typedef enum {
+    RISCVLINT_AUDIT_IMM   = 1u << 0,    // -a imm: check_imm_misfit_audit
+    RISCVLINT_AUDIT_CONST = 1u << 1,    // -a const: check_const_audit
+} riscvlint_audit;
+
+// One -a argument: `imm` or `const`. False for anything else.
+bool riscvlint_parse_audit_name(const char *name, unsigned *audits);
+
+void riscvlint_state_set_audits(riscvlint_state *state, unsigned audits);
+unsigned riscvlint_state_audits(const riscvlint_state *state);
+
+// The immediate form an audit finding judged its constant against,
+// carried on the finding so the driver's summary can tally the audits
+// by value. The constant is tallied as the consumer reads it: a load or
+// store's as the byte offset the access would carry.
+typedef enum {
+    RISCVLINT_AUDIT_KIND_NONE = 0,  // not an audit finding
+    RISCVLINT_AUDIT_ARITH,          // add, addw, sub, subw, slt, sltu: the
+                                    // 12-bit immediate of addi, addiw,
+                                    // slti, sltiu (sub: addi of -K)
+    RISCVLINT_AUDIT_LOGIC,          // and, or, xor: andi, ori, xori, or a
+                                    // zero extension for a low-bit mask
+    RISCVLINT_AUDIT_BRANCH,         // beq, bne: Zibi's beqi/bnei imm5
+    RISCVLINT_AUDIT_MEM,            // a load or store through a computed
+                                    // base: the 12-bit offset field
+} riscvlint_audit_kind;
+
+// The by-value tables' label for a kind.
+const char *riscvlint_audit_kind_name(unsigned kind);
+
+// Whether an encodable neighbour lies within one step of a constant
+// that missed, so that renumbering it is a plausible fix rather than a
+// redesign: twice the field's reach, where armlint draws the same line.
+// A 12-bit immediate or offset reaches 2047, so a magnitude up to 4096;
+// Zibi's imm5 reaches 31, so a magnitude up to 63. Everything else
+// -- a tag, a hash, INT64_MIN as an enum niche -- misses by its whole
+// magnitude, and no renumbering short of a redesign reaches a form.
+bool riscvlint_audit_reachable(unsigned kind, int64_t value);
+
+// The hint column of the by-value tables: for a misfit, what would have
+// encoded; for a constant that fit, which form takes it.
+void riscvlint_audit_hint(unsigned kind, bool fit, int64_t value, char *buf,
+                          size_t cap);
+
 // True when something branches to `addr`, making it a side entry.
 bool riscvlint_is_branch_target(const riscvlint_state *state, uint64_t addr);
 
@@ -449,6 +506,16 @@ typedef struct {
     uint64_t address;       // address of the first instruction covered
     unsigned insn_count;    // how many instructions the finding spans
     char replacement[96];   // the suggested rewrite
+    // Set only by the two constant audits and zero for every other
+    // finding: the form the constant was judged against
+    // (riscvlint_audit_kind), the consumer's width as a letter -- `x`
+    // or `w` for an operation, the access size `b`, `h`, `w` or `d` for
+    // a load or store -- whether the constant fit, and the constant as
+    // the consumer read it.
+    unsigned audit_kind;
+    char audit_width;
+    bool audit_fit;
+    int64_t audit_value;
 } riscvlint_finding;
 
 typedef bool (*riscvlint_check_fn)(riscvlint_state *state,
@@ -1585,6 +1652,66 @@ bool check_const_for_imm(riscvlint_state *state, const cs_insn *insn,
 // masks are followed by a transfer the liveness walk cannot see past.
 bool check_mask_for_zext(riscvlint_state *state, const cs_insn *insn,
                          riscvlint_finding *finding);
+
+// Immediate-misfit audit (opt-in, RISCVLINT_AUDIT_IMM / -a imm): a
+// constant materialized -- by `li`, `lui`, or the chain check_long_li
+// follows -- for a consumer that has an immediate form the value
+// misses. Four consumer classes, each against its own field: `add`,
+// `addw`, `sub`, `subw`, `slt` and `sltu` against the 12-bit immediate
+// of `addi`, `addiw`, `slti` and `sltiu` (a subtrahend as `addi` of its
+// negation, so -2047..2048); `and`, `or` and `xor` against `andi`, `ori`
+// and `xori`, where a mask of the low n bits counts as fitting since
+// `zext.h`, `zext.w` or the shift pair takes it; `beq` and `bne` against
+// Zibi's `beqi`/`bnei` imm5, only where Zibi is positively present,
+// since without it the branch has no immediate form to miss; and a load
+// or store through a base computed from the constant -- `lui`+`add` and
+// then the access, or `addi` and then the access -- against the
+// access's own 12-bit offset, the constant tallied as the byte offset
+// `K + off` the access would carry.
+//
+// The operand rules are the sibling folds' own (check_const_for_imm,
+// check_const_eq_branch, check_base_add_to_offset): the constant in an
+// immediate-capable slot, the other operand neither x0 nor the
+// constant's register, strict adjacency. The shifts are left out, since
+// a shift amount is read modulo the width and never misses. Zero and
+// all-ones under a logical operation are identities, not immediates,
+// and are skipped.
+//
+// Nothing at the site can be rewritten -- `lui`+`addiw` is already the
+// cheapest spelling of 4095 -- so the finding is informational and the
+// review item is the constant: a value the code's author chose that
+// lands one step past the field costs an instruction and a register at
+// every use, and choosing it one step differently turns every site into
+// the immediate form. No liveness proof is made: a constant hoisted
+// into a live register amortizes its materialization, but each use
+// still pays for the register operand. The driver's summary tallies the
+// findings by value, the constants within one step of a form first.
+// Reported as "... (imm audit)", one title per consumer class.
+bool check_imm_misfit_audit(riscvlint_state *state, const cs_insn *insn,
+                            riscvlint_finding *finding);
+
+// Constant audit (opt-in, RISCVLINT_AUDIT_CONST / -a const): the
+// immediate-misfit audit's twin for the constants that fit. The same
+// four consumers under the same operand rules, for a value the
+// consumer's immediate form would have held: `li a5,5; add a0,a1,a5`
+// where `addi a0,a1,5` was available. The folds report this shape as a
+// two-for-one once the liveness walk proves the constant's register
+// dead, since their rewrite deletes the materialization; the audit
+// reports every site with no proof, since the immediate form is a valid
+// rewrite with the materialization kept, and renders that form.
+//
+// Why no proof: in compiler output the deletion proof fails for reasons
+// unrelated to the site -- the walk stops at a call, or the allocator
+// keeps the register for a second use -- and a JIT whose register
+// allocator materializes every constant input produces the shape at
+// every compare, with a deoptimization exit the walk cannot see past.
+// TODO.md's entry 44 records that gap at 1,738 of 20,743 in V8's code.
+// The fold's count is what a peephole could delete; the audit's is the
+// population an instruction-selection change reaches. A site the fold
+// proves is reported under both names. Reported as "... (const
+// audit)", one title per consumer class.
+bool check_const_audit(riscvlint_state *state, const cs_insn *insn,
+                       riscvlint_finding *finding);
 
 // A transfer whose target is an unconditional jump: a conditional
 // branch, `j` or `jal` whose target is a `j`, a `c.j` or V8's far jump

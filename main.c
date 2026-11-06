@@ -194,6 +194,11 @@ static bool census_mode;
 // hardware"). Neither is expressible if the flag merely unions.
 static unsigned forced_exts;
 static bool have_forced;
+// -a: opt into an audit, a report about the code that proposes no
+// rewrite. Additional rather than a replacement, like -c: audit findings
+// join the summary and count toward the exit status, and the by-value
+// tables below the summary are theirs.
+static unsigned audits;
 // -c: also report the constants the code materializes, tallied by value
 // and ranked by what they cost. An additional report rather than a
 // replacement, as armlint's is: it answers a question about the binary
@@ -355,6 +360,161 @@ static void tally_add(const char *title)
     tally[ntitles].title = title;
     tally[ntitles].count = 1;
     ntitles++;
+}
+
+// ---- the audits' by-value tally ----
+//
+// An -a imm or -a const finding carries the constant it judged, and a
+// by-type count of them says nothing a reader can act on: the worklist
+// is the constants, most frequent first. Keyed by (kind, width, fit,
+// value); a hash, like the by-function table, since libxul holds
+// thousands of distinct values.
+typedef struct {
+    unsigned kind;
+    char width;
+    bool fit;
+    bool used;
+    int64_t value;
+    uint64_t count;
+} audit_entry;
+
+static audit_entry *audit_tally;
+static size_t audit_cap, audit_used;
+static uint64_t audit_dropped;
+
+static uint64_t audit_hash(unsigned kind, char width, bool fit, int64_t value)
+{
+    uint64_t h = (uint64_t)value * 0x9e3779b97f4a7c15ull;
+    h ^= ((uint64_t)kind << 16) | ((uint64_t)(unsigned char)width << 8) |
+         (fit ? 1u : 0u);
+    h *= 0x100000001b3ull;
+    return h ^ (h >> 29);
+}
+
+static bool audit_tally_grow(void)
+{
+    size_t cap = audit_cap ? audit_cap * 2 : 1024;
+    audit_entry *grown = calloc(cap, sizeof *grown);
+    if (!grown) return false;
+    for (size_t i = 0; i < audit_cap; i++) {
+        const audit_entry *e = &audit_tally[i];
+        if (!e->used) continue;
+        size_t j = audit_hash(e->kind, e->width, e->fit, e->value) & (cap - 1);
+        while (grown[j].used) j = (j + 1) & (cap - 1);
+        grown[j] = *e;
+    }
+    free(audit_tally);
+    audit_tally = grown;
+    audit_cap = cap;
+    return true;
+}
+
+static void audit_tally_add(const riscvlint_finding *f)
+{
+    if (audit_used * 10 >= audit_cap * 7 && !audit_tally_grow()) {
+        // Counted rather than fatal: the scan's own findings are intact,
+        // and the table says how many it could not place.
+        audit_dropped++;
+        return;
+    }
+    size_t i = audit_hash(f->audit_kind, f->audit_width, f->audit_fit,
+                          f->audit_value) & (audit_cap - 1);
+    while (audit_tally[i].used) {
+        audit_entry *e = &audit_tally[i];
+        if (e->kind == f->audit_kind && e->width == f->audit_width &&
+            e->fit == f->audit_fit && e->value == f->audit_value) {
+            e->count++;
+            return;
+        }
+        i = (i + 1) & (audit_cap - 1);
+    }
+    audit_tally[i].kind = f->audit_kind;
+    audit_tally[i].width = f->audit_width;
+    audit_tally[i].fit = f->audit_fit;
+    audit_tally[i].value = f->audit_value;
+    audit_tally[i].count = 1;
+    audit_tally[i].used = true;
+    audit_used++;
+}
+
+// Most frequent first, ties by value, so the two renderings of one
+// constant sit together.
+static int cmp_audit(const void *a, const void *b)
+{
+    const audit_entry *ea = a, *eb = b;
+    if (ea->count != eb->count) return eb->count > ea->count ? 1 : -1;
+    if (ea->value != eb->value) return ea->value < eb->value ? -1 : 1;
+    if (ea->kind != eb->kind) return ea->kind < eb->kind ? -1 : 1;
+    return (int)ea->width - (int)eb->width;
+}
+
+// The three tables: the misfits within one step of an immediate form,
+// the misfits beyond it, and the constants that fit.
+typedef enum { AUDIT_NEAR, AUDIT_FAR, AUDIT_FIT } audit_part;
+
+static bool audit_in_part(const audit_entry *e, audit_part part)
+{
+    if (e->fit) return part == AUDIT_FIT;
+    bool near = riscvlint_audit_reachable(e->kind, e->value);
+    return part == (near ? AUDIT_NEAR : AUDIT_FAR);
+}
+
+#define AUDIT_TOP 40
+
+static void audit_table_print(const char *title, const audit_entry *rows,
+                              size_t n, audit_part part)
+{
+    size_t total = 0;
+    for (size_t i = 0; i < n; i++)
+        if (audit_in_part(&rows[i], part)) total++;
+    if (!total) return;
+    printf("%s:\n", title);
+    size_t shown = 0;
+    for (size_t i = 0; i < n && shown < AUDIT_TOP; i++) {
+        if (!audit_in_part(&rows[i], part)) continue;
+        char hint[112];
+        riscvlint_audit_hint(rows[i].kind, rows[i].fit, rows[i].value, hint,
+                             sizeof hint);
+        printf("%8" PRIu64 "  %-14s %c  %-12" PRId64 " %s\n", rows[i].count,
+               riscvlint_audit_kind_name(rows[i].kind), rows[i].width,
+               rows[i].value, hint);
+        shown++;
+    }
+    if (total > shown)
+        printf("          (%zu more distinct values)\n", total - shown);
+    printf("\n");
+}
+
+// Printed below the by-type and by-function summaries, and only when an
+// audit found anything, so the usual run is unchanged. The misfits come
+// as two tables because a real corpus is dominated by constants no
+// renumbering reaches -- tags, hashes, INT64_MIN as an enum niche --
+// which would otherwise bury the worklist: first the constants within
+// one step of an encodable neighbour, then the rest, each with what
+// would have encoded. The constant audit's table follows, with what did.
+static void audit_tally_print(void)
+{
+    if (!audit_used && !audit_dropped) return;
+    audit_entry *rows = malloc((audit_used ? audit_used : 1) * sizeof *rows);
+    if (!rows) {
+        printf("Constants by value (-a): %zu distinct values (table not "
+               "printed: out of memory)\n\n", audit_used);
+        return;
+    }
+    size_t n = 0;
+    for (size_t i = 0; i < audit_cap; i++)
+        if (audit_tally[i].used) rows[n++] = audit_tally[i];
+    qsort(rows, n, sizeof rows[0], cmp_audit);
+    audit_table_print("Immediate misfits by value (-a imm), within one step "
+                      "of an immediate form", rows, n, AUDIT_NEAR);
+    audit_table_print("Immediate misfits by value (-a imm), beyond one step "
+                      "(informational)", rows, n, AUDIT_FAR);
+    audit_table_print("Constants with an immediate form, by value (-a const)",
+                      rows, n, AUDIT_FIT);
+    if (audit_dropped)
+        printf("          (%" PRIu64 " audit findings not tallied: the table "
+               "could not grow)\n\n", audit_dropped);
+    free(rows);
 }
 
 // ---- Go's pclntab ----
@@ -757,6 +917,7 @@ static void report(void *ctx, const riscvlint_finding *f)
     const report_ctx *c = ctx;
     tally_add(f->title);
     total_findings++;
+    if (f->audit_kind) audit_tally_add(f);
 
     // Looked up in every mode, not only under -v: the by-function
     // summary is keyed by the same name the annotation prints, so the
@@ -845,6 +1006,7 @@ static void json_finding(void *ctx, const riscvlint_finding *f)
     const report_ctx *c = ctx;
     tally_add(f->title);
     total_findings++;
+    if (f->audit_kind) audit_tally_add(f);
 
     // Streamed as they are found rather than collected first: libxul
     // has 567,706 of them, which is not a document to hold in memory.
@@ -886,6 +1048,14 @@ static void json_finding(void *ctx, const riscvlint_finding *f)
         fwrite(digits, 1, 2 * len, stdout);
         putchar('"');
     }
+    // An audit finding's tuple, so the by-value tables can be rebuilt
+    // from the document -- or joined against a profile, which is what a
+    // constant's cost needs. `value` is a number, like `vaddr`.
+    if (f->audit_kind)
+        printf(", \"audit\": \"%s\", \"class\": \"%s\", \"width\": \"%c\", "
+               "\"value\": %" PRId64, f->audit_fit ? "const" : "imm",
+               riscvlint_audit_kind_name(f->audit_kind), f->audit_width,
+               f->audit_value);
     putchar('}');
 }
 
@@ -1134,6 +1304,7 @@ static int scan_file(csh handle, const char *path)
                            "(pass -m to pin)\n", path);
             }
             riscvlint_state_set_extensions(state, effective);
+            riscvlint_state_set_audits(state, audits);
             riscvlint_state_set_image(state, image_read, &im);
             // The two notes above as fields: a reader of the document
             // needs them for the same reason a reader of the report
@@ -1254,7 +1425,7 @@ int main(int argc, char **argv)
     static const char usage[] =
         "usage: %s [-v] [-i] [-c] [-f] [--json] "
         "[-m zba|zbb|zbs|zcb|zfa|zilx|zibi|zacas|c|rva20|rva22|rva23]... "
-        "<binary>...\n";
+        "[-a imm|const]... <binary>...\n";
     int argi = 1;
     while (argi < argc && argv[argi][0] == '-' && argv[argi][1]) {
         if (strcmp(argv[argi], "-v") == 0) {
@@ -1282,6 +1453,15 @@ int main(int argc, char **argv)
             }
             forced_exts |= e;
             have_forced = true;
+        } else if (strcmp(argv[argi], "-a") == 0 && argi + 1 < argc) {
+            unsigned a;
+            if (!riscvlint_parse_audit_name(argv[++argi], &a)) {
+                fprintf(stderr, "%s: unknown -a name '%s'\n", argv[0],
+                        argv[argi]);
+                fprintf(stderr, usage, argv[0]);
+                return 2;
+            }
+            audits |= a;
         } else {
             fprintf(stderr, usage, argv[0]);
             return 2;
@@ -1301,6 +1481,11 @@ int main(int argc, char **argv)
     if (fusion_mode && have_forced)
         fprintf(stderr, "%s: -m has no effect with -f; fusion depends on "
                 "the core, not the extensions\n", argv[0]);
+    // The audits are checks, and neither the census nor the fusion
+    // report runs any.
+    if ((census_mode || fusion_mode) && audits)
+        fprintf(stderr, "%s: -a has no effect with %s; that report runs no "
+                "checks\n", argv[0], census_mode ? "-i" : "-f");
     // --json describes the lint scan. The census is a separate report
     // whose output would interleave with the document, so the two are
     // refused rather than one of them chosen for the caller.
@@ -1356,6 +1541,7 @@ int main(int argc, char **argv)
             printf("\n");
         }
         func_tally_print();
+        audit_tally_print();
         // Only when there were any, so the usual run is unchanged: a
         // scan that resynchronized past undecodable halfwords is not a
         // clean sweep of the section, and nothing else said so.

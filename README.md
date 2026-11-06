@@ -3,8 +3,9 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Forty-six checks are implemented and the ledger lists five candidates,
-all from SpiderMonkey's JIT code. [TODO.md](TODO.md) is that ledger:
+Forty-six checks and two audits (`-a imm`, `-a const`) are implemented,
+and the ledger lists five candidates, all from SpiderMonkey's JIT code.
+[TODO.md](TODO.md) is that ledger:
 every candidate that was measured, the population it came back with,
 and the ones rejected on that evidence.
 What got written was decided by the corpus rather than by intuition,
@@ -1601,6 +1602,134 @@ them. Zfa is mandatory there too, and is the second.
 Without `-m`, the arch string decides, and a file that carries none is
 reported as such rather than silently assumed permissive.
 
+## Audits (`-a`)
+
+`-a <audit>` is a different kind of flag from `-m`. `-m` asserts what
+the target can run, so that a rewrite may use it; `-a` opts into a
+report about the code that proposes no rewrite. Every audit finding is
+a review item rather than a missed fold -- nothing at the site can be
+respelled -- and the review item is a constant, so the summary tallies
+the audits by value, most frequent first, and those tables are the
+report. The two audits are armlint's `-a imm` and `-a const`, the two
+of its three that have a RISC-V shape; its PAC audit has none.
+
+Audit findings count toward the total and the exit status like any
+other, so a test suite that gates on a clean run should not pass `-a`.
+`-a` may be repeated, and is accepted under `--json`, where each audit
+finding carries its tuple as fields.
+
+### Immediate-misfit audit (`-a imm`)
+
+The complement of the constant folds. The immediate-operand check
+above reports `li rc,K` whose consumer could have taken K as an
+immediate; the audit reports the constant whose consumer has an
+immediate form the value *misses*: `lui a5,1; add a0,a1,a5`, where 4096
+is one past `addi`'s reach. Four consumer classes, each against its own
+field:
+
+* `add`, `addw`, `sub`, `subw`, `slt`, `sltu` against the 12-bit
+  immediate of `addi`, `addiw`, `slti`, `sltiu`, a subtrahend as `addi`
+  of its negation (-2047..2048);
+* `and`, `or`, `xor` against `andi`, `ori`, `xori`, where a mask of the
+  low n bits counts as fitting -- `zext.h`, `zext.w` or the shift pair
+  takes it, and the mask check reports those sites;
+* `beq`, `bne` against Zibi's `beqi`/`bnei` imm5 (1..31 and -1), only
+  under `-m zibi`: without the extension the branch has no immediate
+  form to miss, RV64I having no compare-immediate-and-branch at all;
+* a load or store through a base computed from the constant -- `lui` +
+  `add` and then the access, or `addi` and then the access -- against
+  the access's own 12-bit offset, tallied as the byte offset the access
+  would carry.
+
+The constant is `li`, `lui`, or the chain the constant-chain check
+follows, and the consumer follows it directly. The operand rules are
+the folds' own: the constant in an immediate-capable slot (`sub`, `slt`
+and `sltu` take it second only), the other operand neither `x0` nor the
+constant's register. The shifts are left out, since a shift amount is
+read modulo the width and never misses; zero and all-ones under a
+logical operation are identities and are skipped.
+
+Nothing at the site can be rewritten -- `lui`+`addiw` is already the
+cheapest spelling of 4095 -- so the finding is informational and the
+review item is the constant itself. A value the code's author chose (an
+object-size limit, a sentinel, a field's offset) that lands one step
+past the field costs an instruction and a register at every use, and
+choosing it one step differently turns every site into the immediate
+form. No liveness proof is made: a constant hoisted into a live
+register amortizes its materialization, but each use still pays for the
+register operand the immediate form would not need.
+
+The summary adds two tables below the by-type one: the constants within
+one step of an immediate form -- a magnitude up to 4096 for a 12-bit
+field or offset, up to 63 for Zibi's imm5 -- which is the renumbering
+worklist, and then everything beyond reach, whose whole magnitude is
+the point: tags, hashes, `INT64_MIN` as an enum niche. A real corpus is
+dominated by the second kind, which is why they are kept apart. Each
+row is a count of sites, the consumer class, a width letter (`x` or `w`
+for an operation; the access size `b`, `h`, `w` or `d` for a load or
+store), the constant, and what would have encoded:
+
+```console
+$ ./riscvlint -a imm -m zibi ./app
+...
+Immediate misfits by value (-a imm), within one step of an immediate form:
+     ...  add/sub imm12  x  4096         addi/slti immediates cover -2048..2047; sub -2047..2048
+     ...  branch imm5    x  32           beqi/bnei immediates cover 1..31 and -1
+     ...  ld/st offset   d  2056         immediate offsets cover -2048..2047
+
+Immediate misfits by value (-a imm), beyond one step (informational):
+     ...  logic imm12    x  65536        0x10000; andi/ori/xori cover -2048..2047; low-bit masks zext
+```
+
+Where AArch64's `-a imm` has bitmask hints and a shifted `add`
+immediate to aim at, RISC-V's field is one signed range, so the hint is
+the range and the only encodable neighbour of a misfit is the field's
+edge. Two things are larger here instead. The branch class is a
+question about the extension rather than the code: TODO.md's entry 30
+counted 238,018 equality shapes with a constant outside Zibi's imm5
+beside 461,300 inside it, and this table says *which* values those are.
+And the load/store class is harsher: base RISC-V has no register-offset
+addressing, so a field past the 12-bit reach costs `lui`, `add` and the
+access, three instructions for one, at every width.
+
+To find the sites of one value, `-v` prints each finding as
+`... (imm audit) at offset: 0x...: -> 4096; addi/slti ...`, so a grep
+for the constant lists them with their functions.
+
+### Constant audit (`-a const`)
+
+The misfit audit's twin, for the constants that fit: the same four
+consumers under the same operand rules, where the consumer's immediate
+form would have held the value -- `li a5,5; add a0,a1,a5` where
+`addi a0,a1,5` was available. The folds report this shape as a
+two-for-one once the liveness walk proves the constant's register dead,
+since their rewrite deletes the materialization; the audit reports
+every site with no proof, since the immediate form is a valid rewrite
+with the materialization kept, and renders it: `-> addi a0, a1, 5`;
+`-> addi a0, a1, -5` for a subtraction; `-> zext.h a0, a1` for a mask;
+`-> beqi a4, 17, 0x100a` under `-m zibi`; `-> ld a1, 24(a0)` for an
+access through a computed base. A site the fold proves is reported
+under both names.
+
+Why no proof: in compiler output the deletion proof fails for reasons
+unrelated to the site -- the walk stops at a call, or the allocator
+keeps the register for a second use -- and a JIT whose register
+allocator materializes every constant input produces the shape at
+every compare, with a deoptimization exit the walk cannot see past.
+That is TODO.md's entry 44 exactly: riscv64's Maglev takes a constant
+right input in a register where arm64's takes an immediate, the miner
+counted 20,743 of the shape and the fold proves 1,738. The fold's count
+is what a peephole could delete; the audit's is the population an
+instruction-selection change reaches, which riscvlint could until now
+only cite from a miner.
+
+The summary's third table tallies the audit by value, with the form
+that takes each constant as its hint.
+
+Neither audit has been run over the corpus yet; what they will show is
+bounded by the ledger's figures above, and TODO.md's entry 53 says
+where to record it.
+
 ## ISA census (`-i`)
 
 `riscvlint -i` replaces the lint scan with a census: every instruction
@@ -1930,6 +2059,12 @@ what the human report's `note:` lines say, and a gated finding means
 nothing without them: a Zcb finding against an object that declares no
 Zcb is the answer to "what would rebuilding buy me", not a defect.
 
+An audit finding (`-a`) carries four more: `audit` (`imm` or `const`),
+`class` (the consumer class as the by-value tables name it), `width`
+(the table's letter) and `value`, the constant as the consumer read it,
+a number like `vaddr`. The by-value tables can be rebuilt from them, or
+joined against a profile, which is what a constant's cost needs.
+
 Findings are written as they are found rather than collected first, so
 libxul's 567,706 stream instead of accumulating in memory; the totals
 close the document because the scan only knows them then. Section and
@@ -2200,6 +2335,10 @@ they found is not the answer to the question that was asked. The `-i`
 census is a description of the file rather than a verdict on it and so
 never returns 1 -- nothing in it is a finding -- but a file it could not
 read is still a 2. The `-f` fusion report is the same.
+
+An `-a` audit's findings count toward the total like any other, so a
+run that passes it exits 1 whenever the audit found anything to review;
+a suite that gates on a clean run should not pass it.
 
 `make driver-test` covers all three; the snapshot suite cannot, because
 it compares stdout and discards the status.
