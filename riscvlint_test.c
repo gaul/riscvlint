@@ -6605,6 +6605,89 @@ static void test_imm_audits(csh handle)
                      BOTH, NULL));
 }
 
+// check_release_run: values popped one at a time, the push run read
+// backwards.
+static void test_release_run(csh handle)
+{
+    riscvlint_finding f;
+    const uint32_t pop8 = 0x00810113u;           // addi sp,sp,8
+    const uint32_t pop16 = 0x01010113u;          // addi sp,sp,16
+    const uint32_t ld_ra = 0x00013083u;          // ld ra,0(sp)
+    const uint32_t ld_s0 = 0x00013403u;          // ld s0,0(sp)
+    const uint32_t ld_a0 = 0x00013503u;          // ld a0,0(sp)
+    const uint32_t ld_a2 = 0x00013603u;          // ld a2,0(sp)
+    const uint32_t ret = 0x00008067u;
+
+    // A Wasm epilogue: the frame freed, the saved pair restored, the
+    // pair's slots freed. One addi of 32 at the end, with the loads at
+    // 24 and 16.
+    uint32_t wasm[] = { pop16, 0x00813083u /* ld ra,8(sp) */, ld_s0, pop16,
+                        ret };
+    CHECK(run_words(handle, check_release_run, wasm, 5, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement,
+                 "one addi sp, sp, 32 for 2 adjustments (16 -> 12 bytes)") == 0);
+    CHECK(f.insn_count == 4 && f.address == 0x1000);
+    CHECK(strcmp(f.title, "releases one stack adjustment would do") == 0);
+
+    // Ion popping s0 and ra one at a time. The run starts at the first
+    // release, after the load it pairs with.
+    uint32_t ion[] = { ld_s0, pop8, ld_ra, pop8, ret };
+    CHECK(run_words(handle, check_release_run, ion, 5, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement,
+                 "one addi sp, sp, 16 for 2 adjustments (12 -> 8 bytes)") == 0);
+    CHECK(f.insn_count == 3 && f.address == 0x1004);
+
+    // Three releases; the load after the last one is not in the run.
+    uint32_t three[] = { pop8, ld_a0, pop8, ld_a2, pop16, ld_ra, ret };
+    CHECK(run_words(handle, check_release_run, three, 7, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement,
+                 "one addi sp, sp, 32 for 3 adjustments (20 -> 12 bytes)") == 0);
+    CHECK(f.insn_count == 5);
+
+    // Not reported: a reservation ends the run; a load into sp or a store
+    // of sp itself ends it; `mv t0,sp` reads sp; and a `j` back to the
+    // second release makes it a side entry.
+    uint32_t reserve[] = { pop8, ld_a0, 0xff810113u /* addi sp,sp,-8 */,
+                           ld_a2, pop8, ret };
+    CHECK(run_words(handle, check_release_run, reserve, 6, 0x1000, NULL) == 0);
+    uint32_t ldsp[] = { pop8, 0x00013103u /* ld sp,0(sp) */, pop8, ret };
+    CHECK(run_words(handle, check_release_run, ldsp, 4, 0x1000, NULL) == 0);
+    uint32_t sdsp[] = { pop8, 0x00213023u /* sd sp,0(sp) */, pop8, ret };
+    CHECK(run_words(handle, check_release_run, sdsp, 4, 0x1000, NULL) == 0);
+    uint32_t reads[] = { pop8, ld_a0, 0x00010293u /* mv t0,sp */, pop8, ret };
+    CHECK(run_words(handle, check_release_run, reads, 5, 0x1000, NULL) == 0);
+    uint32_t entry[] = { pop8, ld_a0, pop8, ld_a2, ret,
+                         0xff5ff06fu /* j -12 */ };
+    CHECK(run_words(handle, check_release_run, entry, 6, 0x1000, NULL) == 0);
+
+    // Limits of the immediates: 2040 and 8 more is past what one addi
+    // adds, and a load at 2040 moved up by 8 is past its own offset.
+    uint32_t total[] = { 0x7f810113u /* addi sp,sp,2040 */, ld_a0, pop8, ret };
+    CHECK(run_words(handle, check_release_run, total, 4, 0x1000, NULL) == 0);
+    uint32_t reach[] = { pop8, 0x7f813503u /* ld a0,2040(sp) */, pop8, ret };
+    CHECK(run_words(handle, check_release_run, reach, 4, 0x1000, NULL) == 0);
+
+    // Compressed: c.addi16sp 16; c.ldsp ra,0(sp); c.addi16sp 16 is one
+    // c.addi16sp 32 and the load at 16, two bytes saved. With c.addi
+    // sp,8 and c.addi16sp 32 the total is 40, which no compressed addi
+    // spells, and nothing is saved.
+    uint8_t rvc[] = { 0x41, 0x61, 0x82, 0x60, 0x41, 0x61, 0x82, 0x80 };
+    CHECK(run_window(handle, check_release_run, rvc, sizeof rvc, 0x1000, &f)
+          == 1);
+    CHECK(strcmp(f.replacement,
+                 "one addi sp, sp, 32 for 2 adjustments (6 -> 4 bytes)") == 0);
+    uint8_t odd[] = { 0x21, 0x01, 0x82, 0x60, 0x05, 0x61, 0x82, 0x80 };
+    CHECK(run_window(handle, check_release_run, odd, sizeof odd, 0x1000, NULL)
+          == 0);
+
+    // The push run stays quiet over a release run, and the release run
+    // over a push run.
+    CHECK(run_words(handle, check_push_run, wasm, 5, 0x1000, NULL) == 0);
+    uint32_t pushes[] = { 0xff810113u, 0x00a13023u /* sd a0,0(sp) */,
+                          0xff810113u, 0x00b13023u /* sd a1,0(sp) */, ret };
+    CHECK(run_words(handle, check_release_run, pushes, 5, 0x1000, NULL) == 0);
+}
+
 int main(void)
 {
     csh handle;
@@ -6674,6 +6757,7 @@ int main(void)
     test_decode_not();
     test_not_logic_fold(handle);
     test_imm_audits(handle);
+    test_release_run(handle);
     test_census(handle);
     test_fusion(handle);
 

@@ -1306,6 +1306,10 @@ struct riscvlint_state {
     // push of a run is not reported again as the start of a shorter one.
     uint64_t push_end;
 
+    // And for check_release_run: the address after the last release of
+    // the run it has already judged.
+    uint64_t release_end;
+
     // The address of an `add` that a deeper Zilx fold has already
     // claimed -- check_scaled_indexed_load's triple or
     // check_zext_indexed_load's quad. The unscaled check matches that
@@ -1497,6 +1501,7 @@ bool riscvlint_state_set_section(riscvlint_state *state, csh handle,
     memset(&state->fp, 0, sizeof state->fp);
     state->zrun_end = 0;
     state->push_end = 0;
+    state->release_end = 0;
     state->zilx_folded = UINT64_MAX;
     memset(state->guarantees, 0, sizeof state->guarantees);
     memset(&state->win, 0, sizeof state->win);
@@ -6117,6 +6122,114 @@ bool check_push_run(riscvlint_state *state, const cs_insn *insn,
     return true;
 }
 
+// ---- releases one stack adjustment would do ----
+
+// check_push_run read backwards. The run begins at a release,
+// `addi sp,sp,+K`, and takes every further release and every
+// sp-relative access up to the last release, with anything between
+// them that neither reads nor writes sp. One addi by the total where
+// the last release stood does what the run did, each access before it
+// re-offset by what had been released ahead of it: with the releases
+// deferred, sp is lower at the access by exactly that much. Delaying a
+// release is the safe direction -- the memory stays reserved longer and
+// nothing is read below sp -- where the push run brings a reservation
+// forward.
+bool check_release_run(riscvlint_state *state, const cs_insn *insn,
+                       riscvlint_finding *finding)
+{
+    if (insn->address < state->release_end) return false;
+    if (insn->size != 2 && insn->size != 4) return false;
+    uint32_t w;
+    if (!riscvlint_word_at(state, insn->address, &w)) return false;
+    int64_t k;
+    if (!rv_decode_sp_adjust(w, insn->size, &k) || k <= 0) return false;
+    if (riscvlint_is_relocated(state, insn->address)) return false;
+
+    struct {
+        rv_mem_kind kind;
+        unsigned data, size;
+        int64_t off;
+        int64_t above;          // what the run had released by then
+    } acc[PUSH_ACCESSES];
+    // Accesses after the last release are not in the run: `committed`
+    // is how many sit before it, and `pending` their bytes since.
+    unsigned nacc = 0, committed = 0, pending = 0;
+    unsigned nadj = 1, bytes = insn->size, seen = 1, span = 1;
+    int64_t total = k;
+    uint64_t at = insn->address + insn->size, end = at;
+    for (int budget = PUSH_WALK; budget > 0; budget--) {
+        // A side entry would arrive expecting sp where the run had it.
+        if (riscvlint_is_branch_target(state, at)) break;
+        uint32_t w2;
+        if (!riscvlint_word_at(state, at, &w2)) break;
+        unsigned len = rv_insn_len(w2);
+        if (riscvlint_is_relocated(state, at)) break;
+        seen++;
+        int64_t k2, off;
+        rv_mem_kind kind;
+        unsigned data, base;
+        if (rv_decode_sp_adjust(w2, len, &k2)) {
+            // A reservation ends the run, and so does a total one addi
+            // cannot add.
+            if (k2 <= 0 || total + k2 > 2047) break;
+            total += k2;
+            nadj++;
+            bytes += pending + len;
+            pending = 0;
+            committed = nacc;
+            at += len;
+            end = at;
+            span = seen;
+            continue;
+        }
+        if (len == 2 && (w2 & 0x3u) == 2u && ((w2 >> 13) & 0x7u) == 5u)
+            break;      // c.fsdsp's space, which Zcmp's pop reuses
+        if (rv_decode_mem(w2, len, &kind, &data, &base, &off) && base == 2) {
+            // An integer access naming sp as its data either stores sp's
+            // own value, which the fold changes, or loads into sp, which
+            // ends the run.
+            if (!rv_mem_is_fp(kind) && data == 2) break;
+            if (nacc == PUSH_ACCESSES) break;
+            acc[nacc].kind = kind;
+            acc[nacc].data = data;
+            acc[nacc].size = len;
+            acc[nacc].off = off;
+            acc[nacc].above = total;
+            nacc++;
+            pending += len;
+            at += len;
+            continue;
+        }
+        // Anything else may sit between releases -- a value popped is
+        // often used before the next pop -- provided it neither reads
+        // sp, which would see the wrong value, nor writes it.
+        if (rv_may_name(w2, len, 2) || rv_stops_walk(w2, len)) break;
+        at += len;
+    }
+    state->release_end = end;
+    if (nadj < 2) return false;
+
+    bool zcb = riscvlint_may_use(state, RISCVLINT_EXT_ZCB);
+    unsigned after = sp_adjust_bytes(total, insn->size == 2);
+    for (unsigned i = 0; i < committed; i++) {
+        int64_t off = acc[i].off + acc[i].above;
+        if (off > 2047) return false;
+        after += acc[i].size == 2
+                     ? rv_mem_encoded_size(acc[i].kind, acc[i].data, 2, off,
+                                           zcb)
+                     : 4;
+    }
+    if (after >= bytes) return false;
+
+    finding->title = "releases one stack adjustment would do";
+    finding->address = insn->address;
+    finding->insn_count = span;
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "one addi sp, sp, %" PRId64 " for %u adjustments (%u -> %u "
+             "bytes)", total, nadj, bytes, after);
+    return true;
+}
+
 // ---- zero loaded for a store ----
 
 #define ZSTORE_WALK 16      // instructions the stores may span
@@ -7264,6 +7377,7 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_long_li,
     check_no_effect,
     check_push_run,
+    check_release_run,
     check_zero_for_store,
     check_zero_eq_branch,
     check_slli_srli_to_andi,

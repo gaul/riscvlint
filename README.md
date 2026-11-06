@@ -3,8 +3,8 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Forty-six checks and two audits (`-a imm`, `-a const`) are implemented,
-and the ledger lists five candidates, all from SpiderMonkey's JIT code.
+Forty-seven checks and two audits (`-a imm`, `-a const`) are implemented,
+and the ledger lists four candidates, all from SpiderMonkey's JIT code.
 [TODO.md](TODO.md) is that ledger:
 every candidate that was measured, the population it came back with,
 and the ones rejected on that evidence.
@@ -13,19 +13,21 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Forty-six of them, and the table lists twenty-seven. The jump pair, the
-constant chain, the no-op, the push run, the zero store, the zero
+Forty-seven of them, and the table lists twenty-seven. The jump pair,
+the constant chain, the no-op, the push run, the zero store, the zero
 branch, the andi pair, the max clamp, the immediate operand, the mask,
 the jump threading and the floating-point constant built through an
 integer register have so far been measured over the JetStream corpus
-of TODO.md, which the table does not cover. Seven report nothing
+of TODO.md, which the table does not cover, and the release run was
+sized over the SpiderMonkey corpus there. Eight report nothing
 over this corpus -- the bit count because no baseline object declares
 Zbb; the three indexed loads, the equality branch and the
 compare-exchange loop because those five require their extension to be
 positively present rather than merely un-denied, and no object declares
-Zilx, Zibi or Zacas; and the unsigned divide by a power of two because
-all three toolchains already do that fold themselves. Those entries
-below say why. Every figure is what the check itself reports over the
+Zilx, Zibi or Zacas; the unsigned divide by a power of two because
+all three toolchains already do that fold themselves; and the release
+run because each of them frees a frame with one adjustment. Those
+entries below say why. Every figure is what the check itself reports over the
 [corpus](#corpus) -- 108,165,211 instructions of three toolchains across
 31 objects -- rather than what a mining tool estimated for it. The two
 have differed by an order of magnitude every time both were measured.
@@ -622,6 +624,41 @@ except a handful of `jalr ra,0(ra)` that were already two.
   Maglev, 3,020 in regexp code. 148,192 are two adjustments and 19,383
   are six or more. Compilers allocate a frame once, so the package
   corpus is not expected to have any.
+
+* **releases one stack adjustment would do** -- the push run read
+  backwards: values popped one at a time, `ld r,0(sp)` + `addi sp,sp,8`
+  again and again, where one adjustment by the total where the last
+  release stood, and the same loads at new offsets, leave memory and sp
+  exactly as the run did. SpiderMonkey's Wasm epilogue frees the frame
+  and then the saved pair's slots separately, and its Ion code pops s0
+  and ra one at a time:
+
+  ```
+   addi sp, sp, 16
+   ld ra, 8(sp)
+   ld s0, 0(sp)                       -> one addi sp, sp, 32 for 2
+   addi sp, sp, 16                       adjustments (16 -> 12 bytes)
+  ```
+
+  The run takes every release and every sp-relative access from the
+  first release to the last, with anything between them that neither
+  reads nor writes sp, and ends at a side entry, a transfer, a
+  reservation, an access that stores or loads sp itself, or a total one
+  `addi` cannot add. An access before the last release is re-offset by
+  what had been released ahead of it -- with the releases deferred, sp
+  is lower there by exactly that much -- and the new offset has to fit
+  its immediate. Delaying a release is the safe direction: the memory
+  stays reserved longer and nothing reads below sp, where the push run
+  has to show that bringing a reservation forward changes nothing.
+
+  The SpiderMonkey corpus (TODO.md, entry 48) has 307,725 runs by the
+  miner's count, 1,396,600 bytes, and the check has not yet been run
+  over it. Over the package corpus it reports nothing: GCC, LLVM and
+  Go's assembler each free a frame with one adjustment, and the only
+  releases that follow one another are a frame too large for one
+  `addi`, freed in two steps -- `addi sp,sp,0x7f0` then `addi
+  sp,sp,0x680` in libmozsqlite3 -- which the check declines because the
+  total is what one `addi` cannot add.
 
 * **comparison a branch could have made** -- `slt`/`sltu`/`xor`/`sub`
   writing a condition into a register, then `beqz`/`bnez` testing it,

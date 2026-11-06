@@ -1980,22 +1980,24 @@ code is one blob per code segment, so a Wasm blob holds a module's
 functions rather than one. Unlike V8's, the backend emits no constant
 pools and no compressed instructions, and the ELFs carry no relocations.
 
-The existing checks report 4,118,517 findings over it. The five entries
-below are shapes none of them reports, found by `pairscan`, `defuse` and
-`tools/sm_corpus_mine.py`, and sized by that last one. Each figure
-carries its entry's own conditions -- side entries, reach, offset range,
-and a liveness walk where the fold needs one -- but it is a miner's
-figure all the same, read from objdump text, so a check is expected to
-come in under it. None has been sized over the package corpus or V8's,
-which were not at hand: they are candidates for a JIT's code first.
+The checks written before this corpus report 4,118,517 findings over
+it. The five entries below are shapes none of them reported, found by
+`pairscan`, `defuse` and `tools/sm_corpus_mine.py`, and sized by that
+last one. Each figure carries its entry's own conditions -- side
+entries, reach, offset range, and a liveness walk where the fold needs
+one -- but it is a miner's figure all the same, read from objdump text,
+so a check is expected to come in under it. The dumps were not at hand
+when the checks were written, so the `check` column is what each check
+reports over the package corpus, and none has yet been run over this
+corpus or V8's: `tools/sm_analyze.sh` over a run directory would.
 
-| # | candidate | Ion | BL | WA | RE+TR | sites | bytes |
-|---|---|---:|---:|---:|---:|---:|---:|
-| 48 | releases one stack adjustment would do | 40,599 | 78,538 | 186,474 | 2,114 | 307,725 runs | 1,396,600 |
-| 49 | a release followed by a reservation | 21,630 | 154,493 | 515 | 47 | 176,685 | 1,147,716 |
-| 52 | a tail every jump to one label repeats | 7,713 | 1,786 | 346 | 143 | 9,988 labels | 787,776 |
-| 50 | a copy its only reader could do without | 1,951 | 24,340 | 110,444 | 466 | 137,201 | 548,804 |
-| 51 | a call through a scratch register that `jal` would reach | 0 | 0 | 44,115 | 0 | 44,115 of 203,833 | 176,460 |
+| # | candidate | Ion | BL | WA | RE+TR | sites | bytes | check |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| 48 | releases one stack adjustment would do | 40,599 | 78,538 | 186,474 | 2,114 | 307,725 runs | 1,396,600 | **implemented**, 0 in the package corpus |
+| 49 | a release followed by a reservation | 21,630 | 154,493 | 515 | 47 | 176,685 | 1,147,716 | candidate |
+| 52 | a tail every jump to one label repeats | 7,713 | 1,786 | 346 | 143 | 9,988 labels | 787,776 | candidate |
+| 50 | a copy its only reader could do without | 1,951 | 24,340 | 110,444 | 466 | 137,201 | 548,804 | candidate |
+| 51 | a call through a scratch register that `jal` would reach | 0 | 0 | 44,115 | 0 | 44,115 of 203,833 | 176,460 | candidate |
 
 Together that is 4,057,356 bytes, 1.5% of the corpus's code. 48 and 49
 meet at 11,314 sites, and there the two add up except in one case: of
@@ -2003,7 +2005,7 @@ the pairs 49 counts as cancelling, 11,233 follow a run 48 merges, and
 once it has, the release no longer matches the reservation and the pair
 saves four bytes rather than eight -- 44,932 bytes fewer.
 
-## 48. Releases one stack adjustment would do -- 307,725 runs  [candidate]
+## 48. Releases one stack adjustment would do -- 307,725 runs  [implemented]
 
 Check 40 read backwards. `ld r,0(sp)` + `addi sp,sp,8`, again and
 again: one `addi sp,sp,+total` at the last release does the same, with
@@ -2029,8 +2031,29 @@ sp,sp,N+16` would do. The Ion runs sampled pop s0 and ra one at a time
 Baseline ones free a call's arguments and then pop the values under them
 one by one.
 
-The check would be `check_push_run` with the sign reversed and the one
-adjustment at the end of the run instead of the start.
+The check is `check_push_run` with the sign reversed and the one
+adjustment at the end of the run instead of the start. The run takes
+every release and every sp-relative access up to the last release, and
+the accesses after the last release are not in it: they see sp at its
+final value either way. An access before it is re-offset by what the
+run had released when it executed, which must still fit the immediate,
+and the run is priced as 40 prices its own -- the one addi at the run's
+encoding class, a four-byte access staying four bytes. A run's last
+release may be the first half of a pair 49 reads, and the two must not
+count that addi twice: this check keeps it, since the run is reported
+first, and 49 has to stand down there.
+
+What check_release_run reports over the package corpus: nothing, in
+108,165,211 instructions. GCC, LLVM and Go's assembler free a frame
+with one adjustment, so two releases in a row occur only where one
+`addi` cannot free the frame: a disassembly probe finds three such
+pairs in libmozsqlite3 (`addi sp,sp,0x7f0` then `addi sp,sp,0x680`,
+and two like it) and none in gofmt or ripgrep, and the check declines
+all three, since their total is what it has to stop at. The shape is a
+JIT's, which pushes and pops values as its own interpreter would. The
+SpiderMonkey dumps were not at hand for this run, so the 307,725 above
+stays the miner's figure until `tools/sm_analyze.sh` is run over a dump
+directory with this check in the binary.
 
 ## 49. A release followed by a reservation -- 176,685  [candidate]
 
@@ -2129,9 +2152,10 @@ of `mark_branch_targets`.
 
 # Remaining candidates
 
-Five, 48 to 52, all from the SpiderMonkey corpus above and none yet
-written. Forty-six checks and the two audits of entry 53 are implemented,
-36 to 47 being the twelve from the JetStream corpus above, and
+Four, 49 to 52, all from the SpiderMonkey corpus above and none yet
+written. Forty-seven checks and the two audits of entry 53 are
+implemented, 36 to 47 being the twelve from the JetStream corpus above
+and 48 the first from the SpiderMonkey corpus, and
 everything this file sized over the package corpus is either written or
 recorded as rejected with the evidence that rejected it. Thirteen of
 the package entries, 23 to 35, did not come from a corpus probe at all:

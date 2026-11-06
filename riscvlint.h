@@ -1534,6 +1534,32 @@ bool check_no_effect(riscvlint_state *state, const cs_insn *insn,
 bool check_push_run(riscvlint_state *state, const cs_insn *insn,
                     riscvlint_finding *finding);
 
+// The push run read backwards: values popped one at a time -- `ld
+// r,0(sp)` + `addi sp,sp,8`, again and again -- where one adjustment by
+// the total where the last release stood, and the same loads at
+// re-computed offsets, leave memory and sp exactly as the run did. The
+// run is every release and every sp-relative access from the first
+// release to the last, with anything between them that neither reads
+// nor writes sp; it ends at a side entry, a transfer, a reservation, an
+// access that stores or loads sp itself, or a total one addi cannot add.
+// Each access before the last release is re-offset by what had been
+// released ahead of it, and the new offset must still fit its
+// immediate. Delaying a release is the safe direction: the memory stays
+// reserved longer and nothing reads below sp. Reported once, at the
+// first release, when there are at least two.
+//
+// Priced as check_push_run prices its run: the one addi at the run's
+// own encoding class, and an access keeps four bytes if it had them.
+//
+// Measured population: the SpiderMonkey corpus (TODO.md, entry 48) has
+// 307,725 runs by the miner's count, 1,396,600 bytes -- Wasm epilogues
+// that free the frame and then the saved pair separately, Ion popping
+// s0 and ra one at a time, Baseline freeing a call's arguments and then
+// the values under them. Compilers free a frame once; the package
+// corpus figure is in the entry.
+bool check_release_run(riscvlint_state *state, const cs_insn *insn,
+                       riscvlint_finding *finding);
+
 // A register loaded with zero only to be stored: `li rt,0` and then
 // integer stores of rt, each of which could store x0 instead, and the
 // `li` go. The stores are every one of rt that follows before anything
