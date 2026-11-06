@@ -1819,6 +1819,25 @@ bool check_transfer_to_jump(riscvlint_state *state, const cs_insn *insn,
 bool check_copy_for_reader(riscvlint_state *state, const cs_insn *insn,
                            riscvlint_finding *finding);
 
+// The call pair with a register other than the link carrying the
+// address: `auipc rx,hi` + `jalr rl,lo(rx)`, rl neither x0, which is the
+// jump pair's shape, nor rx, which is the call pair's. `jal rl,target`
+// writes the same link, so the fold changes one thing: rx is no longer
+// written. It is sound only where rx is dead at both places control
+// goes next -- the callee, which may read it as an argument, and the
+// return address, whose code may expect the auipc's value -- which the
+// liveness walk of check_jump_pair_to_j is asked at both. The jalr must
+// not be a branch target, neither half may be relocated, and the target
+// must be inside jal's +/-1MB.
+//
+// Measured population: 203,833 pairs in the SpiderMonkey corpus
+// (TODO.md, entry 51), every one a Wasm call through t4; 124,953 are
+// outside jal's reach, since a module's code is one segment, and the
+// miner finds t4 dead at both destinations for 44,115 of the rest.
+// The package corpus figure is in the entry.
+bool check_scratch_call_to_jal(riscvlint_state *state, const cs_insn *insn,
+                               riscvlint_finding *finding);
+
 // ---- running every check ----
 //
 // Called once per finding, with `ctx` as given. The finding is valid

@@ -6895,6 +6895,77 @@ static void test_copy_for_reader(csh handle)
           == 0);
 }
 
+// check_scratch_call_to_jal: `auipc rx` + `jalr ra,lo(rx)` where jal
+// reaches and rx is dead at the callee and at the return.
+static void test_scratch_call_to_jal(csh handle)
+{
+    riscvlint_finding f;
+    const uint32_t auipc_t4 = 0x00000e97u;       // auipc t4,0
+    const uint32_t call16 = 0x010e80e7u;         // jalr ra,16(t4)
+    const uint32_t li_t4 = 0x06400e93u;          // li t4,100
+    const uint32_t mv_a0_t4 = 0x000e8513u;       // mv a0,t4
+    const uint32_t ret = 0x00008067u;
+
+    // The pair at 0x1000 calls 0x1010. t4 is written first at the return
+    // address (0x1008) and at the callee (0x1010): the pair folds.
+    uint32_t folds[] = { auipc_t4, call16, li_t4, ret, li_t4, ret };
+    CHECK(run_words(handle, check_scratch_call_to_jal, folds, 6, 0x1000, &f)
+          == 1);
+    CHECK(strcmp(f.replacement, "jal ra, 0x1010 (8 -> 4 bytes)") == 0);
+    CHECK(f.insn_count == 2 && f.address == 0x1000);
+    CHECK(strcmp(f.title, "call through a scratch register foldable to jal")
+          == 0);
+    // Any link register other than the scratch one: jalr t0,16(t4).
+    uint32_t t0link[] = { auipc_t4, 0x010e82e7u, li_t4, ret, li_t4, ret };
+    CHECK(run_words(handle, check_scratch_call_to_jal, t0link, 6, 0x1000, &f)
+          == 1);
+    CHECK(strcmp(f.replacement, "jal t0, 0x1010 (8 -> 4 bytes)") == 0);
+
+    // Not reported: t4 read at the callee; t4 read at the return; a
+    // `ret` at the return before any write, which the walk cannot see
+    // past; the jalr a branch target; a megabyte ahead, past jal's reach.
+    uint32_t callee[] = { auipc_t4, call16, li_t4, ret, mv_a0_t4, ret };
+    CHECK(run_words(handle, check_scratch_call_to_jal, callee, 6, 0x1000, NULL)
+          == 0);
+    uint32_t after[] = { auipc_t4, call16, mv_a0_t4, ret, li_t4, ret };
+    CHECK(run_words(handle, check_scratch_call_to_jal, after, 6, 0x1000, NULL)
+          == 0);
+    uint32_t unknown[] = { auipc_t4, call16, ret, ret, li_t4, ret };
+    CHECK(run_words(handle, check_scratch_call_to_jal, unknown, 6, 0x1000, NULL)
+          == 0);
+    uint32_t entry[] = { auipc_t4, call16, li_t4, ret, li_t4, ret,
+                         0xfedff06fu /* j -20, to the jalr */ };
+    CHECK(run_words(handle, check_scratch_call_to_jal, entry, 7, 0x1000, NULL)
+          == 0);
+    uint32_t far[] = { 0x00100e97u /* auipc t4,0x100 */, 0x000e80e7u, li_t4,
+                       ret };
+    CHECK(run_words(handle, check_scratch_call_to_jal, far, 4, 0x1000, NULL)
+          == 0);
+
+    // The other two spellings belong to the other two checks: the link
+    // register carrying the address is the call pair's, and x0 is the
+    // jump pair's. Neither is this check's.
+    uint32_t callpair[] = { auipc_t4, 0x010e8ee7u /* jalr t4,16(t4) */, li_t4,
+                            ret, li_t4, ret };
+    CHECK(run_words(handle, check_scratch_call_to_jal, callpair, 6, 0x1000,
+                    NULL) == 0);
+    CHECK(run_words(handle, check_call_pair_to_jal, callpair, 6, 0x1000, NULL)
+          == 1);
+    uint32_t jumppair[] = { auipc_t4, 0x010e8067u /* jr 16(t4) */, li_t4, ret,
+                            li_t4, ret };
+    CHECK(run_words(handle, check_scratch_call_to_jal, jumppair, 6, 0x1000,
+                    NULL) == 0);
+    CHECK(run_words(handle, check_jump_pair_to_j, jumppair, 6, 0x1000, NULL)
+          == 1);
+    CHECK(run_words(handle, check_call_pair_to_jal, folds, 6, 0x1000, NULL)
+          == 0);
+    // `auipc t4` + `c.jalr t4` is another encoding and is not taken.
+    uint8_t cjalr[] = { 0x97, 0x0e, 0x00, 0x00, 0x82, 0x9e,
+                        0x93, 0x0e, 0x40, 0x06, 0x67, 0x80, 0x00, 0x00 };
+    CHECK(run_window(handle, check_scratch_call_to_jal, cjalr, sizeof cjalr,
+                     0x1000, NULL) == 0);
+}
+
 int main(void)
 {
     csh handle;
@@ -6967,6 +7038,7 @@ int main(void)
     test_release_run(handle);
     test_release_reserve(handle);
     test_copy_for_reader(handle);
+    test_scratch_call_to_jal(handle);
     test_census(handle);
     test_fusion(handle);
 

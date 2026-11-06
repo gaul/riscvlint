@@ -3,8 +3,8 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Forty-nine checks and two audits (`-a imm`, `-a const`) are implemented,
-and the ledger lists two candidates, both from SpiderMonkey's JIT code.
+Fifty checks and two audits (`-a imm`, `-a const`) are implemented, and
+the ledger lists one candidate, from SpiderMonkey's JIT code.
 [TODO.md](TODO.md) is that ledger:
 every candidate that was measured, the population it came back with,
 and the ones rejected on that evidence.
@@ -13,21 +13,22 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Forty-nine of them, and the table lists twenty-nine. The jump pair,
+Fifty of them, and the table lists twenty-nine. The jump pair,
 the constant chain, the no-op, the push run, the zero store, the zero
 branch, the andi pair, the max clamp, the immediate operand, the mask,
 the jump threading and the floating-point constant built through an
 integer register have so far been measured over the JetStream corpus
 of TODO.md, which the table does not cover, and the release run, the
-cancelling pair and the needless copy were sized over the SpiderMonkey
-corpus there. Eight report nothing
+cancelling pair, the needless copy and the scratch-register call were
+sized over the SpiderMonkey corpus there. Nine report nothing
 over this corpus -- the bit count because no baseline object declares
 Zbb; the three indexed loads, the equality branch and the
 compare-exchange loop because those five require their extension to be
 positively present rather than merely un-denied, and no object declares
 Zilx, Zibi or Zacas; the unsigned divide by a power of two because
 all three toolchains already do that fold themselves; and the release
-run because each of them frees a frame with one adjustment. Those
+run and the scratch-register call because each of them frees a frame
+with one adjustment and calls through the link register. Those
 entries below say why. Every figure is what the check itself reports over the
 [corpus](#corpus) -- 108,165,211 instructions of three toolchains across
 31 objects -- rather than what a mining tool estimated for it. The two
@@ -138,6 +139,38 @@ except a handful of `jalr ra,0(ra)` that were already two.
   under a conditional branch that skips exactly them, which once the
   pair is a `j` is the shape the branch-over-jump entry below reads, so
   the two compose.
+
+* **call through a scratch register foldable to jal** -- the call pair
+  with a register other than the link carrying the address. `auipc
+  t4,X` + `jalr ra,Y(t4)` is how SpiderMonkey's Wasm code calls, and
+  where the target is inside +/-1MB one `jal ra,target` does the same
+  job:
+
+  ```
+   auipc t4, 0
+   jalr ra, 16(t4)                    -> jal ra, 0x1010 (8 -> 4 bytes)
+  ```
+
+  The call pair declines this on purpose and the jump pair would take
+  it if it were a jump; this check is the one with the other's walk.
+  `jal ra` writes the same link the `jalr` wrote, so the fold changes
+  one thing: t4 is no longer written. That is sound only where t4 is
+  dead at both places control goes next -- the callee, which may read
+  it as an argument, and the return address, whose code may expect the
+  auipc's value -- and the liveness walk is asked at both. The jalr must
+  not be a branch target, and neither half may be relocated.
+
+  The SpiderMonkey corpus (TODO.md, entry 51) has 203,833 such calls by
+  the miner's count, every one Wasm; 124,953 are outside `jal`'s reach,
+  since a module's code is one segment, and the miner finds t4 dead at
+  both destinations for 44,115 of the rest. The check has not yet been
+  run over it. Over the package corpus it reports nothing: GCC and LLVM
+  call through the link register, `auipc ra` + `jalr ra` or `jal` once
+  the linker has relaxed it, and Go calls with `jal` or indirectly
+  through a register loaded from a table. The one pair in the corpus
+  that uses another register, ripgrep's `auipc t0` + `jalr t0,lo(t0)`,
+  writes its link into that register and is the call pair's. The shape
+  is a JIT's that keeps a scratch register for every far transfer.
 
 * **slli + add foldable to shNadd** -- `slli rd,rs,{1,2,3}` +
   `add rd,rd,rs2` computes a scaled-index address in two dependent

@@ -28,8 +28,10 @@ _start:
     ret
 
     // 3) The call spelling. It writes ra, which is a different question
-    //    and a different check (and not that check's shape either, whose
-    //    jalr has to write the auipc's own register).
+    //    and a different check: not the call pair's, whose jalr has to
+    //    write the auipc's own register, but the scratch-register call's,
+    //    which asks t6's fate at the callee and at the return and finds
+    //    it written first at both.
     auipc   t6, 0
     jalr    ra, 8(t6)
     li      t6, 0

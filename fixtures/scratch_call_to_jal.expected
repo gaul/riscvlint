@@ -1,0 +1,80 @@
+call through a scratch register foldable to jal at offset: 0x0: -> jal ra, 0x10 (8 -> 4 bytes) (2 instructions)
+  auipc t4, 0
+  jalr 0x10(t4)
+
+instruction compressible to a base C form at offset: 0x8: -> c.li (4 -> 2 bytes) (1 instructions)
+  li t4, 0
+
+instruction compressible to a base C form at offset: 0xc: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+instruction compressible to a base C form at offset: 0x10: -> c.li (4 -> 2 bytes) (1 instructions)
+  li t4, 1
+
+instruction compressible to a base C form at offset: 0x14: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+instruction compressible to a base C form at offset: 0x20: -> c.li (4 -> 2 bytes) (1 instructions)
+  li t4, 0
+
+instruction compressible to a base C form at offset: 0x24: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+instruction compressible to a base C form at offset: 0x2c: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+instruction compressible to a base C form at offset: 0x3c: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+instruction compressible to a base C form at offset: 0x40: -> c.li (4 -> 2 bytes) (1 instructions)
+  li t4, 1
+
+instruction compressible to a base C form at offset: 0x44: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+instruction compressible to a base C form at offset: 0x50: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+instruction compressible to a base C form at offset: 0x54: -> c.li (4 -> 2 bytes) (1 instructions)
+  li t4, 1
+
+instruction compressible to a base C form at offset: 0x58: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+instruction compressible to a base C form at offset: 0x64: -> c.li (4 -> 2 bytes) (1 instructions)
+  li t4, 0
+
+instruction compressible to a base C form at offset: 0x68: -> c.beqz (4 -> 2 bytes) (1 instructions)
+  beqz a0, 0x60
+
+instruction compressible to a base C form at offset: 0x6c: -> c.li (4 -> 2 bytes) (1 instructions)
+  li t4, 1
+
+instruction compressible to a base C form at offset: 0x70: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+instruction compressible to a base C form at offset: 0x78: -> c.jalr (4 -> 2 bytes) (1 instructions)
+  jalr t4
+
+instruction compressible to a base C form at offset: 0x7c: -> c.li (4 -> 2 bytes) (1 instructions)
+  li t4, 0
+
+instruction compressible to a base C form at offset: 0x80: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+call pair foldable to jal at offset: 0x84: -> jal ra, 0x90 (2 instructions)
+  auipc ra, 0
+  jalr 0xc(ra)
+
+instruction compressible to a base C form at offset: 0x8c: -> c.li (4 -> 2 bytes) (1 instructions)
+  li t4, 0
+
+instruction compressible to a base C form at offset: 0x90: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+Optimization opportunities by type:
+      22  instruction compressible to a base C form
+       1  call pair foldable to jal
+       1  call through a scratch register foldable to jal
+
+24 optimization opportunities in 37 instructions

@@ -7053,6 +7053,64 @@ bool check_transfer_to_jump(riscvlint_state *state, const cs_insn *insn,
     return true;
 }
 
+// ---- a call through a scratch register that jal would reach ----
+
+// check_call_pair_to_jal's pair with a register other than the link
+// carrying the address: `auipc rx,hi` + `jalr rl,lo(rx)`, rl neither x0
+// (check_jump_pair_to_j's shape) nor rx (the call pair's). `jal
+// rl,target` writes the same link, so the only thing the fold changes is
+// that rx is no longer written, and that is sound only where rx is dead
+// at both places control goes next: the callee, and the return address
+// the callee comes back to.
+bool check_scratch_call_to_jal(riscvlint_state *state, const cs_insn *insn,
+                               riscvlint_finding *finding)
+{
+    if (insn->size != 4) return false;
+    uint32_t w1;
+    if (!riscvlint_word_at(state, insn->address, &w1)) return false;
+    unsigned rx;
+    int64_t hi;
+    if (!rv_decode_auipc(w1, &rx, &hi) || rx == 0) return false;
+
+    uint64_t second = insn->address + 4;
+    uint32_t w2;
+    if (!riscvlint_word_at(state, second, &w2)) return false;
+    unsigned rl, rs1;
+    int64_t lo;
+    // The four-byte jalr only; `c.jalr rx` writes ra through a different
+    // encoding and is left to its own check, as the call pair leaves it.
+    if (!rv_decode_jalr(w2, &rl, &rs1, &lo)) return false;
+    if (rs1 != rx || rl == 0 || rl == rx) return false;
+
+    // Something branching to the jalr would lose its transfer, and a
+    // relocated pair's immediates are placeholders.
+    if (riscvlint_is_branch_target(state, second)) return false;
+    if (riscvlint_is_relocated(state, insn->address) ||
+        riscvlint_is_relocated(state, second))
+        return false;
+
+    int64_t target = ((int64_t)insn->address + hi + lo) & ~(int64_t)1;
+    if (target < 0) return false;
+    if (!rv_jal_reaches(target - (int64_t)insn->address)) return false;
+
+    // rx holds the auipc's result after the pair and nothing after the
+    // fold. The callee may read it as an argument, and the code after
+    // the return may read it expecting that value; both walks must find
+    // it written first.
+    if (riscvlint_liveness(state, (uint64_t)target, rx) != RISCVLINT_LIVE_DEAD)
+        return false;
+    if (riscvlint_liveness(state, second + 4, rx) != RISCVLINT_LIVE_DEAD)
+        return false;
+
+    finding->title = "call through a scratch register foldable to jal";
+    finding->address = insn->address;
+    finding->insn_count = 2;
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "jal %s, 0x%" PRIx64 " (8 -> 4 bytes)", rv_reg_name(rl),
+             (uint64_t)target);
+    return true;
+}
+
 // ---- a copy its only reader could do without ----
 
 // Where `w` reads integer registers through its own encoding: each
@@ -7670,6 +7728,7 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_transfer_to_jump,
     check_fp_int_to_fli,
     check_copy_for_reader,
+    check_scratch_call_to_jal,
     check_imm_misfit_audit,
     check_const_audit,
 };

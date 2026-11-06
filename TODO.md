@@ -1997,7 +1997,7 @@ corpus or V8's: `tools/sm_analyze.sh` over a run directory would.
 | 49 | a release followed by a reservation | 21,630 | 154,493 | 515 | 47 | 176,685 | 1,147,716 | **implemented**, 12 in the package corpus |
 | 52 | a tail every jump to one label repeats | 7,713 | 1,786 | 346 | 143 | 9,988 labels | 787,776 | candidate |
 | 50 | a copy its only reader could do without | 1,951 | 24,340 | 110,444 | 466 | 137,201 | 548,804 | **implemented**, 9,733 in the package corpus |
-| 51 | a call through a scratch register that `jal` would reach | 0 | 0 | 44,115 | 0 | 44,115 of 203,833 | 176,460 | candidate |
+| 51 | a call through a scratch register that `jal` would reach | 0 | 0 | 44,115 | 0 | 44,115 of 203,833 | 176,460 | **implemented**, 0 in the package corpus |
 
 Together that is 4,057,356 bytes, 1.5% of the corpus's code. 48 and 49
 meet at 11,314 sites, and there the two add up except in one case: of
@@ -2150,7 +2150,7 @@ t0,t0` for `neg t0,a0`. libxul holds 2,653, the Debian LLVM 22 build
 Rust's 1,027 are rust-coreutils. The SpiderMonkey dumps were not at
 hand, so the 137,201 above stays the miner's figure.
 
-## 51. A call through a scratch register that `jal` would reach -- 44,115 of 203,833  [candidate]
+## 51. A call through a scratch register that `jal` would reach -- 44,115 of 203,833  [implemented]
 
 Check 1 folds `auipc ra,hi` + `jalr ra,lo(ra)` to `jal ra` and asks no
 liveness question, because the `jalr` overwrites what the `auipc` wrote.
@@ -2168,7 +2168,26 @@ transfer first for 34,765 (176,460 bytes for the 44,115). It found no
 site where t4 is read first.
 
 The check is check 1 with check 36's walk run twice, once at each
-destination.
+destination. It takes any link register but the scratch one -- `jalr
+t0,lo(t4)` folds to `jal t0` -- and only the four-byte `jalr`, as the
+other two pair checks do; `auipc rx` + `c.jalr rx` is another encoding.
+Its walk is riscvlint_liveness rather than the probe's straight line,
+so a destination that branches before writing the register is decided
+by every path from it, and a `ret` or a call before any write answers
+unknown, as it does for 36 and 43.
+
+What check_scratch_call_to_jal reports over the package corpus:
+nothing. GCC and LLVM call through the link register -- `auipc ra` +
+`jalr ra`, check 1's shape, or `jal` once the linker has relaxed the
+pair -- and Go calls with `jal` or indirectly through a register loaded
+from a table. A disassembly probe over ripgrep, gofmt and libmozsqlite3
+finds 45,390 pairs through ra and 18 through another register, all 18
+ripgrep's `auipc t0` + `jalr t0,lo(t0)`, which writes its link into the
+scratch register and so is the call pair's finding, not this one's. The
+PLT stub, `auipc t3; ld t3,off(t3); jalr t1,0(t3)`, has a load between
+its two halves. The shape is a JIT's: SpiderMonkey's Wasm backend keeps
+t4 for every far transfer and links through ra. The SpiderMonkey dumps
+were not at hand, so the 44,115 above stays the miner's figure.
 
 ## 52. A tail every jump to one label repeats -- 9,988 labels  [candidate]
 
@@ -2201,10 +2220,10 @@ of `mark_branch_targets`.
 
 # Remaining candidates
 
-Two, 51 and 52, both from the SpiderMonkey corpus above and neither yet
-written. Forty-nine checks and the two audits of entry 53 are
-implemented, 36 to 47 being the twelve from the JetStream corpus above
-and 48 to 50 the first three from the SpiderMonkey corpus, and
+One, 52, from the SpiderMonkey corpus above and not yet written. Fifty
+checks and the two audits of entry 53 are implemented, 36 to 47 being
+the twelve from the JetStream corpus above and 48 to 51 the first four
+from the SpiderMonkey corpus, and
 everything this file sized over the package corpus is either written or
 recorded as rejected with the evidence that rejected it. Thirteen of
 the package entries, 23 to 35, did not come from a corpus probe at all:
