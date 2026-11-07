@@ -1922,7 +1922,7 @@ not tracked (about 75K, every one a dispatch handle that a later
 
 ## Macro-op fusion -- a report, not a check
 
-`-f` counts the pairs a fusing core issues as one operation, per core,
+`-u` counts the pairs a fusing core issues as one operation, per core,
 from LLVM's `RISCVMacroFusion.td` and the processors that enable each
 pair (README.md, "Macro-op fusion"). It is not a check because a fused
 pair is not a defect. Its near misses are as close as it comes: split

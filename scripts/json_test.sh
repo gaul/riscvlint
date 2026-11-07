@@ -161,7 +161,7 @@ fi
 #    reports whose output would interleave with the document, so those
 #    combinations are refused rather than one of them chosen for the
 #    caller.
-for flag in -i -f -v; do
+for flag in -i -u -v; do
     set +e
     "$ROOT/riscvlint" --json $flag "$WORK/clean.o" > "$WORK/out" 2> /dev/null
     status=$?

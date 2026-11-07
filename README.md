@@ -1787,11 +1787,38 @@ except a handful of `jalr ra,0(ra)` that were already two.
   builds a floating-point constant in an integer register and moves it
   across.
 
+## Options
+
+Every option has a long name and a one-letter alias, and `riscvlint
+--help` prints the table. The letters shared with armlint and x86lint
+(`-v`, `-i`, `-c`, `-m`, `-a` and `--json`) mean the same thing in all
+three tools, and so do their long names; both of them spell
+`--function` `-f`, which is why the fusion report is `-u`. A value
+follows its option as the next argument or joined with `=`
+(`--assume=rva23`), and options are read wherever they stand among the
+files.
+
+| option | effect |
+| --- | --- |
+| `-v`, `--verbose` | print each finding with its disassembly |
+| `-q`, `--quiet` | the default; kept for the scripts that passed it |
+| `-i`, `--isa` | an ISA census in place of the lint scan |
+| `-u`, `--fusion` | a macro-op fusion report in place of the lint scan |
+| `-c`, `--constants` | also report the constants the code builds, by cost |
+| `--json` | the findings as a JSON document on stdout |
+| `-m EXT`, `--assume EXT` | the target has EXT: `zba`, `zbb`, `zbs`, `zcb`, `zfa`, `zilx`, `zibi`, `zacas` or `c`; `rva20`, `rva22` and `rva23` name a profile |
+| `-a AUDIT`, `--enable AUDIT` | also run the `imm` or `const` audit |
+| `-h`, `--help` | print this table |
+
+The sections below name each mode by its letter, which is how the
+examples spell it.
+
 ## Selecting the target
 
-`-m <name>` pins the extensions the checks may assume, and may be
-repeated. Names are either extensions (`zba`, `zbb`, `zbs`, `zcb`,
-`zfa`, `zilx`, `zibi`, `zacas`, `c`) or profiles that bundle them
+`-m <name>` (`--assume`) pins the extensions the checks may assume,
+and may be repeated. Names are either extensions (`zba`, `zbb`,
+`zbs`, `zcb`, `zfa`, `zilx`, `zibi`, `zacas`, `c`) or profiles that
+bundle them
 (`rva20`, `rva22`, `rva23`). `zilx`, `zibi` and `zacas` are the three no
 profile contains, so they only ever arrive by being named -- and the
 checks behind them are the five that want the extension positively
@@ -1820,7 +1847,7 @@ them. Zfa is mandatory there too, and is the second.
 Without `-m`, the arch string decides, and a file that carries none is
 reported as such rather than silently assumed permissive.
 
-## Audits (`-a`)
+## Audits (`-a`, `--enable`)
 
 `-a <audit>` is a different kind of flag from `-m`. `-m` asserts what
 the target can run, so that a rewrite may use it; `-a` opts into a
@@ -1956,7 +1983,7 @@ comparisons against a constant, one more bit would reach 69%, and a
 `DenseMap` empty key, rustc's enum niche and SpiderMonkey's shifted
 JS::Value tags, none of which a renumbering reaches.
 
-## ISA census (`-i`)
+## ISA census (`-i`, `--isa`)
 
 `riscvlint -i` replaces the lint scan with a census: every instruction
 in the binary's executable sections, attributed to the extensions it
@@ -2058,9 +2085,9 @@ faults. The census counts both the same way, because from the
 encodings they are the same thing; the sample addresses are what tells
 them apart.
 
-## Macro-op fusion (`-f`)
+## Macro-op fusion (`-u`, `--fusion`)
 
-`riscvlint -f` replaces the lint scan with a fusion report: the
+`riscvlint -u` replaces the lint scan with a fusion report: the
 adjacent instruction pairs a fusing core would issue as one operation,
 and the pairs that would fuse after one small rewrite. Fusion is a
 property of a core rather than of the ISA, so the report has one block
@@ -2108,7 +2135,7 @@ is a single rewrite away from fusing:
   result as its second operand.
 
 ```console
-$ ./riscvlint -f out/rv/d8
+$ ./riscvlint -u out/rv/d8
 Fusion report of out/rv/d8: 8477352 instructions
   spacemit-x100: 13557 pairs fuse, 0.2% fewer macro-ops; near misses 8047 split, 1570 rename, 111 swap
     pair                      fused      split     rename       swap
@@ -2189,7 +2216,7 @@ which is 836,602 adjacent pairs. XiangShan's three are the shift
 spellings of `zext.w` and `zext.h`, and an RVA23 build spells those
 with Zba and Zbb instead.
 
-## The report (`-v`)
+## The report (`-v`, `--verbose`)
 
 By default riscvlint prints only the summary: the opportunities grouped
 by type and sorted by prevalence, then a total and the instruction
@@ -2234,10 +2261,10 @@ prints the unannotated form.
 This is armlint's and x86lint's polarity, and riscvlint had the
 opposite one until it was flipped: every finding printed unless `-q`
 said otherwise, which made a bare invocation on a real binary unusable
-and the flag a thing you had to know. `-q` still asks for what is now
-the default and is still accepted, silently, so the corpus-scale
-invocations that passed it keep working -- and those are the last place
-to add a line of noise. `-v` is also what adds the sample addresses to
+and the flag a thing you had to know. `-q` (`--quiet`) still asks for
+what is now the default and is still accepted, silently, so the
+corpus-scale invocations that passed it keep working -- and those are
+the last place to add a line of noise. `-v` is also what adds the sample addresses to
 the `-i` census, which is that report's own per-finding detail.
 
 Every fixture under `fixtures/` passes `-v`, since what they snapshot is
@@ -2302,7 +2329,7 @@ reads it unadorned, `json.JSONDecoder().raw_decode` in a loop in
 Python. A file the driver rejects leaves stdout empty rather than half a
 document, and the exit status is unchanged by the mode.
 
-`-i`, `-f` and `-v` are separate reports whose output would interleave
+`-i`, `-u` and `-v` are separate reports whose output would interleave
 with the document, so those combinations are refused rather than chosen
 for the caller. `-q` asks for what `--json` already does and is accepted, so
 a script that passed it still gets a document.
@@ -2421,7 +2448,7 @@ libLLVM covering 16.9 MB of a 51.9 MB `.text`, so it would name about a
 third of the findings and leave the rest looking like they belong to
 whichever export preceded them.
 
-## Constant chains (`-c`)
+## Constant chains (`-c`, `--constants`)
 
 `riscvlint -c` adds a second report to the scan: every constant the
 code materializes, tallied by value and ranked by the instructions it
@@ -2560,7 +2587,7 @@ which could not be read exits 2 whatever the other four reported: what
 they found is not the answer to the question that was asked. The `-i`
 census is a description of the file rather than a verdict on it and so
 never returns 1 -- nothing in it is a finding -- but a file it could not
-read is still a 2. The `-f` fusion report is the same.
+read is still a 2. The `-u` fusion report is the same.
 
 An `-a` audit's findings count toward the total like any other, so a
 run that passes it exits 1 whenever the audit found anything to review;

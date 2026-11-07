@@ -204,7 +204,7 @@ static unsigned audits;
 // replacement, as armlint's is: it answers a question about the binary
 // that the findings do not.
 static bool cchain_mode;
-// -f: report the instruction pairs a fusing core would issue as one, and
+// -u: report the instruction pairs a fusing core would issue as one, and
 // the near misses, instead of the lint scan. A replacement like -i, for
 // the same reason: it describes the code for a core rather than
 // proposing rewrites of it, and a pair that fuses is not a finding.
@@ -1420,78 +1420,202 @@ static int cmp_tally(const void *a, const void *b)
     return strcmp(ta->title, tb->title);
 }
 
+// The command line. Every option has a long name, which is the documented
+// spelling, and a one-letter alias, kept because the letters predate the
+// names and scripts use them. The letters shared with armlint and x86lint
+// (-v, -i, -c, -m, -a and --json) mean the same thing in all three tools,
+// so a reader of one report can read the others, and so do the long names.
+// Both of them spell --function -f, which is why the fusion report is -u.
+// This table is also what --help and a usage error print, so no option can
+// be parsed without being documented.
+enum option_id {
+    OPT_VERBOSE,
+    OPT_QUIET,
+    OPT_ISA,
+    OPT_FUSION,
+    OPT_CONSTANTS,
+    OPT_JSON,
+    OPT_ASSUME,
+    OPT_ENABLE,
+    OPT_HELP,
+};
+
+struct option_spec {
+    enum option_id id;
+    const char *shrt;   // the one-letter alias, or NULL
+    const char *lng;    // the long name
+    const char *arg;    // what the help calls the value, or NULL for a switch
+    const char *help;   // wrapped at its newlines
+};
+
+static const struct option_spec options[] = {
+    {OPT_VERBOSE, "-v", "--verbose", NULL,
+     "print each finding with its disassembly"},
+    // What the default already does. Accepted rather than refused: it was
+    // the flag for corpus-scale runs, and those are the last place to add
+    // a line of noise.
+    {OPT_QUIET, "-q", "--quiet", NULL,
+     "the default; kept for the scripts that passed it"},
+    // The census and the fusion report replace the lint scan.
+    {OPT_ISA, "-i", "--isa", NULL,
+     "an ISA census in place of the lint scan"},
+    {OPT_FUSION, "-u", "--fusion", NULL,
+     "a macro-op fusion report in place of the lint scan"},
+    {OPT_CONSTANTS, "-c", "--constants", NULL,
+     "also report the constants the code builds, by cost"},
+    {OPT_JSON, NULL, "--json", NULL,
+     "the findings as a JSON document on stdout"},
+    {OPT_ASSUME, "-m", "--assume", "EXT",
+     "the target has EXT: zba, zbb, zbs, zcb, zfa, zilx, zibi,\n"
+     "zacas or c; rva20, rva22 and rva23 name a profile"},
+    {OPT_ENABLE, "-a", "--enable", "AUDIT",
+     "also run the imm or const audit"},
+    {OPT_HELP, "-h", "--help", NULL,
+     "print this help"},
+};
+
+static void usage(FILE *to, const char *argv0)
+{
+    fprintf(to, "usage: %s [OPTION]... <ELF_FILE>...\n", argv0);
+    for (size_t k = 0; k < sizeof options / sizeof options[0]; k++) {
+        const struct option_spec *o = &options[k];
+        char name[32];
+        snprintf(name, sizeof name, "%s%s%s", o->lng,
+                 o->arg != NULL ? " " : "", o->arg != NULL ? o->arg : "");
+        fprintf(to, "  %s%s %-18s ", o->shrt != NULL ? o->shrt : "  ",
+                o->shrt != NULL ? "," : " ", name);
+        // A help text wraps at its newlines, continued under itself.
+        for (const char *h = o->help; *h != '\0'; h++) {
+            fputc(*h, to);
+            if (*h == '\n') fprintf(to, "%25s", "");
+        }
+        fputc('\n', to);
+    }
+}
+
+// The option argv[i] spells, or NULL for a non-option. A long name may
+// carry its value as --name=VALUE, which *value then points at; otherwise
+// *value is NULL and a valued option takes the next argument.
+static const struct option_spec *option_match(const char *arg,
+                                              const char **value)
+{
+    *value = NULL;
+    for (size_t k = 0; k < sizeof options / sizeof options[0]; k++) {
+        const struct option_spec *o = &options[k];
+        if (o->shrt != NULL && strcmp(arg, o->shrt) == 0) return o;
+        size_t n = strlen(o->lng);
+        if (strncmp(arg, o->lng, n) == 0) {
+            if (arg[n] == '\0') return o;
+            if (arg[n] == '=') {
+                *value = arg + n + 1;
+                return o;
+            }
+        }
+    }
+    return NULL;
+}
+
 int main(int argc, char **argv)
 {
-    static const char usage[] =
-        "usage: %s [-v] [-i] [-c] [-f] [--json] "
-        "[-m zba|zbb|zbs|zcb|zfa|zilx|zibi|zacas|c|rva20|rva22|rva23]... "
-        "[-a imm|const]... <binary>...\n";
-    int argi = 1;
-    while (argi < argc && argv[argi][0] == '-' && argv[argi][1]) {
-        if (strcmp(argv[argi], "-v") == 0) {
+    // The non-option arguments are the files. They are compacted to the
+    // front of argv[1..] as they are met, which never overwrites an
+    // argument not yet read: at most one file lands per argument consumed.
+    char **files = argv + 1;
+    int nfiles = 0;
+    for (int i = 1; i < argc; i++) {
+        const char *value;
+        const struct option_spec *o = option_match(argv[i], &value);
+        if (o == NULL) {
+            if (argv[i][0] != '-' || argv[i][1] == '\0') {
+                files[nfiles++] = argv[i];
+                continue;
+            }
+            fprintf(stderr, "%s: unknown option '%s'\n", argv[0], argv[i]);
+            usage(stderr, argv[0]);
+            return 2;
+        }
+        if (o->arg == NULL && value != NULL) {
+            fprintf(stderr, "%s: %s takes no value\n", argv[0], o->lng);
+            return 2;
+        }
+        if (o->arg != NULL && value == NULL) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "%s: %s needs a value\n", argv[0], o->lng);
+                usage(stderr, argv[0]);
+                return 2;
+            }
+            value = argv[++i];
+        }
+        switch (o->id) {
+        case OPT_VERBOSE:
             verbose = true;
-        } else if (strcmp(argv[argi], "-q") == 0) {
-            // What the default already does. Accepted silently rather
-            // than refused or warned about: it was the flag for
-            // corpus-scale runs, and those are the last place to add a
-            // line of noise.
-        } else if (strcmp(argv[argi], "-i") == 0) {
+            break;
+        case OPT_QUIET:
+            break;
+        case OPT_ISA:
             census_mode = true;
-        } else if (strcmp(argv[argi], "-c") == 0) {
-            cchain_mode = true;
-        } else if (strcmp(argv[argi], "-f") == 0) {
+            break;
+        case OPT_FUSION:
             fusion_mode = true;
-        } else if (strcmp(argv[argi], "--json") == 0) {
+            break;
+        case OPT_CONSTANTS:
+            cchain_mode = true;
+            break;
+        case OPT_JSON:
             json_mode = true;
-        } else if (strcmp(argv[argi], "-m") == 0 && argi + 1 < argc) {
+            break;
+        case OPT_ASSUME: {
             unsigned e;
-            if (!riscvlint_parse_ext_name(argv[++argi], &e)) {
-                fprintf(stderr, "%s: unknown -m name '%s'\n", argv[0],
-                        argv[argi]);
-                fprintf(stderr, usage, argv[0]);
+            if (!riscvlint_parse_ext_name(value, &e)) {
+                fprintf(stderr, "%s: unknown --assume name '%s' (known: zba, "
+                        "zbb, zbs, zcb, zfa, zilx, zibi, zacas, c, rva20, "
+                        "rva22, rva23)\n", argv[0], value);
                 return 2;
             }
             forced_exts |= e;
             have_forced = true;
-        } else if (strcmp(argv[argi], "-a") == 0 && argi + 1 < argc) {
+            break;
+        }
+        case OPT_ENABLE: {
             unsigned a;
-            if (!riscvlint_parse_audit_name(argv[++argi], &a)) {
-                fprintf(stderr, "%s: unknown -a name '%s'\n", argv[0],
-                        argv[argi]);
-                fprintf(stderr, usage, argv[0]);
+            if (!riscvlint_parse_audit_name(value, &a)) {
+                fprintf(stderr, "%s: unknown --enable audit '%s' (known: imm, "
+                        "const)\n", argv[0], value);
                 return 2;
             }
             audits |= a;
-        } else {
-            fprintf(stderr, usage, argv[0]);
-            return 2;
+            break;
         }
-        argi++;
+        case OPT_HELP:
+            usage(stdout, argv[0]);
+            return 0;
+        }
     }
-    if (argi >= argc) {
-        fprintf(stderr, usage, argv[0]);
+    if (nfiles == 0) {
+        usage(stderr, argv[0]);
         return 2;
     }
     // -m pins what the checks may assume, and the census assumes
     // nothing: it reports the extensions that are there. Saying so beats
     // ignoring a flag the caller thought was doing something.
     if (census_mode && have_forced)
-        fprintf(stderr, "%s: -m has no effect with -i; the census reports "
-                "what the binary uses\n", argv[0]);
+        fprintf(stderr, "%s: --assume has no effect with --isa; the census "
+                "reports what the binary uses\n", argv[0]);
     if (fusion_mode && have_forced)
-        fprintf(stderr, "%s: -m has no effect with -f; fusion depends on "
-                "the core, not the extensions\n", argv[0]);
+        fprintf(stderr, "%s: --assume has no effect with --fusion; fusion "
+                "depends on the core, not the extensions\n", argv[0]);
     // The audits are checks, and neither the census nor the fusion
     // report runs any.
     if ((census_mode || fusion_mode) && audits)
-        fprintf(stderr, "%s: -a has no effect with %s; that report runs no "
-                "checks\n", argv[0], census_mode ? "-i" : "-f");
+        fprintf(stderr, "%s: --enable has no effect with %s; that report "
+                "runs no checks\n", argv[0],
+                census_mode ? "--isa" : "--fusion");
     // --json describes the lint scan. The census is a separate report
     // whose output would interleave with the document, so the two are
     // refused rather than one of them chosen for the caller.
     if (census_mode && json_mode) {
-        fprintf(stderr, "%s: --json and -i are separate reports; pick one\n",
-                argv[0]);
+        fprintf(stderr, "%s: --json and --isa are separate reports; pick "
+                "one\n", argv[0]);
         return 2;
     }
     // -v prints the human report's per-finding half, which would
@@ -1499,18 +1623,18 @@ int main(int argc, char **argv)
     // reason -i is: the caller gets to pick, rather than being picked
     // for.
     if (json_mode && verbose) {
-        fprintf(stderr, "%s: --json and -v are separate reports; pick one\n",
-                argv[0]);
+        fprintf(stderr, "%s: --json and --verbose are separate reports; "
+                "pick one\n", argv[0]);
         return 2;
     }
     if (json_mode && fusion_mode) {
-        fprintf(stderr, "%s: --json and -f are separate reports; pick one\n",
-                argv[0]);
+        fprintf(stderr, "%s: --json and --fusion are separate reports; "
+                "pick one\n", argv[0]);
         return 2;
     }
     if (json_mode && cchain_mode) {
-        fprintf(stderr, "%s: --json and -c are separate reports; pick one\n",
-                argv[0]);
+        fprintf(stderr, "%s: --json and --constants are separate reports; "
+                "pick one\n", argv[0]);
         return 2;
     }
     csh handle;
@@ -1520,8 +1644,8 @@ int main(int argc, char **argv)
     }
     cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
     unsigned failures = 0;
-    for (; argi < argc; argi++)
-        if (scan_file(handle, argv[argi]) != 0) failures++;
+    for (int i = 0; i < nfiles; i++)
+        if (scan_file(handle, files[i]) != 0) failures++;
     cs_close(&handle);
 
     // The census is the whole report of a -i run; there are no findings

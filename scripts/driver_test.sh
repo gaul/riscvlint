@@ -75,12 +75,48 @@ expect 2
 expect 0 -q -i "$WORK/dirty.o"
 expect 2 -q -i "$WORK/does-not-exist"
 # The fusion report likewise: a pair that fuses is not a finding.
-expect 0 -f "$WORK/dirty.o"
-expect 2 -f "$WORK/does-not-exist"
+expect 0 -u "$WORK/dirty.o"
+expect 2 -u "$WORK/does-not-exist"
 # -q asks for the default and is kept only so the invocations that
 # passed it still work, so it must stay accepted.
 expect 1 -q "$WORK/dirty.o"
 expect 1 -v "$WORK/dirty.o"
+
+# Every long name runs the same scan as its letter, with a value as the
+# next argument or joined with '='.
+expect 1 --verbose "$WORK/dirty.o"
+expect 1 --quiet "$WORK/dirty.o"
+expect 0 --isa "$WORK/dirty.o"
+expect 0 --fusion "$WORK/dirty.o"
+expect 1 --constants "$WORK/dirty.o"
+expect 1 -m rva23 "$WORK/dirty.o"
+expect 1 --assume rva23 "$WORK/dirty.o"
+expect 1 --assume=rva23 "$WORK/dirty.o"
+expect 1 --enable=imm "$WORK/dirty.o"
+# Options are read wherever they stand, so a file may come first.
+expect 1 "$WORK/dirty.o" -v
+# The error paths: a value on a switch, a valued option without one, an
+# unknown value, and the old fusion letter -- -f is --function in armlint
+# and x86lint, so it is refused here rather than given a third meaning.
+expect 2 --verbose=yes "$WORK/dirty.o"
+expect 2 -m
+expect 2 --assume
+expect 2 --assume=no-such-extension "$WORK/clean.o"
+expect 2 --enable no-such-audit "$WORK/clean.o"
+expect 2 -f "$WORK/dirty.o"
+# --help is an answer rather than a scan: it exits 0 and needs no file,
+# and it names every option.
+expect 0 --help
+expect 0 -h
+missing=""
+for name in verbose quiet isa fusion constants json assume enable help; do
+    "$ROOT/riscvlint" --help | grep -q -- "--$name" || missing="$missing --$name"
+done
+if [ -z "$missing" ]; then
+    ok "--help names every option"
+else
+    bad "--help names every option" "missing:$missing"
+fi
 
 # The verbosity default, which is the other thing the snapshot suite
 # cannot see: every fixture passes -v, so nothing there would notice the
