@@ -3,7 +3,7 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Fifty-one checks and two audits (`-a imm`, `-a const`) are implemented,
+Fifty-two checks and two audits (`-a imm`, `-a const`) are implemented,
 and the ledger's candidate list is empty.
 [TODO.md](TODO.md) is that ledger:
 every candidate that was measured, the population it came back with,
@@ -13,7 +13,7 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Fifty-one of them, and the table lists the forty-two that report
+Fifty-two of them, and the table lists the forty-three that report
 something over the corpus. Twelve of those -- the jump pair, the
 constant chain, the no-op, the push run, the zero store, the zero
 branch, the andi pair, the max clamp, the immediate operand, the mask,
@@ -21,7 +21,8 @@ the jump threading and the floating-point constant built through an
 integer register -- were written for the JetStream corpus of TODO.md
 and measured there first, and the release run, the cancelling pair, the
 needless copy, the scratch-register call and the shared tail were sized
-over the SpiderMonkey corpus there; their rows here are what they
+over the SpiderMonkey corpus there, and the complement check came out of
+a SpiderMonkey patch; their rows here are what they
 report over this corpus, and their entries in the ledger say what that
 is. Nine report nothing
 over this corpus -- the bit count because no baseline object declares
@@ -65,6 +66,7 @@ the row where no finding does and the arithmetic is uniform instead.
 | slli + srli foldable to zext.h | 0 | 0 | 9,522 | 9,522 | 29,634 | all |
 | transfer to an unconditional jump | 7,221 | 301 | 1,824 | 9,346 | 0 | all |
 | base add foldable into memory offset | 5,768 | 429 | 2,993 | 9,190 | 26,216 | all |
+| constant built in more instructions than li needs | 3,553 | 257 | 4,964 | 8,774 | 13,944 | all |
 | redundant reload | 3,631 | 231 | 4,408 | 8,270 | 10,878 | all |
 | run of zero stores one wider store would do | 5,942 | 143 | 1,292 | 7,377 | 37,928 | all |
 | store of a value the slot already holds | 1,552 | 225 | 5,341 | 7,118 | 21,128 | all |
@@ -72,29 +74,29 @@ the row where no finding does and the arithmetic is uniform instead.
 | transfer to the instruction that follows it | 4,299 | 831 | 20 | 5,150 | 10,354 | all |
 | dead store to a frame slot | 395 | 1 | 4,172 | 4,568 | 17,160 | all |
 | branch over a move foldable to max or min | 0 | 5 | 3,459 | 3,464 | 9,964 | all |
-| constant built in more instructions than li needs | 2,836 | 17 | 60 | 2,913 | 4,090 | all |
 | slli + srai foldable to sext.b or sext.h | 0 | 0 | 2,562 | 2,562 | 6,450 | all |
 | not + and/or/xor foldable to andn/orn/xnor | 2 | 1 | 2,518 | 2,521 | 9,152 | all |
 | constant loaded for an immediate operand | 2,267 | 209 | 0 | 2,476 | 7,784 | all |
 | jump pair foldable to j | 46 | 1,973 | 12 | 2,031 | 8,124 | all |
 | tail every jump to one label repeats | 1,035 | 119 | 430 | 1,584 | 35,132 | all |
 | instruction with no architectural effect | 1,223 | 63 | 282 | 1,568 | 4,394 | all |
-| mask loaded for a zero extension | 567 | 0 | 700 | 1,267 | 3,740 | all |
+| mask loaded for a zero extension | 589 | 0 | 808 | 1,397 | 4,280 | all |
 | bit-cast routed through a frame slot | 1,149 | 0 | 10 | 1,159 | 0 | all |
 | zero loaded for a store | 8 | 0 | 944 | 952 | 2,192 | all |
 | li + mul foldable to shNadd | 0 | 0 | 416 | 416 | 1,046 | all |
 | constant loaded for a branch against zero | 79 | 0 | 202 | 281 | 1,050 | all |
 | floating-point constant built through an integer register | 0 | 0 | 205 | 205 | 1,672 | all |
+| and/or/xor constant whose complement builds shorter | 74 | 7 | 58 | 139 | 132 | all |
 | floating-point constant fli would have built | 0 | 0 | 120 | 120 | 480 | all |
 | release followed by a reservation | 12 | 0 | 0 | 12 | 42 | all |
 | pushes one stack adjustment would do | 0 | 0 | 12 | 12 | 28 | all |
 | zero loaded for an equality branch | 9 | 0 | 0 | 9 | 24 | all |
 | slli + srli foldable to andi | 0 | 1 | 0 | 1 | 4 | all |
-| **total** | **517,837** | **196,327** | **3,094,370** | **3,808,534** | **8,764,174** | |
+| **total** | **518,650** | **196,574** | **3,099,440** | **3,814,664** | **8,774,700** | |
 
 Do not read the total row as a result. One row is 79% of it, and that
 row is Go's assembler declining to select RVC at all, which is a
-different kind of finding from the forty-one around it. The second row
+different kind of finding from the forty-two around it. The second row
 is 8% and belongs to the linker. The `assumed` in the call-pair row is
 the one byte figure that is arithmetic rather than measurement: that
 check prints no size, and every site is eight bytes in and four out
@@ -1153,12 +1155,19 @@ except a handful of `jalr ra,0(ra)` that were already two.
   `andi` cannot hold loads it into a scratch register whatever it is.
 
 * **constant built in more instructions than li needs** -- a chain of
-  `lui` or `li` followed by `addi`, `addiw`, `slli`, `ori` or `xori`
-  reading and writing the same register, in either width, longer than
-  the plain RV64I recurrence needs for the value it ends up holding:
-  `lui`+`addiw` for a 32-bit value, otherwise the high part
-  recursively, one `slli` by its trailing zeros plus twelve, and an
-  `addi` for the low twelve bits.
+  `lui`, `li` or Zbs's `bseti` from x0, then steps reading and writing
+  the same register -- `addi`, `addiw`, `andi`, `ori`, `xori`, the
+  immediate shifts, and the Zba, Zbb, Zbs and Zcb operations a planner
+  ends a sequence with -- longer than what `li` needs for the value it
+  ends up holding. What `li` needs is LLVM's RISCVMatInt, ported and
+  counted rather than emitted, under the object's own extensions: the
+  RV64I recurrence with its retries -- the trailing zeros shifted in by
+  a final `slli`, the leading zeros shifted out by a final `srli`, the
+  value inverted by a final `xori` -- then `slli.uw`, `zext.w` and
+  `shNadd` under Zba, `bseti` and `bclri` under Zbs, and `rori` of a
+  negative twelve-bit immediate under Zbb. One step is not LLVM's:
+  `rori` of anything a single `lui` or `addi` builds, which is how the
+  complement of a mask that wraps bit 63 is two instructions.
 
   ```
    12e77b0: lui t6, 0x156
@@ -1166,31 +1175,93 @@ except a handful of `jalr ra,0(ra)` that were already two.
    12e77b8: slli t6, t6, 0xb
    12e77bc: ori t6, t6, 0x3f0
    12e77c0: slli t6, t6, 0x6
-   12e77c4: ori t6, t6, 0x0    -> li t6, 0x2ac6c4fc00 in 4 instructions
+   12e77c4: ori t6, t6, 0x0    -> li t6, 0x2ac6c4fc00 in 3 instructions: lui, addiw, slli
   ```
 
-  The recurrence is a construction, so it is achievable, and that is
-  all a finding saying "more than needed" has to know; the assemblers
-  find shorter sequences for some values, which makes the count an
-  upper bound and the check conservative. The chain ends at the first
-  instruction that is not such a step or that another path joins, and
-  a relocated instruction anywhere in it drops the site, since in an
-  unlinked object the immediates are placeholders. The replacement is
-  priced at the chain's own encoding class, as the branch-over-jump
-  entry prices its branch, so that the saving does not include what the
-  compression check already reports.
+  Every plan is a construction, so it is achievable, and that is all a
+  finding saying "more than needed" has to know. It is not proved
+  minimal -- LLVM builds some values in fewer with a second register,
+  which a chain on one register cannot use -- so the check stays
+  conservative. The chain ends at the first instruction that is not
+  such a step or that another path joins, and a relocated instruction
+  anywhere in it drops the site, since in an unlinked object the
+  immediates are placeholders. The replacement names the plan's
+  mnemonics and is priced at the chain's own encoding class, as the
+  branch-over-jump entry prices its branch, so that the saving does not
+  include what the compression check already reports.
 
-  Compilers emit the recurrence themselves. V8 does not: its builtin
-  and code addresses go through a fixed six-instruction sequence that
-  `set_target_address` can patch any 48-bit value into, and the
-  JetStream corpus (TODO.md, entry 37) has 554,655 of those where four
-  instructions do, 402,172 of them feeding a `jalr`. The check reports
-  562,957 there, 4,488,784 bytes or 3.0% of the corpus's code: 407,910
-  in Maglev, 85,201 in TurboFan, 48,735 in baseline and 21,056 in
-  regexp code. By what the value needs, 554,655 are four instructions,
-  2,292 three, 1,288 two and 4,722 one, the last being pairs such as
-  `lui a5,4; slli a5,a5,4` for what `lui a5,0x40` holds. Whether the
-  package corpus has any is for the table's next regeneration to say.
+  Until the planner, the reference was the plain RV64I recurrence --
+  `lui`+`addiw` for a 32-bit value, otherwise the high part, one `slli`
+  and an `addi` -- and it missed shorter spellings even without the
+  extensions: the example above is `0xab1b13f << 10`, three
+  instructions where the recurrence counted four.
+
+  Compilers emit the planner's sequences themselves, so over the
+  package corpus the check reports 8,774 sites, 13,944 bytes, where the
+  recurrence reported 2,913 and 4,090. The two baseline builds gain
+  without any extension -- libxul 1,400 to 1,695, Debian's libLLVM 594
+  to 710 -- from the planner's retries and from chains the recognizer
+  now follows through `andi`, `srli` and `sext.w`. Go's row is 60 to
+  4,964, and 4,668 of those are Zb sequences, 4,365 of them `bseti` for
+  `li 1; slli k`: Go declares no extensions, so every gate opens, and
+  under `-m rva20` its row is 296.
+
+  V8 does not emit them: its builtin and code addresses go through a
+  fixed six-instruction sequence that `set_target_address` can patch
+  any 48-bit value into. Over a JetStream dump taken again for this
+  change (TODO.md, entry 54) the check reports 687,606 sites, 5,579,580
+  bytes, where the recurrence reported 559,340 and 4,462,244: 463,982
+  in Maglev, 102,437 in baseline, 97,289 in TurboFan and 23,820 in
+  regexp code. 403,843 of the fixed loads need four instructions and
+  148,631 three, and 74,632 findings are `bseti` for values such as
+  `0x100000000`, which V8 builds with `li 1; slli 32`; 53,523 touch a
+  JS dispatch handle's relocation, so V8 may be patching them.
+  SpiderMonkey's patchable `li_ptr` and `li_constant` are the same
+  story at 1,469,516 sites, and its other constants rose from 50,817 to
+  156,287, about 80,000 of them boxed constants such as
+  `0xfffc000000000001`, `true`, built `li -1; slli 50; addi 1` where a
+  rotated `lui` takes two.
+
+* **and/or/xor constant whose complement builds shorter** -- a constant
+  built only for `and`, `or` or `xor` whose complement `li` builds in
+  fewer instructions. Zbb's `andn`, `orn` and `xnor` take the complement
+  where the plain operations took the constant, so only the
+  materialization changes; a constant built for those three is the same
+  case reversed. SpiderMonkey's nursery check prompted it: the GC chunk
+  mask is three instructions however it is built, and its complement is
+  a rotated `lui`.
+
+  ```
+   lui  t4, 0x8000
+   addiw t4, t4, -1
+   slli t4, t4, 20
+   and  t4, t4, a2     -> li t4, 0xffff8000000fffff in 2 instructions: lui, rori; andn t4, a2, t4 (16 -> 12 bytes)
+  ```
+
+  The chain is the entry above's and the uses are found by the
+  immediate-operand check's walk; the constant must be dead after the
+  last use or overwritten by it. Both values are planned as the entry
+  above plans them, and the complement is measured against the shorter
+  of the chain and that plan, so where both checks report a site their
+  savings add. A mask of the low bits that is only anded with is left
+  to the mask check, whose rewrite needs no constant at all. The swapped
+  operation is priced at four bytes, since none of the three Zbb
+  operations has a compressed form, so a site whose `and` was a `c.and`
+  may not shrink, and is then not reported. A swap to `andn`, `orn` or
+  `xnor` is gated on Zbb permissively; a swap away from one needs
+  nothing.
+
+  The SpiderMonkey corpus (TODO.md, entry 54), which predates the
+  fix, has 67,705, worth 270,824 bytes: 66,596 of them the chunk mask,
+  42,495 in Baseline code and 24,096 in Ion, and most of the rest 32-bit
+  masks in regexps such as `0xf0f0ffff`, `lui`+`addiw` where the
+  complement is one `lui`. V8's JetStream dump has 2,018, all `andn`
+  and 1,980 of them in regexp code, masks of the same kind whose
+  complement is `lui; slli`. The package corpus has 139 -- 59 `xnor`,
+  48 `andn`, 32 `orn` -- and they shrink by instructions more than by
+  bytes, 132 in all, since in compressed code the plain operation was
+  often two bytes and its replacement is four; Go's 58 are behind the
+  gate an object that declares nothing never closes.
 
 * **constant re-materialization** -- a constant built into a register
   while the same value is still live in another, where the constant is

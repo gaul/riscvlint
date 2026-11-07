@@ -1471,17 +1471,21 @@ bool check_not_logic_fold(riscvlint_state *state, const cs_insn *insn,
 bool check_jump_pair_to_j(riscvlint_state *state, const cs_insn *insn,
                           riscvlint_finding *finding);
 
-// A constant built on one register -- `lui` or `li`, then `addi`,
-// `addiw`, `slli`, `ori` or `xori` reading and writing that register,
-// in either width -- in more instructions than the plain RV64I
-// recurrence needs for the value the chain ends up holding. The chain
-// ends at the first instruction that is not such a step or that another
-// path joins; a relocated instruction anywhere in it drops the site,
-// since in an unlinked object the immediates are placeholders.
+// A constant built on one register -- `lui` or `li`, then steps that
+// read and write that register: `addi`, `addiw`, `andi`, `ori`, `xori`,
+// the immediate shifts, and the Zba, Zbb, Zbs and Zcb forms a planner
+// would use -- in more instructions than li needs for the value the
+// chain ends up holding. What li needs is LLVM's RISCVMatInt under the
+// object's own extensions, plus a rotated `lui` under Zbb, which LLVM
+// does not try. The chain ends at the first instruction that is not
+// such a step or that another path joins; a relocated instruction
+// anywhere in it drops the site, since in an unlinked object the
+// immediates are placeholders.
 //
 // The replacement is priced at the chain's own encoding class, as the
 // branch-over-jump check prices its branch, so that the saving does not
-// include what the compression check already reports.
+// include what the compression check already reports, and it names the
+// planned sequence's mnemonics.
 //
 // Measured population: 558,869 chains in the JetStream corpus (TODO.md,
 // entry 37), 554,655 of them V8's fixed six-instruction load of a
@@ -1699,6 +1703,29 @@ bool check_const_for_imm(riscvlint_state *state, const cs_insn *insn,
 // masks are followed by a transfer the liveness walk cannot see past.
 bool check_mask_for_zext(riscvlint_state *state, const cs_insn *insn,
                          riscvlint_finding *finding);
+
+// A constant built only for `and`, `or` and `xor` whose complement li
+// builds in fewer instructions: Zbb's `andn`, `orn` and `xnor` take the
+// complement where the plain operations took the constant, and the
+// reverse for a constant built for those three, so only the
+// materialization changes. SpiderMonkey's GC chunk mask is the case
+// that prompted it -- 0x7ffffff00000 takes three instructions however
+// it is built, and its complement two, a rotated `lui`:
+//
+//     lui t4,0x8000; addiw t4,t4,-1; slli t4,t4,20; and t4,t4,a2
+//         ->  lui t4,0xf8000; rori t4,t4,44; andn t4,a2,t4
+//
+// The chain is followed as check_long_li follows it, the uses as
+// check_const_for_imm walks them, and the constant must be dead after
+// the last use or overwritten by it. Both sides are planned as
+// check_long_li plans, and the complement is measured against the
+// shorter of the chain and that plan, so that where check_long_li also
+// reports the site the two savings add. A swap to a Zbb operation is
+// gated on Zbb permissively; a swap away from one needs nothing. The
+// swapped operation is priced at four bytes, and a site that would grow
+// is not reported.
+bool check_const_complement(riscvlint_state *state, const cs_insn *insn,
+                            riscvlint_finding *finding);
 
 // Immediate-misfit audit (opt-in, RISCVLINT_AUDIT_IMM / -a imm): a
 // constant materialized -- by `li`, `lui`, or the chain check_long_li

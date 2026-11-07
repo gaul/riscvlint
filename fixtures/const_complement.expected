@@ -1,0 +1,87 @@
+and/or/xor constant whose complement builds shorter at offset: 0x0: -> li t4, 0xffff8000000fffff in 2 instructions: lui, rori; andn t4, a2, t4 (16 -> 12 bytes) (4 instructions)
+  lui t4, 0x8000
+  addiw t4, t4, -1
+  slli t4, t4, 0x14
+  and t4, t4, a2
+
+instruction compressible to a base C form at offset: 0x4: -> c.addiw (4 -> 2 bytes) (1 instructions)
+  addiw t4, t4, -1
+
+instruction compressible to a base C form at offset: 0x8: -> c.slli (4 -> 2 bytes) (1 instructions)
+  slli t4, t4, 0x14
+
+instruction compressible to a base C form at offset: 0x14: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd t4, 0(sp)
+
+and/or/xor constant whose complement builds shorter at offset: 0x18: -> li t5, 0xffff8000000fffff in 2 instructions: lui, rori; and a0, a1, t5 (16 -> 12 bytes) (4 instructions)
+  lui t5, 0x8000
+  addiw t5, t5, -1
+  slli t5, t5, 0x14
+  andn a0, a1, t5
+
+instruction compressible to a base C form at offset: 0x1c: -> c.addiw (4 -> 2 bytes) (1 instructions)
+  addiw t5, t5, -1
+
+instruction compressible to a base C form at offset: 0x20: -> c.slli (4 -> 2 bytes) (1 instructions)
+  slli t5, t5, 0x14
+
+instruction compressible to a base C form at offset: 0x28: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a0, 8(sp)
+
+instruction compressible to a base C form at offset: 0x2c: -> c.li (4 -> 2 bytes) (1 instructions)
+  li t5, 0
+
+and/or/xor constant whose complement builds shorter at offset: 0x30: -> li t6, 0xffff8000000fffff in 2 instructions: lui, rori; orn a3, a3, t6 (16 -> 12 bytes) (4 instructions)
+  lui t6, 0x8000
+  addiw t6, t6, -1
+  slli t6, t6, 0x14
+  or a3, a3, t6
+
+instruction compressible to a base C form at offset: 0x34: -> c.addiw (4 -> 2 bytes) (1 instructions)
+  addiw t6, t6, -1
+
+instruction compressible to a base C form at offset: 0x38: -> c.slli (4 -> 2 bytes) (1 instructions)
+  slli t6, t6, 0x14
+
+instruction compressible to a base C form at offset: 0x40: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a3, 0x10(sp)
+
+instruction compressible to a base C form at offset: 0x44: -> c.li (4 -> 2 bytes) (1 instructions)
+  li t6, 0
+
+and/or/xor constant whose complement builds shorter at offset: 0x48: -> li t3, 0xffff8000000fffff in 2 instructions: lui, rori; xnor in 2 uses (20 -> 16 bytes) (5 instructions)
+  lui t3, 0x8000
+  addiw t3, t3, -1
+  slli t3, t3, 0x14
+  xor a4, a4, t3
+  xor a5, a5, t3
+
+instruction compressible to a base C form at offset: 0x4c: -> c.addiw (4 -> 2 bytes) (1 instructions)
+  addiw t3, t3, -1
+
+instruction compressible to a base C form at offset: 0x50: -> c.slli (4 -> 2 bytes) (1 instructions)
+  slli t3, t3, 0x14
+
+instruction compressible to a base C form at offset: 0x5c: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a4, 0x18(sp)
+
+instruction compressible to a base C form at offset: 0x60: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a5, 0x20(sp)
+
+instruction compressible to a base C form at offset: 0x64: -> c.li (4 -> 2 bytes) (1 instructions)
+  li t3, 0
+
+instruction compressible to a base C form at offset: 0x6c: -> c.addiw (4 -> 2 bytes) (1 instructions)
+  addiw t2, t2, -1
+
+instruction compressible to a base C form at offset: 0x70: -> c.slli (4 -> 2 bytes) (1 instructions)
+  slli t2, t2, 0x14
+
+instruction compressible to a base C form at offset: 0x78: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd t2, 0x28(sp)
+
+Optimization opportunities by type:
+      19  instruction compressible to a base C form
+       4  and/or/xor constant whose complement builds shorter
+
+23 optimization opportunities in 38 instructions

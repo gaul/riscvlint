@@ -18,6 +18,11 @@ instruction compressible to a base C form at offset: 0x10: -> c.li (4 -> 2 bytes
 instruction compressible to a base C form at offset: 0x14: -> c.li (4 -> 2 bytes) (1 instructions)
   li t2, 1
 
+constant built in more instructions than li needs at offset: 0x14: -> li t2, 0xffffffff in 2 instructions: addi, srli (12 -> 8 bytes) (3 instructions)
+  li t2, 1
+  slli t2, t2, 0x20
+  addi t2, t2, -1
+
 mask loaded for a zero extension at offset: 0x14: -> zext.w a2, a2 (16 -> 4 bytes) (4 instructions)
   li t2, 1
   slli t2, t2, 0x20
@@ -90,5 +95,6 @@ Optimization opportunities by type:
       20  instruction compressible to a base C form
        4  dead register definition
        3  mask loaded for a zero extension
+       1  constant built in more instructions than li needs
 
-27 optimization opportunities in 27 instructions
+28 optimization opportunities in 27 instructions

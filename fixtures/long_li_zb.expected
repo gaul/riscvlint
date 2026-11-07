@@ -1,0 +1,125 @@
+instruction compressible to a base C form at offset: 0x0: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a0, 1
+
+constant built in more instructions than li needs at offset: 0x0: -> li a0, 0x10000000000 in 1 instructions: bseti (8 -> 4 bytes) (2 instructions)
+  li a0, 1
+  slli a0, a0, 0x28
+
+instruction compressible to a base C form at offset: 0x4: -> c.slli (4 -> 2 bytes) (1 instructions)
+  slli a0, a0, 0x28
+
+instruction compressible to a base C form at offset: 0x8: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a0, 0(sp)
+
+constant built in more instructions than li needs at offset: 0xc: -> li a1, 0x810d9695 in 3 instructions: lui, addiw, zext.w (16 -> 12 bytes) (4 instructions)
+  lui a1, 0x81
+  addiw a1, a1, 0xd9
+  slli a1, a1, 0xc
+  addi a1, a1, 0x695
+
+instruction compressible to a base C form at offset: 0x14: -> c.slli (4 -> 2 bytes) (1 instructions)
+  slli a1, a1, 0xc
+
+instruction compressible to a base C form at offset: 0x1c: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a1, 8(sp)
+
+constant built in more instructions than li needs at offset: 0x20: -> li a2, 0x19f228913 in 3 instructions: lui, addiw, sh2add (16 -> 12 bytes) (4 instructions)
+  lui a2, 0x19f
+  addiw a2, a2, 0x229
+  slli a2, a2, 0xc
+  addi a2, a2, -0x6ed
+
+instruction compressible to a base C form at offset: 0x28: -> c.slli (4 -> 2 bytes) (1 instructions)
+  slli a2, a2, 0xc
+
+instruction compressible to a base C form at offset: 0x30: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a2, 0x10(sp)
+
+constant built in more instructions than li needs at offset: 0x34: -> li a3, 0x154955f7f in 3 instructions: lui, slli.uw, addi (16 -> 12 bytes) (4 instructions)
+  lui a3, 0xaa
+  addiw a3, a3, 0x4ab
+  slli a3, a3, 0xd
+  addi a3, a3, -0x81
+
+instruction compressible to a base C form at offset: 0x3c: -> c.slli (4 -> 2 bytes) (1 instructions)
+  slli a3, a3, 0xd
+
+instruction compressible to a base C form at offset: 0x44: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a3, 0x18(sp)
+
+instruction compressible to a base C form at offset: 0x48: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a4, -1
+
+constant built in more instructions than li needs at offset: 0x48: -> li a4, 0xbffffffffd956be9 in 3 instructions: lui, addiw, bclri (28 -> 12 bytes) (7 instructions)
+  li a4, -1
+  slli a4, a4, 0x25
+  addi a4, a4, -1
+  slli a4, a4, 0xd
+  addi a4, a4, -0x6a9
+  slli a4, a4, 0xc
+  addi a4, a4, -0x417
+
+instruction compressible to a base C form at offset: 0x4c: -> c.slli (4 -> 2 bytes) (1 instructions)
+  slli a4, a4, 0x25
+
+instruction compressible to a base C form at offset: 0x50: -> c.addi (4 -> 2 bytes) (1 instructions)
+  addi a4, a4, -1
+
+instruction compressible to a base C form at offset: 0x54: -> c.slli (4 -> 2 bytes) (1 instructions)
+  slli a4, a4, 0xd
+
+instruction compressible to a base C form at offset: 0x5c: -> c.slli (4 -> 2 bytes) (1 instructions)
+  slli a4, a4, 0xc
+
+instruction compressible to a base C form at offset: 0x64: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a4, 0x20(sp)
+
+instruction compressible to a base C form at offset: 0x68: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a5, -3
+
+constant built in more instructions than li needs at offset: 0x68: -> li a5, 0xffe7ffffffffffff in 2 instructions: addi, rori (12 -> 8 bytes) (3 instructions)
+  li a5, -3
+  slli a5, a5, 0x33
+  addi a5, a5, -1
+
+instruction compressible to a base C form at offset: 0x6c: -> c.slli (4 -> 2 bytes) (1 instructions)
+  slli a5, a5, 0x33
+
+instruction compressible to a base C form at offset: 0x70: -> c.addi (4 -> 2 bytes) (1 instructions)
+  addi a5, a5, -1
+
+instruction compressible to a base C form at offset: 0x74: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a5, 0x28(sp)
+
+instruction compressible to a base C form at offset: 0x78: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a6, -1
+
+constant built in more instructions than li needs at offset: 0x78: -> li a6, 0xffff8000000fffff in 2 instructions: lui, rori (16 -> 8 bytes) (4 instructions)
+  li a6, -1
+  slli a6, a6, 0x25
+  srli a6, a6, 0x11
+  not a6, a6
+
+instruction compressible to a base C form at offset: 0x7c: -> c.slli (4 -> 2 bytes) (1 instructions)
+  slli a6, a6, 0x25
+
+instruction compressible to a base C form at offset: 0x88: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a6, 0x30(sp)
+
+instruction compressible to a base C form at offset: 0x94: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd a7, 0x38(sp)
+
+instruction compressible to a base C form at offset: 0x9c: -> c.addi (4 -> 2 bytes) (1 instructions)
+  addi t0, t0, 5
+
+instruction compressible to a base C form at offset: 0xa0: -> c.sdsp (4 -> 2 bytes) (1 instructions)
+  sd t0, 0x40(sp)
+
+instruction compressible to a base C form at offset: 0xa4: -> c.jr (4 -> 2 bytes) (1 instructions)
+  ret 
+
+Optimization opportunities by type:
+      26  instruction compressible to a base C form
+       7  constant built in more instructions than li needs
+
+33 optimization opportunities in 42 instructions

@@ -1,4 +1,4 @@
-constant built in more instructions than li needs at offset: 0x0: -> li t6, 0x2ac6c4fc00 in 4 instructions (24 -> 16 bytes) (6 instructions)
+constant built in more instructions than li needs at offset: 0x0: -> li t6, 0x2ac6c4fc00 in 3 instructions: lui, addiw, slli (24 -> 12 bytes) (6 instructions)
   lui t6, 0x156
   addi t6, t6, 0x362
   slli t6, t6, 0xb
@@ -21,7 +21,7 @@ instruction compressible to a base C form at offset: 0x18: -> c.jalr (4 -> 2 byt
 instruction compressible to a base C form at offset: 0x1c: -> c.li (4 -> 2 bytes) (1 instructions)
   li a0, 1
 
-constant built in more instructions than li needs at offset: 0x1c: -> li a0, 0x1005 in 2 instructions (12 -> 8 bytes) (3 instructions)
+constant built in more instructions than li needs at offset: 0x1c: -> li a0, 0x1005 in 2 instructions: lui, addiw (12 -> 8 bytes) (3 instructions)
   li a0, 1
   slli a0, a0, 0xc
   addi a0, a0, 5
@@ -68,7 +68,7 @@ instruction compressible to a base C form at offset: 0x50: -> c.sdsp (4 -> 2 byt
 instruction compressible to a base C form at offset: 0x54: -> c.beqz (4 -> 2 bytes) (1 instructions)
   beqz a0, 0x48
 
-constant built in more instructions than li needs at offset: 0x58: -> li a4, 0x1005 in 2 instructions (6 -> 4 bytes) (3 instructions)
+constant built in more instructions than li needs at offset: 0x58: -> li a4, 0x1005 in 2 instructions: lui, addiw (6 -> 4 bytes) (3 instructions)
   li a4, 1
   slli a4, a4, 0xc
   addi a4, a4, 5

@@ -1567,6 +1567,10 @@ holds and the miner's grammar saw 772. The replacement is priced at the
 chain's own encoding class, four bytes an instruction here since V8
 emits no compressed instruction, so a six-for-four site saves eight.
 
+Since entry 54 the reference is LLVM's planner rather than the
+recurrence, and the figures above are the recurrence's; entry 54 has
+the planner's over this corpus, which had to be dumped again.
+
 ## 38. An instruction with no architectural effect -- 812,586  [implemented]
 
 Three spellings make it up. `lui zero,0x54321`, 425,026: the second
@@ -4494,6 +4498,134 @@ and left 2,061 additions of 4096. A table whose top row is one idiom in
 disguise is the thing this entry exists to avoid, and the lesson is
 entry 29's: the direction of the operand decides what the constant
 *is*.
+
+## 54. A constant whose complement builds shorter -- 67,705, 2,018 and 139  [implemented]
+
+Found by a SpiderMonkey patch rather than by the corpus. The riscv64
+backend's `getGCThingValueChunk` built `ValueGCThingPayloadChunkMask`,
+0x7ffffff00000, with `lui`/`addiw`/`slli` and then anded it in, at
+66,590 post-barrier nursery checks in a JetStream run. The first
+rewrite, `slli 17; srli 37; slli 20`, was an instruction shorter and,
+measured on the K3's X100, two cycles later on the check's critical
+path: all three shifts wait on the Value, where the old constant's
+three did not. Zbb's `andn` has both. The mask's complement, a run of
+ones from bit 47 around to bit 19, is `0xfffffffff8000000` rotated, so
+`lui; rori` builds it and `andn` clears its bits -- three instructions,
+one of them waiting on the Value. That patch is Firefox bug 2090641.
+
+riscvlint had said nothing about any of the 66,590, for two reasons,
+which became this check and an amendment to check_long_li:
+
+* three instructions is the shortest `li` of the mask itself under any
+  extension -- no one instruction builds a run of 27 ones, and
+  rotation does not shorten a run -- so nothing about the chain was
+  long. The saving is in changing the consumer, which no check looked
+  at;
+* check_long_li measured chains against the plain RV64I recurrence,
+  which knows no `rori` and is not even the shortest RV64I spelling:
+  LLVM's RISCVMatInt, the planner compilers actually emit, retries with
+  the trailing zeros shifted in, the leading zeros shifted out and the
+  value inverted, and V8's fixed 48-bit loads come out three
+  instructions there rather than four.
+
+### What changed in check_long_li (entry 37)
+
+The reference is now RISCVMatInt, ported to count rather than emit,
+under the object's own extensions, plus `rori` of any one-instruction
+value under Zbb, which LLVM tries only for negative twelve-bit
+immediates. The chain recognizer follows every operation the planner
+ends a sequence with -- `srli`, `srai`, `andi`, `rori`, `bseti`,
+`bclri`, `binvi`, `slli.uw`, `zext.w`, `shNadd` of the register with
+itself, and the compressed `srli`, `srai`, `andi`, `zext.w` and `not` --
+and also starts at `bseti` from x0. check_mask_for_zext and
+check_fp_int_to_fli follow the same chains. The replacement names the
+plan's mnemonics.
+
+A planner that returns a wrong sequence would make every finding wrong
+in a way no snapshot notices, so it was held to a simulator before any
+corpus saw it: 4,000,000 values of nine shapes -- random, 32-bit,
+rotated runs, sparse, two bits set and cleared, multiples of 3, 5 and 9
+-- planned under no extension, each of Zba, Zbb and Zbs alone, and all
+three, with every plan executed. All 20,000,000 built their value, and
+none was longer than the recurrence it replaced.
+
+What that does to check_long_li's figures, before and after, over the
+three corpora -- the package corpus re-fetched and checked to reproduce
+README.md's table to the digit under the old binary before the new one
+ran; the SpiderMonkey corpus as it was; and V8's taken again, since the
+dump entry 37 was measured on had been deleted, with the same d8 build
+(5dba721424b, plus a local Maglev change to integer modulus that builds
+no constants) and the same JetStream selection, 65,968 code objects and
+37,743,326 instructions:
+
+| corpus | sites before | after | bytes before | after |
+|---|---:|---:|---:|---:|
+| package, 31 objects | 2,913 | 8,774 | 4,090 | 13,944 |
+| SpiderMonkey | 1,520,364 | 1,625,803 | 15,036,496 | 16,717,192 |
+| V8, the new dump | 559,340 | 687,606 | 4,462,244 | 5,579,580 |
+
+* **Package.** The two rv64gc builds gain with no extension at all:
+  libxul 1,400 to 1,695 and Debian's libLLVM 594 to 710, from the
+  retries and from chains followed through `andi`, `srli` and `sext.w`.
+  The RVA23 builds gain both ways -- Ubuntu's libLLVM 476 to 574, 61 of
+  them Zb sequences; libLLVM 20 335 to 538, 172 -- and Rust's six
+  objects go from 17 to 257, 200 of them Zb sequences, mostly `bseti`
+  for the sign bit with a small value added. Go goes from 60 to 4,964,
+  of which 4,668 are Zb sequences and 4,365 `bseti` for `li 1; slli k`:
+  Go declares no extension, so every gate opens, and under `-m rva20`
+  Go has 296, 236 of them `lui; slli` the recurrence missed.
+* **SpiderMonkey.** The fixed-length patchable loads are the same
+  sites, 1,054,091 `li_ptr` and 415,425 `li_constant`, now priced at
+  what the planner needs. The rest rose from 50,817 to 156,287, and
+  about 80,000 of the new ones are boxed constant Values --
+  `0xfffc000000000001`, `true`, 34,316 times, and `0xfff9000000000001`,
+  `0xfffd000000000005` and `0xfff9000000000002` after it -- built
+  `li; slli; addi` where `lui; rori` takes two. That is the planner's
+  one non-LLVM step, so SpiderMonkey's own port of RISCVMatInt, which
+  has LLVM's rotate and not this one, could take it too.
+* **V8.** 403,843 of the fixed 48-bit loads need four instructions and
+  148,631 three. 74,632 findings are `bseti` for values such as
+  `0x100000000` and `0x200000000`, which V8 builds `li 1; slli k` and
+  the K3's RVA23 declaration lets Zbs build in one; 53,523 findings,
+  against 2,830 before, contain a JS dispatch handle's relocation, so
+  V8 may patch them. By tier: 463,982 Maglev, 102,437 baseline, 97,289
+  TurboFan, 23,820 regexp.
+
+check_mask_for_zext follows the same chains and goes from 1,267 to
+1,397 over the package corpus; check_fp_int_to_fli does not change.
+
+### What check_const_complement reports
+
+| corpus | Ion / ML | BL | WA | RE | other | sites | bytes |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| SpiderMonkey | 24,101 | 42,495 | 250 | 854 | 5 | 67,705 | 270,824 |
+| V8, the new dump | 30 | 0 | - | 1,980 | 8 TF | 2,018 | 8,072 |
+
+The package corpus has 139 -- C++ 74, Rust 7, Go 58 -- worth 132
+bytes.
+
+SpiderMonkey's 67,705 are 66,596 chunk masks and about 1,100 others,
+32-bit masks such as `0xf0f0ffff` that are `lui`+`addiw` and whose
+complement is a `lui`, most of them in regexps. The 66,596 is the
+66,590 the patch's own scan counted in another run of the same build,
+to within run-to-run noise, and a dump with the patch has none left:
+its 1,109 findings are all the other masks. V8's 2,018 are the same kind of
+mask in its regexp code, `0xf0f0ffff` and `0x8080ffff` among them,
+where the complement is `lui; slli`.
+
+Over the package corpus the check finds instructions more than bytes:
+the RVA23 objects are compressed, the plain operation was often a
+two-byte `c.and`, and the swapped one is four, so a site that would
+grow is not reported and most of the rest break even on bytes. The
+59 `xnor`, 48 `andn` and 32 `orn` are mostly constants such as
+`0xffff`, `0x3fffffff` and `0x7fffffff`, `lui`+`addiw`, used by `xor`
+and `or`, whose complements are one `lui`. Go's 58 are behind a gate an object that declares nothing never
+closes, and `-m rva20` leaves none.
+
+A mask of the low bits that is only anded with is check_mask_for_zext's,
+and the first run, before that rule, reported two of its fixture's sites
+as well: the complement of `0xffff` is one `lui`, so `lui`+`andn` is
+shorter than the mask, but `zext.h` is shorter still.
 
 # Ranked for C++ and Rust specifically
 

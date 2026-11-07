@@ -5523,28 +5523,66 @@ static void test_long_li(csh handle)
 
     // V8's fixed 48-bit load: lui t6,0x156; addi 866; slli 11; ori 0x3f0;
     // slli 6; ori 0; then the jalr through it. Six instructions for
-    // 0x2ac6c4fc00, which lui+addiw+slli 16+addi -1024 builds in four.
+    // 0x2ac6c4fc00, which is 0xab1b13f << 10: lui+addiw+slli, as LLVM's
+    // retry with the trailing zeros shifted in finds.
     uint32_t v8[] = { 0x00156fb7u, 0x362f8f93u, 0x00bf9f93u, 0x3f0fef93u,
                       0x006f9f93u, 0x000fef93u, 0x000f80e7u };
     CHECK(run_words(handle, check_long_li, v8, 7, 0x1000, &f) == 1);
     CHECK(strcmp(f.replacement,
-                 "li t6, 0x2ac6c4fc00 in 4 instructions (24 -> 16 bytes)") == 0);
+                 "li t6, 0x2ac6c4fc00 in 3 instructions: lui, addiw, slli"
+                 " (24 -> 12 bytes)") == 0);
     CHECK(f.insn_count == 6 && f.address == 0x1000);
 
     // li a0,1; slli a0,a0,12; addi a0,a0,5 builds 0x1005: lui 1 + addiw 5.
     uint32_t three[] = { 0x00100513u, 0x00c51513u, 0x00550513u, 0x00008067u };
     CHECK(run_words(handle, check_long_li, three, 4, 0x1000, &f) == 1);
     CHECK(strcmp(f.replacement,
-                 "li a0, 0x1005 in 2 instructions (12 -> 8 bytes)") == 0);
+                 "li a0, 0x1005 in 2 instructions: lui, addiw (12 -> 8 bytes)")
+          == 0);
     CHECK(f.insn_count == 3);
 
     // Optimal chains are not reported: lui+addiw, li+slli, a lone li.
+    // li+slli of a single bit is optimal only without Zbs, whose bseti
+    // does it alone.
     uint32_t opt1[] = { 0x000015b7u, 0x0055859bu, 0x00008067u };
     CHECK(run_words(handle, check_long_li, opt1, 3, 0x1000, NULL) == 0);
     uint32_t opt2[] = { 0x00200613u, 0x02361613u, 0x00008067u };
-    CHECK(run_words(handle, check_long_li, opt2, 3, 0x1000, NULL) == 0);
+    uint8_t opt2b[sizeof opt2];
+    memcpy(opt2b, opt2, sizeof opt2);
+    CHECK(run_window_exts(handle, check_long_li, opt2b, sizeof opt2b, 0x1000,
+                          RISCVLINT_EXT_DECLARED, NULL) == 0);
+    CHECK(run_words(handle, check_long_li, opt2, 3, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement,
+                 "li a2, 0x1000000000 in 1 instructions: bseti (8 -> 4 bytes)")
+          == 0);
     uint32_t opt3[] = { 0x00100513u, 0x00008067u };
     CHECK(run_words(handle, check_long_li, opt3, 2, 0x1000, NULL) == 0);
+
+    // The chain follows srli: li -1 and two srli 1 are li -1 and srli 2.
+    uint32_t srl[] = { 0xfff00513u /* li a0,-1 */, 0x00155513u /* srli 1 */,
+                       0x00155513u, 0x00008067u };
+    CHECK(run_words(handle, check_long_li, srl, 4, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "li a0, 0x3fffffffffffffff in 2 instructions:"
+                                " addi, srli (12 -> 8 bytes)") == 0);
+
+    // The complement of SpiderMonkey's GC chunk mask, 0xffff8000000fffff,
+    // spelled li -1; slli 37; srli 17; not: four instructions without Zbb
+    // and a rotated lui with it. A chain already spelled that way is
+    // short enough.
+    uint32_t inv[] = { 0xfff00513u, 0x02551513u /* slli a0,a0,37 */,
+                       0x01155513u /* srli a0,a0,17 */,
+                       0xfff54513u /* not a0,a0 */, 0x00008067u };
+    CHECK(run_words(handle, check_long_li, inv, 5, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "li a0, 0xffff8000000fffff in 2 instructions:"
+                                " lui, rori (16 -> 8 bytes)") == 0);
+    uint8_t invb[sizeof inv];
+    memcpy(invb, inv, sizeof inv);
+    CHECK(run_window_exts(handle, check_long_li, invb, sizeof invb, 0x1000,
+                          RISCVLINT_EXT_DECLARED | RISCVLINT_EXT_ZBA |
+                              RISCVLINT_EXT_ZBS, NULL) == 0);
+    uint32_t rot[] = { 0xf8000537u /* lui a0,0xf8000 */,
+                       0x62c55513u /* rori a0,a0,44 */, 0x00008067u };
+    CHECK(run_words(handle, check_long_li, rot, 3, 0x1000, NULL) == 0);
 
     // A `j` back to the slli makes it a side entry, which ends the
     // chain at the li: one instruction is never too many.
@@ -5557,8 +5595,76 @@ static void test_long_li(csh handle)
     uint8_t rvc[] = { 0x05, 0x47, 0x32, 0x07, 0x15, 0x07, 0x82, 0x80 };
     CHECK(run_window(handle, check_long_li, rvc, sizeof rvc, 0x1000, &f) == 1);
     CHECK(strcmp(f.replacement,
-                 "li a4, 0x1005 in 2 instructions (6 -> 4 bytes)") == 0);
+                 "li a4, 0x1005 in 2 instructions: lui, addiw (6 -> 4 bytes)")
+          == 0);
     CHECK(f.insn_count == 3);
+}
+
+// check_const_complement: a constant for and/or/xor whose complement is
+// the shorter build.
+static void test_const_complement(csh handle)
+{
+    riscvlint_finding f;
+    const uint32_t ret = 0x00008067u;
+    const uint32_t lui = 0x08000eb7u;            // lui t4,0x8000
+    const uint32_t addiw = 0xfffe8e9bu;          // addiw t4,t4,-1
+    const uint32_t slli = 0x014e9e93u;           // slli t4,t4,20
+    const uint32_t li_t4_0 = 0x00000e93u;        // li t4,0
+
+    // SpiderMonkey's nursery check: the chunk mask, anded into its own
+    // register. Three instructions however the mask is built; two for
+    // its complement, for andn. Without Zbb there is no andn.
+    uint32_t sm[] = { lui, addiw, slli, 0x00cefeb3u /* and t4,t4,a2 */, ret };
+    CHECK(run_words(handle, check_const_complement, sm, 5, 0x1000, &f) == 1);
+    CHECK(strcmp(f.title,
+                 "and/or/xor constant whose complement builds shorter") == 0);
+    CHECK(strcmp(f.replacement, "li t4, 0xffff8000000fffff in 2 instructions:"
+                                " lui, rori; andn t4, a2, t4 (16 -> 12 bytes)")
+          == 0);
+    CHECK(f.insn_count == 4 && f.address == 0x1000);
+    CHECK(run_words(handle, check_long_li, sm, 5, 0x1000, NULL) == 0);
+    uint8_t smb[sizeof sm];
+    memcpy(smb, sm, sizeof sm);
+    CHECK(run_window_exts(handle, check_const_complement, smb, sizeof smb,
+                          0x1000, RISCVLINT_EXT_DECLARED | RISCVLINT_EXT_ZBA |
+                                      RISCVLINT_EXT_ZBS, NULL) == 0);
+
+    // The reverse: the mask built for andn is the complement built for
+    // and, which needs nothing.
+    uint32_t rev[] = { lui, addiw, slli, 0x41d5f533u /* andn a0,a1,t4 */,
+                       li_t4_0, ret };
+    CHECK(run_words(handle, check_const_complement, rev, 6, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "li t4, 0xffff8000000fffff in 2 instructions:"
+                                " lui, rori; and a0, a1, t4 (16 -> 12 bytes)")
+          == 0);
+
+    // Two uses swap together.
+    uint32_t two[] = { lui, addiw, slli, 0x01d57533u /* and a0,a0,t4 */,
+                       0x01d5f5b3u /* and a1,a1,t4 */, li_t4_0, ret };
+    CHECK(run_words(handle, check_const_complement, two, 7, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "li t4, 0xffff8000000fffff in 2 instructions:"
+                                " lui, rori; andn in 2 uses (20 -> 16 bytes)")
+          == 0);
+    CHECK(f.insn_count == 5);
+
+    // Not reported: an add reads the mask too; the mask is stored after
+    // the and, so it is live; and a mask nothing reads.
+    uint32_t add[] = { lui, addiw, slli, 0x01d57533u,
+                       0x01d50533u /* add a0,a0,t4 */, li_t4_0, ret };
+    CHECK(run_words(handle, check_const_complement, add, 7, 0x1000, NULL) == 0);
+    uint32_t live[] = { lui, addiw, slli, 0x01d57533u,
+                        0x01d13023u /* sd t4,0(sp) */, ret };
+    CHECK(run_words(handle, check_const_complement, live, 6, 0x1000, NULL) == 0);
+    uint32_t none[] = { lui, addiw, slli, li_t4_0, ret };
+    CHECK(run_words(handle, check_const_complement, none, 5, 0x1000, NULL) == 0);
+
+    // 0xffff anded is the mask check's zext.h, though its complement is
+    // one lui.
+    uint32_t low[] = { 0x000103b7u /* lui t2,0x10 */,
+                       0xfff3839bu /* addiw t2,t2,-1 */,
+                       0x00737533u /* and a0,t1,t2 */,
+                       0x00000393u /* li t2,0 */, ret };
+    CHECK(run_words(handle, check_const_complement, low, 5, 0x1000, NULL) == 0);
 }
 
 // check_no_effect: the no-ops that are not nop.
@@ -7187,6 +7293,7 @@ int main(void)
     test_branch_to_minmax(handle);
     test_const_for_imm(handle);
     test_mask_for_zext(handle);
+    test_const_complement(handle);
     test_transfer_to_jump(handle);
     test_fp_int_to_fli(handle);
     test_zero_store_run(handle);

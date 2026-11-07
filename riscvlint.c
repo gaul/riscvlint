@@ -5689,10 +5689,21 @@ bool check_jump_pair_to_j(riscvlint_state *state, const cs_insn *insn,
 
 typedef enum { LI_NONE, LI_START, LI_STEP } li_step_kind;
 
+static uint64_t rotr64(uint64_t v, unsigned n)
+{
+    n &= 63u;
+    return n ? (v >> n) | (v << (64u - n)) : v;
+}
+
 // What the instruction `w` does to a constant being built in a register:
-// starts one (lui, c.lui, li, c.li) or extends one it reads and writes
-// in the same register (addi, addiw, slli, ori, xori and the compressed
-// addi, addiw and slli). `cur` is the value so far; on a START it is
+// starts one (lui, c.lui, li, c.li, and Zbs's bseti from x0) or extends
+// one it reads and writes in the same register. The steps are RV64I's addi, addiw, andi, ori,
+// xori and the three immediate shifts; Zba's slli.uw, zext.w and the
+// shNadd of the register with itself; Zbb's rori; Zbs's bseti, bclri and
+// binvi; the compressed addi, addiw, andi, slli, srli and srai; and
+// Zcb's c.zext.w and c.not -- every step the li planner below can end a
+// sequence with, so that a chain built the planner's way is followed to
+// the value it holds. `cur` is the value so far; on a START it is
 // ignored. The arithmetic is done unsigned and reinterpreted, since the
 // chains that matter here wrap by design.
 static li_step_kind li_chain_step(uint32_t w, unsigned size, int64_t cur,
@@ -5702,6 +5713,8 @@ static li_step_kind li_chain_step(uint32_t w, unsigned size, int64_t cur,
     if (size == 4) {
         unsigned op = RV_OPCODE(w), f3 = (w >> 12) & 0x7u;
         unsigned d = (w >> 7) & 0x1fu, s1 = (w >> 15) & 0x1fu;
+        unsigned s2 = (w >> 20) & 0x1fu, sh = (w >> 20) & 0x3fu;
+        unsigned f6 = w >> 26, f7 = w >> 25;
         int64_t imm = sign_extend((uint64_t)(w >> 20) & 0xfffu, 12);
         if (d == 0) return LI_NONE;
         if (op == 0x37u) {                                      // lui
@@ -5714,22 +5727,52 @@ static li_step_kind li_chain_step(uint32_t w, unsigned size, int64_t cur,
             *val = imm;
             return LI_START;
         }
+        if (op == 0x13u && f3 == 1 && f6 == 0x0au && s1 == 0) { // bseti
+            *rd = d;
+            *val = (int64_t)(1ull << sh);
+            return LI_START;
+        }
         if (s1 != d) return LI_NONE;
         *rd = d;
         if (op == 0x13u) {
             switch (f3) {
             case 0: *val = (int64_t)(u + (uint64_t)imm); return LI_STEP;
-            case 1:                                             // slli
-                if ((w >> 26) != 0) return LI_NONE;
-                *val = (int64_t)(u << ((w >> 20) & 0x3fu));
-                return LI_STEP;
+            case 1:
+                switch (f6) {
+                case 0x00u: *val = (int64_t)(u << sh); return LI_STEP;
+                case 0x0au: *val = (int64_t)(u | (1ull << sh)); return LI_STEP;
+                case 0x12u: *val = (int64_t)(u & ~(1ull << sh)); return LI_STEP;
+                case 0x1au: *val = (int64_t)(u ^ (1ull << sh)); return LI_STEP;
+                default: return LI_NONE;            // Zbb's clz and kin
+                }
             case 4: *val = (int64_t)(u ^ (uint64_t)imm); return LI_STEP;
+            case 5:
+                switch (f6) {
+                case 0x00u: *val = (int64_t)(u >> sh); return LI_STEP;
+                case 0x10u: *val = cur >> sh; return LI_STEP;
+                case 0x18u: *val = (int64_t)rotr64(u, sh); return LI_STEP;
+                default: return LI_NONE;            // rev8, orc.b, bexti
+                }
             case 6: *val = (int64_t)(u | (uint64_t)imm); return LI_STEP;
+            case 7: *val = (int64_t)(u & (uint64_t)imm); return LI_STEP;
             default: return LI_NONE;
             }
         }
         if (op == 0x1bu && f3 == 0) {                           // addiw
             *val = sign_extend((u + (uint64_t)imm) & 0xffffffffu, 32);
+            return LI_STEP;
+        }
+        if (op == 0x1bu && f3 == 1 && f6 == 0x02u) {            // slli.uw
+            *val = (int64_t)((u & 0xffffffffu) << sh);
+            return LI_STEP;
+        }
+        if (op == 0x3bu && f3 == 0 && f7 == 0x04u && s2 == 0) { // zext.w
+            *val = (int64_t)(u & 0xffffffffu);
+            return LI_STEP;
+        }
+        if (op == 0x33u && f7 == 0x10u && s2 == d &&
+            (f3 == 2 || f3 == 4 || f3 == 6)) {                  // shNadd
+            *val = (int64_t)((u << (f3 >> 1)) + u);
             return LI_STEP;
         }
         return LI_NONE;
@@ -5739,6 +5782,35 @@ static li_step_kind li_chain_step(uint32_t w, unsigned size, int64_t cur,
     unsigned d = (w >> 7) & 0x1fu;
     int64_t imm6 = sign_extend((uint64_t)(((w >> 12) & 1u) << 5) |
                                ((w >> 2) & 0x1fu), 6);
+    if (cop == 1 && f3 == 4) {
+        // The CB and CA forms, on x8..x15 only: c.srli, c.srai, c.andi,
+        // and Zcb's c.zext.w and c.not. A shift by zero is a hint.
+        unsigned sh = (((w >> 12) & 1u) << 5) | ((w >> 2) & 0x1fu);
+        *rd = 8u + ((w >> 7) & 0x7u);
+        switch ((w >> 10) & 0x3u) {
+        case 0:
+            if (sh == 0) return LI_NONE;
+            *val = (int64_t)(u >> sh);
+            return LI_STEP;
+        case 1:
+            if (sh == 0) return LI_NONE;
+            *val = cur >> sh;
+            return LI_STEP;
+        case 2:
+            *val = (int64_t)(u & (uint64_t)imm6);
+            return LI_STEP;
+        default:
+            if ((w & 0xfc7fu) == 0x9c71u) {
+                *val = (int64_t)(u & 0xffffffffu);
+                return LI_STEP;
+            }
+            if ((w & 0xfc7fu) == 0x9c75u) {
+                *val = (int64_t)~u;
+                return LI_STEP;
+            }
+            return LI_NONE;
+        }
+    }
     if (d == 0) return LI_NONE;
     if (cop == 1) {
         switch (f3) {
@@ -5774,93 +5846,410 @@ static li_step_kind li_chain_step(uint32_t w, unsigned size, int64_t cur,
     return LI_NONE;
 }
 
-// The plain RV64I recurrence for materializing `v`: lui and addiw, or
-// either alone, for a value that fits 32 bits; otherwise the high part
-// recursively, one slli by its trailing zeros plus twelve, and an addi
-// for the low twelve bits where they are not zero. It is a construction
-// and so achievable, which is all a check saying "more than needed" has
-// to know; the assemblers find shorter ones for some values, which
-// makes this an upper bound and the check conservative.
-//
-// It is priced at the encoding class of the chain it replaces -- four
-// bytes an instruction where the chain had a four-byte instruction in
-// it, the compressed form where the chain was all compressed and the
-// form exists -- the rule the branch-over-jump check uses, so that
-// compression stays the compression check's finding.
-static void li_plan(int64_t v, unsigned rd, bool compressed, unsigned *insns,
-                    unsigned *bytes)
+// The chain that starts at `insn`, as the checks built on it follow it:
+// every step on the starting register, ending at the first instruction
+// that is not one or that another path joins, since a side entry
+// arrives with a value this chain did not build. False where no chain
+// starts there or a relocation lies anywhere in it: in an unlinked
+// object the immediates are placeholders waiting on HI20/LO12
+// relocations and the value computed from them is fiction.
+typedef struct {
+    unsigned rd, len, bytes;
+    int64_t val;
+    bool compressed;    // every instruction of it two bytes
+    uint64_t end;       // the address after it
+} li_chain;
+
+static bool li_chain_follow(riscvlint_state *state, const cs_insn *insn,
+                            li_chain *c)
 {
-    int64_t lo = sign_extend((uint64_t)v & 0xfffu, 12);
-    bool fits6 = lo >= -32 && lo <= 31;
-    if (v >= INT32_MIN && v <= INT32_MAX) {
-        int64_t hi20 = sign_extend((((uint64_t)v - (uint64_t)lo) >> 12) &
-                                   0xfffffu, 20);
-        if (hi20 != 0) {
-            (*insns)++;
-            *bytes += (compressed && rd != 2 && hi20 >= -32 && hi20 <= 31)
-                          ? 2 : 4;
-        }
-        if (lo != 0 || hi20 == 0) {
-            (*insns)++;
-            *bytes += (compressed && fits6) ? 2 : 4;
-        }
+    uint32_t w;
+    if (!riscvlint_word_at(state, insn->address, &w)) return false;
+    if (li_chain_step(w, insn->size, 0, &c->rd, &c->val) != LI_START)
+        return false;
+    if (riscvlint_is_relocated(state, insn->address)) return false;
+    c->len = 1;
+    c->bytes = insn->size;
+    c->compressed = insn->size == 2;
+    uint64_t at = insn->address + insn->size;
+    for (;;) {
+        uint32_t w2;
+        if (!riscvlint_word_at(state, at, &w2)) break;
+        unsigned size2 = rv_insn_len(w2), r;
+        int64_t next;
+        if (li_chain_step(w2, size2, c->val, &r, &next) != LI_STEP ||
+            r != c->rd)
+            break;
+        if (riscvlint_is_branch_target(state, at)) break;
+        if (riscvlint_is_relocated(state, at)) return false;
+        c->val = next;
+        c->len++;
+        c->bytes += size2;
+        if (size2 == 4) c->compressed = false;
+        at += size2;
+    }
+    c->end = at;
+    return true;
+}
+
+// ---- the shortest li ----
+
+// What li needs for a value: LLVM's RISCVMatInt, the planner GCC's and
+// LLVM's own output is measured against, ported step for step and
+// counted rather than emitted -- its RV64I recurrence, which takes the
+// low twelve bits off and shifts out the trailing zeros, with LUI made to
+// absorb twelve of them where it can; the retries with the trailing
+// zeros shifted in by a final slli, with the low bits rounded to a run of
+// zeros and an addi, with the leading zeros shifted out by a final srli,
+// and with the value inverted by a final xori; then, where the extension
+// may be used, Zba's slli.uw, zext.w and shNadd, Zbs's bseti and bclri,
+// and Zbb's rori of a negative twelve-bit immediate. One step is ours,
+// not LLVM's: rori of any value one instruction builds, so a rotated
+// `lui` as well, which is how the complement of a mask that wraps bit 63
+// -- SpiderMonkey's GC chunk mask, inverted -- is two instructions.
+//
+// Every sequence it returns is a construction, so the count is
+// achievable, which is all a check saying "more than needed" has to
+// know; it is not proved minimal, which keeps the checks conservative.
+// The extensions come from the object's own declaration, as every gated
+// check reads it: an object that declares none may use them all.
+typedef enum {
+    LIP_LUI, LIP_ADDI, LIP_ADDIW, LIP_SLLI, LIP_SRLI, LIP_XORI,
+    LIP_SLLI_UW, LIP_ZEXT_W, LIP_SH1ADD, LIP_SH2ADD, LIP_SH3ADD,
+    LIP_BSETI, LIP_BCLRI, LIP_RORI,
+} lip_op;
+
+static const char *const lip_names[] = {
+    "lui", "addi", "addiw", "slli", "srli", "xori",
+    "slli.uw", "zext.w", "sh1add", "sh2add", "sh3add",
+    "bseti", "bclri", "rori",
+};
+
+#define LIP_MAX 16
+
+typedef struct {
+    unsigned n;
+    struct {
+        lip_op op;
+        int64_t imm;    // a lui's is its twenty-bit field
+    } i[LIP_MAX];
+} li_seq;
+
+typedef struct {
+    bool zba, zbb, zbs, zcb;
+} li_exts;
+
+static li_exts li_exts_of(const riscvlint_state *state)
+{
+    li_exts e = {
+        riscvlint_may_use(state, RISCVLINT_EXT_ZBA),
+        riscvlint_may_use(state, RISCVLINT_EXT_ZBB),
+        riscvlint_may_use(state, RISCVLINT_EXT_ZBS),
+        riscvlint_may_use(state, RISCVLINT_EXT_ZCB),
+    };
+    return e;
+}
+
+static unsigned bit_ctz(uint64_t v)
+{
+    unsigned n = 0;
+    while (n < 64 && !((v >> n) & 1u)) n++;
+    return n;
+}
+
+static unsigned bit_clz(uint64_t v)
+{
+    unsigned n = 0;
+    while (n < 64 && !((v >> (63 - n)) & 1u)) n++;
+    return n;
+}
+
+static unsigned bit_count(uint64_t v)
+{
+    unsigned n = 0;
+    for (; v; v &= v - 1) n++;
+    return n;
+}
+
+static bool is_int12(int64_t v) { return v >= -2048 && v <= 2047; }
+static bool is_int32(int64_t v) { return v >= INT32_MIN && v <= INT32_MAX; }
+static bool is_uint32(int64_t v) { return (uint64_t)v <= UINT32_MAX; }
+
+static void lis_push(li_seq *s, lip_op op, int64_t imm)
+{
+    if (s->n < LIP_MAX) {
+        s->i[s->n].op = op;
+        s->i[s->n].imm = imm;
+    }
+    s->n++;
+}
+
+// RISCVMatInt's generateInstSeqImpl.
+static void li_impl(int64_t v, const li_exts *e, li_seq *s)
+{
+    uint64_t u = (uint64_t)v;
+    // bseti for a single bit that neither lui nor addi holds.
+    if (e->zbs && u && !(u & (u - 1)) && (!is_int32(v) || v == 0x800)) {
+        lis_push(s, LIP_BSETI, bit_ctz(u));
         return;
     }
-    int64_t hi = (int64_t)((uint64_t)v - (uint64_t)lo) >> 12;
-    while ((hi & 1) == 0) hi >>= 1;
-    li_plan(hi, rd, compressed, insns, bytes);
-    (*insns)++;
-    *bytes += compressed ? 2 : 4;
-    if (lo != 0) {
-        (*insns)++;
-        *bytes += (compressed && fits6) ? 2 : 4;
+    if (is_int32(v)) {
+        int64_t lo = sign_extend(u & 0xfffu, 12);
+        int64_t hi20 = (int64_t)(((u + 0x800u) >> 12) & 0xfffffu);
+        if (hi20) lis_push(s, LIP_LUI, hi20);
+        if (lo || !hi20) lis_push(s, hi20 ? LIP_ADDIW : LIP_ADDI, lo);
+        return;
+    }
+    int64_t lo = sign_extend(u & 0xfffu, 12);
+    int64_t hi = (int64_t)(u - (uint64_t)lo);
+    unsigned sh = 0;
+    bool uw = false;
+    if (!is_int32(hi)) {
+        sh = bit_ctz((uint64_t)hi);
+        hi >>= sh;
+        // Twelve of the zeros can be lui's, which clears the low twelve
+        // bits itself, when the rest is too wide for addi.
+        if (sh > 12 && !is_int12(hi)) {
+            uint64_t up = (uint64_t)hi << 12;
+            if (is_int32((int64_t)up)) {
+                sh -= 12;
+                hi = (int64_t)up;
+            } else if (is_uint32((int64_t)up) && e->zba) {
+                sh -= 12;
+                hi = sign_extend(up & 0xffffffffu, 32);
+                uw = true;
+            }
+        }
+        // A value that is a uint32 but not an int32 is lui's, sign
+        // extended, with slli.uw to clear what the extension set.
+        if (is_uint32(hi) && !is_int32(hi) && e->zba) {
+            hi = sign_extend((uint64_t)hi & 0xffffffffu, 32);
+            uw = true;
+        }
+    }
+    li_impl(hi, e, s);
+    if (sh) lis_push(s, uw ? LIP_SLLI_UW : LIP_SLLI, sh);
+    if (lo) lis_push(s, LIP_ADDI, lo);
+}
+
+// Keeps `t` with `op imm` appended in place of `s` where that is
+// shorter, or, with `empty_ok`, where `s` is still empty and `t` is
+// short.
+static void lis_take(li_seq *s, li_seq *t, lip_op op, int64_t imm,
+                     bool empty_ok)
+{
+    if (t->n + 1 < s->n || (empty_ok && s->n == 0 && t->n < 8)) {
+        lis_push(t, op, imm);
+        *s = *t;
+    }
+}
+
+// RISCVMatInt's generateInstSeqLeadingZeros, for v > 0.
+static void li_leading_zeros(int64_t v, const li_exts *e, li_seq *s)
+{
+    unsigned lz = bit_clz((uint64_t)v);
+    uint64_t ones = (1ull << lz) - 1;
+    // The bits the srli shifts out filled with ones, then with zeros.
+    uint64_t sv = ((uint64_t)v << lz) | ones;
+    li_seq t = { 0 };
+    li_impl((int64_t)sv, e, &t);
+    lis_take(s, &t, LIP_SRLI, lz, true);
+    t.n = 0;
+    li_impl((int64_t)(sv & ~ones), e, &t);
+    lis_take(s, &t, LIP_SRLI, lz, true);
+    // At exactly 32, zext.w can clear what a sign extension set.
+    if (lz == 32 && e->zba) {
+        t.n = 0;
+        li_impl(sign_extend((uint64_t)v & 0xffffffffu, 32), e, &t);
+        lis_take(s, &t, LIP_ZEXT_W, 0, true);
+    }
+}
+
+// RISCVMatInt's generateInstSeq, without its preference for the
+// compressible spelling of a tie, plus the rotated lui.
+static void li_best(int64_t v, const li_exts *e, li_seq *s)
+{
+    uint64_t u = (uint64_t)v;
+    li_seq t;
+    s->n = 0;
+    li_impl(v, e, s);
+
+    if ((u & 0xfffu) && !(u & 1u) && s->n > 2) {
+        unsigned tz = bit_ctz(u);
+        t.n = 0;
+        li_impl(v >> tz, e, &t);
+        lis_take(s, &t, LIP_SLLI, tz, false);
+    }
+    if (s->n <= 2) return;
+
+    // Low thirteen bits like 0x17ff, made 0x1800 and given back by addi.
+    if ((u & 0xfffu) && (u & 0x1800u) == 0x1000u) {
+        int64_t imm12 = -(int64_t)(0x800u - (u & 0xfffu));
+        t.n = 0;
+        li_impl((int64_t)(u - (uint64_t)imm12), e, &t);
+        lis_take(s, &t, LIP_ADDI, imm12, false);
+    }
+    if (v > 0 && s->n > 2) li_leading_zeros(v, e, s);
+    if (v < 0 && s->n > 3) {
+        t.n = 0;
+        li_leading_zeros((int64_t)~u, e, &t);
+        if (t.n) lis_take(s, &t, LIP_XORI, -1, false);
+    }
+
+    if (s->n > 2 && e->zbs) {
+        // The low 31 bits by lui and addiw, the rest set by bseti.
+        uint64_t lo = u & 0x7fffffffu, hi = u ^ lo;
+        t.n = 0;
+        if (lo) li_impl((int64_t)lo, e, &t);
+        if (t.n + bit_count(hi) < s->n) {
+            for (; hi; hi &= hi - 1) lis_push(&t, LIP_BSETI, bit_ctz(hi));
+            *s = t;
+        }
+        // li 1 + slli k is bseti k.
+        if (s->n >= 2 && s->i[0].op == LIP_ADDI && s->i[0].imm == 1 &&
+            s->i[1].op == LIP_SLLI) {
+            for (unsigned j = 1; j < s->n && j < LIP_MAX; j++)
+                s->i[j - 1] = s->i[j];
+            s->i[0].op = LIP_BSETI;
+            s->n--;
+        }
+    }
+    if (s->n > 2 && e->zbs) {
+        // The upper 33 bits set by lui and addiw, the zeros among them
+        // cleared by bclri.
+        uint64_t lo = u | 0xffffffff80000000ull, hi = u ^ lo;
+        t.n = 0;
+        li_impl((int64_t)lo, e, &t);
+        if (t.n + bit_count(hi) < s->n) {
+            for (; hi; hi &= hi - 1) lis_push(&t, LIP_BCLRI, bit_ctz(hi));
+            *s = t;
+        }
+    }
+    if (s->n > 2 && e->zba) {
+        // A multiple of 3, 5 or 9 by shNadd of the register with itself,
+        // or of the part above an addi.
+        static const struct { int64_t div; lip_op op; } m[] = {
+            { 3, LIP_SH1ADD }, { 5, LIP_SH2ADD }, { 9, LIP_SH3ADD },
+        };
+        unsigned j;
+        for (j = 0; j < 3; j++)
+            if (v % m[j].div == 0 && is_int32(v / m[j].div)) break;
+        if (j < 3) {
+            t.n = 0;
+            li_impl(v / m[j].div, e, &t);
+            lis_take(s, &t, m[j].op, 0, false);
+        } else {
+            int64_t hi52 = (int64_t)((u + 0x800u) & ~(uint64_t)0xfffu);
+            int64_t lo12 = sign_extend(u & 0xfffu, 12);
+            for (j = 0; j < 3; j++)
+                if (is_int32(hi52 / m[j].div) && hi52 % m[j].div == 0) break;
+            if (j < 3 && lo12) {
+                t.n = 0;
+                li_impl(hi52 / m[j].div, e, &t);
+                if (t.n + 2 < s->n) {
+                    lis_push(&t, m[j].op, 0);
+                    lis_push(&t, LIP_ADDI, lo12);
+                    *s = t;
+                }
+            }
+        }
+    }
+    if (s->n > 2 && e->zbb) {
+        // rori of a value addi or lui builds alone. LLVM tries only the
+        // negative twelve-bit immediates.
+        for (unsigned r = 1; r < 64; r++) {
+            int64_t x = (int64_t)rotr64(u, 64 - r);
+            if (is_int12(x)) {
+                s->n = 0;
+                lis_push(s, LIP_ADDI, x);
+            } else if (is_int32(x) && !(x & 0xfff)) {
+                s->n = 0;
+                lis_push(s, LIP_LUI, (int64_t)(((uint64_t)x >> 12) & 0xfffffu));
+            } else {
+                continue;
+            }
+            lis_push(s, LIP_RORI, r);
+            break;
+        }
+    }
+}
+
+// What a plan costs in bytes, at the encoding class of the chain it
+// replaces -- four bytes an instruction where the chain had a four-byte
+// instruction in it, the compressed form where the chain was all
+// compressed and the form exists -- the rule the branch-over-jump check
+// uses, so that compression stays the compression check's finding.
+// c.srli and the two Zcb forms want x8..x15; nothing from Zba, Zbb or
+// Zbs has a compressed form.
+static unsigned li_seq_bytes(const li_seq *s, unsigned rd, bool compressed,
+                             bool zcb)
+{
+    unsigned bytes = 0;
+    for (unsigned j = 0; j < s->n && j < LIP_MAX; j++) {
+        int64_t imm = s->i[j].imm;
+        bool c = false;
+        if (compressed) {
+            switch (s->i[j].op) {
+            case LIP_LUI: {
+                int64_t h = sign_extend((uint64_t)imm, 20);
+                c = rd != 2 && h != 0 && fits6(h);
+                break;
+            }
+            case LIP_ADDI: c = fits6(imm) && (j == 0 || imm != 0); break;
+            case LIP_ADDIW: c = fits6(imm); break;
+            case LIP_SLLI: c = imm != 0; break;
+            case LIP_SRLI: c = rvc_reg(rd) && imm != 0; break;
+            case LIP_XORI: c = zcb && rvc_reg(rd) && imm == -1; break;
+            case LIP_ZEXT_W: c = zcb && rvc_reg(rd); break;
+            default: break;
+            }
+        }
+        bytes += c ? 2 : 4;
+    }
+    return bytes;
+}
+
+// The plan's mnemonics, comma-separated.
+static void li_seq_list(const li_seq *s, char *out, size_t size)
+{
+    size_t at = 0;
+    out[0] = '\0';
+    for (unsigned j = 0; j < s->n && j < LIP_MAX && at < size; j++) {
+        int n = snprintf(out + at, size - at, "%s%s", j ? ", " : "",
+                         lip_names[s->i[j].op]);
+        if (n < 0) break;
+        at += (size_t)n;
     }
 }
 
 bool check_long_li(riscvlint_state *state, const cs_insn *insn,
                    riscvlint_finding *finding)
 {
-    uint32_t w;
-    if (!riscvlint_word_at(state, insn->address, &w)) return false;
-    unsigned rd, r;
-    int64_t val;
-    if (li_chain_step(w, insn->size, 0, &rd, &val) != LI_START) return false;
-    // In an unlinked object the immediates are placeholders waiting on
-    // HI20/LO12 relocations and the value computed from them is fiction.
-    if (riscvlint_is_relocated(state, insn->address)) return false;
+    li_chain c;
+    if (!li_chain_follow(state, insn, &c) || c.len < 2) return false;
 
-    unsigned len = 1, bytes = insn->size;
-    bool compressed = insn->size == 2;
-    uint64_t at = insn->address + insn->size;
-    for (;;) {
-        uint32_t w2;
-        if (!riscvlint_word_at(state, at, &w2)) break;
-        unsigned size2 = rv_insn_len(w2);
-        int64_t next;
-        if (li_chain_step(w2, size2, val, &r, &next) != LI_STEP || r != rd)
-            break;
-        // A side entry into the chain arrives with a value this chain
-        // did not build, so the chain ends where another path joins it.
-        if (riscvlint_is_branch_target(state, at)) break;
-        if (riscvlint_is_relocated(state, at)) return false;
-        val = next;
-        len++;
-        bytes += size2;
-        if (size2 == 4) compressed = false;
-        at += size2;
-    }
-    if (len < 2) return false;
-
-    unsigned need = 0, nbytes = 0;
-    li_plan(val, rd, compressed, &need, &nbytes);
-    if (need >= len || nbytes > bytes) return false;
+    li_exts e = li_exts_of(state);
+    li_seq s;
+    li_best(c.val, &e, &s);
+    unsigned nbytes = li_seq_bytes(&s, c.rd, c.compressed, e.zcb);
+    if (s.n >= c.len || nbytes > c.bytes) return false;
 
     finding->title = "constant built in more instructions than li needs";
     finding->address = insn->address;
-    finding->insn_count = len;
-    snprintf(finding->replacement, sizeof finding->replacement,
-             "li %s, 0x%" PRIx64 " in %u instructions (%u -> %u bytes)",
-             rv_reg_name(rd), (uint64_t)val, need, bytes, nbytes);
+    finding->insn_count = c.len;
+    // The mnemonics are dropped where they would not fit, so that the
+    // byte figure the table reads is never cut off.
+    char list[64];
+    li_seq_list(&s, list, sizeof list);
+    int n = snprintf(finding->replacement, sizeof finding->replacement,
+                     "li %s, 0x%" PRIx64 " in %u instructions: %s"
+                     " (%u -> %u bytes)",
+                     rv_reg_name(c.rd), (uint64_t)c.val, s.n, list, c.bytes,
+                     nbytes);
+    if (n < 0 || (size_t)n >= sizeof finding->replacement)
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "li %s, 0x%" PRIx64 " in %u instructions (%u -> %u bytes)",
+                 rv_reg_name(c.rd), (uint64_t)c.val, s.n, c.bytes, nbytes);
     return true;
 }
 
@@ -7082,6 +7471,184 @@ bool check_mask_for_zext(riscvlint_state *state, const cs_insn *insn,
     return true;
 }
 
+// ---- an and/or/xor constant whose complement builds shorter ----
+
+// A logical operation reading rc as one operand and not as the other:
+// `and`, `or` and `xor` with rc on either side, four-byte or the
+// compressed CA forms in place; `andn` and `orn` with rc second, the
+// operand they complement; `xnor` with rc on either side. `*swap` names
+// the operation that takes the complement of rc instead -- andn, orn and
+// xnor for the plain three and the reverse -- and `*zbb` says whether
+// that operation is Zbb's.
+static bool logic_const_use(uint32_t w, unsigned size, unsigned rc,
+                            unsigned *rd, unsigned *rx, const char **swap,
+                            bool *zbb)
+{
+    static const char *const plain[8] = {
+        [4] = "xor", [6] = "or", [7] = "and",
+    };
+    static const char *const inverted[8] = {
+        [4] = "xnor", [6] = "orn", [7] = "andn",
+    };
+    unsigned f3, f7, d, s1, s2;
+    if (size == 4) {
+        if (RV_OPCODE(w) != 0x33u) return false;
+        f3 = (w >> 12) & 0x7u;
+        f7 = w >> 25;
+        d = (w >> 7) & 0x1fu;
+        s1 = (w >> 15) & 0x1fu;
+        s2 = (w >> 20) & 0x1fu;
+    } else if (size == 2 && (w & 0xfc03u) == 0x8c01u) {
+        // CA: c.sub, c.xor, c.or, c.and.
+        static const uint8_t ca_f3[4] = { 0, 4, 6, 7 };
+        f3 = ca_f3[(w >> 5) & 0x3u];
+        f7 = 0;
+        d = s1 = 8u + ((w >> 7) & 0x7u);
+        s2 = 8u + ((w >> 2) & 0x7u);
+    } else {
+        return false;
+    }
+    if (f3 != 4 && f3 != 6 && f3 != 7) return false;
+    if (f7 != 0 && f7 != 0x20u) return false;
+    if (d == 0 || (s1 == rc) == (s2 == rc)) return false;
+    bool inv = f7 == 0x20u;
+    if (inv && f3 != 4 && s2 != rc) return false;
+    *rd = d;
+    *rx = s1 == rc ? s2 : s1;
+    *swap = inv ? plain[f3] : inverted[f3];
+    *zbb = !inv;
+    return true;
+}
+
+// What a constant's logical uses come to: the first one for the finding
+// text, whether every use swaps to the same operation, how many there
+// were, the bytes before and after, the instructions spanned, the
+// address after the last use, whether that use overwrote rc, and
+// whether any swap needs Zbb. `span` arrives holding the chain's own.
+typedef struct {
+    unsigned nuse, before, after, span, rd, rx;
+    const char *swap;
+    bool same, dead, zbb;
+    uint64_t end;
+} logic_uses;
+
+// Every logical operation reading rc from `at` until anything else might
+// name rc, sixteen instructions at most, with no side entry or transfer
+// among them: const_use_walk's walk. The swapped operation is four bytes
+// whatever the use was: andn, orn and xnor have no compressed form, and
+// the plain three replace a four-byte use.
+static void logic_use_walk(riscvlint_state *state, uint64_t at, unsigned rc,
+                           logic_uses *lu)
+{
+    unsigned seen = lu->span;
+    lu->end = at;
+    for (int budget = CONST_WALK; budget > 0; budget--) {
+        if (riscvlint_is_branch_target(state, at)) break;
+        uint32_t w;
+        if (!riscvlint_word_at(state, at, &w)) break;
+        unsigned len = rv_insn_len(w), rd, rx;
+        const char *swap;
+        bool zbb;
+        seen++;
+        if (logic_const_use(w, len, rc, &rd, &rx, &swap, &zbb)) {
+            if (riscvlint_is_relocated(state, at)) break;
+            if (lu->nuse == 0) {
+                lu->rd = rd;
+                lu->rx = rx;
+                lu->swap = swap;
+            } else if (swap != lu->swap) {
+                lu->same = false;
+            }
+            lu->nuse++;
+            lu->zbb |= zbb;
+            lu->before += len;
+            lu->after += 4;
+            lu->end = at + len;
+            lu->span = seen;
+            if (rd == rc) {
+                lu->dead = true;
+                break;
+            }
+        } else if (rv_may_name(w, len, rc) || rv_stops_walk(w, len)) {
+            break;
+        }
+        at += len;
+    }
+}
+
+bool check_const_complement(riscvlint_state *state, const cs_insn *insn,
+                            riscvlint_finding *finding)
+{
+    li_chain c;
+    if (!li_chain_follow(state, insn, &c) || c.len < 2) return false;
+    // sp, gp and tp hold what the ABI says they hold, as in
+    // check_const_for_imm; zero and all ones make every logical
+    // operation an identity or a constant.
+    if (c.rd == 2 || c.rd == 3 || c.rd == 4) return false;
+    if (c.val == 0 || c.val == -1) return false;
+
+    logic_uses lu = { .span = c.len, .same = true };
+    logic_use_walk(state, c.end, c.rd, &lu);
+    if (lu.nuse == 0) return false;
+    if (lu.zbb && !riscvlint_may_use(state, RISCVLINT_EXT_ZBB)) return false;
+    // A mask of the low bits that is only anded with is
+    // check_mask_for_zext's, whose rewrite needs no constant at all.
+    uint64_t m = (uint64_t)c.val;
+    if (!(m & (m + 1)) && lu.same && strcmp(lu.swap, "andn") == 0)
+        return false;
+
+    li_exts e = li_exts_of(state);
+    li_seq direct, comp;
+    li_best(c.val, &e, &direct);
+    li_best((int64_t)~(uint64_t)c.val, &e, &comp);
+    // Measured against the chain, or against the shorter li
+    // check_long_li reports where there is one, so that the two findings'
+    // savings add rather than overlap.
+    unsigned base_n = c.len, base_b = c.bytes;
+    unsigned dbytes = li_seq_bytes(&direct, c.rd, c.compressed, e.zcb);
+    if (direct.n < c.len && dbytes <= c.bytes) {
+        base_n = direct.n;
+        base_b = dbytes;
+    }
+    unsigned cbytes = li_seq_bytes(&comp, c.rd, c.compressed, e.zcb);
+    unsigned before = base_b + lu.before, after = cbytes + lu.after;
+    if (comp.n >= base_n || after > before) return false;
+    if (!lu.dead &&
+        riscvlint_liveness(state, lu.end, c.rd) != RISCVLINT_LIVE_DEAD)
+        return false;
+
+    finding->title = "and/or/xor constant whose complement builds shorter";
+    finding->address = insn->address;
+    finding->insn_count = lu.span;
+    // Spelled in a buffer wide enough for any of it, and the mnemonics
+    // dropped where the whole would not fit the replacement, so that the
+    // byte figure the table reads is never cut off.
+    char list[64], use[48], text[256];
+    li_seq_list(&comp, list, sizeof list);
+    if (lu.nuse == 1)
+        snprintf(use, sizeof use, "%s %s, %s, %s", lu.swap,
+                 rv_reg_name(lu.rd), rv_reg_name(lu.rx), rv_reg_name(c.rd));
+    else
+        snprintf(use, sizeof use, "%s in %u uses",
+                 lu.same ? lu.swap : "the complements", lu.nuse);
+    uint64_t inv = ~(uint64_t)c.val;
+    int n = snprintf(text, sizeof text,
+                     "li %s, 0x%" PRIx64 " in %u instructions: %s; %s"
+                     " (%u -> %u bytes)",
+                     rv_reg_name(c.rd), inv, comp.n, list, use, before, after);
+    if (n < 0 || (size_t)n >= sizeof finding->replacement)
+        n = snprintf(text, sizeof text,
+                     "li %s, 0x%" PRIx64 " in %u instructions; %s"
+                     " (%u -> %u bytes)",
+                     rv_reg_name(c.rd), inv, comp.n, use, before, after);
+    size_t len = n < 0 ? 0 : (size_t)n;
+    if (len >= sizeof finding->replacement)
+        len = sizeof finding->replacement - 1;
+    memcpy(finding->replacement, text, len);
+    finding->replacement[len] = '\0';
+    return true;
+}
+
 // ---- a transfer to an unconditional jump ----
 
 // How many jumps a transfer is threaded through before the walk stops.
@@ -8064,6 +8631,7 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_branch_to_minmax,
     check_const_for_imm,
     check_mask_for_zext,
+    check_const_complement,
     check_transfer_to_jump,
     check_fp_int_to_fli,
     check_copy_for_reader,
