@@ -1920,6 +1920,20 @@ findings, almost all Smi untags), and a `lui`+`addi` pair's range is
 not tracked (about 75K, every one a dispatch handle that a later
 `zext.w` re-extends). Both are table entries rather than checks.
 
+## Register census -- a report, not a check
+
+`-r` counts what register numbering costs under C: the four-byte
+instructions a compressed form would hold but for a register outside
+x8-x15 (README.md, "Register census"). It is not a check because the
+register is rarely the compiler's to change. Over ripgrep 44,041 of the
+51,181 blocking registers are s2-s11, values live across a call with
+only s0 and s1 as nameable alternatives, and 5,029 are the temporaries
+an allocator could have placed in a0-a5 -- 10,058 bytes at most, which
+is the whole of what a renumbering could claim there. The census also
+puts a figure on the frame pointer's second cost: 61,740 of ripgrep's
+61,779 accesses through s0 sit below it, out of the unsigned compressed
+offset's reach, where an sp-based frame would have compressed them.
+
 ## Macro-op fusion -- a report, not a check
 
 `-u` counts the pairs a fusing core issues as one operation, per core,

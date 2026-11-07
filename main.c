@@ -187,6 +187,11 @@ static bool verbose;
 // drop. It replaces the lint scan rather than adding to it -- the two
 // answer different questions and nothing in the census is a finding.
 static bool census_mode;
+// -r: a register census -- which registers the code names, in what role
+// and at what width, and how many four-byte instructions a compressed
+// form would have held but for a register outside x8-x15. A replacement
+// like -i, and combinable with it: both describe the file.
+static bool regs_mode;
 // -m replaces what the object declares, in both directions: it enables a
 // gated check against a declaration that omits the extension ("what
 // would rebuilding for RVA23 buy me?") and disables one against an
@@ -1233,6 +1238,7 @@ static int scan_file(csh handle, const char *path)
         // nothing on it, so it needs no state and no extension mask.
         riscvlint_state *state = NULL;
         riscvlint_census *census = NULL;
+        riscvlint_regs *regs = NULL;
         riscvlint_fusion *fusion = NULL;
         anchor_ctx actx = { base, map_len, eh, &syms };
         riscvlint_cchain *cchain = NULL;
@@ -1265,12 +1271,9 @@ static int scan_file(csh handle, const char *path)
                 return -1;
             }
         }
-        // The fusion report needs a state for the side-entry map and the
-        // liveness walk, though not the extension notes: it gates
-        // nothing on the arch string.
-        if (!census_mode || fusion_mode) {
-            state = riscvlint_state_create();
-            if (!state) {
+        if (regs_mode) {
+            regs = riscvlint_regs_create();
+            if (!regs) {
                 riscvlint_census_destroy(census);
                 riscvlint_fusion_destroy(fusion);
                 riscvlint_cchain_destroy(cchain);
@@ -1279,7 +1282,22 @@ static int scan_file(csh handle, const char *path)
                 return -1;
             }
         }
-        if (!census_mode && !fusion_mode) {
+        // The fusion report needs a state for the side-entry map and the
+        // liveness walk, though not the extension notes: it gates
+        // nothing on the arch string.
+        if ((!census_mode && !regs_mode) || fusion_mode) {
+            state = riscvlint_state_create();
+            if (!state) {
+                riscvlint_regs_destroy(regs);
+                riscvlint_census_destroy(census);
+                riscvlint_fusion_destroy(fusion);
+                riscvlint_cchain_destroy(cchain);
+                free(syms.e);
+                munmap((void *)base, map_len);
+                return -1;
+            }
+        }
+        if (!census_mode && !regs_mode && !fusion_mode) {
             // Say which extension set is in force whenever it was not
             // simply read from the object. Reporting a Zba finding
             // because nothing said otherwise is a guess, and a guess the
@@ -1372,7 +1390,10 @@ static int scan_file(csh handle, const char *path)
             if (census)
                 riscvlint_census_scan(census, handle, base + sh[i].sh_offset,
                                       sh[i].sh_size, sh[i].sh_addr);
-            else if (!fusion)
+            if (regs)
+                riscvlint_regs_scan(regs, handle, base + sh[i].sh_offset,
+                                    sh[i].sh_size, sh[i].sh_addr);
+            if (!census && !regs && !fusion)
                 scan_section(handle, state, base + sh[i].sh_offset,
                              sh[i].sh_size, sh[i].sh_addr, base, map_len, eh,
                              &syms, set,
@@ -1397,6 +1418,10 @@ static int scan_file(csh handle, const char *path)
             // per-finding detail: the same thing -v adds to a scan.
             riscvlint_census_print(census, path, arch, verbose);
             riscvlint_census_destroy(census);
+        }
+        if (regs) {
+            riscvlint_regs_print(regs, path, verbose);
+            riscvlint_regs_destroy(regs);
         }
         if (fusion) {
             riscvlint_fusion_print(fusion, path, verbose);
@@ -1432,6 +1457,7 @@ enum option_id {
     OPT_VERBOSE,
     OPT_QUIET,
     OPT_ISA,
+    OPT_REGISTERS,
     OPT_FUSION,
     OPT_CONSTANTS,
     OPT_JSON,
@@ -1459,6 +1485,8 @@ static const struct option_spec options[] = {
     // The census and the fusion report replace the lint scan.
     {OPT_ISA, "-i", "--isa", NULL,
      "an ISA census in place of the lint scan"},
+    {OPT_REGISTERS, "-r", "--registers", NULL,
+     "a register census"},
     {OPT_FUSION, "-u", "--fusion", NULL,
      "a macro-op fusion report in place of the lint scan"},
     {OPT_CONSTANTS, "-c", "--constants", NULL,
@@ -1555,6 +1583,9 @@ int main(int argc, char **argv)
         case OPT_ISA:
             census_mode = true;
             break;
+        case OPT_REGISTERS:
+            regs_mode = true;
+            break;
         case OPT_FUSION:
             fusion_mode = true;
             break;
@@ -1601,21 +1632,30 @@ int main(int argc, char **argv)
     if (census_mode && have_forced)
         fprintf(stderr, "%s: --assume has no effect with --isa; the census "
                 "reports what the binary uses\n", argv[0]);
+    if (regs_mode && have_forced)
+        fprintf(stderr, "%s: --assume has no effect with --registers; the "
+                "census counts the encodings as they stand\n", argv[0]);
     if (fusion_mode && have_forced)
         fprintf(stderr, "%s: --assume has no effect with --fusion; fusion "
                 "depends on the core, not the extensions\n", argv[0]);
     // The audits are checks, and neither the census nor the fusion
     // report runs any.
-    if ((census_mode || fusion_mode) && audits)
+    if ((census_mode || regs_mode || fusion_mode) && audits)
         fprintf(stderr, "%s: --enable has no effect with %s; that report "
                 "runs no checks\n", argv[0],
-                census_mode ? "--isa" : "--fusion");
+                census_mode ? "--isa" : regs_mode ? "--registers"
+                                                  : "--fusion");
     // --json describes the lint scan. The census is a separate report
     // whose output would interleave with the document, so the two are
     // refused rather than one of them chosen for the caller.
     if (census_mode && json_mode) {
         fprintf(stderr, "%s: --json and --isa are separate reports; pick "
                 "one\n", argv[0]);
+        return 2;
+    }
+    if (regs_mode && json_mode) {
+        fprintf(stderr, "%s: --json and --registers are separate reports; "
+                "pick one\n", argv[0]);
         return 2;
     }
     // -v prints the human report's per-finding half, which would
@@ -1652,7 +1692,7 @@ int main(int argc, char **argv)
     // to summarize below it. It is a description of the file rather than
     // a verdict on it, so it never sets the "found something" status --
     // but a file that could not be read is still a tool failure.
-    if (census_mode || fusion_mode) return failures ? 2 : 0;
+    if (census_mode || regs_mode || fusion_mode) return failures ? 2 : 0;
 
     // --json already closed each file's document with that file's
     // totals; there is no cross-file summary to print below them.

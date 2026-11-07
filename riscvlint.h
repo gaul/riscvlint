@@ -2127,6 +2127,104 @@ size_t riscvlint_census_extension_count(const riscvlint_census *census,
 // rather than the whole of it.
 const char *riscvlint_census_profile(const riscvlint_census *census);
 
+// ---- register census ----
+//
+// Which registers the code names, in what role and in which encoding
+// width, and how many bytes the choice of register number cost:
+// x86lint's register census with the axis RISC-V has. x86-64 numbers a
+// register with three bits and takes the fourth from a REX prefix, so
+// r8-r15 cost a byte; the compressed formats CL, CS, CA and CB name a
+// register with three bits and nothing else, so an operand outside
+// x8-x15 costs the whole two-byte form and the instruction is spelled in
+// four.
+//
+// The per-register table is read from capstone's operand model -- a
+// register the disassembly shows, as an operand or as the base of a
+// memory operand -- for the same reason the ISA census reads its feature
+// groups: the question is what the rendering names, and the rendering is
+// capstone's. The holes the file header describes are the implicit
+// ones, so the ra that `jal off`, `jalr rs` and `ret` use without
+// showing it is counted apart, by raw decode, and never folded into
+// ra's row. References are counted per operand, so `add a0,a0,a1` names
+// a0 twice, and `insns` counts each instruction once. The disassembler
+// expands compressed instructions, so `c.add a0,a1` counts as
+// `add a0,a0,a1`.
+//
+// The cost section is the reason the census exists. It is raw decode
+// through the predicates the compressibility checks use -- rv_c_form
+// and rv_zcb_form -- asked a second question with the same code: would
+// the form hold if the registers it names were in x8-x15. Every other
+// condition is still tested, so a `ld` at offset 256 or a `sub` that is
+// not in place is not counted; only the sites a register alone kept at
+// four bytes are, attributed to each register outside x8-x15 the form
+// needed and grouped by what that register is. Only two callee-saved
+// registers, s0 and s1, are nameable, so a value that lives across a
+// call in s2-s11 has no alternative within the ABI, and the frame
+// pointer takes s0; the temporaries t0-t6, a6 and a7 are the part an
+// allocator could have placed in a0-a5. The total is what register
+// numbering cost, not what a better allocation would save.
+//
+// Zcb's forms are counted on their own line, since the base-C figure
+// has to hold on an rv64gc target where they do not exist. The s0 line
+// counts the accesses through the frame pointer: its locals sit below
+// it and the compressed offset is unsigned, so an s0-based frame
+// compresses almost nothing, where the sp-based forms take any register
+// and reach 504 bytes.
+//
+// Relocated sites are counted as the bytes stand, the census having no
+// state to ask; the compressibility checks exclude them, so the two can
+// disagree by that much.
+//
+// Opaque; NULL is accepted everywhere.
+typedef struct riscvlint_regs riscvlint_regs;
+
+riscvlint_regs *riscvlint_regs_create(void);
+void riscvlint_regs_destroy(riscvlint_regs *regs);
+
+// Linear-sweep decode of `len` bytes at `vaddr`, the walk the ISA census
+// makes. Call once per executable section.
+void riscvlint_regs_scan(riscvlint_regs *regs, csh handle,
+                         const uint8_t *code, size_t len, uint64_t vaddr);
+
+// Print the census: the per-register tables, the implicit-ra line and
+// the cost section. `samples` adds up to four addresses per compressed
+// form kept out, which is what checking one in a disassembler takes.
+void riscvlint_regs_print(const riscvlint_regs *regs, const char *path,
+                          bool samples);
+
+size_t riscvlint_regs_instructions(const riscvlint_regs *regs);
+size_t riscvlint_regs_skipped(const riscvlint_regs *regs);
+
+// One figure of a register's row.
+typedef enum {
+    RISCVLINT_REGS_INSNS,     // instructions naming it in any shown role
+    RISCVLINT_REGS_OPERAND,   // references as a register operand
+    RISCVLINT_REGS_BASE,      // references as a memory operand's base
+    RISCVLINT_REGS_SHORT,     // references in two-byte instructions
+    RISCVLINT_REGS_WIDE,      // references in four-byte instructions
+    RISCVLINT_REGS_BLOCKING,  // base C forms it alone kept at four bytes
+} riscvlint_regs_role;
+
+// The figure for general register x or floating-point register f, both
+// 0-31; 0 out of range or for a NULL census.
+size_t riscvlint_regs_gpr(const riscvlint_regs *regs, unsigned x,
+                          riscvlint_regs_role role);
+size_t riscvlint_regs_fpr(const riscvlint_regs *regs, unsigned f,
+                          riscvlint_regs_role role);
+
+// Sites a register alone kept out of the compressed form named as
+// rv_c_form or rv_zcb_form spells it ("c.ld", "c.lbu"); with NULL, every
+// base C site. riscvlint_regs_zcb_blocked is the Zcb total.
+size_t riscvlint_regs_blocked(const riscvlint_regs *regs, const char *form);
+size_t riscvlint_regs_zcb_blocked(const riscvlint_regs *regs);
+
+// The ra links and returns the disassembly shows no operand for.
+size_t riscvlint_regs_hidden_ra(const riscvlint_regs *regs);
+
+// Accesses through s0 at a negative offset: frame-pointer locals, which
+// no compressed offset reaches.
+size_t riscvlint_regs_s0_below(const riscvlint_regs *regs);
+
 // ---- macro-op fusion report ----
 //
 // Which adjacent instruction pairs a fusing core would issue as one

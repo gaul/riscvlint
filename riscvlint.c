@@ -46,6 +46,37 @@ static int64_t sign_extend(uint64_t v, unsigned bits)
 // The three-bit register fields of the compressed formats name x8-x15.
 static bool rvc_reg(unsigned r) { return r >= 8 && r <= 15; }
 
+// Every register a compressed form would put in a three-bit field passes
+// through creg(), so that the register census can ask the encodability
+// predicates a second question with the same code: would the form hold
+// if the register were in x8-x15. A NULL context asks the plain one.
+// With a context, a register outside x8-x15 is recorded and passes, and
+// the predicate then answers yes exactly when the registers were all
+// that stood in the way -- every other condition is still tested.
+enum { CREG_BASE, CREG_DATA, CREG_FDATA };
+typedef struct {
+    unsigned reg[4];     // the registers outside x8-x15 the form needed
+    unsigned role[4];    // CREG_* for each: an address base, a GPR, an FPR
+    unsigned n;
+} creg_ctx;
+
+static bool creg(creg_ctx *c, unsigned r, unsigned role)
+{
+    if (rvc_reg(r)) return true;
+    if (c == NULL) return false;
+    for (unsigned i = 0; i < c->n; i++)
+        if (c->reg[i] == r && c->role[i] == role) return true;
+    if (c->n < 4) {
+        c->reg[c->n] = r;
+        c->role[c->n] = role;
+        c->n++;
+    }
+    return true;
+}
+
+static unsigned branch_encoded_size(unsigned funct3, unsigned rs1,
+                                    unsigned rs2, int64_t off, creg_ctx *c);
+
 // Sign-extended 6-bit immediate of the CI-format compressed forms.
 static int64_t ci_imm6(uint32_t w)
 {
@@ -563,8 +594,9 @@ bool rv_decode_mem(uint32_t w, unsigned size, rv_mem_kind *kind,
     }
 }
 
-unsigned rv_mem_encoded_size(rv_mem_kind kind, unsigned data, unsigned base,
-                             int64_t off, bool zcb)
+static unsigned mem_encoded_size(rv_mem_kind kind, unsigned data,
+                                 unsigned base, int64_t off, bool zcb,
+                                 creg_ctx *c)
 {
     int i = mem_index(kind);
     if (i < 0) return 4;
@@ -584,8 +616,8 @@ unsigned rv_mem_encoded_size(rv_mem_kind kind, unsigned data, unsigned base,
         if (off >= 0 && off <= limit && off % width == 0 && load_ok) return 2;
     }
     // Quadrant 0: both registers in x8-x15.
-    if (!rvc_reg(base)) return 4;
-    if (!rvc_reg(data)) return 4;
+    if (!creg(c, base, CREG_BASE)) return 4;
+    if (!creg(c, data, fp ? CREG_FDATA : CREG_DATA)) return 4;
     switch (kind) {
     case RV_MEM_LW: case RV_MEM_SW:
         return (off >= 0 && off <= 124 && off % 4 == 0) ? 2 : 4;
@@ -600,6 +632,12 @@ unsigned rv_mem_encoded_size(rv_mem_kind kind, unsigned data, unsigned base,
         // lb, lwu, flw and fsw have no compressed spelling on RV64.
         return 4;
     }
+}
+
+unsigned rv_mem_encoded_size(rv_mem_kind kind, unsigned data, unsigned base,
+                             int64_t off, bool zcb)
+{
+    return mem_encoded_size(kind, data, base, off, zcb, NULL);
 }
 
 bool rv_decode_base_add(uint32_t w, unsigned size, unsigned *rd,
@@ -639,14 +677,15 @@ static bool fits6(int64_t v) { return v >= -32 && v <= 31; }
 // A commutative two-register form fits whenever the destination is one
 // of the sources and the other is nameable; which source it is does not
 // matter, because the assembler will swap them.
-static bool c_commutes(unsigned rd, unsigned rs1, unsigned rs2)
+static bool c_commutes(creg_ctx *c, unsigned rd, unsigned rs1, unsigned rs2)
 {
-    if (rd == rs1 && rvc_reg(rs2)) return true;
-    if (rd == rs2 && rvc_reg(rs1)) return true;
+    if (rd == rs1) return creg(c, rs2, CREG_DATA);
+    if (rd == rs2) return creg(c, rs1, CREG_DATA);
     return false;
 }
 
-bool rv_c_form(uint32_t w, unsigned size, char *out, size_t outsz)
+static bool c_form(uint32_t w, unsigned size, creg_ctx *c, char *out,
+                   size_t outsz)
 {
     if (size != 4) return false;
     unsigned op = RV_OPCODE(w), f3 = (w >> 12) & 0x7u;
@@ -662,7 +701,7 @@ bool rv_c_form(uint32_t w, unsigned size, char *out, size_t outsz)
     unsigned data, base;
     int64_t off;
     if (rv_decode_mem(w, 4, &kind, &data, &base, &off)) {
-        if (rv_mem_encoded_size(kind, data, base, off, false) != 2)
+        if (mem_encoded_size(kind, data, base, off, false, c) != 2)
             return false;
         snprintf(out, outsz, "c.%s%s", rv_mem_name(kind),
                  base == 2 ? "sp" : "");
@@ -673,7 +712,7 @@ bool rv_c_form(uint32_t w, unsigned size, char *out, size_t outsz)
     unsigned brs1, brs2, bf3;
     int64_t boff;
     if (rv_decode_cond_branch(w, 4, &brs1, &brs2, &bf3, &boff)) {
-        if (rv_branch_encoded_size(bf3, brs1, brs2, boff) != 2) return false;
+        if (branch_encoded_size(bf3, brs1, brs2, boff, c) != 2) return false;
         snprintf(out, outsz, "c.%s", bf3 == 0 ? "beqz" : "bnez");
         return true;
     }
@@ -691,7 +730,7 @@ bool rv_c_form(uint32_t w, unsigned size, char *out, size_t outsz)
             else if (rs1 == 0 && fits6(imm12)) name = "c.li";
             else if (rd == 2 && rs1 == 2 && imm12 != 0 && imm12 % 16 == 0 &&
                      imm12 >= -512 && imm12 <= 496) name = "c.addi16sp";
-            else if (rs1 == 2 && rvc_reg(rd) && imm12 > 0 &&
+            else if (rs1 == 2 && creg(c, rd, CREG_DATA) && imm12 > 0 &&
                      imm12 % 4 == 0 && imm12 <= 1020) name = "c.addi4spn";
             else if (rd == rs1 && imm12 != 0 && fits6(imm12)) name = "c.addi";
             // `mv rd,rs` is `addi rd,rs,0`, and c.mv is `add rd,x0,rs2`
@@ -708,11 +747,11 @@ bool rv_c_form(uint32_t w, unsigned size, char *out, size_t outsz)
         if (f3 == 5u) {                               // srli, srai
             unsigned f6 = (w >> 26) & 0x3fu, sh = (w >> 20) & 0x3fu;
             if ((f6 != 0u && f6 != 0x10u) || sh == 0) break;
-            if (rd == rs1 && rvc_reg(rd))
+            if (rd == rs1 && creg(c, rd, CREG_DATA))
                 name = f6 == 0u ? "c.srli" : "c.srai";
             break;
         }
-        if (f3 == 7u && rd == rs1 && rvc_reg(rd) && fits6(imm12))
+        if (f3 == 7u && rd == rs1 && creg(c, rd, CREG_DATA) && fits6(imm12))
             name = "c.andi";
         break;
     case 0x1bu:                                       // OP-IMM-32
@@ -735,27 +774,27 @@ bool rv_c_form(uint32_t w, unsigned size, char *out, size_t outsz)
                 name = "c.add";                       // commutes
             break;
         }
-        if (!rvc_reg(rd)) break;
+        if (!creg(c, rd, CREG_DATA)) break;
         // The two-register forms put the destination in one source slot.
         // The commutative ones reach either slot, since the assembler
         // will swap the operands to fit; `sub` reaches only the first.
         if (f7 == 0x20u && f3 == 0u) {
-            if (rd == rs1 && rvc_reg(rs2)) name = "c.sub";
+            if (rd == rs1 && creg(c, rs2, CREG_DATA)) name = "c.sub";
             break;
         }
         if (f7 != 0u) break;
-        if (!c_commutes(rd, rs1, rs2)) break;
+        if (!c_commutes(c, rd, rs1, rs2)) break;
         if (f3 == 4u) name = "c.xor";
         else if (f3 == 6u) name = "c.or";
         else if (f3 == 7u) name = "c.and";
         break;
     case 0x3bu:                                       // OP-32
-        if (!rvc_reg(rd)) break;
+        if (!creg(c, rd, CREG_DATA)) break;
         if (f7 == 0x20u && f3 == 0u) {
-            if (rd == rs1 && rvc_reg(rs2)) name = "c.subw";
+            if (rd == rs1 && creg(c, rs2, CREG_DATA)) name = "c.subw";
             break;
         }
-        if (f7 == 0u && f3 == 0u && c_commutes(rd, rs1, rs2))
+        if (f7 == 0u && f3 == 0u && c_commutes(c, rd, rs1, rs2))
             name = "c.addw";
         break;
     case 0x67u:                                       // jalr
@@ -782,9 +821,14 @@ bool rv_c_form(uint32_t w, unsigned size, char *out, size_t outsz)
     return true;
 }
 
+bool rv_c_form(uint32_t w, unsigned size, char *out, size_t outsz)
+{
+    return c_form(w, size, NULL, out, outsz);
+}
+
 // ---- Zcb encodability ----
 
-const char *rv_zcb_form(uint32_t w, unsigned size)
+static const char *zcb_form(uint32_t w, unsigned size, creg_ctx *c)
 {
     if (size != 4) return NULL;
     unsigned op = RV_OPCODE(w), f3 = (w >> 12) & 0x7u;
@@ -795,7 +839,7 @@ const char *rv_zcb_form(uint32_t w, unsigned size)
     switch (op) {
     case 0x03u: {                                     // LOAD
         int64_t off = sign_extend(field, 12);
-        if (!rvc_reg(rd) || !rvc_reg(rs1)) return NULL;
+        if (!creg(c, rd, CREG_DATA) || !creg(c, rs1, CREG_BASE)) return NULL;
         // c.lbu's offset field is two bits and unsigned; c.lhu and c.lh
         // share a one-bit field that names the halfword, so 0 or 2.
         if (f3 == 4 && off >= 0 && off <= 3) return "c.lbu";
@@ -806,14 +850,14 @@ const char *rv_zcb_form(uint32_t w, unsigned size)
     case 0x23u: {                                     // STORE
         // S-type splits the immediate across two fields.
         int64_t off = sign_extend(((uint64_t)f7 << 5) | rd, 12);
-        if (!rvc_reg(rs2) || !rvc_reg(rs1)) return NULL;
+        if (!creg(c, rs2, CREG_DATA) || !creg(c, rs1, CREG_BASE)) return NULL;
         if (f3 == 0 && off >= 0 && off <= 3) return "c.sb";
         if (f3 == 1 && (off == 0 || off == 2)) return "c.sh";
         return NULL;
     }
     case 0x13u:                                       // OP-IMM
         // The unary forms all write the register they read.
-        if (rd != rs1 || !rvc_reg(rd)) return NULL;
+        if (rd != rs1 || !creg(c, rd, CREG_DATA)) return NULL;
         if (f3 == 7 && field == 255) return "c.zext.b";
         if (f3 == 4 && field == 0xfffu) return "c.not";   // xori rd,rd,-1
         if (f3 == 1 && field == 0x604u) return "c.sext.b";
@@ -821,22 +865,27 @@ const char *rv_zcb_form(uint32_t w, unsigned size)
         return NULL;
     case 0x3bu:                                       // OP-32
         if (f7 != 0x04u || rs2 != 0) return NULL;
-        if (rd != rs1 || !rvc_reg(rd)) return NULL;
+        if (rd != rs1 || !creg(c, rd, CREG_DATA)) return NULL;
         if (f3 == 0) return "c.zext.w";               // add.uw rd,rd,x0
         if (f3 == 4) return "c.zext.h";
         return NULL;
     case 0x33u:                                       // OP
         if (f7 != 0x01u || f3 != 0) return NULL;      // mul only
-        if (!rvc_reg(rd)) return NULL;
+        if (!creg(c, rd, CREG_DATA)) return NULL;
         // c.mul is `rd = rd * rs2'`. Multiplication commutes, so the
         // operands can be swapped to fit -- clang does, GNU as does not,
         // and the site is compressible either way.
-        if (rd == rs1 && rvc_reg(rs2)) return "c.mul";
-        if (rd == rs2 && rvc_reg(rs1)) return "c.mul";
+        if (rd == rs1 && creg(c, rs2, CREG_DATA)) return "c.mul";
+        if (rd == rs2 && creg(c, rs1, CREG_DATA)) return "c.mul";
         return NULL;
     default:
         return NULL;
     }
+}
+
+const char *rv_zcb_form(uint32_t w, unsigned size)
+{
+    return zcb_form(w, size, NULL);
 }
 
 // ---- what a result guarantees about its own high bits ----
@@ -1168,13 +1217,19 @@ bool rv_decode_jump(uint32_t w, unsigned size, unsigned *rd, int64_t *off)
     return true;
 }
 
+static unsigned branch_encoded_size(unsigned funct3, unsigned rs1,
+                                    unsigned rs2, int64_t off, creg_ctx *c)
+{
+    if (funct3 != 0u && funct3 != 1u) return 4;                 // not beq/bne
+    if (rs2 != 0 || !creg(c, rs1, CREG_DATA)) return 4;
+    if (off < -256 || off > 254 || (off & 1)) return 4;
+    return 2;
+}
+
 unsigned rv_branch_encoded_size(unsigned funct3, unsigned rs1, unsigned rs2,
                                 int64_t off)
 {
-    if (funct3 != 0u && funct3 != 1u) return 4;                 // not beq/bne
-    if (rs2 != 0 || !rvc_reg(rs1)) return 4;
-    if (off < -256 || off > 254 || (off & 1)) return 4;
-    return 2;
+    return branch_encoded_size(funct3, rs1, rs2, off, NULL);
 }
 
 // ---- the windowed memory and constant table ----
@@ -9090,6 +9145,449 @@ void riscvlint_census_print(const riscvlint_census *census, const char *path,
             printf("%s 0x%" PRIx64, k == 0 ? "" : ",", e->samples[k]);
         if (e->count > e->nsamples)
             printf(" (+%zu more)", e->count - e->nsamples);
+        printf("\n");
+    }
+}
+
+// ---- register census ----
+//
+// See riscvlint.h for what the census claims and what it trusts capstone
+// with. The cost section asks c_form and zcb_form, with a creg_ctx,
+// whether the registers were all that kept a compressed form out; that
+// question is why those two take a context.
+
+#define REGS_SAMPLES 4
+#define REGS_FORMS   32
+#define REGS_NAME    16
+
+typedef struct {
+    size_t insns;            // instructions naming the register at all
+    size_t operand;          // references as a register operand
+    size_t base;             // references as a memory operand's base
+    size_t in2;              // references in two-byte instructions
+    size_t in4;              // ... and in four-byte ones
+    size_t blocking;         // base C forms this register alone kept wide
+} regs_row;
+
+typedef struct {
+    char name[REGS_NAME];    // the compressed form, as rv_c_form spells it
+    bool zcb;
+    size_t sites;
+    size_t by_base;          // sites where an address base was a blocker
+    size_t by_data;          // ... where a data register was
+    uint64_t samples[REGS_SAMPLES];
+    unsigned nsamples;
+} regs_form;
+
+struct riscvlint_regs {
+    regs_row x[32];
+    regs_row f[32];
+    size_t vector_refs;
+    size_t vector_insns;
+    size_t ra_links;         // ra written by a link that does not show it
+    size_t ra_returns;       // ra read by a return that does not show it
+    size_t instructions;
+    size_t skipped;
+    regs_form forms[REGS_FORMS];
+    size_t nforms;
+    size_t blocked;          // base C sites a register alone kept wide
+    size_t zcb_blocked;      // the same for Zcb's forms
+    // The blocking registers of the base C sites, by what they are.
+    size_t by_saved;         // s2-s11
+    size_t by_temp;          // t0-t6, a6, a7
+    size_t by_fixed;         // zero, ra, sp, gp, tp
+    size_t by_fpr;           // f-registers outside f8-f15
+    size_t s0_based;         // accesses through s0 ...
+    size_t s0_below;         // ... at a negative offset
+};
+
+static const char *const regs_xname[32] = {
+    "zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2",
+    "s0", "s1", "a0", "a1", "a2", "a3", "a4", "a5",
+    "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7",
+    "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6",
+};
+static const char *const regs_fname[32] = {
+    "ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6", "ft7",
+    "fs0", "fs1", "fa0", "fa1", "fa2", "fa3", "fa4", "fa5",
+    "fa6", "fa7", "fs2", "fs3", "fs4", "fs5", "fs6", "fs7",
+    "fs8", "fs9", "fs10", "fs11", "ft8", "ft9", "ft10", "ft11",
+};
+
+riscvlint_regs *riscvlint_regs_create(void)
+{
+    return calloc(1, sizeof(riscvlint_regs));
+}
+
+void riscvlint_regs_destroy(riscvlint_regs *regs)
+{
+    free(regs);
+}
+
+size_t riscvlint_regs_instructions(const riscvlint_regs *regs)
+{
+    return regs ? regs->instructions : 0;
+}
+
+size_t riscvlint_regs_skipped(const riscvlint_regs *regs)
+{
+    return regs ? regs->skipped : 0;
+}
+
+static size_t regs_figure(const regs_row *r, riscvlint_regs_role role)
+{
+    switch (role) {
+    case RISCVLINT_REGS_INSNS: return r->insns;
+    case RISCVLINT_REGS_OPERAND: return r->operand;
+    case RISCVLINT_REGS_BASE: return r->base;
+    case RISCVLINT_REGS_SHORT: return r->in2;
+    case RISCVLINT_REGS_WIDE: return r->in4;
+    case RISCVLINT_REGS_BLOCKING: return r->blocking;
+    }
+    return 0;
+}
+
+size_t riscvlint_regs_gpr(const riscvlint_regs *regs, unsigned x,
+                          riscvlint_regs_role role)
+{
+    return regs && x < 32 ? regs_figure(&regs->x[x], role) : 0;
+}
+
+size_t riscvlint_regs_fpr(const riscvlint_regs *regs, unsigned f,
+                          riscvlint_regs_role role)
+{
+    return regs && f < 32 ? regs_figure(&regs->f[f], role) : 0;
+}
+
+size_t riscvlint_regs_blocked(const riscvlint_regs *regs, const char *form)
+{
+    if (!regs) return 0;
+    if (!form) return regs->blocked;
+    for (size_t i = 0; i < regs->nforms; i++)
+        if (strcmp(regs->forms[i].name, form) == 0)
+            return regs->forms[i].sites;
+    return 0;
+}
+
+size_t riscvlint_regs_zcb_blocked(const riscvlint_regs *regs)
+{
+    return regs ? regs->zcb_blocked : 0;
+}
+
+size_t riscvlint_regs_hidden_ra(const riscvlint_regs *regs)
+{
+    return regs ? regs->ra_links + regs->ra_returns : 0;
+}
+
+size_t riscvlint_regs_s0_below(const riscvlint_regs *regs)
+{
+    return regs ? regs->s0_below : 0;
+}
+
+// The registers the disassembly shows: each register operand and each
+// memory operand's base, in its own file. Vector registers are tallied
+// as a whole, since no compressed form names one.
+static void regs_count(riscvlint_regs *regs, const cs_insn *insn)
+{
+    const cs_riscv *a = &insn->detail->riscv;
+    uint32_t seen_x = 0, seen_f = 0;
+    bool seen_v = false;
+    for (int i = 0; i < a->op_count; i++) {
+        const cs_riscv_op *o = &a->operands[i];
+        unsigned id;
+        bool is_base;
+        if (o->type == RISCV_OP_REG) {
+            id = o->reg;
+            is_base = false;
+        } else if (o->type == RISCV_OP_MEM) {
+            id = o->mem.base;
+            is_base = true;
+        } else {
+            continue;
+        }
+        regs_row *row;
+        unsigned n = cs_reg_to_num(id);
+        if (n < 32) {
+            row = &regs->x[n];
+            if (!(seen_x & (1u << n))) {
+                seen_x |= 1u << n;
+                row->insns++;
+            }
+        } else if ((n = cs_freg_to_num(id)) < 32) {
+            row = &regs->f[n];
+            if (!(seen_f & (1u << n))) {
+                seen_f |= 1u << n;
+                row->insns++;
+            }
+        } else if (id >= RISCV_REG_V0 && id <= RISCV_REG_V31) {
+            regs->vector_refs++;
+            if (!seen_v) {
+                seen_v = true;
+                regs->vector_insns++;
+            }
+            continue;
+        } else {
+            continue;
+        }
+        if (is_base) row->base++;
+        else row->operand++;
+        if (insn->size == 2) row->in2++;
+        else row->in4++;
+    }
+}
+
+// The ra that `jal off`, `jalr rs` and `c.jalr rs` write and that `ret`
+// reads without showing it. Counted only where no operand names ra, so
+// a `jalr ra,16(ra)` that does show it is not counted twice.
+static void regs_hidden_ra(riscvlint_regs *regs, const cs_insn *insn,
+                           uint32_t w)
+{
+    const cs_riscv *a = &insn->detail->riscv;
+    for (int i = 0; i < a->op_count; i++) {
+        const cs_riscv_op *o = &a->operands[i];
+        if ((o->type == RISCV_OP_REG && o->reg == RISCV_REG_X1) ||
+            (o->type == RISCV_OP_MEM && o->mem.base == RISCV_REG_X1))
+            return;
+    }
+    if (insn->size == 4) {
+        unsigned rd, rs1;
+        int64_t imm;
+        if (RV_OPCODE(w) == RV_OP_JAL) {
+            if (((w >> 7) & 0x1fu) == 1) regs->ra_links++;
+        } else if (rv_decode_jalr(w, &rd, &rs1, &imm)) {
+            if (rd == 1) regs->ra_links++;
+            if (rs1 == 1) regs->ra_returns++;
+        }
+        return;
+    }
+    // c.jr and c.jalr: funct4 100x with rs2 zero in quadrant 2, and an
+    // rs1 of zero is c.ebreak or reserved rather than a jump.
+    if (insn->size == 2 && (w & 0xe07fu) == 0x8002u) {
+        unsigned rs1 = (w >> 7) & 0x1fu;
+        if (rs1 == 0) return;
+        if (w & 0x1000u) regs->ra_links++;
+        if (rs1 == 1) regs->ra_returns++;
+    }
+}
+
+static regs_form *regs_form_slot(riscvlint_regs *regs, const char *name,
+                                 bool zcb)
+{
+    for (size_t i = 0; i < regs->nforms; i++)
+        if (strcmp(regs->forms[i].name, name) == 0) return &regs->forms[i];
+    if (regs->nforms == REGS_FORMS) return NULL;
+    regs_form *f = &regs->forms[regs->nforms++];
+    snprintf(f->name, sizeof f->name, "%s", name);
+    f->zcb = zcb;
+    return f;
+}
+
+// A four-byte site that `form` would hold but for the registers in `c`.
+// The per-register column and the classes count the base C forms only:
+// they have to hold on an rv64gc target, where Zcb's do not exist.
+static void regs_blocked_site(riscvlint_regs *regs, const char *form,
+                              bool zcb, const creg_ctx *c, uint64_t at)
+{
+    regs_form *f = regs_form_slot(regs, form, zcb);
+    bool base = false, data = false;
+    for (unsigned i = 0; i < c->n; i++) {
+        unsigned r = c->reg[i];
+        if (c->role[i] == CREG_BASE) base = true;
+        else data = true;
+        if (zcb) continue;
+        if (c->role[i] == CREG_FDATA) {
+            regs->f[r].blocking++;
+            regs->by_fpr++;
+        } else {
+            regs->x[r].blocking++;
+            if (r >= 18 && r <= 27) regs->by_saved++;
+            else if ((r >= 5 && r <= 7) || r == 16 || r == 17 || r >= 28)
+                regs->by_temp++;
+            else regs->by_fixed++;
+        }
+    }
+    if (zcb) regs->zcb_blocked++;
+    else regs->blocked++;
+    if (f == NULL) return;
+    f->sites++;
+    if (base) f->by_base++;
+    if (data) f->by_data++;
+    if (f->nsamples < REGS_SAMPLES) f->samples[f->nsamples++] = at;
+}
+
+void riscvlint_regs_scan(riscvlint_regs *regs, csh handle,
+                         const uint8_t *code, size_t len, uint64_t vaddr)
+{
+    if (!regs) return;
+    cs_insn *insn = cs_malloc(handle);
+    if (!insn) return;
+
+    const uint8_t *p = code;
+    size_t remain = len;
+    uint64_t addr = vaddr;
+    while (remain >= 2) {
+        uint64_t at = addr;
+        if (!cs_disasm_iter(handle, &p, &remain, &addr, insn)) {
+            // The check driver's resynchronisation, so the census and
+            // the findings are taken over one instruction stream.
+            p += 2;
+            remain -= 2;
+            addr += 2;
+            regs->skipped++;
+            continue;
+        }
+        regs->instructions++;
+        uint32_t w = 0;
+        for (unsigned i = 0; i < insn->size && i < 4; i++)
+            w |= (uint32_t)insn->bytes[i] << (8 * i);
+        if (insn->detail) {
+            regs_count(regs, insn);
+            regs_hidden_ra(regs, insn, w);
+        }
+
+        rv_mem_kind kind;
+        unsigned data, base;
+        int64_t off;
+        if (rv_decode_mem(w, insn->size, &kind, &data, &base, &off) &&
+            base == 8) {
+            regs->s0_based++;
+            if (off < 0) regs->s0_below++;
+        }
+
+        if (insn->size != 4) continue;
+        // Compressible as it stands is the checks' finding; the census
+        // wants the sites that only a register kept out.
+        char form[24];
+        creg_ctx c = {{0}, {0}, 0};
+        if (!c_form(w, 4, NULL, form, sizeof form) &&
+            c_form(w, 4, &c, form, sizeof form) && c.n != 0)
+            regs_blocked_site(regs, form, false, &c, at);
+        creg_ctx z = {{0}, {0}, 0};
+        if (zcb_form(w, 4, NULL) == NULL) {
+            const char *zf = zcb_form(w, 4, &z);
+            if (zf && z.n != 0) regs_blocked_site(regs, zf, true, &z, at);
+        }
+    }
+    cs_free(insn, 1);
+}
+
+static void regs_print_rows(const regs_row *rows, const char *const *names,
+                            size_t total, bool all)
+{
+    printf("    %-5s %9s %6s %9s %9s %9s %9s %9s\n", "reg", "insns", "share",
+           "operand", "base", "2-byte", "4-byte", "blocked");
+    for (unsigned i = 0; i < 32; i++) {
+        const regs_row *r = &rows[i];
+        if (!all && r->insns == 0 && r->blocking == 0) continue;
+        printf("    %-5s %9zu %5.1f%% %9zu %9zu %9zu %9zu %9zu%s\n", names[i],
+               r->insns,
+               total ? 100.0 * (double)r->insns / (double)total : 0.0,
+               r->operand, r->base, r->in2, r->in4, r->blocking,
+               rvc_reg(i) ? "  *" : "");
+    }
+}
+
+// The forms of one group by descending count, ties by name, so two
+// censuses diff line for line; wrapped, since a corpus object reaches
+// every one of the eighteen.
+static void regs_print_forms(const riscvlint_regs *regs, bool zcb)
+{
+    size_t order[REGS_FORMS];
+    size_t n = 0;
+    for (size_t i = 0; i < regs->nforms; i++)
+        if (regs->forms[i].zcb == zcb && regs->forms[i].sites != 0)
+            order[n++] = i;
+    if (n == 0) {
+        printf("      none\n");
+        return;
+    }
+    int col = 0;
+    for (size_t i = 0; i < n; i++) {
+        size_t best = i;
+        for (size_t j = i + 1; j < n; j++) {
+            const regs_form *a = &regs->forms[order[j]];
+            const regs_form *b = &regs->forms[order[best]];
+            if (a->sites > b->sites ||
+                (a->sites == b->sites && strcmp(a->name, b->name) < 0))
+                best = j;
+        }
+        size_t tmp = order[i];
+        order[i] = order[best];
+        order[best] = tmp;
+        const regs_form *f = &regs->forms[order[i]];
+        char item[80];
+        int len = snprintf(item, sizeof item, "%s %zu", f->name, f->sites);
+        if (f->by_base)
+            len += snprintf(item + len, sizeof item - (size_t)len,
+                            " (base %zu, data %zu)", f->by_base, f->by_data);
+        if (i == 0) {
+            printf("      ");
+            col = 6;
+        } else if (col + 2 + len > 78) {
+            printf(",\n      ");
+            col = 6;
+        } else {
+            printf(", ");
+            col += 2;
+        }
+        printf("%s", item);
+        col += len;
+    }
+    printf("\n");
+}
+
+void riscvlint_regs_print(const riscvlint_regs *regs, const char *path,
+                          bool samples)
+{
+    if (!regs) return;
+
+    printf("register census");
+    if (path) printf(" of %s", path);
+    printf(": %zu instructions, %zu undecodable halfword%s skipped\n",
+           regs->instructions, regs->skipped,
+           regs->skipped == 1 ? "" : "s");
+    printf("  general-purpose registers: references by role and by encoding "
+           "width;\n  * marks x8-x15, the eight a three-bit compressed field "
+           "can name\n");
+    regs_print_rows(regs->x, regs_xname, regs->instructions, true);
+    bool any_f = false;
+    for (unsigned i = 0; i < 32; i++)
+        if (regs->f[i].insns != 0 || regs->f[i].blocking != 0) any_f = true;
+    if (any_f) {
+        printf("  floating-point registers; * marks f8-f15\n");
+        regs_print_rows(regs->f, regs_fname, regs->instructions, false);
+    }
+    if (regs->vector_insns != 0)
+        printf("  vector registers: %zu references in %zu instructions\n",
+               regs->vector_refs, regs->vector_insns);
+    printf("  implicit ra: %zu links write it and %zu returns read it "
+           "without showing it\n", regs->ra_links, regs->ra_returns);
+
+    printf("  encoding cost of register numbering: %zu bytes\n",
+           2 * regs->blocked);
+    printf("    base C forms kept at four bytes by a register outside x8-x15 "
+           "alone: %zu sites\n", regs->blocked);
+    regs_print_forms(regs, false);
+    printf("    the blocking register: s2-s11 %zu, t0-t6 and a6-a7 %zu, "
+           "zero/ra/sp/gp/tp %zu, f-registers outside f8-f15 %zu\n",
+           regs->by_saved, regs->by_temp, regs->by_fixed, regs->by_fpr);
+    printf("    Zcb forms, counted apart because the target may lack them: "
+           "%zu sites, %zu bytes\n", regs->zcb_blocked,
+           2 * regs->zcb_blocked);
+    regs_print_forms(regs, true);
+    printf("    accesses through s0: %zu, %zu at a negative offset -- "
+           "frame-pointer locals, below the reach of the unsigned "
+           "compressed offset\n", regs->s0_based, regs->s0_below);
+
+    if (!samples) return;
+    for (size_t i = 0; i < regs->nforms; i++) {
+        const regs_form *f = &regs->forms[i];
+        if (f->sites == 0) continue;
+        printf("    %s at", f->name);
+        for (unsigned k = 0; k < f->nsamples; k++)
+            printf("%s 0x%" PRIx64, k == 0 ? "" : ",", f->samples[k]);
+        if (f->sites > f->nsamples)
+            printf(" (+%zu more)", f->sites - f->nsamples);
         printf("\n");
     }
 }

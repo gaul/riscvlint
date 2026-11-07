@@ -1,0 +1,58 @@
+register census of reg_census.o: 20 instructions, 0 undecodable halfwords skipped
+  general-purpose registers: references by role and by encoding width;
+  * marks x8-x15, the eight a three-bit compressed field can name
+    reg       insns  share   operand      base    2-byte    4-byte   blocked
+    zero          1   5.0%         1         0         0         1         1
+    ra            1   5.0%         1         0         1         0         0
+    sp            2  10.0%         1         1         1         1         0
+    gp            0   0.0%         0         0         0         0         0
+    tp            0   0.0%         0         0         0         0         0
+    t0            8  40.0%        12         0         0        12         5
+    t1            1   5.0%         1         0         0         1         1
+    t2            0   0.0%         0         0         0         0         0
+    s0            1   5.0%         0         1         0         1         0  *
+    s1            0   0.0%         0         0         0         0         0  *
+    a0           10  50.0%         8         3         3         8         0  *
+    a1            5  25.0%         1         4         2         3         0  *
+    a2            0   0.0%         0         0         0         0         0  *
+    a3            0   0.0%         0         0         0         0         0  *
+    a4            0   0.0%         0         0         0         0         0  *
+    a5            0   0.0%         0         0         0         0         0  *
+    a6            0   0.0%         0         0         0         0         0
+    a7            0   0.0%         0         0         0         0         0
+    s2            2  10.0%         1         1         0         2         2
+    s3            1   5.0%         0         1         0         1         1
+    s4            0   0.0%         0         0         0         0         0
+    s5            0   0.0%         0         0         0         0         0
+    s6            0   0.0%         0         0         0         0         0
+    s7            0   0.0%         0         0         0         0         0
+    s8            0   0.0%         0         0         0         0         0
+    s9            0   0.0%         0         0         0         0         0
+    s10           0   0.0%         0         0         0         0         0
+    s11           0   0.0%         0         0         0         0         0
+    t3            0   0.0%         0         0         0         0         0
+    t4            0   0.0%         0         0         0         0         0
+    t5            0   0.0%         0         0         0         0         0
+    t6            0   0.0%         0         0         0         0         0
+  floating-point registers; * marks f8-f15
+    reg       insns  share   operand      base    2-byte    4-byte   blocked
+    ft0           1   5.0%         1         0         0         1         1
+  implicit ra: 1 links write it and 1 returns read it without showing it
+  encoding cost of register numbering: 18 bytes
+    base C forms kept at four bytes by a register outside x8-x15 alone: 9 sites
+      c.ld 3 (base 2, data 2), c.addi4spn 1, c.and 1, c.beqz 1, c.fld 1,
+      c.sd 1, c.srli 1
+    the blocking register: s2-s11 3, t0-t6 and a6-a7 6, zero/ra/sp/gp/tp 1, f-registers outside f8-f15 1
+    Zcb forms, counted apart because the target may lack them: 3 sites, 6 bytes
+      c.lbu 1, c.mul 1, c.zext.b 1
+    accesses through s0: 1, 1 at a negative offset -- frame-pointer locals, below the reach of the unsigned compressed offset
+    c.ld at 0x4, 0x8, 0xc
+    c.sd at 0x14
+    c.beqz at 0x1c
+    c.and at 0x20
+    c.addi4spn at 0x24
+    c.srli at 0x28
+    c.lbu at 0x2c
+    c.zext.b at 0x30
+    c.mul at 0x34
+    c.fld at 0x38

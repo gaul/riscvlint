@@ -1792,8 +1792,9 @@ except a handful of `jalr ra,0(ra)` that were already two.
 Every option has a long name and a one-letter alias, and `riscvlint
 --help` prints the table. The letters shared with armlint and x86lint
 (`-v`, `-i`, `-c`, `-m`, `-a` and `--json`) mean the same thing in all
-three tools, and so do their long names; both of them spell
-`--function` `-f`, which is why the fusion report is `-u`. A value
+three tools, `-r` the same as in x86lint, and so do their long names;
+both of them spell `--function` `-f`, which is why the fusion report is
+`-u`. A value
 follows its option as the next argument or joined with `=`
 (`--assume=rva23`), and options are read wherever they stand among the
 files.
@@ -1803,6 +1804,7 @@ files.
 | `-v`, `--verbose` | print each finding with its disassembly |
 | `-q`, `--quiet` | the default; kept for the scripts that passed it |
 | `-i`, `--isa` | an ISA census in place of the lint scan |
+| `-r`, `--registers` | a register census |
 | `-u`, `--fusion` | a macro-op fusion report in place of the lint scan |
 | `-c`, `--constants` | also report the constants the code builds, by cost |
 | `--json` | the findings as a JSON document on stdout |
@@ -2085,6 +2087,109 @@ faults. The census counts both the same way, because from the
 encodings they are the same thing; the sample addresses are what tells
 them apart.
 
+## Register census (`-r`, `--registers`)
+
+`riscvlint -r` replaces the lint scan with a census of registers: which
+architectural registers the code names, in what role and in which
+encoding width, and how many bytes the choice of register number cost.
+It is x86lint's `-r` with the axis RISC-V has. x86-64 numbers a register
+with three bits and takes the fourth from a REX prefix, so r8-r15 cost a
+byte per use; the compressed CL, CS, CA and CB formats name a register
+with three bits and nothing else, so an operand outside x8-x15 costs the
+whole two-byte form and the instruction is spelled in four. It sweeps
+the same bytes as `-i` and combines with it.
+
+```console
+$ ./riscvlint -r corpus/rust/ripgrep--rg
+register census of corpus/rust/ripgrep--rg: 819303 instructions, 0 undecodable halfwords skipped
+  general-purpose registers: references by role and by encoding width;
+  * marks x8-x15, the eight a three-bit compressed field can name
+    reg       insns  share   operand      base    2-byte    4-byte   blocked
+    zero      17979   2.2%     18154         0         6     18148      1847
+    ra       107676  13.1%    107698        14     15851     91861        64
+    sp       114174  13.9%     49198     81489    114852     15835       200
+    ...
+    s0       120636  14.7%     58857     61779     22550     98086         0  *
+    s1        74267   9.1%     62623     17067     45920     33770         0  *
+    a0       215330  26.3%    221978     26889     99164    149703         0  *
+    ...
+    a6         8371   1.0%      8346       526      2126      6746      1075
+    a7         6830   0.8%      6914       338      1534      5718       906
+    s2        38916   4.7%     31959      7866     20488     19337      8237
+    s3        34095   4.2%     27871      6991     16302     18560      7494
+    ...
+  vector registers: 19129 references in 17580 instructions
+  implicit ra: 931 links write it and 6644 returns read it without showing it
+  encoding cost of register numbering: 89734 bytes
+    base C forms kept at four bytes by a register outside x8-x15 alone: 44867 sites
+      c.ld 23491 (base 19549, data 7018), c.sd 11584 (base 8498, data 5585),
+      c.beqz 2783, c.sw 1275 (base 753, data 785), c.or 1215, c.and 1077,
+      c.bnez 921, c.lw 848 (base 602, data 418), c.sub 775, c.xor 647,
+      c.addi4spn 178, c.subw 40, c.srli 16, c.addw 10, c.andi 7
+    the blocking register: s2-s11 44041, t0-t6 and a6-a7 5029, zero/ra/sp/gp/tp 2111, f-registers outside f8-f15 0
+    Zcb forms, counted apart because the target may lack them: 3892 sites, 7784 bytes
+      c.lbu 2281 (base 1720, data 870), c.sb 1265 (base 573, data 849),
+      c.mul 165, c.sh 123 (base 96, data 60), c.lhu 24 (base 5, data 19),
+      c.sext.h 12, c.lh 8, c.zext.b 7, c.zext.w 7
+    accesses through s0: 61779, 61740 at a negative offset -- frame-pointer locals, below the reach of the unsigned compressed offset
+```
+
+References are counted per operand, so `add a0,a0,a1` names a0 twice,
+and `insns` counts each instruction once; `operand` is a register the
+disassembly shows and `base` the address register of a load or store.
+The disassembler expands compressed instructions, so `c.add a0,a1`
+counts as `add a0,a0,a1`, and the `2-byte` and `4-byte` columns say
+which spelling each reference sat in. The table is read from capstone's
+operand model -- the question is what the rendering names, and the
+rendering is capstone's -- and the one thing that model leaves out, the
+ra a `jal`, a `jalr rs` or a `ret` uses without showing it, is counted
+on its own line by raw decode rather than folded into ra's row.
+Floating-point rows print only when used, and vector registers as a
+total, since no compressed form names one.
+
+The cost section is the reason the census exists. Every four-byte
+instruction is put to the same predicates the compressibility checks
+use, asked a second question with the same code: would a compressed
+form hold it if the registers it names were in x8-x15. Every other
+condition is still tested -- an `ld` at offset 256 or a `sub` that is
+not in place is not counted -- so what remains is the sites a register
+alone kept at four bytes, two bytes each. Each is attributed to the
+registers that blocked it in the `blocked` column and grouped by what
+they are:
+
+* **s2-s11** hold values that live across a call, and only two
+  callee-saved registers, s0 and s1, are nameable -- one of them taken
+  by the frame pointer where there is one -- so this share has no
+  alternative within the ABI. It is 44,041 of ripgrep's 51,181 blocking
+  registers.
+* **t0-t6, a6 and a7** are caller-saved like a0-a5 and could have been
+  a0-a5 whenever those were free. This is the share an allocator could
+  move, and the one LLVM's compressible-register allocation hints exist
+  to shrink.
+* **zero, ra, sp, gp and tp** are fixed: `sd zero,0(a0)` has no two-byte
+  spelling because no three-bit field names x0.
+
+Zcb's forms are counted on their own line, since the base figure has to
+hold on an rv64gc target where they do not exist; on an RVA23 target,
+add the two. The s0 line is the frame pointer's cost in this axis:
+ripgrep addresses 61,779 locals through s0 and 61,740 of them sit below
+it, where the unsigned compressed offset cannot reach, while the
+sp-based forms take any register and reach 504 bytes. That is the
+compression side of the frame-pointer cost the redundant stack-pointer
+restore check reports.
+
+The total is what register numbering cost, not what a better allocation
+would save: most registers outside x8-x15 are in use because the eight
+were occupied. It is 3.5% of ripgrep's code bytes and 5.6% of
+libmozsqlite3's, against the 2.2-2.9% x86lint measures for REX bytes.
+Offsets are the other axis -- past 248 a load costs the same two bytes,
+and a probe over ripgrep's disassembly counts 33,409 `ld` kept wide by
+their offset against the 23,491 kept wide by a register -- and that one
+is the audit TODO.md sketches rather than this census's. Relocated
+sites are counted as the bytes stand, which the compressibility checks
+exclude, so the two can disagree by that much. With `-v` the census
+prints up to four sample addresses per form.
+
 ## Macro-op fusion (`-u`, `--fusion`)
 
 `riscvlint -u` replaces the lint scan with a fusion report: the
@@ -2329,7 +2434,7 @@ reads it unadorned, `json.JSONDecoder().raw_decode` in a loop in
 Python. A file the driver rejects leaves stdout empty rather than half a
 document, and the exit status is unchanged by the mode.
 
-`-i`, `-u` and `-v` are separate reports whose output would interleave
+`-i`, `-r`, `-u` and `-v` are separate reports whose output would interleave
 with the document, so those combinations are refused rather than chosen
 for the caller. `-q` asks for what `--json` already does and is accepted, so
 a script that passed it still gets a document.
@@ -2587,7 +2692,8 @@ which could not be read exits 2 whatever the other four reported: what
 they found is not the answer to the question that was asked. The `-i`
 census is a description of the file rather than a verdict on it and so
 never returns 1 -- nothing in it is a finding -- but a file it could not
-read is still a 2. The `-u` fusion report is the same.
+read is still a 2. The `-r` register census and the `-u` fusion report
+are the same.
 
 An `-a` audit's findings count toward the total like any other, so a
 run that passes it exits 1 whenever the audit found anything to review;

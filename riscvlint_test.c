@@ -6241,6 +6241,92 @@ static const uint8_t fusion_code[] = {
     0x01, 0x91,                    // c.srli a0,32         fused on both
 };
 
+// The register census. Encodings from llvm-mc for rv64imd without C, so
+// that the four-byte spellings stay four bytes, plus four compressed
+// instructions assembled with it.
+static void test_regs(csh handle)
+{
+    static const uint8_t code[] = {
+        0x03, 0xb5, 0x85, 0x00,        // ld a0,8(a1)      c.ld holds it: not blocked
+        0x83, 0xb2, 0x85, 0x00,        // ld t0,8(a1)      blocked by t0, the data
+        0x03, 0x35, 0x89, 0x00,        // ld a0,8(s2)      blocked by s2, the base
+        0x03, 0xb9, 0x89, 0x00,        // ld s2,8(s3)      blocked by both
+        0x03, 0xb5, 0x05, 0x10,        // ld a0,256(a1)    the offset: not blocked
+        0x03, 0x35, 0x81, 0x00,        // ld a0,8(sp)      c.ldsp: not blocked
+        0x23, 0x30, 0x05, 0x00,        // sd zero,0(a0)    blocked by zero
+        0x23, 0x3c, 0xa4, 0xfe,        // sd a0,-8(s0)     below the frame pointer
+        0x63, 0x84, 0x02, 0x00,        // beqz t0,8        blocked by t0
+        0xb3, 0xf2, 0x62, 0x00,        // and t0,t0,t1     blocked by t0 and t1
+        0x33, 0x85, 0xc5, 0x40,        // sub a0,a1,a2     not in place: not blocked
+        0x93, 0x02, 0x01, 0x01,        // addi t0,sp,16    c.addi4spn, blocked by t0
+        0x93, 0xd2, 0x32, 0x00,        // srli t0,t0,3     blocked by t0
+        0x83, 0x42, 0x15, 0x00,        // lbu t0,1(a0)     Zcb c.lbu, blocked by t0
+        0x93, 0xf2, 0xf2, 0x0f,        // andi t0,t0,255   Zcb c.zext.b, blocked by t0
+        0xb3, 0x82, 0xa2, 0x02,        // mul t0,t0,a0     Zcb c.mul, blocked by t0
+        0xef, 0x00, 0x80, 0x00,        // jal 8            ra written, not shown
+        0x67, 0x80, 0x00, 0x00,        // ret              ra read, not shown
+        0x07, 0x30, 0x85, 0x00,        // fld ft0,8(a0)    blocked by ft0
+        0x13, 0x05, 0x15, 0x00,        // addi a0,a0,1     c.addi holds it: not blocked
+        0x03, 0xa6, 0x46, 0x00,        // lw a2,4(a3)      c.lw holds it: not blocked
+        0x88, 0x61,                    // c.ld a0,0(a1)
+        0x2e, 0x95,                    // c.add a0,a1
+        0x06, 0xe4,                    // c.sdsp ra,8(sp)
+        0x01, 0xc5,                    // c.beqz a0,8
+    };
+
+    riscvlint_regs *regs = riscvlint_regs_create();
+    CHECK(regs != NULL);
+    if (!regs) return;
+    riscvlint_regs_scan(regs, handle, code, sizeof code, 0x1000);
+    CHECK(riscvlint_regs_instructions(regs) == 25);
+    CHECK(riscvlint_regs_skipped(regs) == 0);
+
+    // Nine four-byte instructions a base C form would hold but for a
+    // register; the three Zcb ones are counted apart from them.
+    CHECK(riscvlint_regs_blocked(regs, NULL) == 9);
+    CHECK(riscvlint_regs_blocked(regs, "c.ld") == 3);
+    CHECK(riscvlint_regs_blocked(regs, "c.sd") == 1);
+    CHECK(riscvlint_regs_blocked(regs, "c.beqz") == 1);
+    CHECK(riscvlint_regs_blocked(regs, "c.and") == 1);
+    CHECK(riscvlint_regs_blocked(regs, "c.addi4spn") == 1);
+    CHECK(riscvlint_regs_blocked(regs, "c.srli") == 1);
+    CHECK(riscvlint_regs_blocked(regs, "c.fld") == 1);
+    CHECK(riscvlint_regs_blocked(regs, "c.lw") == 0);
+    CHECK(riscvlint_regs_zcb_blocked(regs) == 3);
+    CHECK(riscvlint_regs_blocked(regs, "c.lbu") == 1);
+    CHECK(riscvlint_regs_blocked(regs, "c.zext.b") == 1);
+    CHECK(riscvlint_regs_blocked(regs, "c.mul") == 1);
+
+    // Attribution: t0 blocks five base forms and the column leaves out
+    // its three Zcb ones; s2 blocks twice, once as a base and once as
+    // data; s3, t1 and zero once; ft0 once, in the other file.
+    CHECK(riscvlint_regs_gpr(regs, 5, RISCVLINT_REGS_BLOCKING) == 5);
+    CHECK(riscvlint_regs_gpr(regs, 6, RISCVLINT_REGS_BLOCKING) == 1);
+    CHECK(riscvlint_regs_gpr(regs, 18, RISCVLINT_REGS_BLOCKING) == 2);
+    CHECK(riscvlint_regs_gpr(regs, 19, RISCVLINT_REGS_BLOCKING) == 1);
+    CHECK(riscvlint_regs_gpr(regs, 0, RISCVLINT_REGS_BLOCKING) == 1);
+    CHECK(riscvlint_regs_gpr(regs, 10, RISCVLINT_REGS_BLOCKING) == 0);
+    CHECK(riscvlint_regs_fpr(regs, 0, RISCVLINT_REGS_BLOCKING) == 1);
+
+    // The table reads what the disassembly shows: a1 is a base four
+    // times, sp twice and s0 once; a0 is named by fourteen instructions
+    // and t0 by eight; the compressed ld, add and beqz name a0 in two
+    // bytes, and c.sdsp names ra.
+    CHECK(riscvlint_regs_gpr(regs, 11, RISCVLINT_REGS_BASE) == 4);
+    CHECK(riscvlint_regs_gpr(regs, 2, RISCVLINT_REGS_BASE) == 2);
+    CHECK(riscvlint_regs_gpr(regs, 8, RISCVLINT_REGS_BASE) == 1);
+    CHECK(riscvlint_regs_gpr(regs, 10, RISCVLINT_REGS_INSNS) == 14);
+    CHECK(riscvlint_regs_gpr(regs, 5, RISCVLINT_REGS_INSNS) == 8);
+    CHECK(riscvlint_regs_gpr(regs, 10, RISCVLINT_REGS_SHORT) >= 3);
+    CHECK(riscvlint_regs_gpr(regs, 1, RISCVLINT_REGS_SHORT) == 1);
+    CHECK(riscvlint_regs_fpr(regs, 0, RISCVLINT_REGS_INSNS) == 1);
+    // `jal 8` writes ra and `ret` reads it, and neither shows it.
+    CHECK(riscvlint_regs_hidden_ra(regs) == 2);
+    // The one access through s0 sits below the frame pointer.
+    CHECK(riscvlint_regs_s0_below(regs) == 1);
+    riscvlint_regs_destroy(regs);
+}
+
 static void test_fusion(csh handle)
 {
     static const char x100[] = "spacemit-x100";
@@ -7131,6 +7217,7 @@ int main(void)
     test_scratch_call_to_jal(handle);
     test_cross_jump(handle);
     test_census(handle);
+    test_regs(handle);
     test_fusion(handle);
 
     cs_close(&handle);

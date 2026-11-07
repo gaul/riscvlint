@@ -77,6 +77,10 @@ expect 2 -q -i "$WORK/does-not-exist"
 # The fusion report likewise: a pair that fuses is not a finding.
 expect 0 -u "$WORK/dirty.o"
 expect 2 -u "$WORK/does-not-exist"
+# And the register census, alone or beside the ISA census.
+expect 0 -r "$WORK/dirty.o"
+expect 0 -i -r "$WORK/dirty.o"
+expect 2 -r "$WORK/does-not-exist"
 # -q asks for the default and is kept only so the invocations that
 # passed it still work, so it must stay accepted.
 expect 1 -q "$WORK/dirty.o"
@@ -87,6 +91,7 @@ expect 1 -v "$WORK/dirty.o"
 expect 1 --verbose "$WORK/dirty.o"
 expect 1 --quiet "$WORK/dirty.o"
 expect 0 --isa "$WORK/dirty.o"
+expect 0 --registers "$WORK/dirty.o"
 expect 0 --fusion "$WORK/dirty.o"
 expect 1 --constants "$WORK/dirty.o"
 expect 1 -m rva23 "$WORK/dirty.o"
@@ -109,7 +114,8 @@ expect 2 -f "$WORK/dirty.o"
 expect 0 --help
 expect 0 -h
 missing=""
-for name in verbose quiet isa fusion constants json assume enable help; do
+for name in verbose quiet isa registers fusion constants json assume enable \
+            help; do
     "$ROOT/riscvlint" --help | grep -q -- "--$name" || missing="$missing --$name"
 done
 if [ -z "$missing" ]; then
