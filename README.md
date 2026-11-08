@@ -424,9 +424,12 @@ except a handful of `jalr ra,0(ra)` that were already two.
   has 1,658, every one in TurboFan, worth 8,154 bytes -- 6.8% of its
   24,383 adjacent pairs. The rest are declined by those conditions, the
   liveness proof above all: in a sample part a fifth of the declined
-  pairs reach V8's `auipc`+`jr` far jump on the fall-through before
-  anything touches the register, and the walk cannot follow an indirect
-  jump.
+  pairs reached V8's `auipc`+`jr` far jump on the fall-through before
+  anything touched the register, where the walk gave up. It now follows
+  the pair to its target, and over the JetStream dump taken again for
+  entry 54 the check goes from 1,649 to 2,436, still all TurboFan.
+  The walks that follow one stop most often at a deoptimization exit,
+  a call the walk cannot see past.
 
 * **unsigned divide or remainder by a power of two** -- `li rc,2^k` +
   `divu rd,rx,rc` is a shift: `srli rd,rx,k`. `divuw` divides the low

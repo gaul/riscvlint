@@ -2095,6 +2095,31 @@ static bool live_names(uint64_t regs, unsigned rd)
     return rd <= 32 && (regs >> rd & 1);
 }
 
+// V8's far jump at `at`, `auipc rd,hi` + `jr lo(rd)`: where it goes, and
+// in `*rd` the register it leaves holding the auipc's result. Neither
+// half may carry a relocation, since in an unlinked object both
+// immediates are placeholders and the target computed from them is
+// fiction.
+static bool far_jump_at(const riscvlint_state *state, uint64_t at,
+                        uint64_t *dest, unsigned *rd)
+{
+    uint32_t w, w2;
+    unsigned r, rd2, rs1;
+    int64_t hi, lo;
+    if (!riscvlint_word_at(state, at, &w) || !rv_decode_auipc(w, &r, &hi) ||
+        r == 0 || riscvlint_is_relocated(state, at))
+        return false;
+    if (!riscvlint_word_at(state, at + 4, &w2) ||
+        riscvlint_is_relocated(state, at + 4))
+        return false;
+    if (!rv_decode_jalr(w2, &rd2, &rs1, &lo) || rd2 != 0 || rs1 != r)
+        return false;
+    // jalr clears bit 0 of the computed address.
+    *dest = (at + (uint64_t)(hi + lo)) & ~(uint64_t)1;
+    *rd = r;
+    return true;
+}
+
 int riscvlint_liveness(riscvlint_state *state, uint64_t addr, unsigned rd)
 {
     if (!state->probe || !state->dec) return RISCVLINT_LIVE_UNKNOWN;
@@ -2113,7 +2138,7 @@ int riscvlint_liveness(riscvlint_state *state, uint64_t addr, unsigned rd)
         if (at < state->vaddr || at >= state->vaddr + state->size)
             return RISCVLINT_LIVE_UNKNOWN;
 
-        uint64_t a = at;
+        uint64_t a = at, prev = 0;
         for (;;) {
             if (budget-- <= 0) return RISCVLINT_LIVE_UNKNOWN;
             const rvl_dec *in = live_decode(state, a);
@@ -2144,6 +2169,13 @@ int riscvlint_liveness(riscvlint_state *state, uint64_t addr, unsigned rd)
             }
             uint64_t t = in->target;
             if (in->kind & LIVE_UNCOND) {
+                // V8's far jump goes where its two immediates say, for a
+                // walk that came through the auipc. One that starts on
+                // the jr, as a branch to it does, arrives with anything
+                // in the register.
+                unsigned rx;
+                if (!t && a != at && prev + 4 == a)
+                    far_jump_at(state, prev, &t, &rx);
                 if (!t) return RISCVLINT_LIVE_UNKNOWN;   // indirect
                 if (nq >= LIVE_PATHS) return RISCVLINT_LIVE_UNKNOWN;
                 queue[nq++] = t;
@@ -2153,6 +2185,7 @@ int riscvlint_liveness(riscvlint_state *state, uint64_t addr, unsigned rd)
                 if (nq >= LIVE_PATHS) return RISCVLINT_LIVE_UNKNOWN;
                 queue[nq++] = t;
             }
+            prev = a;
             a += in->len;
         }
     }
@@ -7674,19 +7707,7 @@ static bool thread_jump_at(const riscvlint_state *state, uint64_t at,
         *wrote = 0;
         return true;
     }
-    int64_t hi, lo;
-    unsigned rd2, rs1;
-    uint32_t w2;
-    if (size != 4 || !rv_decode_auipc(w, &rd, &hi) || rd == 0) return false;
-    if (!riscvlint_word_at(state, at + 4, &w2) ||
-        riscvlint_is_relocated(state, at + 4))
-        return false;
-    if (!rv_decode_jalr(w2, &rd2, &rs1, &lo) || rd2 != 0 || rs1 != rd)
-        return false;
-    // jalr clears bit 0 of the computed address.
-    *dest = (at + (uint64_t)(hi + lo)) & ~(uint64_t)1;
-    *wrote = rd;
-    return true;
+    return far_jump_at(state, at, dest, wrote);
 }
 
 bool check_transfer_to_jump(riscvlint_state *state, const cs_insn *insn,

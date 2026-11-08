@@ -1491,7 +1491,7 @@ which is to the digit what check 3 reports over this corpus.
 | 40 | pushes one stack adjustment would do | 81,103 runs | ML 78K | **implemented**, 259,684 |
 | 41 | `li rt,0` + a store of rt | 43,002 | BL 20K, ML 13K, RE 7K | **implemented**, 31,052 |
 | 42 | a branch over a constant move that Zbb `max`/`min` does | 31,906 | ML | **implemented**, 28,292 |
-| 43 | `li rc,0` + `beq`/`bne rx,rc` | 29,089 | TF 25K | **implemented**, 1,658 |
+| 43 | `li rc,0` + `beq`/`bne rx,rc` | 29,089 | TF 25K | **implemented**, 1,658; 2,436 following far jumps |
 | 44 | an immediate operand materialized into a register | 20,743 | ML | **implemented**, 1,738 |
 | 45 | `slli k` + `srli k`, k >= 53 -> `andi` | 17,097 | BL 12K, ML 5K | **implemented**, 17,097 |
 | 46 | `and` with a materialized 0xffff -> `zext.h` | 1,499 | ML | **implemented**, 1,142 |
@@ -1684,11 +1684,60 @@ reported, and of the 827 declined, 165 reach an `auipc`+`jr` on the
 fall-through before anything touches the register, 83 read the zero
 again, 44 reach a call, and 388 leave through a `j` first, whose target
 decides. The `jr` is V8's far jump, 36's shape, and the liveness walk
-cannot follow an indirect jump, so every liveness proof in this corpus
-stops at one. Teaching the walk the `auipc`+`jr` pair -- the target is
-in the two immediates, as check_jump_pair_to_j computes it -- would
-raise this check and every other that asks the walk, and is the one
-improvement here that is not a new check.
+could not follow an indirect jump, so every liveness proof in this
+corpus stopped at one. The target is in the two immediates, as
+check_jump_pair_to_j computes it, and the walk now follows the pair;
+the next section has what that bought, which is less than the 165
+promised.
+
+### Following the far jump -- 7,092 more over V8, 14,894 over SpiderMonkey
+
+The walk takes `auipc rx,hi` + `jr lo(rx)` as a `j` to the address
+the immediates name when it reaches the `jr` through the `auipc`. A
+walk that starts on the `jr`, as one from a branch to it does, arrives
+with anything in rx and still gives up, and neither half may carry a
+relocation; check_jump_pair_to_j and check_transfer_to_jump share the
+decoding. Nothing else about the walk changes: it used to give up at
+the pair, so only an UNKNOWN can become DEAD or READ, and no finding
+was lost anywhere.
+
+Measured finding by finding against the binary without it, over the
+JetStream dump taken again for entry 54 -- where this check stood at
+1,649 rather than 1,658 -- the SpiderMonkey corpus and the package
+corpus:
+
+| check | V8 | bytes | SpiderMonkey | bytes |
+|---|---:|---:|---:|---:|
+| dead register definition | +3,315 | +13,260 | +2,848 | +11,392 |
+| comparison a branch could have made | +1,833 | +7,332 | +194 | +912 |
+| zero loaded for an equality branch | +787 | +4,062 | 0 | 0 |
+| zero loaded for a store | +606 | +2,424 | +668 | +2,672 |
+| copy its only reader could do without | +309 | +1,236 | +1,635 | +6,540 |
+| base add foldable into memory offset | +96 | +390 | +7,567 | +30,872 |
+| call through a scratch register foldable to jal | 0 | 0 | +1,456 | +5,824 |
+| jump pair foldable to j | 0 | 0 | +474 | +1,896 |
+| five others | +146 | +792 | +52 | +208 |
+| total | +7,092 | +29,496 | +14,894 | +60,316 |
+
+This check goes from 1,649 to 2,436, all TurboFan still, and the
+dead-definition check gains a fifth. The package corpus does not move:
+its pairs are mostly Rust's tail calls, and in ripgrep the walks that
+follow one mostly leave the section or find the register read, while
+the few that end DEAD make no finding.
+
+### Why the 165 did not come back
+
+In code.elf.10, 18,866 walk queries follow at least one far jump. 2.2%
+of them end DEAD and 26.5% READ; 61.8% stop at a call, 6.1% at the
+walk's bound on path starts, 2.5% at its instruction budget and 1% at
+a return. 8,149 of the 11,651 calls are a block of identical `jal`s to
+one stub -- V8's deoptimization exits -- and 3,016 are builtin calls
+through `auipc`+`jalr`. The deoptimizer reads whatever registers the
+frame state names, so UNKNOWN is the right answer there rather than a
+gap in the walk -- the wall entry 44's constants hit, as it predicted.
+The SpiderMonkey site traced by hand went the other way: its far jump
+lands on an Ion out-of-line bailout, which writes t4 with the
+snapshot's offset before anything reads it.
 
 ## 45. slli + srli foldable to andi -- 17,097  [implemented]
 

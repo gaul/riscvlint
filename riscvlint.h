@@ -394,7 +394,8 @@ bool riscvlint_is_relocated(const riscvlint_state *state, uint64_t addr);
 // READ when a read is found; UNKNOWN for anything ambiguous -- an
 // exhausted budget, an indirect jump, a branch out of the section, or a
 // call that might read the register as an argument. Only DEAD licenses a
-// rewrite.
+// rewrite. V8's far jump, `auipc rx` + `jr lo(rx)`, is followed to its
+// target like a `j` when the walk reaches the jr through the auipc.
 //
 // This is the one place a check consults capstone's register model
 // rather than the raw encoding, because answering it by raw decode would
@@ -1616,7 +1617,8 @@ bool check_zero_for_store(riscvlint_state *state, const cs_insn *insn,
 //
 // Measured population: 1,658 sites in the JetStream corpus (TODO.md,
 // entry 43), every one TurboFan's, of 24,383 adjacent pairs; the
-// liveness proof declines most of the rest.
+// liveness proof declines most of the rest. Following V8's far jump
+// took a second dump, taken the same way, from 1,649 to 2,436.
 bool check_zero_eq_branch(riscvlint_state *state, const cs_insn *insn,
                           riscvlint_finding *finding);
 

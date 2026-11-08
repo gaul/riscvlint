@@ -5939,6 +5939,41 @@ static void test_zero_eq_branch(csh handle)
     };
     CHECK(run_window(handle, check_zero_eq_branch, target, sizeof target,
                      0x1000, NULL) == 0);
+
+    // V8's far jump on the fall-through, which a fifth of the corpus's
+    // declined pairs reach before anything touches the zero: li a7,0 ;
+    // beq a6,a7,.T ; auipc t6,0 ; jr 16(t6) ; ret ; .T: li a7,8 ;
+    // .J: li a7,9 ; ret. The walk follows the pair to .J, where a7 is
+    // redefined.
+    const uint32_t li_a7_0 = 0x00000893u, li_a7_8 = 0x00800893u;
+    const uint32_t li_a7_9 = 0x00900893u, mv_a0_a7 = 0x00088513u;
+    const uint32_t beq_16 = 0x01180863u;         // beq a6,a7,.+16
+    const uint32_t beq_8 = 0x01180463u;          // beq a6,a7,.+8
+    const uint32_t ret = 0x00008067u;
+    uint32_t farj[] = { li_a7_0, beq_16, enc_auipc(31, 0),
+                        enc_jalr(0, 31, 16), ret, li_a7_8, li_a7_9, ret };
+    CHECK(run_words(handle, check_zero_eq_branch, farj, 8, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "beqz a6, 0x1014 (8 -> 4 bytes)") == 0);
+
+    // Not followed: a target that reads the zero; a branch onto the jr,
+    // which arrives without the auipc; a jr through another register;
+    // and a target outside the section.
+    uint32_t farread[] = { li_a7_0, beq_16, enc_auipc(31, 0),
+                           enc_jalr(0, 31, 16), ret, li_a7_8, mv_a0_a7, ret };
+    CHECK(run_words(handle, check_zero_eq_branch, farread, 8, 0x1000,
+                    NULL) == 0);
+    uint32_t onjr[] = { li_a7_0, beq_8, enc_auipc(31, 0),
+                        enc_jalr(0, 31, 16), ret, li_a7_8, li_a7_9, ret };
+    CHECK(run_words(handle, check_zero_eq_branch, onjr, 8, 0x1000,
+                    NULL) == 0);
+    uint32_t other[] = { li_a7_0, beq_16, enc_auipc(31, 0),
+                         enc_jalr(0, 30, 16), ret, li_a7_8, li_a7_9, ret };
+    CHECK(run_words(handle, check_zero_eq_branch, other, 8, 0x1000,
+                    NULL) == 0);
+    uint32_t away[] = { li_a7_0, beq_16, enc_auipc(31, 0x10),
+                        enc_jalr(0, 31, 16), ret, li_a7_8, li_a7_9, ret };
+    CHECK(run_words(handle, check_zero_eq_branch, away, 8, 0x1000,
+                    NULL) == 0);
 }
 
 // check_slli_srli_to_andi: an equal shift pair keeping eleven bits or
