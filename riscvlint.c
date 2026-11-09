@@ -8246,6 +8246,76 @@ bool check_copy_for_reader(riscvlint_state *state, const cs_insn *insn,
     return true;
 }
 
+// ---- a call through t0, which pops the return-address stack ----
+
+// The return-address stack is steered by the registers a jal or jalr
+// names (the unprivileged spec, section 2.5.1): ra and t0 are the link
+// registers, a write to one pushes, a jump through one pops, and a jalr
+// whose rd and rs1 are both links but differ pops and then pushes. That
+// last is meant for a coroutine, which returns to rs1 and leaves its own
+// continuation in rd. `jalr ra,lo(t0)` -- `c.jalr t0` is the same
+// instruction -- is therefore not the call it looks like: it throws the
+// caller's own entry away, and every return above it mispredicts until
+// calls refill the stack. Through any other register, ra included, it
+// only pushes.
+//
+// The coroutine reading needs t0 to hold a return address, which it can
+// only have from a link -- a call, `jal t0` or `jalr t0` -- or from a
+// copy of ra. So the straight line before the call is walked back to
+// t0's writer, and the call is reported only when that writer is none of
+// those: a load, an add, anything that leaves a code pointer. A side
+// entry, a call or a walk that runs out first answers nothing.
+#define T0_CALL_WALK 16     // instructions back to t0's writer
+
+bool check_t0_call(riscvlint_state *state, const cs_insn *insn,
+                   riscvlint_finding *finding)
+{
+    if (insn->size != 2 && insn->size != 4) return false;
+    if (!state->dec || !state->probe) return false;
+    uint32_t w;
+    if (!riscvlint_word_at(state, insn->address, &w)) return false;
+    if (insn->size == 4) {
+        unsigned rd, rs1;
+        int64_t off;
+        if (!rv_decode_jalr(w, &rd, &rs1, &off) || rd != 1 || rs1 != 5)
+            return false;
+    } else if ((w & 0xffffu) != 0x9282u) {      // c.jalr t0
+        return false;
+    }
+
+    uint64_t at = insn->address, writer = 0;
+    for (int budget = T0_CALL_WALK; budget > 0 && !writer; budget--) {
+        if (riscvlint_is_branch_target(state, at)) return false;
+        uint64_t prev;
+        unsigned len;
+        if (!rv_prev_insn(state, at, &prev, &len)) return false;
+        const rvl_dec *d = live_decode(state, prev);
+        if (!d || !d->ok) return false;
+        // A callee may leave anything in t0, the continuation a
+        // coroutine hands back included, and `jal t0` and `jalr t0` are
+        // calls. Past a jump or a return the call is not reached from
+        // here at all.
+        if (d->kind & (LIVE_CALL | LIVE_RET | LIVE_UNCOND)) return false;
+        if (live_names(d->writes, 5)) {
+            uint32_t pw;
+            unsigned rd, rs;
+            if (!riscvlint_word_at(state, prev, &pw)) return false;
+            if (rv_decode_mv(pw, len, &rd, &rs) && rs == 1) return false;
+            writer = prev;
+        }
+        at = prev;
+    }
+    if (!writer) return false;
+
+    finding->title = "call through t0 that pops the return-address stack";
+    finding->address = insn->address;
+    finding->insn_count = 1;
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "keep the target written at 0x%" PRIx64 " out of t0 (%u -> %u "
+             "bytes)", writer, insn->size, insn->size);
+    return true;
+}
+
 // ---- the immediate audits (-a imm, -a const) ----
 
 // One consumer of a materialized constant, as the two audits read it.
@@ -8658,6 +8728,7 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_copy_for_reader,
     check_scratch_call_to_jal,
     check_cross_jump,
+    check_t0_call,
     check_imm_misfit_audit,
     check_const_audit,
 };

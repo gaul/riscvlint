@@ -47,7 +47,7 @@ scans are not rerun per corpus change.
 | 8 | frame-pointer teardown over a static frame | 216,226 | 135,045 | **implemented** |
 | 11 | Zcb-compressible 4-byte encodings | 30,649 | 386,257 | **implemented** |
 | 16+20 | a computation a live register already holds | 50,938 | 39,274 | **implemented** |
-| 5 | dead register definitions | 21,537 | 120,647 | **implemented** |
+| 5 | dead register definitions | 22,292 | 120,647 | **implemented** |
 | 3 | Zba `zext.w` | 18,125 | 203,831 | **implemented** |
 | 15 | a load into the register that still holds it | 20,068 | - | **implemented** |
 | 2 | Zba shift-add | 13,418 | 180,591 | **implemented** |
@@ -1720,10 +1720,15 @@ corpus:
 | total | +7,092 | +29,496 | +14,894 | +60,316 |
 
 This check goes from 1,649 to 2,436, all TurboFan still, and the
-dead-definition check gains a fifth. The package corpus does not move:
-its pairs are mostly Rust's tail calls, and in ripgrep the walks that
-follow one mostly leave the section or find the register read, while
-the few that end DEAD make no finding.
+dead-definition check gains a fifth. This entry first said the package
+corpus does not move, and it does: regenerating the README table for
+entry 55 found 755 more dead register definitions than the commit
+before this walk -- 738 in C++ (libllvm20 219, libxul 204, Ubuntu's
+libLLVM 22 158, Debian's 157) and 17 in Rust (uutils 10, ripgrep 7) --
+and no other check moved. They are walks that follow a tail call,
+`auipc t1` + `jr`, into a callee that overwrites the argument register
+before reading it: ripgrep's `mv a0,a2; mv a1,a3` ahead of one whose
+callee loads a0 from a2 and builds a1 from it.
 
 ### Why the 165 did not come back
 
@@ -4675,6 +4680,95 @@ A mask of the low bits that is only anded with is check_mask_for_zext's,
 and the first run, before that rule, reported two of its fixture's sites
 as well: the complement of `0xffff` is one `lui`, so `lui`+`andn` is
 shorter than the mask, but `zext.h` is shorter still.
+
+## 55. A call through t0 that pops the return-address stack -- 48,208 and 105,240  [implemented]
+
+Found by asking what RISC-V has that AArch64 and x86-64 do not, rather
+than by porting a check from armlint or x86lint. Those two call and
+return with their own opcodes, `bl`/`ret` and `call`/`ret`, and their
+return-address stacks follow the opcode. RISC-V calls and returns with
+`jal` and `jalr`, and its return-address stack follows the registers
+they name (the unprivileged spec, section 2.5.1): ra and t0 are the
+link registers, writing one pushes, jumping through one pops, and a
+`jalr` naming two different ones pops and then pushes. That last is
+for coroutines, which return to rs1 and leave their own continuation
+in rd. A call through t0, `jalr ra,lo(t0)` or `c.jalr t0`, is one
+whether it means it or not: it discards its caller's entry.
+
+### What it costs on the X100
+
+A driver loop calls a chain of D frames, the innermost calls a leaf --
+a bare `ret` -- through the register under test, and every frame
+returns. Pinned to one X100 core, user-mode cycles from perf per
+iteration, the fastest of three runs of 22 million iterations:
+
+| D | direct call | t1, t2, a5 | t0 | extra | returns that mispredict | each |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 11.1 | 13.0-13.1 | 38.2 | +25.2 | 2 | 12.6 |
+| 2 | 16.0 | 16.1 | 52.9 | +36.8 | 3 | 12.3 |
+| 4 | 24.0 | 24.1-24.2 | 82.3 | +58.2 | 5 | 11.6 |
+| 8 | 41.5 | 41.1-41.2 | 138.2 | +97.1 | 9 | 10.8 |
+| 16 | 132.0 | 134-136 | 249.0 | +113 | -- | -- |
+
+The instruction counts are the same in every column, and the three
+runs agree within 1%. One call through t0 leaves the stack an entry
+short, so each return above it -- D frames and the driver's --
+mispredicts, until control is back where new calls refill it. At 16
+frames the stack overflows by itself: the direct baseline jumps between
+8 and 16, so it holds between 10 and 17 entries. perf's
+`branch-misses` stays at about zero throughout and does not count
+these; only cycles see them. The A100 cores were not measured.
+
+### Who emits it
+
+Go before 1.27 calls closures and interfaces through X5:
+`ld t0,0(s10); ... jalr t0`, 13,033 of gh's indirect calls and 7,731 of
+the compiler's, about nine in ten. golang/go#76654 (2d1f571c6b, January
+2026, in Go 1.27) takes X5 out of those calls' register masks, and its
+commit message reports about 7% on golang.org/x/benchmarks/json on a
+SpacemiT K1. The corpus's Go is 1.26.
+
+SpiderMonkey's JIT loads a callee's code into t0 and calls through it,
+`ld t0,...; ld t0,0(t0); jalr t0`, in Wasm and Ion code. Its
+`CallTempReg0` is t0, but no call goes through that name, so the
+register is each call path's own choice.
+
+LLVM never has. Its GPRJALR register class, which indirect calls are
+allocated from, is GPR without x0-x5, so neither link register, sp, gp
+nor tp can be a call's target. GCC's output in the corpus has none
+either, and V8 calls through t6 and a2.
+
+### What check_t0_call reports
+
+| corpus | sites | |
+|---|---:|---|
+| package, Go | 48,207 | gh 12,982, restic 10,894, the toolchain's ten binaries the rest |
+| package, C++ | 1 | libxul's `NS_InvokeByIndex` |
+| package, Rust | 0 | |
+| V8 JetStream dump | 0 | |
+| SpiderMonkey JetStream dump | 105,240 | Wasm 67,594, Ion 37,646 |
+
+libxul's one is hand-written:
+`xpcom/reflect/xptcall/md/unix/xptcinvoke_asm_riscv64.S` loads the
+method from the vtable with `ld t0,0(s2)` and calls it with `jalr t0`,
+which assembles to `c.jalr t0` -- so the two-byte form is not
+theoretical.
+
+Every finding is size-neutral, `(4 -> 4 bytes)` or `(2 -> 2 bytes)`:
+the rewrite is a different register, not fewer instructions. The
+probe that found the shape counted every `jalr` with rd and rs1 two
+different link registers -- 48,471 in the Go objects, 108,017 in the
+SpiderMonkey dump, 1 in libxul -- and the check keeps 99.5% and 97.4%
+of them. The rest are calls whose t0 the walk cannot see written: the
+call is a side entry, a call comes first, or the writer is more than
+16 instructions back. Those are the cases where t0 could hold a
+continuation, and pop-then-push would be right.
+
+The check takes only rd = ra and rs1 = t0. `jalr t0,lo(ra)`, the
+other pop-then-push spelling, jumps to a return address and links t0,
+which is a coroutine yielding rather than a call. `jalr t0,lo(t0)`,
+the machine outliner's call, names one link register twice and only
+pushes, and its `jr t0` return pops it.
 
 # Ranked for C++ and Rust specifically
 

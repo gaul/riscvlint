@@ -3,7 +3,7 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Fifty-two checks and two audits (`-a imm`, `-a const`) are implemented,
+Fifty-three checks and two audits (`-a imm`, `-a const`) are implemented,
 and the ledger's candidate list is empty.
 [TODO.md](TODO.md) is that ledger:
 every candidate that was measured, the population it came back with,
@@ -13,7 +13,7 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Fifty-two of them, and the table lists the forty-three that report
+Fifty-three of them, and the table lists the forty-four that report
 something over the corpus. Twelve of those -- the jump pair, the
 constant chain, the no-op, the push run, the zero store, the zero
 branch, the andi pair, the max clamp, the immediate operand, the mask,
@@ -21,8 +21,9 @@ the jump threading and the floating-point constant built through an
 integer register -- were written for the JetStream corpus of TODO.md
 and measured there first, and the release run, the cancelling pair, the
 needless copy, the scratch-register call and the shared tail were sized
-over the SpiderMonkey corpus there, and the complement check came out of
-a SpiderMonkey patch; their rows here are what they
+over the SpiderMonkey corpus there, the complement check came out of a
+SpiderMonkey patch, and the t0 call out of a probe for what only RISC-V
+has; their rows here are what they
 report over this corpus, and their entries in the ledger say what that
 is. Nine report nothing
 over this corpus -- the bit count because no baseline object declares
@@ -53,8 +54,9 @@ the row where no finding does and the arithmetic is uniform instead.
 | call pair foldable to jal | 120,580 | 171,665 | 56 | 292,301 | 1,169,204 | assumed |
 | redundant stack-pointer restore | 204,543 | 11,683 | 0 | 216,226 | 864,904 | all |
 | computation a live register already holds | 42,573 | 3,450 | 4,915 | 50,938 | 106,004 | all |
+| call through t0 that pops the return-address stack | 1 | 0 | 48,207 | 48,208 | 0 | all |
 | instruction compressible to a Zcb form | 706 | 181 | 29,762 | 30,649 | 61,298 | all |
-| dead register definition | 13,413 | 248 | 7,876 | 21,537 | 58,266 | all |
+| dead register definition | 14,151 | 265 | 7,876 | 22,292 | 60,126 | all |
 | load of a value the register still holds | 13,957 | 519 | 5,592 | 20,068 | 50,496 | all |
 | constant re-materialization | 16,410 | 571 | 1,457 | 18,438 | 36,876 | all |
 | slli + srli foldable to zext.w | 2 | 52 | 18,071 | 18,125 | 50,178 | all |
@@ -92,11 +94,11 @@ the row where no finding does and the arithmetic is uniform instead.
 | pushes one stack adjustment would do | 0 | 0 | 12 | 12 | 28 | all |
 | zero loaded for an equality branch | 9 | 0 | 0 | 9 | 24 | all |
 | slli + srli foldable to andi | 0 | 1 | 0 | 1 | 4 | all |
-| **total** | **518,650** | **196,574** | **3,099,440** | **3,814,664** | **8,774,700** | |
+| **total** | **519,389** | **196,591** | **3,147,647** | **3,863,627** | **8,776,560** | |
 
-Do not read the total row as a result. One row is 79% of it, and that
+Do not read the total row as a result. One row is 78% of it, and that
 row is Go's assembler declining to select RVC at all, which is a
-different kind of finding from the forty-two around it. The second row
+different kind of finding from the forty-three around it. The second row
 is 8% and belongs to the linker. The `assumed` in the call-pair row is
 the one byte figure that is arithmetic rather than measurement: that
 check prints no size, and every site is eight bytes in and four out
@@ -192,6 +194,42 @@ except a handful of `jalr ra,0(ra)` that were already two.
   that uses another register, ripgrep's `auipc t0` + `jalr t0,lo(t0)`,
   writes its link into that register and is the call pair's. The shape
   is a JIT's that keeps a scratch register for every far transfer.
+
+* **call through t0 that pops the return-address stack** -- `jalr
+  ra,lo(t0)`, or `c.jalr t0`, the same instruction in two bytes. The
+  return-address stack takes its hints from the registers a jalr names
+  (the unprivileged spec, section 2.5.1): ra and t0 are the link
+  registers, and a jalr naming two different ones pops and then pushes.
+  A call through t0 therefore throws away its caller's return
+  prediction, and every return above it mispredicts until calls refill
+  the stack. This is Go 1.26 calling a closure:
+
+  ```
+     1a308: ld t0, 0(s10)
+     1a30c: ld a1, 8(a0)
+     1a310: mv a0, a2
+     1a314: jalr t0          -> keep the target written at 0x1a308 out of t0 (4 -> 4 bytes)
+  ```
+
+  Any other register, ra included, only pushes, so the fix is the
+  emitter choosing another one, at the same size. On the K3's X100 a
+  call through t0 cost 11 to 13 cycles for every return after it, and a
+  call through t1, t2 or a5 nothing (TODO.md, entry 55). Pop-then-push
+  is what a coroutine wants -- it returns to t0 and leaves its own
+  continuation in ra -- and t0 holds a return address only after a link
+  or a copy of ra. So the straight line before the call is walked back
+  to t0's writer, at most 16 instructions, and the call is reported only
+  when that writer is an ordinary instruction, a load or an add. A
+  link, a call, a copy of ra, a side entry or a walk that runs out first
+  reports nothing.
+
+  The package corpus has 48,208. 48,207 are Go's closure and interface
+  calls, which Go 1.27 moved off X5 (golang/go#76654), and the other is
+  Firefox's hand-written XPCOM invoke stub, `xptcinvoke_asm_riscv64.S`,
+  which loads the method into t0. LLVM's GPRJALR class, the registers an
+  indirect call is allocated from, has never included x0-x5. The
+  SpiderMonkey dump has 105,240, 67,594 in Wasm code and 37,646 in
+  Ion's; V8, which calls through t6, has none.
 
 * **slli + add foldable to shNadd** -- `slli rd,rs,{1,2,3}` +
   `add rd,rd,rs2` computes a scaled-index address in two dependent
@@ -1529,8 +1567,8 @@ except a handful of `jalr ra,0(ra)` that were already two.
   what that proves dead. The commonest shape is a frame pointer
   established and never used.
 
-  Population: 21,537 sites -- C++ 13,413, Go 7,876, Rust 248 -- and the
-  first check here that fires meaningfully on C++, where libxul's 5,239
+  Population: 22,292 sites -- C++ 14,151, Go 7,876, Rust 265 -- and the
+  first check here that fires meaningfully on C++, where libxul's 5,443
   and libQt6Core's 5,203 nearly tie. The walk makes no ABI assumptions:
   what a call may read and what a return exposes both differ between the
   C and Go conventions, and riscvlint cannot tell which it is looking at,

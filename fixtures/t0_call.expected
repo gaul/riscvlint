@@ -1,0 +1,23 @@
+instruction compressible to a base C form at offset: 0x8: -> c.ld (4 -> 2 bytes) (1 instructions)
+  ld a1, 8(a0)
+
+instruction compressible to a base C form at offset: 0xc: -> c.jalr (4 -> 2 bytes) (1 instructions)
+  jalr t0
+
+call through t0 that pops the return-address stack at offset: 0xc: -> keep the target written at 0x4 out of t0 (4 -> 4 bytes) (1 instructions)
+  jalr t0
+
+call through t0 that pops the return-address stack at offset: 0x14: -> keep the target written at 0x10 out of t0 (2 -> 2 bytes) (1 instructions)
+  jalr t0
+
+call through t0 that pops the return-address stack at offset: 0x1c: -> keep the target written at 0x16 out of t0 (4 -> 4 bytes) (1 instructions)
+  jalr 0x10(t0)
+
+instruction compressible to a base C form at offset: 0x42: -> c.jalr (4 -> 2 bytes) (1 instructions)
+  jalr ra
+
+Optimization opportunities by type:
+       3  call through t0 that pops the return-address stack
+       3  instruction compressible to a base C form
+
+6 optimization opportunities in 25 instructions

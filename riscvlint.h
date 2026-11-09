@@ -1897,6 +1897,30 @@ bool check_scratch_call_to_jal(riscvlint_state *state, const cs_insn *insn,
 bool check_cross_jump(riscvlint_state *state, const cs_insn *insn,
                       riscvlint_finding *finding);
 
+// A call through t0: `jalr ra,lo(t0)` or `c.jalr t0`. The return-address
+// stack takes its hints from the registers a jalr names (the
+// unprivileged spec, section 2.5.1), and with rd = ra and rs1 = t0, two
+// different link registers, the hint is pop-then-push: the call
+// discards its caller's entry, and every return above it mispredicts
+// until calls refill the stack. Any other register, ra included, only
+// pushes, so the fix is in whatever chose t0, at the same size.
+//
+// Pop-then-push is what a coroutine wants, returning to t0 and leaving
+// its continuation in ra, and t0 holds a return address only after a
+// link or a copy of ra. The straight line before the call is walked
+// back to t0's writer, at most 16 instructions, and the call is reported
+// only when that writer is an ordinary instruction -- a load, an add.
+// A link, a call, a copy of ra, a side entry or a walk that runs out
+// first reports nothing.
+//
+// Measured: on the K3's X100 each such call cost 11-13 cycles per
+// return that followed it, against nothing through t1, t2 or a5
+// (TODO.md, entry 55). The populations are Go before 1.27, which chose
+// X5 for closure and interface calls, and SpiderMonkey's JIT; LLVM's
+// GPRJALR class has never allowed x0-x5. The figures are in the entry.
+bool check_t0_call(riscvlint_state *state, const cs_insn *insn,
+                   riscvlint_finding *finding);
+
 // ---- running every check ----
 //
 // Called once per finding, with `ctx` as given. The finding is valid

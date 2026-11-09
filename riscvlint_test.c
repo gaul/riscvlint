@@ -7283,6 +7283,89 @@ static void test_cross_jump(csh handle)
     CHECK(f.insn_count == 2 && f.address == 0x1000);
 }
 
+// check_t0_call: `jalr ra,lo(t0)` or `c.jalr t0` whose t0 an ordinary
+// instruction wrote, which pops the return-address stack.
+static void test_t0_call(csh handle)
+{
+    riscvlint_finding f;
+    const uint32_t ld_t0 = 0x00093283u;          // ld t0,0(s2)
+    const uint32_t ld_t1 = 0x00093303u;          // ld t1,0(s2)
+    const uint32_t call_t0 = 0x000280e7u;        // jalr ra,0(t0)
+    const uint32_t ret = 0x00008067u;
+    const uint32_t nop = 0x00000013u;
+
+    // The code pointer loaded into t0 and called through it, as Go
+    // before 1.27 calls a closure: reported at the jalr, naming the load.
+    uint32_t loaded[] = { ld_t0, call_t0, ret };
+    CHECK(run_words(handle, check_t0_call, loaded, 3, 0x1000, &f) == 1);
+    CHECK(f.address == 0x1004 && f.insn_count == 1);
+    CHECK(strcmp(f.title, "call through t0 that pops the return-address "
+                          "stack") == 0);
+    CHECK(strcmp(f.replacement,
+                 "keep the target written at 0x1000 out of t0 (4 -> 4 bytes)")
+          == 0);
+    // Any offset; an instruction that leaves t0 alone, and a conditional
+    // branch, whose fall-through still carries t0, between the two.
+    uint32_t off16[] = { ld_t0, 0x010280e7u /* jalr ra,16(t0) */, ret };
+    CHECK(run_words(handle, check_t0_call, off16, 3, 0x1000, NULL) == 1);
+    uint32_t between[] = { ld_t0, 0x00a30333u /* add t1,t1,a0 */,
+                           0x00050463u /* beqz a0,+8 */, call_t0, ret };
+    CHECK(run_words(handle, check_t0_call, between, 5, 0x1000, &f) == 1);
+    CHECK(f.address == 0x100c);
+    // `c.jalr t0` is the same instruction in two bytes, as Firefox's
+    // XPCOM invoke stub spells it.
+    static const uint8_t cjalr[] = {
+        0x83, 0x32, 0x09, 0x00,            // ld t0,0(s2)
+        0x82, 0x92,                        // c.jalr t0
+        0x67, 0x80, 0x00, 0x00,            // ret
+    };
+    CHECK(run_window(handle, check_t0_call, cjalr, sizeof cjalr, 0x1000, &f)
+          == 1);
+    CHECK(f.address == 0x1004);
+    CHECK(strcmp(f.replacement,
+                 "keep the target written at 0x1000 out of t0 (2 -> 2 bytes)")
+          == 0);
+
+    // Not reported: a call through t1, or through t0 linking t0, both of
+    // which only push; `jalr t0,0(ra)`, a coroutine's yield, which pops
+    // on purpose.
+    uint32_t t1[] = { ld_t1, 0x000300e7u /* jalr ra,0(t1) */, ret };
+    CHECK(run_words(handle, check_t0_call, t1, 3, 0x1000, NULL) == 0);
+    uint32_t self[] = { ld_t0, 0x000282e7u /* jalr t0,0(t0) */, ret };
+    CHECK(run_words(handle, check_t0_call, self, 3, 0x1000, NULL) == 0);
+    uint32_t yield[] = { ld_t0, 0x000082e7u /* jalr t0,0(ra) */, ret };
+    CHECK(run_words(handle, check_t0_call, yield, 3, 0x1000, NULL) == 0);
+
+    // Not reported: t0 may hold a return address -- copied from ra, or
+    // left by a call, `jal t0` among them -- and a coroutine resuming
+    // through it wants the pop.
+    uint32_t copy[] = { 0x00008293u /* mv t0,ra */, call_t0, ret };
+    CHECK(run_words(handle, check_t0_call, copy, 3, 0x1000, NULL) == 0);
+    uint32_t called[] = { ld_t0, 0x008000efu /* jal ra,+8 */, call_t0, ret };
+    CHECK(run_words(handle, check_t0_call, called, 4, 0x1000, NULL) == 0);
+    uint32_t linked[] = { 0x008002efu /* jal t0,+8 */, call_t0, ret };
+    CHECK(run_words(handle, check_t0_call, linked, 3, 0x1000, NULL) == 0);
+
+    // Not reported: a side entry at the call, whose t0 may come from the
+    // other path; no writer before the section starts; and a writer
+    // further back than the walk goes. Fifteen instructions between is
+    // within it, sixteen is not.
+    uint32_t entry[] = { ld_t0, call_t0, ret, 0xff9ff06fu /* j -8 */ };
+    CHECK(run_words(handle, check_t0_call, entry, 4, 0x1000, NULL) == 0);
+    uint32_t first[] = { call_t0, ret };
+    CHECK(run_words(handle, check_t0_call, first, 2, 0x1000, NULL) == 0);
+    uint32_t walk[19];
+    walk[0] = 0x06400293u;                       // li t0,100
+    for (int i = 1; i <= 15; i++) walk[i] = nop;
+    walk[16] = call_t0;
+    walk[17] = ret;
+    CHECK(run_words(handle, check_t0_call, walk, 18, 0x1000, NULL) == 1);
+    walk[16] = nop;
+    walk[17] = call_t0;
+    walk[18] = ret;
+    CHECK(run_words(handle, check_t0_call, walk, 19, 0x1000, NULL) == 0);
+}
+
 int main(void)
 {
     csh handle;
@@ -7358,6 +7441,7 @@ int main(void)
     test_copy_for_reader(handle);
     test_scratch_call_to_jal(handle);
     test_cross_jump(handle);
+    test_t0_call(handle);
     test_census(handle);
     test_regs(handle);
     test_fusion(handle);
