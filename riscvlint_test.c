@@ -320,6 +320,24 @@ static void test_check(csh handle)
     cs_free(insn, 1);
     riscvlint_state_destroy(state);
 
+    // The pair's own target is a side entry, whatever its link: capstone
+    // sees each half alone and reports no branch, so set_section marks
+    // it. V8's far jump lands inside the code it was emitted with.
+    uint32_t far_jump[] = { enc_auipc(30, 0), enc_jalr(0, 30, 12),
+                            0x00000013u, 0x00000013u, 0x00008067u };
+    uint32_t far_call[] = { enc_auipc(1, 0), enc_jalr(1, 1, 12),
+                            0x00000013u, 0x00000013u, 0x00008067u };
+    const uint32_t *pairs[] = { far_jump, far_call };
+    for (int i = 0; i < 2; i++) {
+        memcpy(buf, pairs[i], sizeof far_jump);
+        state = riscvlint_state_create();
+        CHECK(riscvlint_state_set_section(state, handle, buf, sizeof far_jump,
+                                          0x1000));
+        CHECK(riscvlint_is_branch_target(state, 0x100c));
+        CHECK(!riscvlint_is_branch_target(state, 0x1008));
+        riscvlint_state_destroy(state);
+    }
+
     // A relocated site: the immediates are placeholders, so no range
     // test on them means anything.
     state = riscvlint_state_create();
@@ -834,6 +852,17 @@ static void test_redundant_ext_check(csh handle)
         0x67, 0x80, 0x00, 0x00,        // ret
     };
     CHECK(run_redundant_ext(handle, side, sizeof side, 0x1000, NULL) == 0);
+
+    // The same through V8's far jump, which lands on the extension past
+    // the load that would have made it redundant.
+    static const uint8_t far[] = {
+        0x17, 0x0f, 0x00, 0x00,        // auipc t5,0
+        0x67, 0x00, 0xcf, 0x00,        // jr 12(t5)
+        0x03, 0xa5, 0x05, 0x00,        // lw a0,0(a1)
+        0x1b, 0x05, 0x05, 0x00,        // sext.w a0,a0   <- jump target
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_redundant_ext(handle, far, sizeof far, 0x1000, NULL) == 0);
 }
 
 // ---- Zcb encodability ----

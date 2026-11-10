@@ -1671,6 +1671,11 @@ bool riscvlint_state_set_section(riscvlint_state *state, csh handle,
             veneer = true;
         }
         if (t >= 0 && (uint64_t)t < size) {
+            // Capstone sees each half of a pair alone, so the pair's
+            // target is marked here: V8's far jump lands inside the code
+            // it was emitted with, and an instruction it lands on is
+            // reached other than by falling through.
+            if (veneer) bit_set(state->targets, (size_t)t / 2);
             if (!jump) {
                 bit_set(state->nonjump, (size_t)t / 2);
             } else if (preds_ok) {
