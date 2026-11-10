@@ -88,7 +88,9 @@
 //   shift  the pair folds: slli + srli to zext.w, zext.h or andi, slli +
 //          srai to sext.b or sext.h, slli + add and li + mul to shNadd,
 //          not + and/or/xor to andn/orn/xnor, li + divu/remu to a shift
-//          or a mask.
+//          or a mask; and a population count spelled out, as cpop of
+//          the value its source held when it began (see popcount_edits
+//          for what of that rewrite runs).
 //   branch the control-flow rewrites: a branch its operands decide, a
 //          constant or a comparison made for one branch, a branch over
 //          a jump, a transfer to the next instruction or to a jump, the
@@ -1372,8 +1374,80 @@ static void plant_mem(void)
 // shift: the pairs that fold into one instruction, at their own shift
 // amounts and around them, with the intermediate dead, overwritten or
 // read again.
+// Builds v in rc: li_seq's way, and now and then an addi of 0 after.
+static void push_chain(unsigned rc, int64_t v)
+{
+    uint32_t w[8];
+    int n = li_seq(rc, v, w);
+    for (int i = 0; i < n; i++) {
+        push(w[i]);
+    }
+    if (coin(4)) {
+        push(addi(rc, rc, 0));
+    }
+}
+
+// LLVM's expansion of a population count, at 64 bits or at 32, each
+// mask rebuilt into one register just before it is needed: computing
+// in place over its source or not, the source read afterwards or not,
+// and now and then a mask or the final shift wrong.
+static void plant_popcount(void)
+{
+    unsigned r[8];
+    for (unsigned i = 0; i < 8; i++) {
+        r[i] = A0 + i;
+    }
+    for (unsigned i = 7; i > 0; i--) {
+        unsigned j = rr(i + 1), tmp = r[i];
+        r[i] = r[j];
+        r[j] = tmp;
+    }
+    unsigned x = r[0], t = r[1], m = r[2];
+    unsigned y = coin(3) ? x : r[3], d = coin(2) ? y : r[4];
+    bool wide = coin(2);
+    int64_t masks[4] = {
+        (int64_t)0x5555555555555555ull, (int64_t)0x3333333333333333ull,
+        (int64_t)0x0f0f0f0f0f0f0f0full, (int64_t)0x0101010101010101ull,
+    };
+    for (int i = 0; i < 4; i++) {
+        if (!wide) {
+            masks[i] &= 0xffffffff;
+        }
+        if (coin(24)) {
+            masks[i] ^= 1ll << rr(32);
+        }
+    }
+    push_chain(m, masks[0]);
+    push(srli(t, x, 1));
+    push(coin(2) ? and_(t, t, m) : and_(t, m, t));
+    push(sub(y, x, t));
+    push_chain(m, masks[1]);
+    push(and_(t, y, m));
+    push(srli(y, y, 2));
+    push(and_(y, y, m));
+    push(coin(2) ? add(y, t, y) : add(y, y, t));
+    push(srli(t, y, 4));
+    push(add(y, y, t));
+    push_chain(m, masks[2]);
+    push(and_(y, y, m));
+    push_chain(m, masks[3]);
+    push(rop_word(wide || coin(2) ? "mul" : "mulw", y, y, m));
+    unsigned k = wide ? 56 : 24;
+    if (coin(16)) {
+        k -= 8;
+    }
+    push(wide ? srli(d, y, k) : iop_word(iop("srliw"), d, y, k));
+    if (coin(2)) {
+        push(add(breg(), x, sreg()));
+    }
+}
+
 static void plant_shift(void)
 {
+    if (coin(10)) {
+        plant_popcount();
+        return;
+    }
     unsigned r = breg(), s = sreg(), d = coin(3) ? breg() : r;
     unsigned t = breg(), x = sreg();
     switch (rr(9)) {
@@ -1666,20 +1740,6 @@ static int64_t run_value(void)
     unsigned len = 1 + rr(63), at = rr(64 - len);
     uint64_t v = (len == 64 ? ~0ull : ((1ull << len) - 1)) << at;
     return (int64_t)(coin(3) ? ~v : v);
-}
-
-// Builds v in rc: li_seq's way, or a longer one -- an extra slli and
-// srli pair, or an addi of 0 -- now and then.
-static void push_chain(unsigned rc, int64_t v)
-{
-    uint32_t w[8];
-    int n = li_seq(rc, v, w);
-    for (int i = 0; i < n; i++) {
-        push(w[i]);
-    }
-    if (coin(4)) {
-        push(addi(rc, rc, 0));
-    }
 }
 
 // A use of rc as one operand of an operation: `kind` 0 the immediate
@@ -2991,6 +3051,65 @@ static bool tail_edits(const prog_t *p, const hit_t *h, edits_t *ed)
     return true;
 }
 
+// check_swar_popcount's `cpop RD, SRC (...)`. The finding names the
+// sequence's first instruction; its rewrite deletes the dozen it
+// matched, spread among the masks' materializations, and the rendering
+// does not say which they are. What rwfuzz can test is what makes the
+// rewrite right: that RD ends as the count of what SRC held when the
+// sequence began, and that SRC, which the sequence may overwrite in
+// place and the rewrite leaves alone, is dead where the claim says.
+// So t6, which nothing else uses, takes a copy of SRC at the first
+// instruction; the final shift becomes the cpop of it; and SRC gets
+// its old value back after. The sequence's temporaries keep what it
+// computed, which leaves their liveness untested.
+static bool popcount_edits(const prog_t *p, const hit_t *h, edits_t *ed)
+{
+    char op[8], rd_s[8], src_s[8];
+    unsigned rd, src;
+    if (sscanf(h->text, "%7s %7[a-z0-9], %7[a-z0-9]", op, rd_s, src_s) != 3 ||
+            !parse_reg(rd_s, &rd) || !parse_reg(src_s, &src)) {
+        return false;
+    }
+    bool wide = strcmp(op, "cpop") == 0;
+    if (!wide && strcmp(op, "cpopw") != 0) {
+        return false;
+    }
+    // The final shift: the first srli or srliw into RD of what a mul or
+    // mulw left, whatever its amount, so that a sequence ending in the
+    // wrong shift still runs.
+    int fin = -1;
+    unsigned product = 0;
+    for (int i = h->slot + 1; i < p->epi && fin < 0; i++) {
+        uint32_t w = p->s[i].word;
+        unsigned op = w & 0x7fu, f3 = w >> 12 & 7u;
+        if (p->s[i].kind != S_PLAIN) {
+            continue;
+        }
+        if ((op == OP_OP || op == OP_OP32) && f3 == 0 && (w >> 25) == 1) {
+            product = w >> 7 & 31u;
+        } else if ((op == OP_IMM || op == OP_IMM32) && f3 == 5 &&
+                   (w >> 26) == 0 && (w >> 7 & 31u) == rd && product != 0 &&
+                   (w >> 15 & 31u) == product) {
+            fin = i;
+        }
+    }
+    if (fin < 0) {
+        return false;
+    }
+    ed->n = 0;
+    edit_t *e = add_edit(ed, h->slot);
+    e->rep[0] = plain(mv(T6, src));
+    e->rep[1] = p->s[h->slot];
+    e->n = 2;
+    e = add_edit(ed, fin);
+    e->rep[0] = plain(iop_word(iop(op), rd, T6, 0));
+    e->n = 1;
+    if (rd != src) {
+        e->rep[e->n++] = plain(mv(src, T6));
+    }
+    return true;
+}
+
 // The advice a finding gives, as edits to the program.
 static bool advice(const prog_t *p, const hit_t *h, const char *title,
                    edits_t *ed)
@@ -3011,6 +3130,9 @@ static bool advice(const prog_t *p, const hit_t *h, const char *title,
     }
     if (strcmp(title, "copy its only reader could do without") == 0) {
         return copy_edits(p, h, ed);
+    }
+    if (strcmp(title, "a bit count spelled out longhand") == 0) {
+        return popcount_edits(p, h, ed);
     }
     if (strcmp(title, "tail every jump to one label repeats") == 0) {
         return tail_edits(p, h, ed);
@@ -3637,7 +3759,8 @@ static const mode_t_ modes[] = {
                  "slli + add foldable to shNadd",
                  "not + and/or/xor foldable to andn/orn/xnor",
                  "li + mul foldable to shNadd",
-                 "unsigned divide or remainder by a power of two" },
+                 "unsigned divide or remainder by a power of two",
+                 "a bit count spelled out longhand" },
       plant_shift, shift_control },
     { "branch", { "conditional branch whose operands fix its outcome",
                   "constant loaded for a branch against zero",
