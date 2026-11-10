@@ -92,8 +92,9 @@
 //   branch the control-flow rewrites: a branch its operands decide, a
 //          constant or a comparison made for one branch, a branch over
 //          a jump, a transfer to the next instruction or to a jump, the
-//          jump and call pairs that fold to j and jal, and a branch over
-//          a move that max or min does.
+//          jump and call pairs that fold to j and jal, a branch over a
+//          move that max or min does, and a tail every jump to one label
+//          repeats, hoisted to just before the label.
 //   copy   check_copy_for_reader: delete the mv and have its reader name
 //          the register the finding renders; and check_odd_move and
 //          check_no_effect, the moves spelled otherwise and the
@@ -1445,9 +1446,53 @@ static void plant_shift(void)
     }
 }
 
+// A tail: the same instructions before each of several jumps to one
+// label, which follows an unconditional transfer. Now and then one
+// site's tail differs, something falls through into the label, or a
+// site jumps through V8's far jump.
+static void plant_tail(void)
+{
+    unsigned k = 1 + rr(3), nsites = 2 + rr(2);
+    uint32_t tail[3];
+    bool c[3];
+    for (unsigned i = 0; i < k; i++) {
+        tail[i] = coin(3) ? store_of(sreg()) : alu_op(breg());
+        c[i] = coin(2);
+    }
+    int jumps[4];
+    for (unsigned j = 0; j < nsites; j++) {
+        for (unsigned g = rr(3); g > 0; g--) {
+            push(filler());
+        }
+        for (unsigned i = 0; i < k; i++) {
+            put(coin(16) ? alu_op(breg()) : tail[i], c[i]);
+        }
+        if (coin(4)) {
+            push_far(0);
+        } else {
+            push_jump(0);
+        }
+        jumps[j] = gen.n - 1;
+    }
+    if (coin(4)) {
+        push(filler());
+    } else {
+        push_jump(0);
+    }
+    int label = gen.n;
+    push(filler());
+    for (unsigned j = 0; j < nsites; j++) {
+        gen.s[jumps[j]].aim = (int8_t)(label - jumps[j]);
+    }
+}
+
 // branch: shapes for each of the control-flow checks.
 static void plant_branch(void)
 {
+    if (coin(8)) {
+        plant_tail();
+        return;
+    }
     unsigned r = breg(), x = sreg(), c = breg();
     unsigned f3 = branch_f3[rr(6)];
     switch (rr(10)) {
@@ -2897,6 +2942,55 @@ static bool zero_run_edits(const hit_t *h, edits_t *ed)
     return true;
 }
 
+// check_cross_jump's `one copy of the K-instruction tail before 0xL for
+// N jumps`: every jump to L loses the K instructions before it, and one
+// copy of them goes in just before L -- where every transfer that named
+// L now arrives, since the replacement starts there.
+static bool tail_edits(const prog_t *p, const hit_t *h, edits_t *ed)
+{
+    unsigned k, n;
+    uint64_t label;
+    if (sscanf(h->text, "one copy of the %u-instruction tail before 0x%"
+               SCNx64 " for %u jumps", &k, &label, &n) != 3 ||
+            label < VADDR || k == 0 || k >= REP_MAX) {
+        return false;
+    }
+    int at = slot_at(p, label - VADDR);
+    if (at < 0) {
+        return false;
+    }
+    // The sites: a `j`, or a far jump's pair, whose site is its auipc.
+    int sites[16];
+    unsigned ns = 0;
+    for (int i = 0; i < p->n && ns < 16; i++) {
+        const slot_t *s = &p->s[i];
+        if (!is_transfer(s) || s->target != at) {
+            continue;
+        }
+        if (s->kind == S_JUMP) {
+            sites[ns++] = i;
+        } else if (s->kind == S_JALR && s->rb == X0) {
+            sites[ns++] = i - 1;
+        }
+    }
+    if (ns != n || sites[0] - (int)k < p->body) {
+        return false;
+    }
+    ed->n = 0;
+    for (unsigned j = 0; j < ns; j++) {
+        for (unsigned i = 0; i < k; i++) {
+            add_edit(ed, sites[j] - (int)k + (int)i);
+        }
+    }
+    edit_t *e = add_edit(ed, at);
+    for (unsigned i = 0; i < k; i++) {
+        e->rep[i] = p->s[sites[0] - (int)k + (int)i];
+    }
+    e->rep[k] = p->s[at];
+    e->n = (int)k + 1;
+    return true;
+}
+
 // The advice a finding gives, as edits to the program.
 static bool advice(const prog_t *p, const hit_t *h, const char *title,
                    edits_t *ed)
@@ -2917,6 +3011,9 @@ static bool advice(const prog_t *p, const hit_t *h, const char *title,
     }
     if (strcmp(title, "copy its only reader could do without") == 0) {
         return copy_edits(p, h, ed);
+    }
+    if (strcmp(title, "tail every jump to one label repeats") == 0) {
+        return tail_edits(p, h, ed);
     }
     if (strcmp(title, "run of zero stores one wider store would do") == 0) {
         return zero_run_edits(h, ed);
@@ -3500,7 +3597,7 @@ static bool stack_control(const prog_t *p, int i, edits_t *ed)
     return true;
 }
 
-#define TITLES_MAX 12
+#define TITLES_MAX 16
 
 struct mode {
     const char *name;
@@ -3552,7 +3649,8 @@ static const mode_t_ modes[] = {
                   "jump pair foldable to j",
                   "call pair foldable to jal",
                   "call through a scratch register foldable to jal",
-                  "branch over a move foldable to max or min" },
+                  "branch over a move foldable to max or min",
+                  "tail every jump to one label repeats" },
       plant_branch, branch_control },
     { "copy", { "copy its only reader could do without",
                 "move or zeroing spelled other than mv or li",
