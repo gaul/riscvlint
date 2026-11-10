@@ -24,7 +24,8 @@
 // Each program is a fixed prologue that reserves a 64-byte frame and
 // fills it, loads a0..a7, and points s0 at the frame's top and s1 at a
 // scratch buffer, all from a state block; a random body; and an epilogue
-// that stores a0..a7 and the frame back. After it sit a stub the body
+// that records where the body left sp, restores it from s0, and stores
+// a0..a7 and the frame back. After it sit a stub the body
 // can call, which reads its arguments, the frame and the buffer and
 // writes a0..a7 and a word of the frame and of the buffer, as a callee
 // handed their addresses may, and a `j` to the stub. The body writes
@@ -41,10 +42,13 @@
 // original part.
 //
 // A thunk runs each program on a stack of its own, so that the frame is
-// at one address in every run, and with s0..s11 zero; what they hold
-// when it returns is compared with the rest. A rewrite that writes gp or
-// tp is reported without being run, since rwfuzz reaches its own
-// globals and its thread's data through them.
+// at one address in every run, and with s0..s11 zero; what they and sp
+// hold when it returns is compared with the rest, and so is the whole
+// stack, below sp included, since a rewrite that moves sp must leave
+// memory as the original did. A guard above the frame takes a body that
+// releases more than it reserved. A rewrite that writes gp or tp is
+// reported without being run, since rwfuzz reaches its own globals and
+// its thread's data through them.
 //
 // t1 and t5 are written only by an auipc, so they hold zero or a code
 // address, which the layout moves; the body reads them only through
@@ -73,6 +77,12 @@
 //          uses, so the chain goes and each use is rewritten -- as the
 //          rendering spells it where it spells it, and where it gives
 //          only a count, as rwfuzz itself works out.
+//   stack  the stack adjustments: pushes or pops one adjustment would do
+//          -- the adjustments merged into one by the total rendered, and
+//          the accesses between moved by what rwfuzz works out the run
+//          had yet to reserve or had already released -- a release
+//          followed by a reservation, and the restore of an sp that
+//          never moved from the frame pointer.
 //   shift  the pair folds: slli + srli to zext.w, zext.h or andi, slli +
 //          srai to sext.b or sext.h, slli + add and li + mul to shNadd,
 //          not + and/or/xor to andn/orn/xnor, li + divu/remu to a shift
@@ -167,7 +177,7 @@ static bool coin(unsigned n)
 
 enum {
     X0 = 0, RA = 1, SP = 2, T0 = 5, T1 = 6, T2 = 7, S0 = 8, S1 = 9,
-    A0 = 10, T3 = 28, T4 = 29, T5 = 30, T6 = 31,
+    A0 = 10, S2 = 18, S3 = 19, T3 = 28, T4 = 29, T5 = 30, T6 = 31,
 };
 
 static const char *const xnames[32] = {
@@ -269,6 +279,7 @@ static uint32_t xor_(unsigned d, unsigned a, unsigned b) { return enc_r(OP_OP, 4
 static uint32_t or_(unsigned d, unsigned a, unsigned b) { return enc_r(OP_OP, 6, 0x00, d, a, b); }
 static uint32_t and_(unsigned d, unsigned a, unsigned b) { return enc_r(OP_OP, 7, 0x00, d, a, b); }
 static uint32_t lui(unsigned d, uint32_t imm20) { return enc_u(OP_LUI, d, imm20); }
+static uint32_t auipc(unsigned d, uint32_t imm20) { return enc_u(OP_AUIPC, d, imm20); }
 static uint32_t mv(unsigned d, unsigned s) { return addi(d, s, 0); }
 static uint32_t li(unsigned d, int32_t v) { return addi(d, X0, v); }
 static uint32_t ld(unsigned d, unsigned b, int32_t off) { return enc_i(OP_LOAD, 3, d, b, off); }
@@ -475,6 +486,20 @@ static uint16_t compress(uint32_t w)
             }
             if (rs1 == 0 && fits6(imm)) {
                 return c_i(0x4001u, rd, imm);                       // c.li
+            }
+            if (rd == SP && rs1 == SP && imm != 0 && imm % 16 == 0 &&
+                    imm >= -512 && imm <= 496) {                    // c.addi16sp
+                uint32_t u = (uint32_t)imm;
+                return (uint16_t)(0x6101u | (u >> 9 & 1u) << 12 |
+                                  (u >> 4 & 1u) << 6 | (u >> 6 & 1u) << 5 |
+                                  (u >> 7 & 3u) << 3 | (u >> 5 & 1u) << 2);
+            }
+            if (rs1 == SP && creg(rd) && imm > 0 && imm < 1024 &&
+                    imm % 4 == 0) {                                 // c.addi4spn
+                uint32_t u = (uint32_t)imm;
+                return (uint16_t)((u >> 4 & 3u) << 11 | (u >> 6 & 15u) << 7 |
+                                  (u >> 2 & 1u) << 6 | (u >> 3 & 1u) << 5 |
+                                  (rd - 8u) << 2);
             }
             if (imm == 0 && rs1 != 0) {
                 return (uint16_t)(0x8002u | rd << 7 | rs1 << 2);    // c.mv
@@ -728,18 +753,23 @@ typedef struct {
 #define BUF_SIZE 4096
 #define VADDR 0x10000u
 
-// The state block: what the prologue loads and the epilogue stores,
-// and what the callee-saved registers held when the program returned.
+// The state block: what the prologue loads and the epilogue stores;
+// where the body left sp, from the frame's top; and what the
+// callee-saved registers and sp held when the program returned.
 typedef struct {
     uint64_t a[8];
     uint64_t frame[FRAME / 8];
     uint64_t buf;
     uint64_t s[12];
+    int64_t sp_end;
+    int64_t sp_ret;
 } state_t;
 
 #define STATE_FRAME 64
 #define STATE_BUF 128
 #define STATE_S 136
+#define STATE_SP_END 232
+#define STATE_SP_RET 240
 
 typedef struct {
     slot_t s[SLOTS_MAX];
@@ -881,6 +911,7 @@ static int slot_at(const prog_t *p, uint64_t a)
 // === Generation ===
 
 static prog_t gen;
+static int sp_up, sp_down;      // what the body releases and reserves
 
 static slot_t *push_slot(uint8_t kind)
 {
@@ -1644,12 +1675,102 @@ static void plant_const(void)
     }
 }
 
+// stack: sp moved by pushes and pops, a release and a reservation side
+// by side, and a restore from the frame pointer. What the body releases
+// is capped over the whole program, since a path that skips a push and
+// takes its pop leaves sp higher than the frame: the cap keeps every
+// path's sp, and the accesses through it, inside the guard above the
+// frame.
+#define SP_UP_MAX 512
+#define SP_DOWN_MAX 4096
+
+static void push_sp(int32_t k)
+{
+    push(addi(SP, SP, k));
+    if (k > 0) {
+        sp_up += k;
+    } else {
+        sp_down -= k;
+    }
+}
+
+static void plant_stack(void)
+{
+    unsigned n = 2 + rr(3);
+    switch (rr(5)) {
+    case 0:                                     // pushes
+        if (sp_down + 16 * (int)n > SP_DOWN_MAX) {
+            return;
+        }
+        for (unsigned k = 0; k < n; k++) {
+            if (coin(3)) {
+                push(coin(2) ? load_into(breg()) : alu_op(breg()));
+            }
+            int32_t step = 8 * (1 + (int32_t)rr(2));
+            push_sp(-step);
+            for (int32_t j = 0; j < step; j += 8) {
+                if (!coin(5)) {
+                    push(sd(sreg(), SP, j));
+                }
+            }
+            if (coin(6)) {
+                push(ld(breg(), SP, 8 * (int32_t)rr(4)));
+            }
+            if (coin(12)) {
+                push(coin(2) ? mv(breg(), SP) : sd(SP, SP, 0));
+            }
+        }
+        break;
+    case 1:                                     // pops
+        for (unsigned k = 0; k < n; k++) {
+            int32_t step = 8 * (1 + (int32_t)rr(2));
+            if (sp_up + step > SP_UP_MAX) {
+                return;
+            }
+            push(ld(breg(), SP, 8 * (int32_t)rr((unsigned)step / 8)));
+            push_sp(step);
+            if (coin(4)) {
+                push(coin(2) ? sd(sreg(), SP, 8 * (int32_t)rr(4))
+                             : alu_op(breg()));
+            }
+        }
+        break;
+    case 2: {                                   // a release, a reservation
+        int32_t a = 8 * (1 + (int32_t)rr(4));
+        int32_t b = coin(2) ? a : 8 * (1 + (int32_t)rr(4));
+        if (sp_up + a > SP_UP_MAX) {
+            return;
+        }
+        push_sp(a);
+        push_sp(-b);
+        break;
+    }
+    case 3:                                     // the frame pointer's restore
+        push(addi(SP, S0, -FRAME));
+        break;
+    default:                                    // a push, a call, a pop
+        if (sp_up + 16 > SP_UP_MAX) {
+            return;
+        }
+        push_sp(-16);
+        push(sd(breg(), SP, 0));
+        push(sd(breg(), SP, 8));
+        if (coin(2)) {
+            push_call();
+        }
+        push(ld(breg(), SP, 0));
+        push(ld(breg(), SP, 8));
+        push_sp(16);
+        break;
+    }
+}
+
 // self: any of the shapes.
 static void plant_any(void)
 {
     static void (*const planters[])(void) = {
         plant_ext, plant_dead, plant_remat, plant_mem, plant_shift,
-        plant_branch, plant_copy, plant_const,
+        plant_branch, plant_copy, plant_const, plant_stack,
     };
     planters[rr(sizeof planters / sizeof planters[0])]();
 }
@@ -1691,20 +1812,21 @@ static int forward(int i, int aim)
 static void build(void (*plant)(void))
 {
     gen.n = 0;
-    put(addi(SP, SP, -(FRAME + 48)), false);
-    put(sd(RA, SP, FRAME), false);
-    put(sd(S0, SP, FRAME + 8), false);
-    put(sd(S1, SP, FRAME + 16), false);
-    put(sd(A0, SP, FRAME + 24), false);
-    put(mv(T6, A0), false);
+    sp_up = sp_down = 0;
+    // s2 keeps the state block and s3 the return address, so nothing the
+    // body does to sp or the memory around it can lose either. The
+    // thunk saves and restores s0..s11 itself.
+    put(mv(S2, A0), false);
+    put(mv(S3, RA), false);
+    put(addi(SP, SP, -FRAME), false);
     put(addi(S0, SP, FRAME), false);
-    put(ld(S1, T6, STATE_BUF), false);
+    put(ld(S1, S2, STATE_BUF), false);
     for (int i = 0; i < FRAME / 8; i++) {
-        put(ld(T0, T6, STATE_FRAME + 8 * i), false);
+        put(ld(T0, S2, STATE_FRAME + 8 * i), false);
         put(sd(T0, SP, 8 * i), false);
     }
     for (unsigned i = 0; i < 8; i++) {
-        put(ld(A0 + i, T6, 8 * (int32_t)i), false);
+        put(ld(A0 + i, S2, 8 * (int32_t)i), false);
     }
     put(li(T1, 0), false);
     put(li(T5, 0), false);
@@ -1721,19 +1843,21 @@ static void build(void (*plant)(void))
     put(li(T1, 0), false);
     put(li(T5, 0), false);
     put(mv(T3, S1), false);
-    put(mv(T4, SP), false);
-    put(ld(T6, SP, FRAME + 24), false);
+    put(addi(T4, S0, -FRAME), false);
+    // Where the body left sp, which a stack-moving rewrite must not
+    // change, and then the frame back from s0 whatever it did.
+    put(sub(T0, SP, S0), false);
+    put(sd(T0, S2, STATE_SP_END), false);
+    put(addi(SP, S0, -FRAME), false);
     for (unsigned i = 0; i < 8; i++) {
-        put(sd(A0 + i, T6, 8 * (int32_t)i), false);
+        put(sd(A0 + i, S2, 8 * (int32_t)i), false);
     }
     for (int i = 0; i < FRAME / 8; i++) {
         put(ld(T0, SP, 8 * i), false);
-        put(sd(T0, T6, STATE_FRAME + 8 * i), false);
+        put(sd(T0, S2, STATE_FRAME + 8 * i), false);
     }
-    put(ld(RA, SP, FRAME), false);
-    put(ld(S0, SP, FRAME + 8), false);
-    put(ld(S1, SP, FRAME + 16), false);
-    put(addi(SP, SP, FRAME + 48), false);
+    put(addi(SP, SP, FRAME), false);
+    put(mv(RA, S3), false);
     put(jalr(X0, RA, 0), false);
 
     gen.tramp = gen.n;
@@ -2298,7 +2422,10 @@ static bool window_edits(const prog_t *p, const hit_t *h, edits_t *ed)
     }
     seq_t q = { .n = 0 };
     for (int i = 0; i < np; i++) {
-        if (!assemble(p, pieces[i], &q)) {
+        // check_release_reserve's `one addi sp, sp, K`
+        const char *text = strncmp(pieces[i], "one ", 4) == 0
+            ? pieces[i] + 4 : pieces[i];
+        if (!assemble(p, text, &q)) {
             break;
         }
     }
@@ -2379,19 +2506,30 @@ static bool copy_edits(const prog_t *p, const hit_t *h, edits_t *ed)
 // still runs, and still has to agree.
 enum { K_IMM, K_ZERO, K_MASK, K_COMP };
 
-// A step of a chain building rc: it writes rc and reads nothing else.
+// A step of a chain building rc, of the kinds riscvlint's chain takes:
+// an immediate operation, addiw or slli.uw on rc, zext.w of rc, or
+// shNadd of rc with itself. An `or rc, zero, rc` reads only rc too, but
+// it is a use of the constant rather than a step in building it.
 static bool chain_step(const slot_t *s, unsigned rc)
 {
-    if (s->kind != S_PLAIN || (s->word >> 7 & 31u) != rc) {
+    if (s->kind != S_PLAIN || (s->word >> 7 & 31u) != rc ||
+            (s->word >> 15 & 31u) != rc) {
         return false;
     }
-    unsigned op = s->word & 0x7fu, a = s->word >> 15 & 31u;
-    unsigned b = s->word >> 20 & 31u;
-    if (op == OP_IMM || op == OP_IMM32) {
-        return a == rc;
+    unsigned op = s->word & 0x7fu, f3 = s->word >> 12 & 7u;
+    unsigned b = s->word >> 20 & 31u, f7 = s->word >> 25;
+    switch (op) {
+    case OP_IMM:
+        return true;
+    case OP_IMM32:
+        return f3 == 0 || (f3 == 1 && (s->word >> 26) == 0x02);
+    case OP_OP32:
+        return f3 == 0 && f7 == 0x04 && b == X0;
+    case OP_OP:
+        return f7 == 0x10 && f3 != 0 && (f3 & 1) == 0 && b == rc;
+    default:
+        return false;
     }
-    return (op == OP_OP || op == OP_OP32) && (a == rc || a == X0) &&
-           (b == rc || b == X0) && (a == rc || b == rc);
 }
 
 // The value a chain leaves, for the steps riscvlint follows: li, lui
@@ -2583,6 +2721,98 @@ static bool const_edits(const prog_t *p, const hit_t *h, int kind,
     return uses > 0;
 }
 
+static int32_t store_off(uint32_t w)
+{
+    return (int32_t)sext((w >> 25) << 5 | (w >> 7 & 31u), 12);
+}
+
+// An `addi sp,sp,K`, and K.
+static bool sp_adjust(const slot_t *s, int64_t *k)
+{
+    if (s->kind != S_PLAIN || (s->word & 0xfffffu) != 0x10113u) {
+        return false;
+    }
+    *k = sext(s->word >> 20, 12);
+    return true;
+}
+
+// A load or store through sp, and its offset.
+static bool sp_access(const slot_t *s, int64_t *off)
+{
+    if (s->kind != S_PLAIN || (s->word >> 15 & 31u) != SP) {
+        return false;
+    }
+    unsigned op = s->word & 0x7fu;
+    if (op == OP_LOAD) {
+        *off = sext(s->word >> 20, 12);
+        return true;
+    }
+    if (op == OP_STORE) {
+        *off = store_off(s->word);
+        return true;
+    }
+    return false;
+}
+
+static uint32_t with_off(uint32_t w, int64_t off)
+{
+    if ((w & 0x7fu) == OP_LOAD) {
+        return (w & 0x000fffffu) | ((uint32_t)off & 0xfffu) << 20;
+    }
+    return enc_s(w >> 12 & 7u, w >> 15 & 31u, w >> 20 & 31u, (int32_t)off);
+}
+
+// check_push_run's and check_release_run's `one addi sp, sp, K for N
+// adjustments`: the run's adjustments become one by the K rendered --
+// at the first reservation for pushes, at the last release for pops --
+// and each access through sp between them moves by what the run had
+// yet to reserve, or had already released, when it ran. The rendering
+// says only the total, so rwfuzz works out the rest.
+static bool run_edits(const prog_t *p, const hit_t *h, bool pushes,
+                      edits_t *ed)
+{
+    int64_t total, k, off;
+    if (sscanf(h->text, "one addi sp, sp, %" SCNd64, &total) != 1) {
+        return false;
+    }
+    int first = h->slot, end = h->slot + (int)h->count, last = -1;
+    int64_t all = 0;
+    for (int i = first; i < end; i++) {
+        if (sp_adjust(&p->s[i], &k)) {
+            all += k;
+            last = i;
+        }
+    }
+    int at = pushes ? first : last;
+    if (last < 0 || !sp_adjust(&p->s[at], &k)) {
+        return false;
+    }
+    ed->n = 0;
+    int64_t sofar = 0;
+    for (int i = first; i < end; i++) {
+        if (sp_adjust(&p->s[i], &k)) {
+            sofar += k;
+            edit_t *e = add_edit(ed, i);
+            if (i == at) {
+                e->rep[0] = plain(addi(SP, SP, (int32_t)total));
+                e->n = 1;
+            }
+        } else if (sp_access(&p->s[i], &off)) {
+            // Pushes: sp is already at the total, which is lower by what
+            // is still to come. Pops: sp is still where the run began,
+            // lower by what had been released.
+            int64_t moved = pushes ? off + (sofar - all) : off + sofar;
+            if (!in_imm12(moved)) {
+                return false;
+            }
+            edit_t *e = add_edit(ed, i);
+            e->rep[0] = plain(with_off(p->s[i].word, moved));
+            e->n = 1;
+        }
+    }
+    return true;
+}
+
 // The advice a finding gives, as edits to the program.
 static bool advice(const prog_t *p, const hit_t *h, const char *title,
                    edits_t *ed)
@@ -2604,23 +2834,38 @@ static bool advice(const prog_t *p, const hit_t *h, const char *title,
     if (strcmp(title, "copy its only reader could do without") == 0) {
         return copy_edits(p, h, ed);
     }
+    if (strcmp(title, "pushes one stack adjustment would do") == 0) {
+        return run_edits(p, h, true, ed);
+    }
+    if (strcmp(title, "releases one stack adjustment would do") == 0) {
+        return run_edits(p, h, false, ed);
+    }
     return window_edits(p, h, ed);
 }
 
 // === Execution ===
 
-// The executable region: a thunk, then the program. The thunk runs the
-// program on a stack of its own, so that the frame -- whose address the
-// body may copy into a register or memory -- is at the same place in
-// every run, whatever called it. It also starts it with s0..s11 zero and
-// records what they hold when it returns, then puts back the caller's:
-// a rewrite that stores over the frame's save area shows as a
-// difference rather than corrupting rwfuzz itself.
+// The executable region: a thunk, its save area, then the program. The
+// thunk runs the program on a stack of its own, so that the frame --
+// whose address the body may copy into a register or memory -- is at
+// the same place in every run, whatever called it, and so that the
+// whole stack can be compared afterwards: a stack-moving rewrite must
+// leave the memory below sp as the original did. GUARD bytes above the
+// frame take a body that releases more than it reserved. The thunk
+// starts the program with s0..s11 zero, records what they and sp hold
+// when it returns, and puts back the caller's from its save area, which
+// it reaches pc-relative: whatever the program did to its registers and
+// its stack, rwfuzz itself survives it.
 static uint8_t *jit;
-#define CODE_AT 256
-static uint8_t exec_stack[16384] __attribute__((aligned(16)));
+#define SAVE_AT 512
+#define CODE_AT 1024
+#define STACK_SIZE 16384
+#define GUARD 1024
+static uint8_t exec_stack[STACK_SIZE] __attribute__((aligned(16)));
 static uint8_t exec_mem[BUF_SIZE] __attribute__((aligned(64)));
 static uint8_t mem_init[BUF_SIZE];
+static uint8_t stack_init[STACK_SIZE];
+static state_t run_state;
 
 static sigjmp_buf escape;
 static volatile sig_atomic_t in_jit, caught;
@@ -2646,30 +2891,37 @@ static bool exec_open(void)
         return false;
     }
     jit = m;
-    // a0 the state, a1 the program, a2 the stack's top.
+    // a0 the state, a1 the program, a2 the sp to call it with. The save
+    // area holds sp, ra, the state, that sp and s0..s11, in that order.
     static const unsigned saved[12] = { 8, 9, 18, 19, 20, 21, 22, 23, 24,
                                         25, 26, 27 };
-    uint32_t thunk[CODE_AT / 4];
+    uint32_t thunk[SAVE_AT / 4];
     int n = 0;
-    thunk[n++] = mv(T0, SP);
-    thunk[n++] = mv(SP, A0 + 2);
-    thunk[n++] = addi(SP, SP, -128);
-    thunk[n++] = sd(T0, SP, 0);
-    thunk[n++] = sd(RA, SP, 8);
-    thunk[n++] = sd(A0, SP, 112);
+    thunk[n++] = auipc(T0, 0);
+    thunk[n++] = addi(T0, T0, SAVE_AT);
+    thunk[n++] = sd(SP, T0, 0);
+    thunk[n++] = sd(RA, T0, 8);
+    thunk[n++] = sd(A0, T0, 16);
+    thunk[n++] = sd(A0 + 2, T0, 24);
     for (int i = 0; i < 12; i++) {
-        thunk[n++] = sd(saved[i], SP, 16 + 8 * i);
+        thunk[n++] = sd(saved[i], T0, 32 + 8 * i);
         thunk[n++] = li(saved[i], 0);
     }
+    thunk[n++] = mv(SP, A0 + 2);
     thunk[n++] = jalr(RA, A0 + 1, 0);
-    thunk[n++] = ld(T0, SP, 112);
+    int back = n;
+    thunk[n++] = auipc(T0, 0);
+    thunk[n++] = addi(T0, T0, SAVE_AT - 4 * back);
+    thunk[n++] = ld(T6, T0, 16);
     for (int i = 0; i < 12; i++) {
-        thunk[n++] = sd(saved[i], T0, STATE_S + 8 * i);
-        thunk[n++] = ld(saved[i], SP, 16 + 8 * i);
+        thunk[n++] = sd(saved[i], T6, STATE_S + 8 * i);
+        thunk[n++] = ld(saved[i], T0, 32 + 8 * i);
     }
-    thunk[n++] = ld(RA, SP, 8);
-    thunk[n++] = ld(T0, SP, 0);
-    thunk[n++] = mv(SP, T0);
+    thunk[n++] = ld(T1, T0, 24);
+    thunk[n++] = sub(T1, SP, T1);
+    thunk[n++] = sd(T1, T6, STATE_SP_RET);
+    thunk[n++] = ld(RA, T0, 8);
+    thunk[n++] = ld(SP, T0, 0);
     thunk[n++] = jalr(X0, RA, 0);
     for (int i = 0; i < n; i++) {
         put32(jit + 4 * i, thunk[i]);
@@ -2692,6 +2944,7 @@ typedef struct {
     state_t st;
     int sig;            // what stopped it, or 0
     uint8_t mem[BUF_SIZE];
+    uint8_t stack[STACK_SIZE];
 } result_t;
 
 static void run(const prog_t *p, const state_t *in, result_t *out)
@@ -2700,18 +2953,21 @@ static void run(const prog_t *p, const state_t *in, result_t *out)
     memcpy(jit + CODE_AT, p->code, len);
     __builtin___clear_cache((char *)jit, (char *)jit + CODE_AT + len);
     memcpy(exec_mem, mem_init, BUF_SIZE);
-    out->st = *in;
-    out->st.buf = (uint64_t)(uintptr_t)exec_mem;
+    memcpy(exec_stack, stack_init, STACK_SIZE);
+    run_state = *in;
+    run_state.buf = (uint64_t)(uintptr_t)exec_mem;
     out->sig = 0;
     if (sigsetjmp(escape, 0) == 0) {
         in_jit = 1;
         ((void (*)(state_t *, void *, void *))(void *)jit)(
-            &out->st, jit + CODE_AT, exec_stack + sizeof exec_stack);
+            &run_state, jit + CODE_AT, exec_stack + STACK_SIZE - GUARD);
         in_jit = 0;
     } else {
         out->sig = caught;
     }
+    out->st = run_state;
     memcpy(out->mem, exec_mem, BUF_SIZE);
+    memcpy(out->stack, exec_stack, STACK_SIZE);
 }
 
 static uint64_t edge_value(void)
@@ -2736,6 +2992,7 @@ static uint64_t edge_value(void)
 
 static state_t trial_in[TRIALS];
 static uint8_t trial_mem[TRIALS][BUF_SIZE];
+static uint8_t trial_stack[TRIALS][STACK_SIZE];
 static result_t base[TRIALS];
 
 // Draws the states every rewrite of this program runs from, and runs
@@ -2753,7 +3010,12 @@ static void run_original(void)
             uint64_t v = edge_value();
             memcpy(&trial_mem[t][8 * i], &v, 8);
         }
+        for (int i = 0; i < STACK_SIZE / 8; i++) {
+            uint64_t v = rnd();
+            memcpy(&trial_stack[t][8 * i], &v, 8);
+        }
         memcpy(mem_init, trial_mem[t], BUF_SIZE);
+        memcpy(stack_init, trial_stack[t], STACK_SIZE);
         run(&gen, &trial_in[t], &base[t]);
     }
 }
@@ -2764,7 +3026,9 @@ static bool same(const result_t *a, const result_t *b)
            memcmp(a->st.a, b->st.a, sizeof a->st.a) == 0 &&
            memcmp(a->st.s, b->st.s, sizeof a->st.s) == 0 &&
            memcmp(a->st.frame, b->st.frame, sizeof a->st.frame) == 0 &&
-           memcmp(a->mem, b->mem, BUF_SIZE) == 0;
+           a->st.sp_end == b->st.sp_end && a->st.sp_ret == b->st.sp_ret &&
+           memcmp(a->mem, b->mem, BUF_SIZE) == 0 &&
+           memcmp(a->stack, b->stack, STACK_SIZE) == 0;
 }
 
 // Runs a rewrite from each trial state; -1 if all agreed with the
@@ -2775,6 +3039,7 @@ static int differs(const prog_t *alt)
 {
     for (int t = 0; t < TRIALS; t++) {
         memcpy(mem_init, trial_mem[t], BUF_SIZE);
+        memcpy(stack_init, trial_stack[t], STACK_SIZE);
         run(alt, &trial_in[t], &alt_result);
         if (!same(&base[t], &alt_result)) {
             return t;
@@ -2805,14 +3070,14 @@ static void dump(const prog_t *p, const char *heading, int first, int last)
     cs_free(insn, 1);
 }
 
-static void dump_result(const char *what, const result_t *r)
+static void dump_result(const char *what, const state_t *st, int sig)
 {
     printf("  %s:", what);
     for (int i = 0; i < 8; i++) {
-        printf(" %" PRIx64, r->st.a[i]);
+        printf(" %" PRIx64, st->a[i]);
     }
-    if (r->sig != 0) {
-        printf(" (signal %d)", r->sig);
+    if (sig != 0) {
+        printf(" (signal %d)", sig);
     }
     printf("\n");
 }
@@ -2822,9 +3087,9 @@ static void dump_mismatch(const prog_t *alt, const char *heading, int first,
 {
     dump(&gen, heading, first, last);
     dump(alt, "rewritten", -1, -1);
-    dump_result("from    ", &(result_t){ .st = trial_in[trial] });
-    dump_result("original", &base[trial]);
-    dump_result("rewrite ", &alt_result);
+    dump_result("from    ", &trial_in[trial], 0);
+    dump_result("original", &base[trial].st, base[trial].sig);
+    dump_result("rewrite ", &alt_result.st, alt_result.sig);
     if (memcmp(base[trial].st.frame, alt_result.st.frame,
                sizeof alt_result.st.frame) != 0) {
         printf("  the frames differ\n");
@@ -2834,6 +3099,15 @@ static void dump_mismatch(const prog_t *alt, const char *heading, int first,
     }
     if (memcmp(base[trial].st.s, alt_result.st.s, sizeof alt_result.st.s)) {
         printf("  the callee-saved registers differ\n");
+    }
+    if (memcmp(base[trial].stack, alt_result.stack, STACK_SIZE) != 0) {
+        printf("  the stacks differ\n");
+    }
+    if (base[trial].st.sp_end != alt_result.st.sp_end ||
+            base[trial].st.sp_ret != alt_result.st.sp_ret) {
+        printf("  sp differs: %" PRId64 "/%" PRId64 " against %" PRId64
+               "/%" PRId64 "\n", base[trial].st.sp_end, base[trial].st.sp_ret,
+               alt_result.st.sp_end, alt_result.st.sp_ret);
     }
 }
 
@@ -2930,11 +3204,6 @@ static bool same_place(uint32_t a, uint32_t b)
 {
     return (a & 0x000ff000u) == (b & 0x000ff000u) &&       // f3, rs1
            (a >> 15 & 31u) == (b >> 15 & 31u);
-}
-
-static int32_t store_off(uint32_t w)
-{
-    return (int32_t)sext((w >> 25) << 5 | (w >> 7 & 31u), 12);
 }
 
 static bool mem_control(const prog_t *p, int i, edits_t *ed)
@@ -3091,6 +3360,28 @@ static bool const_control(const prog_t *p, int i, edits_t *ed)
     return false;
 }
 
+// stack: an unflagged restore from the frame pointer deleted, or an
+// unflagged pair of adjacent sp adjustments made one.
+static bool stack_control(const prog_t *p, int i, edits_t *ed)
+{
+    int64_t a, b;
+    if (p->s[i].kind == S_PLAIN && p->s[i].word == addi(SP, S0, -FRAME)) {
+        add_edit(ed, i);
+        return true;
+    }
+    if (i + 1 >= p->epi || !sp_adjust(&p->s[i], &a) ||
+            !sp_adjust(&p->s[i + 1], &b) || !in_imm12(a + b)) {
+        return false;
+    }
+    edit_t *e = add_edit(ed, i);
+    if (a + b != 0) {
+        e->rep[0] = plain(addi(SP, SP, (int32_t)(a + b)));
+        e->n = 1;
+    }
+    add_edit(ed, i + 1);
+    return true;
+}
+
 #define TITLES_MAX 12
 
 struct mode {
@@ -3118,6 +3409,11 @@ static const mode_t_ modes[] = {
                  "and/or/xor constant whose complement builds shorter",
                  "constant built in more instructions than li needs" },
       plant_const, const_control },
+    { "stack", { "pushes one stack adjustment would do",
+                 "releases one stack adjustment would do",
+                 "release followed by a reservation",
+                 "redundant stack-pointer restore" },
+      plant_stack, stack_control },
     { "shift", { "slli + srli foldable to zext.w",
                  "slli + srli foldable to zext.h",
                  "slli + srli foldable to andi",

@@ -3096,7 +3096,7 @@ the categories built around them have flagless replacements.
   applies the same kind of rewrite where riscvlint refused to, so a
   harness that stopped seeing differences would show it. Modes cover
   the redundant extension, dead definition, value reuse, memory window,
-  constant, pair fold, control-flow and copy checks
+  constant, stack adjustment, pair fold, control-flow and copy checks
   (`tools/rwfuzz -n 100000 ext`), and `self` checks rwfuzz's own
   encoders; a new rewrite gets a mode, or a shape in one. It is
   armlint's `tools/rwfuzz` with a program made of slots rather than
