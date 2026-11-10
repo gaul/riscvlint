@@ -3080,10 +3080,29 @@ the categories built around them have flagless replacements.
   compressibility audit, documented under
   [Building](#the-compressibility-audit): the probe enumerates every
   compressed form riscvlint's decoders will name, and the script diffs
-  that against LLVM's `CompressPat` records. They are the only tools
-  here that check riscvlint against an oracle rather than measure a
-  corpus, and the only ones whose failure is a defect rather than a
+  that against LLVM's `CompressPat` records. They and `tools/rwfuzz`
+  are the tools here that check riscvlint against an oracle rather than
+  measure a corpus, and the ones whose failure is a defect rather than a
   number.
+
+* `tools/rwfuzz` checks a check's advice by running it. It generates
+  random riscv64 programs with the shapes a group of checks looks for
+  planted in them, applies each rewrite riscvlint suggests to a copy,
+  and runs original and rewrite natively from the same random registers
+  and memory: any difference in `a0`..`a7`, the frame or the scratch
+  buffer is a soundness bug. What it applies is the replacement text,
+  through an assembler of its own, so a rendering that names the wrong
+  register fails as surely as a proof that misses a write. A control arm
+  applies the same kind of rewrite where riscvlint refused to, so a
+  harness that stopped seeing differences would show it. Modes cover
+  the redundant extension, dead definition, value reuse, memory window,
+  constant, pair fold, control-flow and copy checks
+  (`tools/rwfuzz -n 100000 ext`), and `self` checks rwfuzz's own
+  encoders; a new rewrite gets a mode, or a shape in one. It is
+  armlint's `tools/rwfuzz` with a program made of slots rather than
+  words, laid out again after each rewrite, since a RISC-V rewrite
+  changes sizes as often as not. Needs a riscv64 host with Zba, Zbb and
+  Zbs, since the programs run natively, and links `libriscvlint.a`.
 
 * `tools/rank.py` groups `pairscan` output into candidate-check families
   and prints each family's population, because raw frequency ranking

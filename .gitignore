@@ -5,6 +5,7 @@ tools/pairscan
 tools/defuse
 tools/candscan
 tools/tblgen_probe
+tools/rwfuzz
 corpus/
 results/
 *.o

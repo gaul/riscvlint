@@ -75,7 +75,8 @@ gopclntab-test: riscvlint
 
 # Corpus-mining research utilities (see "Mining tools" in README.md);
 # not part of the default build or test targets.
-tools: tools/pairscan tools/defuse tools/candscan tools/tblgen_probe
+tools: tools/pairscan tools/defuse tools/candscan tools/tblgen_probe \
+	tools/rwfuzz
 
 tools/pairscan: tools/pairscan.c
 	$(CC) $(CFLAGS) $(CAPSTONE_CFLAGS) $< $(CAPSTONE_LIBS) -o $@
@@ -93,6 +94,13 @@ tools/tblgen_probe: tools/tblgen_probe.c riscvlint.o
 	$(CC) $(CFLAGS) $(CAPSTONE_CFLAGS) $< riscvlint.o $(CAPSTONE_LIBS) \
 		-lpthread -o $@
 
+# Runs the scan and then the code it scanned, so it links the library.
+# The programs run natively: on a host other than riscv64 this builds a
+# stub that says so.
+tools/rwfuzz: tools/rwfuzz.c libriscvlint.a riscvlint.h
+	$(CC) $(CFLAGS) $(CAPSTONE_CFLAGS) -I. $< libriscvlint.a \
+		$(CAPSTONE_LIBS) -o $@
+
 # The default goal: everything that ships, without running the suites.
 build: lib riscvlint
 
@@ -101,7 +109,7 @@ all: lib riscvlint test
 clean:
 	rm -f riscvlint riscvlint_test libriscvlint.a \
 		tools/pairscan tools/defuse tools/candscan tools/tblgen_probe \
-		*.o
+		tools/rwfuzz *.o
 
 .PHONY: all build clean lib test integration-test integration-test-regen \
 	driver-test json-test gopclntab-test tools
