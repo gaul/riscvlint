@@ -3097,9 +3097,10 @@ the categories built around them have flagless replacements.
   refused to, so a harness that stopped seeing differences would show
   it. Modes cover the redundant extension, dead definition, value reuse,
   memory window, constant, stack adjustment, floating-point, pair fold,
-  control-flow and copy checks (`tools/rwfuzz -n 100000 ext`), and
-  `self` checks rwfuzz's own encoders; a new rewrite gets a mode, or a
-  shape in one. It is armlint's `tools/rwfuzz` with a program made of
+  control-flow and copy checks (`tools/rwfuzz -n 100000 ext`), the
+  Zilx, Zibi and Zacas checks through base-ISA expansions of what they
+  suggest, which the K3 cannot run, and `self` checks rwfuzz's own
+  encoders; a new rewrite gets a mode, or a shape in one. It is armlint's `tools/rwfuzz` with a program made of
   slots rather than words, laid out again after each rewrite, since a
   RISC-V rewrite changes sizes as often as not. Needs a riscv64 host
   with Zba, Zbb and Zbs, since the programs run natively, and links

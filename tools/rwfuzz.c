@@ -96,6 +96,15 @@
 //          value in the ISA manual's table, not riscvlint's. The pool is
 //          reached by auipc + fld through t5 and served to riscvlint
 //          through its image, outside the scanned section.
+//   emu    the checks for extensions the K3 cannot run: Zilx's indexed
+//          loads, Zibi's compare-immediate branches and Zacas's amocas,
+//          with the scan told the target has them. The assembler spells
+//          each rendered instruction as the base-ISA sequence its
+//          specification defines, through t0, t2 and t6, which nothing
+//          else in the body reads -- amocas.w comparing only the low 32
+//          bits, as on RV64 it does. What is tested is the claim around
+//          the instruction: which registers the fold stops writing, and
+//          that the instruction does what the code it replaces did.
 //   shift  the pair folds: slli + srli to zext.w, zext.h or andi, slli +
 //          srai to sext.b or sext.h, slli + add and li + mul to shNadd,
 //          not + and/or/xor to andn/orn/xnor, li + divu/remu to a shift
@@ -803,7 +812,8 @@ typedef struct {
     uint8_t ra, rb;     // S_BRANCH: rs1, rs2; S_AUIPC: rd;
                         // S_JALR: rs1, and the link in rb
     int8_t aim;         // while generating: the target this many slots
-                        // on, or 0 to draw one
+                        // on, back when negative, or 0 to draw one
+    bool fixed;         // while generating: no transfer may land here
     uint16_t half;      // S_PLAIN: the two-byte form, when c
     uint32_t word;      // S_PLAIN: the four-byte form; S_PAIRLO: the
                         // load, its offset filled in at layout; S_DATA:
@@ -2153,12 +2163,122 @@ static void plant_fp(void)
     }
 }
 
+// emu: the shapes for the checks of extensions the K3 cannot run --
+// Zilx's indexed loads, Zibi's compare-immediate branches and Zacas's
+// amocas -- whose rewrites the assembler spells in the base ISA. An
+// indexed load's index is masked small first, and nothing lands between
+// that and the load, so the address is always inside the buffer.
+static uint32_t lr_sc(bool sc, bool dbl, unsigned rd, unsigned addr,
+                      unsigned src)
+{
+    unsigned aq = rr(2), rl = rr(2);
+    return (sc ? 0x03u : 0x02u) << 27 | aq << 26 | rl << 25 | src << 20 |
+           addr << 15 | (dbl ? 3u : 2u) << 12 | rd << 7 | 0x2fu;
+}
+
+static void push_fixed(uint32_t w)
+{
+    push(w);
+    gen.s[gen.n - 1].fixed = true;
+}
+
+static void plant_emu(void)
+{
+    unsigned r[8];
+    for (unsigned i = 0; i < 8; i++) {
+        r[i] = A0 + i;
+    }
+    for (unsigned i = 7; i > 0; i--) {
+        unsigned j = rr(i + 1), tmp = r[i];
+        r[i] = r[j];
+        r[j] = tmp;
+    }
+    switch (rr(5)) {
+    case 0:
+    case 1: {
+        // An index, a scaled or zero-extended one now and then, added
+        // to the buffer's base and loaded through.
+        unsigned ri = r[0], rt = r[1], rd = coin(3) ? rt : r[2];
+        unsigned data = coin(3) ? rd : r[3], base = coin(2) ? S1 : T3;
+        unsigned f3 = rr(7), k = f3 & 3u;
+        if (coin(6)) {
+            k = (k + 1) & 3u;                   // a scale the width denies
+        }
+        push(andi(ri, sreg(), 15));
+        switch (rr(3)) {
+        case 0:
+            push_fixed(coin(2) ? add(rd, base, ri) : add(rd, ri, base));
+            break;
+        case 1:
+            push_fixed(slli(rt, ri, k));
+            push_fixed(add(rd, base, rt));
+            break;
+        default:
+            push_fixed(slli(rt, ri, 32));
+            push_fixed(srli(rt, rt, 32 - k));
+            push_fixed(add(rd, base, rt));
+            break;
+        }
+        push_fixed(enc_i(OP_LOAD, f3, data, rd, 0));
+        if (coin(3)) {
+            push(add(breg(), coin(2) ? rd : rt, sreg()));
+        }
+        break;
+    }
+    case 2: {
+        // A constant loaded for an equality branch, in Zibi's range or
+        // just outside it.
+        unsigned c = r[0], x = r[1];
+        static const int32_t ks[] = { -1, 1, 5, 31, 0, 32, -2 };
+        push(li(c, coin(3) ? ks[rr(7)] : 1 + (int32_t)rr(31)));
+        push_branch_to(rr(2), coin(2) ? x : c, coin(2) ? c : x, 0);
+        if (coin(3)) {
+            push(add(breg(), c, sreg()));
+        }
+        break;
+    }
+    default: {
+        // A compare-exchange loop through t3 or t4, which hold aligned
+        // addresses: lr, bne out, sc, bnez back. The expected value is
+        // sign-extended for a word form now and then, and the sc's
+        // result read afterwards now and then.
+        unsigned rt = r[0], rexp = coin(6) ? X0 : r[1], rnew = r[2];
+        unsigned rs = r[3], addr = coin(2) ? T3 : T4;
+        bool dbl = coin(2);
+        if (!dbl && rexp != X0 && coin(2)) {
+            push(addiw(rexp, rexp, 0));
+        }
+        push(lr_sc(false, dbl, rt, addr, X0));
+        // Now and then the loaded value against itself: never true, so
+        // the loop always stores, where an amocas would compare.
+        unsigned cmp = coin(8) ? rt : rexp;
+        bool swap = coin(2);
+        // Out of the loop to just past it half the time, where the sc's
+        // result may be read. The comparison's way out sees the result
+        // only after a failed sc, which a single thread never has, so
+        // that half of the check's proof goes untested.
+        push_branch_to(1, swap ? cmp : rt, swap ? rt : cmp,
+                       coin(2) ? 3 : 3 + (int)rr(3));
+        gen.s[gen.n - 1].c = false;
+        gen.s[gen.n - 1].fixed = true;
+        push_fixed(lr_sc(true, dbl, rs, addr, rnew));
+        push_branch_to(1, rs, X0, -3);
+        gen.s[gen.n - 1].fixed = true;
+        if (coin(3)) {
+            push(add(breg(), rs, sreg()));
+        }
+        break;
+    }
+    }
+}
+
 // self: any of the shapes.
 static void plant_any(void)
 {
     static void (*const planters[])(void) = {
         plant_ext, plant_dead, plant_remat, plant_mem, plant_shift,
         plant_branch, plant_copy, plant_const, plant_stack, plant_fp,
+        plant_emu,
     };
     planters[rr(sizeof planters / sizeof planters[0])]();
 }
@@ -2191,8 +2311,8 @@ static int forward(int i, int aim)
 {
     int t = aim > 0 && i + aim <= gen.epi
         ? i + aim : i + 1 + (int)rr((unsigned)(gen.epi - i));
-    while (t < gen.epi &&
-           (gen.s[t].kind == S_JALR || gen.s[t].kind == S_PAIRLO)) {
+    while (t < gen.epi && (gen.s[t].kind == S_JALR ||
+                           gen.s[t].kind == S_PAIRLO || gen.s[t].fixed)) {
         t++;
     }
     return t;
@@ -2294,7 +2414,9 @@ static void build(void (*plant)(void))
         switch (s->kind) {
         case S_BRANCH:
         case S_JUMP:
-            s->target = forward(i, s->aim);
+            // Only an LR/SC retry aims back; every other transfer goes
+            // forward, so that every program terminates.
+            s->target = s->aim < 0 ? i + s->aim : forward(i, s->aim);
             break;
         case S_JALR:
             s->target = s->rb != X0 ? (coin(3) ? gen.tramp : gen.stub)
@@ -2367,6 +2489,7 @@ static void record(void *ctx, const riscvlint_finding *f)
      RISCVLINT_EXT_ZFA)
 
 static long undecoded;
+static unsigned mode_extensions(void);
 
 // The image riscvlint resolves a pool load against: the pool, which is
 // not in the scanned section and which nothing in the program writes.
@@ -2387,7 +2510,7 @@ static void analyze(const prog_t *p)
 {
     nhits = 0;
     riscvlint_state *st = riscvlint_state_create();
-    riscvlint_state_set_extensions(st, EXTENSIONS);
+    riscvlint_state_set_extensions(st, EXTENSIONS | mode_extensions());
     riscvlint_state_set_image(st, read_pool, (void *)p);
     uint64_t skipped = 0;
     size_t len = p->addr[p->pool];
@@ -2660,6 +2783,42 @@ static bool transfer_slot(seq_t *q, uint8_t kind, int target)
     return seq_add(q, s);
 }
 
+// Zilx's indexed loads by mnemonic: the load's funct3, the scale (log2
+// of the width for the scaled forms, 0 for the unscaled), and whether
+// the index is zero-extended from 32 bits first. Byte loads are scaled
+// forms whose scale is 0.
+static bool zilx_load(const char *mn, unsigned *f3, int *scale, bool *zext)
+{
+    static const char *const widths[7] = {
+        "b", "h", "w", "d", "bu", "hu", "wu",
+    };
+    const char *w;
+    bool scaled;
+    if (strncmp(mn, "lxsuw", 5) == 0) {
+        w = mn + 5;
+        scaled = true;
+        *zext = true;
+    } else if (strncmp(mn, "lxs", 3) == 0) {
+        w = mn + 3;
+        scaled = true;
+        *zext = false;
+    } else if (strncmp(mn, "lx", 2) == 0) {
+        w = mn + 2;
+        scaled = false;
+        *zext = false;
+    } else {
+        return false;
+    }
+    for (unsigned i = 0; i < 7; i++) {
+        if (strcmp(w, widths[i]) == 0) {
+            *f3 = i;
+            *scale = scaled ? (int)(i & 3u) : 0;
+            return true;
+        }
+    }
+    return false;
+}
+
 // Assembles one rendered instruction onto q. False where the text is
 // not an instruction this assembler knows -- which is how the
 // annotations after a rendering's instructions are told from them.
@@ -2669,9 +2828,13 @@ static bool assemble(const prog_t *p, const char *text, seq_t *q)
     size_t len = strnlen(text, sizeof buf - 1);
     memcpy(buf, text, len);
     buf[len] = '\0';
-    char *cut = strstr(buf, " (");     // the byte count
-    if (cut != NULL) {
-        *cut = '\0';
+    // The byte count, ` (8 -> 4 bytes)`, ends the instruction; an
+    // operand such as ` (t3)` does not.
+    for (char *cut = strstr(buf, " ("); cut != NULL; cut = strstr(cut + 1, " (")) {
+        if (isdigit((unsigned char)cut[2])) {
+            *cut = '\0';
+            break;
+        }
     }
     char *mn = buf;
     while (*mn == ' ') {
@@ -2779,6 +2942,56 @@ static bool assemble(const prog_t *p, const char *text, seq_t *q)
         int entry = fli_entry(ops[1]);
         return entry >= 0 &&
                seq_word(q, fli(mn[4] == 'd', fd, (unsigned)entry));
+    }
+    // The extensions the K3 lacks, as base-ISA sequences through t0, t2
+    // and t6, which nothing else in the body reads: what each does, per
+    // the specifications, rather than the instruction itself.
+    unsigned zf3;
+    int scale;
+    bool zext;
+    if (zilx_load(mn, &zf3, &scale, &zext)) {
+        // lx* rd, (rb), ri: rb plus ri, the index zero-extended from 32
+        // bits for lxsuw*, scaled for lxs* and lxsuw* by the width.
+        char rbuf[16];
+        if (nops != 3 || !r0 || sscanf(ops[1], "(%15[a-z0-9])", rbuf) != 1 ||
+                !parse_reg(rbuf, &ra) || !r2) {
+            return false;
+        }
+        bool ok = zext ? seq_word(q, iop_word(iop("slli.uw"), T6, rb, scale))
+                : scale > 0 ? seq_word(q, slli(T6, rb, (unsigned)scale))
+                : seq_word(q, mv(T6, rb));
+        return ok && seq_word(q, add(T6, ra, T6)) &&
+               seq_word(q, enc_i(OP_LOAD, zf3, rd, T6, 0));
+    }
+    if ((strcmp(mn, "beqi") == 0 || strcmp(mn, "bnei") == 0) && nops == 3 &&
+            r0 && parse_int(ops[1], &imm) && in_imm12(imm) &&
+            parse_target(p, ops[2], &target)) {
+        return seq_word(q, li(T6, (int32_t)imm)) &&
+               branch_slot(q, mn[1] == 'e' ? 0 : 1, rd, T6, target);
+    }
+    if (strncmp(mn, "amocas.", 7) == 0 && (mn[7] == 'd' || mn[7] == 'w') &&
+            nops == 3 && r0 && r1) {
+        // amocas rd, rs2, (rs1): the old value, compared with rd -- on
+        // RV64 the word form compares the low 32 bits only -- and rs2
+        // stored where they agree, the old value otherwise; rd gets the
+        // old value, sign-extended for a word.
+        char rbuf[16];
+        unsigned addr;
+        if (sscanf(ops[2], "(%15[a-z0-9])", rbuf) != 1 ||
+                !parse_reg(rbuf, &addr)) {
+            return false;
+        }
+        bool dbl = mn[7] == 'd';
+        return seq_word(q, enc_i(OP_LOAD, dbl ? 3 : 2, T2, addr, 0)) &&
+               seq_word(q, xor_(T0, T2, rd)) &&
+               (dbl || seq_word(q, slli(T0, T0, 32))) &&
+               seq_word(q, enc_i(OP_IMM, 3, T0, T0, 1)) &&         // seqz
+               seq_word(q, sub(T0, X0, T0)) &&
+               seq_word(q, xor_(T6, ra, T2)) &&
+               seq_word(q, and_(T6, T6, T0)) &&
+               seq_word(q, xor_(T6, T6, T2)) &&
+               seq_word(q, enc_s(dbl ? 3 : 2, addr, T6, 0)) &&
+               seq_word(q, mv(rd, T2));
     }
     if (strcmp(mn, "lui") == 0 && nops == 2 && r0 &&
             parse_int(ops[1], &imm) && imm >= 0 && imm <= 0xfffff) {
@@ -3451,6 +3664,30 @@ static bool popcount_edits(const prog_t *p, const hit_t *h, edits_t *ed)
     return true;
 }
 
+// check_cas_loop_to_amocas's `mv rt, rexp ; amocas.d rt, rnew, (ra)`:
+// the loop's four instructions become the rendering, and the comparison
+// that left the loop stays after it, deciding on what amocas left in rt.
+static bool cas_edits(const prog_t *p, const hit_t *h, edits_t *ed)
+{
+    char pieces[8][96];
+    int np = split(h->text, pieces, 8);
+    seq_t q = { .n = 0 };
+    if (np < 2 || h->count != 4 || !assemble(p, pieces[0], &q) ||
+            !assemble(p, pieces[1], &q) || q.n == REP_MAX ||
+            p->s[h->slot + 1].kind != S_BRANCH) {
+        return false;
+    }
+    q.s[q.n++] = p->s[h->slot + 1];
+    ed->n = 0;
+    edit_t *e = add_edit(ed, h->slot);
+    memcpy(e->rep, q.s, sizeof(slot_t) * (size_t)q.n);
+    e->n = q.n;
+    for (int k = 1; k < 4; k++) {
+        add_edit(ed, h->slot + k);
+    }
+    return true;
+}
+
 // The advice a finding gives, as edits to the program.
 static bool advice(const prog_t *p, const hit_t *h, const char *title,
                    edits_t *ed)
@@ -3471,6 +3708,9 @@ static bool advice(const prog_t *p, const hit_t *h, const char *title,
     }
     if (strcmp(title, "copy its only reader could do without") == 0) {
         return copy_edits(p, h, ed);
+    }
+    if (strcmp(title, "compare-exchange loop foldable to amocas") == 0) {
+        return cas_edits(p, h, ed);
     }
     if (strcmp(title, "a bit count spelled out longhand") == 0) {
         return popcount_edits(p, h, ed);
@@ -4129,6 +4369,35 @@ static bool fp_control(const prog_t *p, int i, edits_t *ed)
     return false;
 }
 
+// emu: an unflagged li and the equality branch on it that follows,
+// made the branch on t6 that Zibi's expansion is, whatever reads the
+// constant's register afterwards.
+static bool emu_control(const prog_t *p, int i, edits_t *ed)
+{
+    const slot_t *s = &p->s[i], *b = &p->s[i + 1];
+    if (i + 1 >= p->epi || s->kind != S_PLAIN ||
+            (s->word & 0x000ff07fu) != OP_IMM || b->kind != S_BRANCH ||
+            b->f3 > 1) {
+        return false;
+    }
+    unsigned c = s->word >> 7 & 31u;
+    if (b->ra != c && b->rb != c) {
+        return false;
+    }
+    edit_t *e = add_edit(ed, i);
+    e->rep[0] = plain((s->word & ~(31u << 7)) | T6 << 7);
+    e->rep[1] = *b;
+    if (b->ra == c) {
+        e->rep[1].ra = T6;
+    } else {
+        e->rep[1].rb = T6;
+    }
+    e->rep[1].c = false;
+    e->n = 2;
+    add_edit(ed, i + 1);
+    return true;
+}
+
 #define TITLES_MAX 16
 
 struct mode {
@@ -4194,8 +4463,22 @@ static const mode_t_ modes[] = {
                 "move or zeroing spelled other than mv or li",
                 "instruction with no architectural effect" },
       plant_copy, copy_control },
+    { "emu", { "address computed for one indexed load",
+               "address scaled for one indexed load",
+               "address scaled from a zero-extended index",
+               "constant loaded for one equality branch",
+               "compare-exchange loop foldable to amocas" },
+      plant_emu, emu_control },
     { "self", { NULL }, plant_any, NULL },
 };
+
+// What the scan assumes beyond EXTENSIONS: for the emu mode, the
+// extensions the K3 cannot run, which its expansions stand in for.
+static unsigned mode_extensions(void)
+{
+    return strcmp(mode->name, "emu") == 0
+        ? RISCVLINT_EXT_ZILX | RISCVLINT_EXT_ZIBI | RISCVLINT_EXT_ZACAS : 0;
+}
 
 static int title_index(const char *title)
 {
@@ -4304,7 +4587,7 @@ int main(int argc, char **argv)
 
     long tested = 0, mismatches = 0, unapplied = 0, entries = 0;
     long controls = 0, control_diffs = 0;
-    long per_title[TITLES_MAX] = { 0 };
+    long per_title[TITLES_MAX] = { 0 }, per_title_bad[TITLES_MAX] = { 0 };
     for (long it = 0; it < programs; it++) {
         alarm(10);
         build(mode->plant);
@@ -4356,6 +4639,7 @@ int main(int argc, char **argv)
             int t = reserved ? -1 : differs(&alt);
             if (reserved || t >= 0) {
                 mismatches++;
+                per_title_bad[h->title]++;
                 if (mismatches <= 5) {
                     char heading[256];
                     snprintf(heading, sizeof heading, "MISMATCH: %s: %s%s",
@@ -4400,7 +4684,11 @@ int main(int argc, char **argv)
            "(%ld side entries), %ld not applied\n", mode->name, programs,
            tested, mismatches, entries, unapplied);
     for (int i = 0; i < TITLES_MAX && mode->titles[i] != NULL; i++) {
-        printf("  %8ld  %s\n", per_title[i], mode->titles[i]);
+        printf("  %8ld  %s", per_title[i], mode->titles[i]);
+        if (per_title_bad[i] != 0) {
+            printf(" (%ld mismatched)", per_title_bad[i]);
+        }
+        printf("\n");
     }
     printf("  control: %ld refused rewrites applied anyway, %ld changed the "
            "result\n", controls, control_diffs);
