@@ -5086,6 +5086,20 @@ static void test_cas_loop_to_amocas(csh handle)
         0x82, 0x80,                  // c.ret
     };
     CHECK(!run_cas(handle, twobody, sizeof twobody, Z, NULL));
+    // The loaded value compared with itself never differs, so the loop
+    // always stores: an exchange, which amocas, comparing with what a3
+    // held before the loop, is not.
+    static const uint8_t selfcmp[] = {
+        0xaf, 0x36, 0x05, 0x10,      // lr.d a3,(a0)
+        0x63, 0x97, 0xd6, 0x00,      // bne a3,a3,F
+        0xaf, 0x37, 0xe5, 0x1a,      // sc.d.rl a5,a4,(a0)
+        0xf5, 0xfb,                  // c.bnez a5,L
+        0x81, 0x47,                  // c.li a5,0
+        0x82, 0x80,                  // c.ret
+        0x85, 0x47,                  // c.li a5,1
+        0x82, 0x80,                  // c.ret
+    };
+    CHECK(!run_cas(handle, selfcmp, sizeof selfcmp, Z, NULL));
     // Positive presence, as the Zilx and Zibi checks want: Zacas is
     // ratified but in no profile, so declaring nothing is not enough.
     CHECK(!run_cas(handle, cas, sizeof cas, 0, NULL));

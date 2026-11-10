@@ -5473,6 +5473,10 @@ bool check_cas_loop_to_amocas(riscvlint_state *state, const cs_insn *insn,
     if (b1 == rt) rexp = b2;
     else if (b2 == rt) rexp = b1;
     else return false;
+    // The loaded value compared with itself never differs, so the loop
+    // always stores: an exchange, not a compare-exchange. amocas would
+    // compare with what rt held before the loop instead.
+    if (rexp == rt) return false;
 
     uint64_t third = second + len2;
     uint32_t w3;
