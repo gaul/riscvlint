@@ -68,7 +68,9 @@
 //          the register still holds, the dead store to a frame slot and
 //          the store of a value the slot already holds: delete the
 //          access, or make the load the move or extension rendered;
-//          and the base add folded into the access's offset.
+//          the base add folded into the access's offset; and a run of
+//          zero stores as the aligned stores rwfuzz works out cover the
+//          bytes rendered.
 //   const  the constants built for their uses: a constant loaded for
 //          operations with an immediate form, zero loaded for stores, a
 //          mask loaded for ands, a constant whose complement builds
@@ -1257,8 +1259,50 @@ static void nudge(unsigned base, unsigned width, int32_t *off)
     }
 }
 
+// A run of stores of zero through sp or s0 to bytes that abut, each
+// aligned to its own width, growing up or down -- now and then with a
+// gap, an overlap or a store of something else, which the run must end
+// at.
+static void plant_zero_run(void)
+{
+    unsigned base = coin(2) ? SP : S0;
+    int32_t lo = base == SP ? 0 : -FRAME, hi = lo + FRAME;
+    bool up = !coin(4);
+    int32_t pos = lo + (int32_t)rr(FRAME + 1);
+    for (unsigned k = 2 + rr(6); k > 0; k--) {
+        // The widths an aligned store there can take, widest first.
+        unsigned widths[4], nw = 0;
+        for (unsigned w = 8; w >= 1; w /= 2) {
+            int32_t at = up ? pos : pos - (int32_t)w;
+            if (at >= lo && at + (int32_t)w <= hi && at % (int32_t)w == 0) {
+                widths[nw++] = w;
+            }
+        }
+        if (nw == 0) {
+            return;
+        }
+        unsigned w = widths[rr(nw)];
+        int32_t at = up ? pos : pos - (int32_t)w;
+        unsigned data = coin(10) ? breg() : X0;
+        push(enc_s(w == 8 ? 3 : w == 4 ? 2 : w == 2 ? 1 : 0, base, data, at));
+        pos = up ? at + (int32_t)w : at;
+        if (coin(12)) {
+            pos += up ? 1 : -1;                 // a gap
+        } else if (coin(12)) {
+            pos -= up ? 1 : -1;                 // an overlap
+        }
+    }
+    if (coin(2)) {
+        push(load_into(breg()));
+    }
+}
+
 static void plant_mem(void)
 {
+    if (coin(5)) {
+        plant_zero_run();
+        return;
+    }
     unsigned r = breg(), r2 = coin(3) ? r : breg();
     unsigned f3 = rr(4), w = width_of(f3);
     // A load of the width the store wrote, signed or not, mostly.
@@ -2813,6 +2857,46 @@ static bool run_edits(const prog_t *p, const hit_t *h, bool pushes,
     return true;
 }
 
+// check_zero_store_run's `N instead of M stores for B bytes at
+// OFF(BASE)`: the run's stores replaced by the cover of those bytes with
+// naturally aligned stores of zero, the widest that fits at each step,
+// which rwfuzz works out itself and holds to N.
+static bool zero_run_edits(const hit_t *h, edits_t *ed)
+{
+    int n, m;
+    int64_t bytes, off;
+    char base[8];
+    unsigned b;
+    if (sscanf(h->text, "%d instead of %d stores for %" SCNd64 " bytes at %"
+               SCNd64 "(%7[a-z0-9])", &n, &m, &bytes, &off, base) != 5 ||
+            !parse_reg(base, &b) || m != (int)h->count) {
+        return false;
+    }
+    seq_t q = { .n = 0 };
+    for (int64_t pos = off; pos < off + bytes; ) {
+        int64_t w = 8;
+        while (w > 1 && (pos % w != 0 || pos + w > off + bytes)) {
+            w /= 2;
+        }
+        unsigned f3 = w == 8 ? 3 : w == 4 ? 2 : w == 2 ? 1 : 0;
+        if (!seq_word(&q, enc_s(f3, b, X0, (int32_t)pos))) {
+            return false;
+        }
+        pos += w;
+    }
+    if (q.n != n) {
+        return false;
+    }
+    ed->n = 0;
+    edit_t *e = add_edit(ed, h->slot);
+    memcpy(e->rep, q.s, sizeof(slot_t) * (size_t)q.n);
+    e->n = q.n;
+    for (unsigned k = 1; k < h->count; k++) {
+        add_edit(ed, h->slot + (int)k);
+    }
+    return true;
+}
+
 // The advice a finding gives, as edits to the program.
 static bool advice(const prog_t *p, const hit_t *h, const char *title,
                    edits_t *ed)
@@ -2833,6 +2917,9 @@ static bool advice(const prog_t *p, const hit_t *h, const char *title,
     }
     if (strcmp(title, "copy its only reader could do without") == 0) {
         return copy_edits(p, h, ed);
+    }
+    if (strcmp(title, "run of zero stores one wider store would do") == 0) {
+        return zero_run_edits(h, ed);
     }
     if (strcmp(title, "pushes one stack adjustment would do") == 0) {
         return run_edits(p, h, true, ed);
@@ -3206,11 +3293,42 @@ static bool same_place(uint32_t a, uint32_t b)
            (a >> 15 & 31u) == (b >> 15 & 31u);
 }
 
+// A store of zero through sp or s0: its width and offset.
+static bool zero_store(const slot_t *s, unsigned *base, int64_t *off,
+                       int64_t *width)
+{
+    if (s->kind != S_PLAIN || (s->word & 0x7fu) != OP_STORE ||
+            (s->word >> 20 & 31u) != X0) {
+        return false;
+    }
+    *base = s->word >> 15 & 31u;
+    *off = store_off(s->word);
+    *width = 1 << (s->word >> 12 & 3u);
+    return *base == SP || *base == S0;
+}
+
 static bool mem_control(const prog_t *p, int i, edits_t *ed)
 {
     const slot_t *s = &p->s[i];
     if (s->kind != S_PLAIN || coin(2)) {
         return false;
+    }
+    // Two adjacent stores of zero to abutting bytes, as one store where
+    // their union is one aligned width.
+    unsigned b0, b1;
+    int64_t o0, o1, w0, w1;
+    if (i + 1 < p->epi && zero_store(s, &b0, &o0, &w0) &&
+            zero_store(&p->s[i + 1], &b1, &o1, &w1) && b0 == b1 &&
+            w0 == w1 && w0 < 8 && (o1 == o0 + w0 || o0 == o1 + w1)) {
+        int64_t lo = o0 < o1 ? o0 : o1;
+        if (lo % (2 * w0) == 0) {
+            unsigned f3 = w0 == 4 ? 3 : w0 == 2 ? 2 : 1;
+            edit_t *e = add_edit(ed, i);
+            e->rep[0] = plain(enc_s(f3, b0, X0, (int32_t)lo));
+            e->n = 1;
+            add_edit(ed, i + 1);
+            return true;
+        }
     }
     unsigned op = s->word & 0x7fu;
     if (op == OP_LOAD) {
@@ -3401,7 +3519,8 @@ static const mode_t_ modes[] = {
                "load of a value the register still holds",
                "dead store to a frame slot",
                "store of a value the slot already holds",
-               "base add foldable into memory offset" },
+               "base add foldable into memory offset",
+               "run of zero stores one wider store would do" },
       plant_mem, mem_control },
     { "const", { "constant loaded for an immediate operand",
                  "zero loaded for a store",
