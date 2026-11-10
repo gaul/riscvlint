@@ -8,8 +8,9 @@
 // scan find the opportunities of one mode's kinds in each, applies every
 // finding's rewrite to a copy of the program, and runs original and
 // rewrite natively from the same random registers and memory. Any
-// difference in a0..a7, the frame or the scratch buffer at the end is a
-// soundness bug in the check -- or in the harness.
+// difference in a0..a7, fa0..fa7, fcsr, the frame, the stack or the
+// scratch buffer at the end is a soundness bug in the check -- or in
+// the harness.
 //
 // It is armlint's tools/rwfuzz with what RISC-V changes. Instructions
 // are two or four bytes and riscvlint's rewrites change sizes as often
@@ -22,10 +23,12 @@
 // gets.
 //
 // Each program is a fixed prologue that reserves a 64-byte frame and
-// fills it, loads a0..a7, and points s0 at the frame's top and s1 at a
+// fills it, loads a0..a7 and fa0..fa7, and points s0 at the frame's top
+// and s1 at a
 // scratch buffer, all from a state block; a random body; and an epilogue
 // that records where the body left sp, restores it from s0, and stores
-// a0..a7 and the frame back. After it sit a stub the body
+// a0..a7, fa0..fa7, fcsr and the frame back. After it sit a stub the
+// body
 // can call, which reads its arguments, the frame and the buffer and
 // writes a0..a7 and a word of the frame and of the buffer, as a callee
 // handed their addresses may, and a `j` to the stub. The body writes
@@ -85,6 +88,14 @@
 //          had yet to reserve or had already released -- a release
 //          followed by a reservation, and the restore of an sp that
 //          never moved from the frame pointer.
+//   fp     the floating-point rewrites: a bit-cast through a frame slot
+//          made the move between the register files; an fli constant
+//          built in an integer register, or loaded from the constant
+//          pool after the stub, made the fli rendered; and an fmv.d onto
+//          itself deleted. rwfuzz maps fli's operand to its entry by the
+//          value in the ISA manual's table, not riscvlint's. The pool is
+//          reached by auipc + fld through t5 and served to riscvlint
+//          through its image, outside the scanned section.
 //   shift  the pair folds: slli + srli to zext.w, zext.h or andi, slli +
 //          srai to sext.b or sext.h, slli + add and li + mul to shNadd,
 //          not + and/or/xor to andn/orn/xnor, li + divu/remu to a shift
@@ -211,9 +222,10 @@ static bool creg(unsigned r)
 // === Encoders ===
 
 enum {
-    OP_LOAD = 0x03, OP_IMM = 0x13, OP_AUIPC = 0x17, OP_IMM32 = 0x1b,
-    OP_STORE = 0x23, OP_OP = 0x33, OP_LUI = 0x37, OP_OP32 = 0x3b,
-    OP_BRANCH = 0x63, OP_JALR = 0x67, OP_JAL = 0x6f,
+    OP_LOAD = 0x03, OP_LOADFP = 0x07, OP_IMM = 0x13, OP_AUIPC = 0x17,
+    OP_IMM32 = 0x1b, OP_STORE = 0x23, OP_STOREFP = 0x27, OP_OP = 0x33,
+    OP_LUI = 0x37, OP_OP32 = 0x3b, OP_BRANCH = 0x63, OP_JALR = 0x67,
+    OP_JAL = 0x6f, OP_FP = 0x53,
 };
 
 static int64_t sext(uint64_t v, unsigned bits)
@@ -290,6 +302,15 @@ static uint32_t li(unsigned d, int32_t v) { return addi(d, X0, v); }
 static uint32_t ld(unsigned d, unsigned b, int32_t off) { return enc_i(OP_LOAD, 3, d, b, off); }
 static uint32_t sd(unsigned s, unsigned b, int32_t off) { return enc_s(3, b, s, off); }
 static uint32_t jalr(unsigned d, unsigned s, int32_t off) { return enc_i(OP_JALR, 0, d, s, off); }
+
+// Floating point: f registers by number, fa0..fa7 being 10..17. `dbl`
+// picks the D form over the F one.
+static uint32_t fload(bool dbl, unsigned fd, unsigned b, int32_t off) { return enc_i(OP_LOADFP, dbl ? 3 : 2, fd, b, off); }
+static uint32_t fstore(bool dbl, unsigned fs, unsigned b, int32_t off) { return (enc_s(dbl ? 3 : 2, b, fs, off) & ~0x7fu) | OP_STOREFP; }
+static uint32_t fp_r(unsigned f7, unsigned f3, unsigned d, unsigned a, unsigned b) { return enc_r(OP_FP, f3, f7, d, a, b); }
+static uint32_t fmv_to_x(bool dbl, unsigned d, unsigned fs) { return fp_r(dbl ? 0x71 : 0x70, 0, d, fs, 0); }
+static uint32_t fmv_from_x(bool dbl, unsigned fd, unsigned s) { return fp_r(dbl ? 0x79 : 0x78, 0, fd, s, 0); }
+static uint32_t fli(bool dbl, unsigned fd, unsigned entry) { return fp_r(dbl ? 0x79 : 0x78, 0, fd, entry, 1); }
 
 // The register-register operations: the assembler's table, and the
 // generator draws from the first N_GEN_ROPS. Zicond is the K3's, but
@@ -668,6 +689,41 @@ static uint16_t compress(uint32_t w)
         }
         return 0;
     }
+    case OP_LOADFP: {
+        // c.fld and c.fldsp: the D loads only, rd an f register.
+        uint32_t off = (uint32_t)imm;
+        if (f3 != 3 || imm < 0 || off % 8 != 0) {
+            return 0;
+        }
+        if (rs1 == SP && off < 512) {
+            return (uint16_t)(0x2002u | (off >> 5 & 1u) << 12 | rd << 7 |
+                              (off >> 3 & 3u) << 5 | (off >> 6 & 7u) << 2);
+        }
+        if (creg(rd) && creg(rs1) && off < 256) {
+            return (uint16_t)(0x2000u | (off >> 3 & 7u) << 10 |
+                              (rs1 - 8u) << 7 | (off >> 6 & 3u) << 5 |
+                              (rd - 8u) << 2);
+        }
+        return 0;
+    }
+    case OP_STOREFP: {
+        // c.fsd and c.fsdsp.
+        int64_t simm = sext((w >> 25) << 5 | (w >> 7 & 31u), 12);
+        uint32_t off = (uint32_t)simm;
+        if (f3 != 3 || simm < 0 || off % 8 != 0) {
+            return 0;
+        }
+        if (rs1 == SP && off < 512) {
+            return (uint16_t)(0xa002u | (off >> 3 & 7u) << 10 |
+                              (off >> 6 & 7u) << 7 | rs2 << 2);
+        }
+        if (creg(rs2) && creg(rs1) && off < 256) {
+            return (uint16_t)(0xa000u | (off >> 3 & 7u) << 10 |
+                              (rs1 - 8u) << 7 | (off >> 6 & 3u) << 5 |
+                              (rs2 - 8u) << 2);
+        }
+        return 0;
+    }
     case OP_STORE: {
         int64_t simm = sext((w >> 25) << 5 | (w >> 7 & 31u), 12);
         uint32_t off = (uint32_t)simm;
@@ -738,7 +794,7 @@ static uint16_t c_jump(int32_t off)
 // rewrite can replace slots of any size and the program still holds
 // together.
 
-enum { S_PLAIN, S_BRANCH, S_JUMP, S_CALL, S_AUIPC, S_JALR };
+enum { S_PLAIN, S_BRANCH, S_JUMP, S_CALL, S_AUIPC, S_JALR, S_PAIRLO, S_DATA };
 
 typedef struct {
     uint8_t kind;
@@ -749,8 +805,12 @@ typedef struct {
     int8_t aim;         // while generating: the target this many slots
                         // on, or 0 to draw one
     uint16_t half;      // S_PLAIN: the two-byte form, when c
-    uint32_t word;      // S_PLAIN: the four-byte form
-    int target;         // a transfer's slot; S_AUIPC: its pair's
+    uint32_t word;      // S_PLAIN: the four-byte form; S_PAIRLO: the
+                        // load, its offset filled in at layout; S_DATA:
+                        // the low word
+    uint32_t hi;        // S_DATA: the high word
+    int target;         // a transfer's slot; S_AUIPC: its pair's;
+                        // S_PAIRLO: the data it loads
 } slot_t;
 
 #define SLOTS_MAX 400
@@ -759,8 +819,9 @@ typedef struct {
 #define VADDR 0x10000u
 
 // The state block: what the prologue loads and the epilogue stores;
-// where the body left sp, from the frame's top; and what the
-// callee-saved registers and sp held when the program returned.
+// where the body left sp, from the frame's top; what the callee-saved
+// registers and sp held when the program returned; fa0..fa7; and fcsr,
+// which the prologue clears.
 typedef struct {
     uint64_t a[8];
     uint64_t frame[FRAME / 8];
@@ -768,6 +829,8 @@ typedef struct {
     uint64_t s[12];
     int64_t sp_end;
     int64_t sp_ret;
+    uint64_t f[8];
+    uint64_t fcsr;
 } state_t;
 
 #define STATE_FRAME 64
@@ -775,18 +838,27 @@ typedef struct {
 #define STATE_S 136
 #define STATE_SP_END 232
 #define STATE_SP_RET 240
+#define STATE_F 248
+#define STATE_FCSR 312
 
 typedef struct {
     slot_t s[SLOTS_MAX];
     int n;
     int body, epi, tramp, stub;     // where each part starts
+    int pool;                       // the first pool entry, or n
     uint32_t addr[SLOTS_MAX + 1];   // each slot's offset, and the end
-    uint8_t code[SLOTS_MAX * 4];
+    uint8_t code[SLOTS_MAX * 4 + 64];
 } prog_t;
 
 static bool is_transfer(const slot_t *s)
 {
-    return s->kind != S_PLAIN;
+    return s->kind != S_PLAIN && s->kind != S_PAIRLO && s->kind != S_DATA;
+}
+
+// A slot that names another, which a rewrite has to renumber.
+static bool has_target(const slot_t *s)
+{
+    return s->kind != S_PLAIN && s->kind != S_DATA;
 }
 
 static unsigned slot_size(const slot_t *s, bool wide)
@@ -799,6 +871,8 @@ static unsigned slot_size(const slot_t *s, bool wide)
             ? 2 : 4;
     case S_JUMP:
         return s->c && !wide ? 2 : 4;
+    case S_DATA:
+        return 8;
     default:
         return 4;
     }
@@ -825,6 +899,9 @@ static void layout(prog_t *p)
     for (;;) {
         uint32_t a = 0;
         for (int i = 0; i < p->n; i++) {
+            if (p->s[i].kind == S_DATA) {
+                a = (a + 7u) & ~7u;     // fld wants its eight aligned
+            }
             p->addr[i] = a;
             a += slot_size(&p->s[i], wide[i]);
         }
@@ -847,11 +924,12 @@ static void layout(prog_t *p)
             break;
         }
     }
+    memset(p->code, 0, p->addr[p->n]);
     for (int i = 0; i < p->n; i++) {
         const slot_t *s = &p->s[i];
         uint8_t *at = p->code + p->addr[i];
         bool two = slot_size(s, wide[i]) == 2;
-        int32_t off = is_transfer(s)
+        int32_t off = has_target(s)
             ? (int32_t)((int64_t)p->addr[s->target] - (int64_t)p->addr[i])
             : 0;
         switch (s->kind) {
@@ -883,6 +961,17 @@ static void layout(prog_t *p)
             put32(at, enc_u(OP_AUIPC, s->ra,
                             (uint32_t)((int64_t)(off + 0x800) >> 12)));
             break;
+        case S_DATA:
+            put32(at, s->word);
+            put32(at + 4, s->hi);
+            break;
+        case S_PAIRLO: {
+            int64_t from = i > 0 ? (int64_t)p->addr[i - 1] : 0;
+            int64_t pair = (int64_t)p->addr[s->target] - from;
+            put32(at, (s->word & 0x000fffffu) |
+                      ((uint32_t)sext((uint64_t)pair, 12) & 0xfffu) << 20);
+            break;
+        }
         default: {
             // The jalr's half of the displacement is measured from the
             // auipc before it.
@@ -917,6 +1006,13 @@ static int slot_at(const prog_t *p, uint64_t a)
 
 static prog_t gen;
 static int sp_up, sp_down;      // what the body releases and reserves
+
+// The body's loads from the constant pool, which build() lays out after
+// the stub: the S_PAIRLO slot of each and the eight bytes it reads.
+#define POOL_MAX 8
+static int pool_at[POOL_MAX];
+static uint64_t pool_val[POOL_MAX];
+static int npool;
 
 static slot_t *push_slot(uint8_t kind)
 {
@@ -1914,12 +2010,155 @@ static void plant_stack(void)
     }
 }
 
+// fp: a value moved between the register files through a frame slot,
+// an fli constant built in an integer register or loaded from the pool,
+// a floating-point move onto itself, and arithmetic around them, in the
+// D and F forms. The pool's auipc writes t5, which the body reads only
+// through snez, as for the far jump.
+static unsigned freg(void)
+{
+    return A0 + rr(8);                          // fa0..fa7
+}
+
+static uint32_t fp_filler(void)
+{
+    unsigned d = freg(), a = freg(), b = freg(), dbl = coin(4) ? 0 : 1;
+    unsigned base;
+    int32_t off;
+    switch (rr(11)) {
+    case 0: return fp_r(0x00 | dbl, 7, d, a, b);            // fadd
+    case 1: return fp_r(0x04 | dbl, 7, d, a, b);            // fsub
+    case 2: return fp_r(0x08 | dbl, 7, d, a, b);            // fmul
+    case 3: return fp_r(0x10 | dbl, rr(3), d, a, b);        // fsgnj*
+    case 4: return fp_r(0x14 | dbl, rr(2), d, a, b);        // fmin, fmax
+    case 5: return fp_r(0x50 | dbl, rr(3), breg(), a, b);   // fle, flt, feq
+    case 6: return fmv_to_x(dbl, breg(), a);
+    case 7: return fmv_from_x(dbl, d, sreg());
+    case 8:
+        mem_where(dbl ? 8 : 4, &base, &off);
+        return fload(dbl, d, base, off);
+    case 9:
+        mem_where(dbl ? 8 : 4, &base, &off);
+        return fstore(dbl, a, base, off);
+    default:
+        return coin(2) ? fp_r(0x61, 1, breg(), a, 2)        // fcvt.l.d, rtz
+                       : fp_r(0x69, 7, d, sreg(), 2);       // fcvt.d.l
+    }
+}
+
+// The bits of fli entry e, as a double or as a float.
+static uint64_t fli_bits(bool dbl, unsigned e)
+{
+    static const double values[30] = {
+        -1.0, 0, 0x1p-16, 0x1p-15, 0x1p-8, 0x1p-7, 0.0625, 0.125, 0.25,
+        0.3125, 0.375, 0.4375, 0.5, 0.625, 0.75, 0.875, 1.0, 1.25, 1.5,
+        1.75, 2.0, 2.5, 3.0, 4.0, 8.0, 16.0, 128.0, 256.0, 32768.0,
+        65536.0,
+    };
+    switch (e) {
+    case 1: return dbl ? 0x0010000000000000ull : 0x00800000u;
+    case 30: return dbl ? 0x7ff0000000000000ull : 0x7f800000u;
+    case 31: return dbl ? 0x7ff8000000000000ull : 0x7fc00000u;
+    default:
+        break;
+    }
+    if (dbl) {
+        uint64_t bits;
+        memcpy(&bits, &values[e], 8);
+        return bits;
+    }
+    float f = (float)values[e];
+    uint32_t bits;
+    memcpy(&bits, &f, 4);
+    return bits;
+}
+
+// A constant for a floating-point register: mostly one fli holds, now
+// and then one a bit away from it, or anything.
+static uint64_t fp_const(bool dbl)
+{
+    uint64_t v = fli_bits(dbl, rr(32));
+    if (coin(6)) {
+        v ^= 1ull << rr(dbl ? 63 : 31);
+    } else if (coin(10)) {
+        v = rnd();
+    }
+    return dbl ? v : (v & 0xffffffffu) | (coin(2) ? 0 : rnd() << 32);
+}
+
+static void plant_fp(void)
+{
+    bool dbl = !coin(4);
+    unsigned f = freg(), r = breg(), w = dbl ? 8 : 4;
+    switch (rr(6)) {
+    case 0:
+    case 1: {
+        // A bit-cast through a frame slot, either way round, read back
+        // through the same base or the other, now and then at the wrong
+        // width or signedness.
+        unsigned base = coin(2) ? SP : S0;
+        int32_t off = base == SP ? (int32_t)(w * rr(FRAME / w))
+                                 : -(int32_t)(w * (1 + rr(FRAME / w)));
+        unsigned b2 = base;
+        int32_t o2 = off;
+        if (coin(4)) {
+            alias(&b2, &o2);
+        }
+        if (coin(2)) {
+            push(fstore(dbl, f, base, off));
+            gap(2);
+            unsigned lf3 = dbl ? (coin(6) ? 2 : 3) : (coin(6) ? 6 : 2);
+            push(enc_i(OP_LOAD, lf3, r, b2, o2));
+        } else {
+            push(enc_s(dbl ? 3 : 2, base, r, off));
+            gap(2);
+            push(fload(dbl, f, b2, o2));
+        }
+        break;
+    }
+    case 2:
+        // An fli constant built in an integer register and moved across;
+        // the register read afterwards now and then.
+        push_chain(r, dbl ? (int64_t)fp_const(true)
+                          : sext(fp_const(false), 32));
+        push(fmv_from_x(dbl, f, r));
+        if (coin(3)) {
+            push(add(breg(), r, sreg()));
+        }
+        break;
+    case 3: {
+        // A load from the pool, its address in t5.
+        if (npool == POOL_MAX) {
+            return;
+        }
+        slot_t *s = push_slot(S_AUIPC);
+        s->ra = T5;
+        s = push_slot(S_PAIRLO);
+        s->word = fload(dbl, f, T5, 0);
+        pool_at[npool] = gen.n - 1;
+        pool_val[npool++] = fp_const(dbl);
+        if (coin(3)) {
+            push(enc_r(OP_OP, 3, 0, breg(), X0, T5));       // snez
+        }
+        break;
+    }
+    case 4:
+        push(fp_r(0x10 | (dbl ? 1 : 0), 0, f, f, f));       // fmv onto itself
+        break;
+    default:
+        for (unsigned k = 1 + rr(3); k > 0; k--) {
+            push(fp_filler());
+        }
+        break;
+    }
+}
+
 // self: any of the shapes.
 static void plant_any(void)
 {
     static void (*const planters[])(void) = {
         plant_ext, plant_dead, plant_remat, plant_mem, plant_shift,
-        plant_branch, plant_copy, plant_const, plant_stack,
+        plant_branch, plant_copy, plant_const, plant_stack, plant_fp,
     };
     planters[rr(sizeof planters / sizeof planters[0])]();
 }
@@ -1946,13 +2185,14 @@ static void gen_body(void (*plant)(void))
 }
 
 // A forward target for the transfer at i: `aim` slots on when it asks,
-// otherwise anywhere up to the epilogue -- never a pair's jalr, which
-// would run without the auipc that sets its register.
+// otherwise anywhere up to the epilogue -- never the second half of a
+// pair, which would run without the auipc that sets its register.
 static int forward(int i, int aim)
 {
     int t = aim > 0 && i + aim <= gen.epi
         ? i + aim : i + 1 + (int)rr((unsigned)(gen.epi - i));
-    while (t < gen.epi && gen.s[t].kind == S_JALR) {
+    while (t < gen.epi &&
+           (gen.s[t].kind == S_JALR || gen.s[t].kind == S_PAIRLO)) {
         t++;
     }
     return t;
@@ -1962,6 +2202,7 @@ static void build(void (*plant)(void))
 {
     gen.n = 0;
     sp_up = sp_down = 0;
+    npool = 0;
     // s2 keeps the state block and s3 the return address, so nothing the
     // body does to sp or the memory around it can lose either. The
     // thunk saves and restores s0..s11 itself.
@@ -1976,7 +2217,9 @@ static void build(void (*plant)(void))
     }
     for (unsigned i = 0; i < 8; i++) {
         put(ld(A0 + i, S2, 8 * (int32_t)i), false);
+        put(fload(true, A0 + i, S2, STATE_F + 8 * (int32_t)i), false);
     }
+    put(0x00301073u, false);                    // fscsr zero
     put(li(T1, 0), false);
     put(li(T5, 0), false);
     put(mv(T3, S1), false);
@@ -2000,7 +2243,10 @@ static void build(void (*plant)(void))
     put(addi(SP, S0, -FRAME), false);
     for (unsigned i = 0; i < 8; i++) {
         put(sd(A0 + i, S2, 8 * (int32_t)i), false);
+        put(fstore(true, A0 + i, S2, STATE_F + 8 * (int32_t)i), false);
     }
+    put(0x003022f3u, false);                    // frcsr t0
+    put(sd(T0, S2, STATE_FCSR), false);
     for (int i = 0; i < FRAME / 8; i++) {
         put(ld(T0, SP, 8 * i), false);
         put(sd(T0, S2, STATE_FRAME + 8 * i), false);
@@ -2025,11 +2271,23 @@ static void build(void (*plant)(void))
         put(add(A0 + i, A0 + i, T0), false);
         put(xori(A0 + i, A0 + i, 0x5a5 + 0x11 * (int32_t)i), false);
     }
+    for (unsigned i = 0; i < 8; i++) {
+        put(fmv_from_x(true, A0 + i, A0 + i), false);
+    }
     put(addi(T3, S1, 64), false);
     put(mv(T4, SP), false);
     put(sd(A0, S1, 0), false);
     put(sd(A0 + 1, SP, 8), false);
     put(jalr(X0, RA, 0), false);
+
+    // The constant pool, read by auipc + fld pairs in the body.
+    gen.pool = gen.n;
+    for (int k = 0; k < npool; k++) {
+        slot_t *s = push_slot(S_DATA);
+        s->word = (uint32_t)pool_val[k];
+        s->hi = (uint32_t)(pool_val[k] >> 32);
+        gen.s[pool_at[k]].target = gen.n - 1;
+    }
 
     for (int i = gen.body; i < gen.epi; i++) {
         slot_t *s = &gen.s[i];
@@ -2110,6 +2368,19 @@ static void record(void *ctx, const riscvlint_finding *f)
 
 static long undecoded;
 
+// The image riscvlint resolves a pool load against: the pool, which is
+// not in the scanned section and which nothing in the program writes.
+static bool read_pool(void *ctx, uint64_t vaddr, void *out, size_t n)
+{
+    const prog_t *p = ctx;
+    uint64_t lo = VADDR + p->addr[p->pool], hi = VADDR + p->addr[p->n];
+    if (vaddr < lo || vaddr > hi || n > hi - vaddr) {
+        return false;
+    }
+    memcpy(out, p->code + (vaddr - VADDR), n);
+    return true;
+}
+
 // Runs the scan over the program the way the driver does and keeps the
 // mode's findings.
 static void analyze(const prog_t *p)
@@ -2117,10 +2388,12 @@ static void analyze(const prog_t *p)
     nhits = 0;
     riscvlint_state *st = riscvlint_state_create();
     riscvlint_state_set_extensions(st, EXTENSIONS);
+    riscvlint_state_set_image(st, read_pool, (void *)p);
     uint64_t skipped = 0;
-    if (riscvlint_state_set_section(st, cs, p->code, p->addr[p->n], VADDR)) {
-        riscvlint_scan(st, cs, p->code, p->addr[p->n], VADDR, record,
-                       (void *)p, NULL, &skipped);
+    size_t len = p->addr[p->pool];
+    if (riscvlint_state_set_section(st, cs, p->code, len, VADDR)) {
+        riscvlint_scan(st, cs, p->code, len, VADDR, record, (void *)p, NULL,
+                       &skipped);
     }
     riscvlint_state_destroy(st);
     if (skipped == 0) {
@@ -2210,10 +2483,11 @@ static void apply(const prog_t *p, const edits_t *ed, prog_t *out)
     }
     map[p->n] = out->n;
     for (int i = 0; i < out->n; i++) {
-        if (is_transfer(&out->s[i])) {
+        if (has_target(&out->s[i])) {
             out->s[i].target = map[out->s[i].target];
         }
     }
+    out->pool = map[p->pool];
     out->body = map[p->body];
     out->epi = map[p->epi];
     out->tramp = map[p->tramp];
@@ -2260,6 +2534,58 @@ static bool parse_reg(const char *t, unsigned *r)
         return true;
     }
     return false;
+}
+
+static const char *const fnames[32] = {
+    "ft0", "ft1", "ft2",  "ft3",  "ft4", "ft5", "ft6",  "ft7",
+    "fs0", "fs1", "fa0",  "fa1",  "fa2", "fa3", "fa4",  "fa5",
+    "fa6", "fa7", "fs2",  "fs3",  "fs4", "fs5", "fs6",  "fs7",
+    "fs8", "fs9", "fs10", "fs11", "ft8", "ft9", "ft10", "ft11",
+};
+
+static bool parse_freg(const char *t, unsigned *r)
+{
+    for (unsigned i = 0; i < 32; i++) {
+        if (strcmp(t, fnames[i]) == 0) {
+            *r = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Zfa's fli entries, by value: the table in the ISA manual, not
+// riscvlint's, so that the entry the rendering names is held to the
+// value the hardware loads. Entry 1, the smallest normal, and 30 and 31,
+// infinity and the canonical NaN, are spelled by name.
+static int fli_entry(const char *t)
+{
+    static const double values[32] = {
+        -1.0, 0, 0x1p-16, 0x1p-15, 0x1p-8, 0x1p-7, 0.0625, 0.125, 0.25,
+        0.3125, 0.375, 0.4375, 0.5, 0.625, 0.75, 0.875, 1.0, 1.25, 1.5,
+        1.75, 2.0, 2.5, 3.0, 4.0, 8.0, 16.0, 128.0, 256.0, 32768.0,
+        65536.0, 0, 0,
+    };
+    if (strcmp(t, "min") == 0) {
+        return 1;
+    }
+    if (strcmp(t, "inf") == 0) {
+        return 30;
+    }
+    if (strcmp(t, "nan") == 0) {
+        return 31;
+    }
+    char *end;
+    double v = strtod(t, &end);
+    if (*end != '\0' || end == t) {
+        return -1;
+    }
+    for (int i = 0; i < 30; i++) {
+        if (i != 1 && values[i] == v) {
+            return i;
+        }
+    }
+    return -1;
 }
 
 static bool parse_int(const char *t, int64_t *v)
@@ -2438,6 +2764,21 @@ static bool assemble(const prog_t *p, const char *text, seq_t *q)
         if (strcmp(mn, "sgtz") == 0) {
             return seq_word(q, enc_r(OP_OP, 2, 0, rd, X0, ra));
         }
+    }
+    unsigned fd, fs;
+    if ((strcmp(mn, "fmv.x.d") == 0 || strcmp(mn, "fmv.x.w") == 0) &&
+            nops == 2 && r0 && parse_freg(ops[1], &fs)) {
+        return seq_word(q, fmv_to_x(mn[6] == 'd', rd, fs));
+    }
+    if ((strcmp(mn, "fmv.d.x") == 0 || strcmp(mn, "fmv.w.x") == 0) &&
+            nops == 2 && parse_freg(ops[0], &fd) && r1) {
+        return seq_word(q, fmv_from_x(mn[4] == 'd', fd, ra));
+    }
+    if ((strcmp(mn, "fli.d") == 0 || strcmp(mn, "fli.s") == 0) &&
+            nops == 2 && parse_freg(ops[0], &fd)) {
+        int entry = fli_entry(ops[1]);
+        return entry >= 0 &&
+               seq_word(q, fli(mn[4] == 'd', fd, (unsigned)entry));
     }
     if (strcmp(mn, "lui") == 0 && nops == 2 && r0 &&
             parse_int(ops[1], &imm) && imm >= 0 && imm <= 0xfffff) {
@@ -3189,7 +3530,7 @@ static void on_signal(int sig)
 
 static bool exec_open(void)
 {
-    void *m = mmap(NULL, CODE_AT + SLOTS_MAX * 4u,
+    void *m = mmap(NULL, CODE_AT + sizeof gen.code,
                    PROT_READ | PROT_WRITE | PROT_EXEC,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (m == MAP_FAILED) {
@@ -3294,6 +3635,19 @@ static uint64_t edge_value(void)
     }
 }
 
+// A double's bits: the values fli holds, zeros, NaNs and infinities,
+// the extremes, and anything at all.
+static uint64_t fp_value(void)
+{
+    static const uint64_t edges[] = {
+        0x3ff0000000000000ull, 0xbff0000000000000ull, 0x3fe0000000000000ull,
+        0x0000000000000000ull, 0x8000000000000000ull, 0x7ff0000000000000ull,
+        0x7ff8000000000000ull, 0x7ff0000000000001ull, 0x0010000000000000ull,
+        0x0000000000000001ull, 0x4000000000000000ull, 0xffffffff3f800000ull,
+    };
+    return coin(3) ? rnd() : edges[rr(sizeof edges / sizeof edges[0])];
+}
+
 #define TRIALS 6
 
 static state_t trial_in[TRIALS];
@@ -3311,6 +3665,9 @@ static void run_original(void)
         }
         for (int i = 0; i < FRAME / 8; i++) {
             trial_in[t].frame[i] = edge_value();
+        }
+        for (int i = 0; i < 8; i++) {
+            trial_in[t].f[i] = fp_value();
         }
         for (int i = 0; i < BUF_SIZE / 8; i++) {
             uint64_t v = edge_value();
@@ -3333,6 +3690,8 @@ static bool same(const result_t *a, const result_t *b)
            memcmp(a->st.s, b->st.s, sizeof a->st.s) == 0 &&
            memcmp(a->st.frame, b->st.frame, sizeof a->st.frame) == 0 &&
            a->st.sp_end == b->st.sp_end && a->st.sp_ret == b->st.sp_ret &&
+           memcmp(a->st.f, b->st.f, sizeof a->st.f) == 0 &&
+           a->st.fcsr == b->st.fcsr &&
            memcmp(a->mem, b->mem, BUF_SIZE) == 0 &&
            memcmp(a->stack, b->stack, STACK_SIZE) == 0;
 }
@@ -3409,6 +3768,18 @@ static void dump_mismatch(const prog_t *alt, const char *heading, int first,
     if (memcmp(base[trial].stack, alt_result.stack, STACK_SIZE) != 0) {
         printf("  the stacks differ\n");
     }
+    if (memcmp(base[trial].st.f, alt_result.st.f, sizeof alt_result.st.f) ||
+            base[trial].st.fcsr != alt_result.st.fcsr) {
+        printf("  the f registers or fcsr differ:\n");
+        const state_t *both[2] = { &base[trial].st, &alt_result.st };
+        for (int k = 0; k < 2; k++) {
+            printf("   ");
+            for (int i = 0; i < 8; i++) {
+                printf(" %" PRIx64, both[k]->f[i]);
+            }
+            printf(" fcsr %" PRIx64 "\n", both[k]->fcsr);
+        }
+    }
     if (base[trial].st.sp_end != alt_result.st.sp_end ||
             base[trial].st.sp_ret != alt_result.st.sp_ret) {
         printf("  sp differs: %" PRId64 "/%" PRId64 " against %" PRId64
@@ -3419,14 +3790,22 @@ static void dump_mismatch(const prog_t *alt, const char *heading, int first,
 
 // === Modes ===
 
-// The register a plain slot writes, or false for one that writes none.
+// The integer register a plain slot writes, or false for one that
+// writes none: a store, a branch, or a floating-point instruction whose
+// destination is an f register.
 static bool writes(const slot_t *s, unsigned *rd)
 {
     if (s->kind != S_PLAIN) {
         return false;
     }
-    unsigned op = s->word & 0x7fu;
-    if (op == OP_STORE || op == OP_BRANCH) {
+    unsigned op = s->word & 0x7fu, f7 = s->word >> 25;
+    if (op == OP_STORE || op == OP_BRANCH || op == OP_STOREFP ||
+            op == OP_LOADFP) {
+        return false;
+    }
+    // fmv.x, fclass, the comparisons and the conversions to an integer.
+    if (op == OP_FP && f7 != 0x70 && f7 != 0x71 && f7 != 0x50 &&
+            f7 != 0x51 && f7 != 0x60 && f7 != 0x61) {
         return false;
     }
     *rd = s->word >> 7 & 31u;
@@ -3719,6 +4098,37 @@ static bool stack_control(const prog_t *p, int i, edits_t *ed)
     return true;
 }
 
+// fp: an unflagged load of what an earlier store from the other
+// register file left in the same slot, made the move between the files,
+// whatever happened to the slot in between.
+static bool fp_control(const prog_t *p, int i, edits_t *ed)
+{
+    const slot_t *s = &p->s[i];
+    unsigned op = s->word & 0x7fu, f3 = s->word >> 12 & 7u;
+    if (s->kind != S_PLAIN || (op != OP_LOAD && op != OP_LOADFP) ||
+            (f3 != 2 && f3 != 3)) {
+        return false;
+    }
+    unsigned rd = s->word >> 7 & 31u, base = s->word >> 15 & 31u;
+    int64_t off = sext(s->word >> 20, 12);
+    for (int k = i - 1; k >= i - 6 && k >= p->body; k--) {
+        const slot_t *st = &p->s[k];
+        if (st->kind != S_PLAIN ||
+                (st->word & 0x7fu) != (op == OP_LOAD ? OP_STOREFP : OP_STORE) ||
+                (st->word >> 12 & 7u) != f3 || (st->word >> 15 & 31u) != base ||
+                store_off(st->word) != off) {
+            continue;
+        }
+        unsigned data = st->word >> 20 & 31u;
+        edit_t *e = add_edit(ed, i);
+        e->rep[0] = plain(op == OP_LOAD ? fmv_to_x(f3 == 3, rd, data)
+                                        : fmv_from_x(f3 == 3, rd, data));
+        e->n = 1;
+        return true;
+    }
+    return false;
+}
+
 #define TITLES_MAX 16
 
 struct mode {
@@ -3752,6 +4162,11 @@ static const mode_t_ modes[] = {
                  "release followed by a reservation",
                  "redundant stack-pointer restore" },
       plant_stack, stack_control },
+    { "fp", { "bit-cast routed through a frame slot",
+              "floating-point constant built through an integer register",
+              "floating-point constant fli would have built",
+              "instruction with no architectural effect" },
+      plant_fp, fp_control },
     { "shift", { "slli + srli foldable to zext.w",
                  "slli + srli foldable to zext.h",
                  "slli + srli foldable to andi",
