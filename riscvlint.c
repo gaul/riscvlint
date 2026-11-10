@@ -8316,6 +8316,183 @@ bool check_t0_call(riscvlint_state *state, const cs_insn *insn,
     return true;
 }
 
+// ---- a move or zeroing spelled other than mv or li ----
+
+// A copy of one register into another has many spellings -- `ori
+// rd,rs,0`, `or rd,rs,x0`, `slli rd,rs,0` -- and so does zeroing one:
+// `xor rd,rs,rs`, `sub rd,rs,rs`, `andi rd,rs,0`. The ISA manual names
+// one of each, `mv` (`addi rd,rs,0`) and `li rd,0` (`addi rd,x0,0`), and
+// RISE's optimization guide asks for those because they are what a core
+// recognizes. The K3's X100 bears that out: it eliminates most `addi
+// rd,rs,0` and c.mv at rename and runs every other move as a one-cycle
+// operation, the four-byte `add rd,x0,rs` included, and a zeroing that
+// reads a register waits for it like any other operation, where `li
+// rd,0` waits for nothing (TODO.md, entry 56).
+//
+// So a zeroing is reported only when it reads a register other than x0:
+// the dependency is its cost. One built from x0 alone, `or rd,x0,x0` or
+// `lui rd,0`, waits for nothing and is left alone, and with it the
+// `lui rd,0` that heads a patchable constant. A write to x0, or a move
+// onto its own source, does nothing at all and is check_no_effect's.
+// `add rd,x0,rs` is c.mv's own expansion, and where C is available
+// check_c_compressible already turns it into c.mv.
+//
+// On success *zero says which of the two it is and *rs is the register
+// a move copies.
+static bool rv_decode_odd_move(uint32_t w, unsigned size, bool c_ok,
+                               unsigned *rd, unsigned *rs, bool *zero)
+{
+    *zero = false;
+    *rs = 0;
+    if (size == 2) {
+        // c.sub, c.xor and c.subw of a register with itself, and
+        // `c.andi rd',0`, all over x8-x15.
+        unsigned p = 8u + ((w >> 7) & 0x7u), q = 8u + ((w >> 2) & 0x7u);
+        unsigned f = w & 0xfc63u;
+        if (!((f == 0x8c01u || f == 0x8c21u || f == 0x9c01u) && p == q) &&
+            !((w & 0xec03u) == 0x8801u && (w & 0x107cu) == 0))
+            return false;
+        *rd = p;
+        *zero = true;
+        return true;
+    }
+    if (size != 4) return false;
+    unsigned op = RV_OPCODE(w), f3 = (w >> 12) & 0x7u, f7 = w >> 25;
+    unsigned d = (w >> 7) & 0x1fu, a = (w >> 15) & 0x1fu;
+    unsigned b = (w >> 20) & 0x1fu;
+    int64_t imm = sign_extend((uint64_t)(w >> 20) & 0xfffu, 12);
+    if (d == 0) return false;
+    *rd = d;
+    // The one register an x0 pair reads, when exactly one of them is x0.
+    unsigned one = (a == 0) != (b == 0) ? a | b : 0;
+    bool same = a == b && a != 0;
+    unsigned src = 0;                       // a move's source
+    bool z = false;
+    if (op == 0x13u) {                      // OP-IMM
+        if (a == 0) return false;
+        if (f3 == 7u && imm == 0) z = true;
+        else if ((f3 == 6u || f3 == 4u) && imm == 0) src = a;
+        else if (f3 == 7u && imm == -1) src = a;
+        else if ((f3 == 1u || f3 == 5u) && ((w >> 20) & 0x3fu) == 0 &&
+                 (f7 == 0 || (f3 == 5u && f7 == 0x20u)))
+            src = a;                        // shift by zero
+    } else if (op == 0x33u && f7 == 0) {    // OP
+        switch (f3) {
+        case 0:                             // add
+            if (a == 0 && c_ok) return false;
+            src = one;
+            break;
+        case 4:                             // xor
+            if (same) z = true; else src = one;
+            break;
+        case 6:                             // or
+            src = same ? a : one;
+            break;
+        case 7:                             // and
+            if (one) z = true; else if (same) src = a;
+            break;
+        case 1:                             // sll
+        case 5:                             // srl
+            if (a == 0 && b != 0) z = true; else if (b == 0) src = a;
+            break;
+        case 2:                             // slt
+        case 3:                             // sltu
+            z = same || (f3 == 3u && a != 0 && b == 0);
+            break;
+        }
+    } else if (op == 0x33u && f7 == 0x20u) {
+        if (f3 == 0) {                      // sub
+            if (same) z = true; else if (b == 0) src = a;
+        } else if (f3 == 5u) {              // sra
+            if (a == 0 && b != 0) z = true; else if (b == 0) src = a;
+        }
+    } else if (op == 0x33u && f7 == 1u && f3 <= 3u) {
+        z = one != 0;                       // a multiply by x0
+    } else if (op == 0x33u && f7 == 5u && f3 >= 4u) {
+        src = same ? a : 0;                 // Zbb min and max of rs and rs
+    } else if (op == 0x3bu && f7 == 0x20u && f3 == 0) {
+        z = same;                           // subw
+    }
+    if (z) { *zero = true; return true; }
+    if (src == 0 || src == d) return false;
+    *rs = src;
+    return true;
+}
+
+bool check_odd_move(riscvlint_state *state, const cs_insn *insn,
+                    riscvlint_finding *finding)
+{
+    if (insn->size != 2 && insn->size != 4) return false;
+    uint32_t w;
+    if (!riscvlint_word_at(state, insn->address, &w)) return false;
+    bool c_ok = riscvlint_may_use(state, RISCVLINT_EXT_C);
+    unsigned rd, rs;
+    bool zero;
+    if (!rv_decode_odd_move(w, insn->size, c_ok, &rd, &rs, &zero))
+        return false;
+    if (riscvlint_is_relocated(state, insn->address)) return false;
+
+    // c.mv and `c.li rd,0` take any register but x0.
+    unsigned to = c_ok || insn->size == 2 ? 2 : 4;
+    finding->title = "move or zeroing spelled other than mv or li";
+    finding->address = insn->address;
+    finding->insn_count = 1;
+    if (zero)
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "li %s, 0 (%u -> %u bytes)", rv_reg_name(rd), insn->size, to);
+    else
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "mv %s, %s (%u -> %u bytes)", rv_reg_name(rd),
+                 rv_reg_name(rs), insn->size, to);
+    return true;
+}
+
+// ---- a conditional branch whose operands fix its outcome ----
+
+// `beq r,r`, `bge r,r` and `bgeu r,r` are always taken, and so is `bgeu
+// r,x0`, since nothing is below zero unsigned; `bne r,r`, `blt r,r`,
+// `bltu r,r` and `bltu r,x0` never are. The first kind is a jump spelled
+// as a branch, which the ISA manual asks to be `jal x0` -- `j` -- so that
+// it is predicted as one; the second does nothing. GCC and clang both
+// leave them, typically where a copy has made the two registers of a
+// comparison one, `c.mv s10,s11; bne s11,s11,L` (TODO.md, entry 57).
+// c.beqz and c.bnez compare x8-x15 with zero, which no operand fixes.
+bool check_fixed_branch(riscvlint_state *state, const cs_insn *insn,
+                        riscvlint_finding *finding)
+{
+    if (insn->size != 4) return false;
+    uint32_t w;
+    if (!riscvlint_word_at(state, insn->address, &w)) return false;
+    unsigned rs1, rs2, f3;
+    int64_t off;
+    if (!rv_decode_cond_branch(w, 4, &rs1, &rs2, &f3, &off)) return false;
+    bool taken;
+    if (rs1 == rs2) taken = f3 == 0 || f3 == 5u || f3 == 7u;   // beq, bge, bgeu
+    else if (rs2 == 0 && (f3 == 6u || f3 == 7u)) taken = f3 == 7u;
+    else return false;
+    // To the next instruction it goes nowhere either way, and
+    // check_transfer_to_next says to delete it.
+    if (off == 4) return false;
+    // A relocation fills in where the branch goes, which an always-taken
+    // one's replacement has to name.
+    if (riscvlint_is_relocated(state, insn->address)) return false;
+
+    finding->title = "conditional branch whose operands fix its outcome";
+    finding->address = insn->address;
+    finding->insn_count = 1;
+    if (!taken) {
+        snprintf(finding->replacement, sizeof finding->replacement,
+                 "delete; never taken (4 bytes)");
+        return true;
+    }
+    unsigned to = riscvlint_may_use(state, RISCVLINT_EXT_C) &&
+                  off >= -2048 && off <= 2046 ? 2 : 4;
+    snprintf(finding->replacement, sizeof finding->replacement,
+             "j 0x%" PRIx64 " (4 -> %u bytes)",
+             insn->address + (uint64_t)off, to);
+    return true;
+}
+
 // ---- the immediate audits (-a imm, -a const) ----
 
 // One consumer of a materialized constant, as the two audits read it.
@@ -8729,6 +8906,8 @@ static const riscvlint_check_fn riscvlint_checks[] = {
     check_scratch_call_to_jal,
     check_cross_jump,
     check_t0_call,
+    check_odd_move,
+    check_fixed_branch,
     check_imm_misfit_audit,
     check_const_audit,
 };

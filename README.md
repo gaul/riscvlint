@@ -3,7 +3,7 @@
 A RISC-V analogue of [armlint](https://github.com/gaul/armlint): a static
 checker for missed peephole opportunities in riscv64 binaries.
 
-Fifty-three checks and two audits (`-a imm`, `-a const`) are implemented,
+Fifty-five checks and two audits (`-a imm`, `-a const`) are implemented,
 and the ledger's candidate list is empty.
 [TODO.md](TODO.md) is that ledger:
 every candidate that was measured, the population it came back with,
@@ -13,7 +13,7 @@ and what did not get written was rejected the same way.
 
 ## Checks
 
-Fifty-three of them, and the table lists the forty-four that report
+Fifty-five of them, and the table lists the forty-six that report
 something over the corpus. Twelve of those -- the jump pair, the
 constant chain, the no-op, the push run, the zero store, the zero
 branch, the andi pair, the max clamp, the immediate operand, the mask,
@@ -22,8 +22,9 @@ integer register -- were written for the JetStream corpus of TODO.md
 and measured there first, and the release run, the cancelling pair, the
 needless copy, the scratch-register call and the shared tail were sized
 over the SpiderMonkey corpus there, the complement check came out of a
-SpiderMonkey patch, and the t0 call out of a probe for what only RISC-V
-has; their rows here are what they
+SpiderMonkey patch, the t0 call out of a probe for what only RISC-V
+has, and the move spelling and the fixed branch out of the ISA manual's
+and RISE's optimization guide's advice; their rows here are what they
 report over this corpus, and their entries in the ledger say what that
 is. Nine report nothing
 over this corpus -- the bit count because no baseline object declares
@@ -82,9 +83,11 @@ the row where no finding does and the arithmetic is uniform instead.
 | jump pair foldable to j | 46 | 1,973 | 12 | 2,031 | 8,124 | all |
 | tail every jump to one label repeats | 1,035 | 119 | 430 | 1,584 | 35,132 | all |
 | instruction with no architectural effect | 1,223 | 63 | 282 | 1,568 | 4,394 | all |
+| conditional branch whose operands fix its outcome | 1,460 | 19 | 23 | 1,502 | 4,028 | all |
 | mask loaded for a zero extension | 589 | 0 | 808 | 1,397 | 4,280 | all |
 | bit-cast routed through a frame slot | 1,149 | 0 | 10 | 1,159 | 0 | all |
 | zero loaded for a store | 8 | 0 | 944 | 952 | 2,192 | all |
+| move or zeroing spelled other than mv or li | 799 | 23 | 12 | 834 | 1,652 | all |
 | li + mul foldable to shNadd | 0 | 0 | 416 | 416 | 1,046 | all |
 | constant loaded for a branch against zero | 79 | 0 | 202 | 281 | 1,050 | all |
 | floating-point constant built through an integer register | 0 | 0 | 205 | 205 | 1,672 | all |
@@ -94,11 +97,11 @@ the row where no finding does and the arithmetic is uniform instead.
 | pushes one stack adjustment would do | 0 | 0 | 12 | 12 | 28 | all |
 | zero loaded for an equality branch | 9 | 0 | 0 | 9 | 24 | all |
 | slli + srli foldable to andi | 0 | 1 | 0 | 1 | 4 | all |
-| **total** | **519,389** | **196,591** | **3,147,647** | **3,863,627** | **8,776,560** | |
+| **total** | **521,648** | **196,633** | **3,147,682** | **3,865,963** | **8,782,240** | |
 
 Do not read the total row as a result. One row is 78% of it, and that
 row is Go's assembler declining to select RVC at all, which is a
-different kind of finding from the forty-three around it. The second row
+different kind of finding from the forty-five around it. The second row
 is 8% and belongs to the linker. The `assumed` in the call-pair row is
 the one byte figure that is arithmetic rather than measurement: that
 check prints no size, and every site is eight bytes in and four out
@@ -893,6 +896,30 @@ except a handful of `jalr ra,0(ra)` that were already two.
   16 sites, all in Firefox, and the one thing separating this check from
   a wrong one.
 
+* **conditional branch whose operands fix its outcome** -- `beq`, `bge`
+  or `bgeu` of a register with itself, or `bgeu r,x0`, is always taken,
+  since nothing is below zero unsigned; `bne`, `blt` or `bltu` of a
+  register with itself, or `bltu r,x0`, never is. The first kind is a
+  jump, which the ISA manual asks to be spelled `jal x0` -- `j`, two
+  bytes within c.j's reach -- and the second does nothing:
+
+  ```
+   4dfe630: mv s10, s11
+   4dfe632: mv a1, s11
+   4dfe634: bne s11, s11, 0x4dfe684   -> delete; never taken (4 bytes)
+  ```
+
+  That is Ubuntu's clang-built libLLVM, where the copies before the
+  branch suggest how it arises: a comparison of two registers that a
+  copy made one, and nothing afterwards folded the branch. Both C++
+  compilers leave them. Of the 1,460 in C++, 1,054 are in clang-built
+  objects -- Ubuntu's libLLVM 540, libllvm20 358, libxul 153, two other
+  Firefox libraries 3 -- and 406 in Debian's GCC-built libLLVM; Rust
+  has 19, Go 23, the SpiderMonkey JetStream dump 9 and V8's none. A
+  branch to the next instruction is the check above's, which deletes it
+  whatever it compares, and c.beqz and c.bnez compare x8-x15 with zero,
+  which no operand fixes.
+
 * **transfer to an unconditional jump** -- a conditional branch, `j` or
   `jal` whose target is a `j` or V8's far jump `auipc`+`jr`, and which
   could go straight to where that jump goes. The chain is followed
@@ -1003,6 +1030,47 @@ except a handful of `jalr ra,0(ra)` that were already two.
   reported only where the declared architecture positively lacks
   Zicfilp -- V8's does, and uses the encoding as its constant-pool
   guard -- and never where the architecture is unknown.
+
+* **move or zeroing spelled other than mv or li** -- a copy of one
+  register into another spelled `or rd,rs,x0`, `xor rd,rs,x0`, `ori
+  rd,rs,0`, `slli rd,rs,0` and the like rather than `mv` (`addi
+  rd,rs,0`), or a zeroing that reads a register -- `xor rd,rs,rs`, `sub
+  rd,rs,rs`, `andi rd,rs,0` -- rather than `li rd,0`. RISE's
+  optimization guide asks for the two canonical spellings because they
+  are what a core recognizes, and the K3's X100 shows the difference: it
+  eliminates most `addi rd,rs,0` and c.mv at rename and runs every
+  other move as a one-cycle operation, the four-byte `add rd,x0,rs`
+  included, and a zeroing that reads a register waits for it, where `li
+  rd,0` waits for nothing (TODO.md, entry 56). This is an 8- or 16-bit
+  compare-and-exchange in libxul:
+
+  ```
+   749b882: lr.w a2, (s5)
+   749b886: and a3, a2, a0
+   749b88a: bne a3, a1, 0x749be7c
+   749b88e: xor a3, a2, zero         -> mv a3, a2 (4 -> 2 bytes)
+   749b892: and a3, a3, a0
+   749b894: xor a3, a3, a2
+   749b896: sc.w.rl a3, a3, (s5)
+  ```
+
+  LLVM expands that loop after register allocation, and the merge's
+  first `xor` keeps the x0 that a zero being stored arrived in; 591 of
+  libxul's 636 are it. The package corpus has 834 in all -- C++ 799,
+  Rust 23, Go 12 -- and the JIT dumps are where the population is.
+  SpiderMonkey's has 37,944: 27,131 `or rd,sp,zero`, the copy of sp
+  before a call into C++, in every tier, and 10,500 `xor rd,rd,rd`,
+  7,544 of them in Wasm code. V8's has 2,732, all but 28 a `slli
+  rd,rs,0` in regexp code.
+
+  A zeroing from x0 alone, `or rd,x0,x0` or `lui rd,0`, waits for
+  nothing and is not reported, which also leaves alone the `lui rd,0`
+  opening each of SpiderMonkey's fixed-length patchable constants,
+  295,108 in its dump. A move onto its own source or a write to x0 is
+  the no-op check's, and `add rd,x0,rs`, c.mv's own expansion, is the
+  compression check's c.mv where C is available. Where C is available
+  the rewrite is also two bytes shorter, but the reason for it is the
+  cycle.
 
 * **redundant reload** -- the same (base, displacement, width,
   signedness) loaded twice with nothing in between that could have

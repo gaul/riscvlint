@@ -1921,6 +1921,29 @@ bool check_cross_jump(riscvlint_state *state, const cs_insn *insn,
 bool check_t0_call(riscvlint_state *state, const cs_insn *insn,
                    riscvlint_finding *finding);
 
+// A move spelled other than `mv` (`addi rd,rs,0`) -- `or rd,rs,x0`,
+// `ori rd,rs,0`, `slli rd,rs,0` and the like -- or a zeroing spelled
+// other than `li rd,0` that reads a register: `xor rd,rs,rs`, `sub
+// rd,rs,rs`, `andi rd,rs,0`. The ISA manual names the two spellings and
+// RISE's optimization guide asks for them, and the K3's X100 shows why:
+// it eliminates most `addi rd,rs,0` and c.mv at rename, runs the other
+// moves as one-cycle operations, and makes a zeroing that reads rs wait
+// for rs (TODO.md, entry 56). A zeroing from x0 alone waits for nothing and
+// is not reported; a move onto its own source or a write to x0 is
+// check_no_effect's, and `add rd,x0,rs` with C available is
+// check_c_compressible's c.mv.
+bool check_odd_move(riscvlint_state *state, const cs_insn *insn,
+                    riscvlint_finding *finding);
+
+// A conditional branch whose operands fix its outcome: `beq`, `bge` or
+// `bgeu` of a register with itself, or `bgeu r,x0`, always taken, which
+// the ISA manual asks to be spelled `j`; `bne`, `blt` or `bltu` of a
+// register with itself, or `bltu r,x0`, never taken, which can go. GCC
+// and clang both leave them, typically where a copy has merged a
+// comparison's two registers (TODO.md, entry 57).
+bool check_fixed_branch(riscvlint_state *state, const cs_insn *insn,
+                        riscvlint_finding *finding);
+
 // ---- running every check ----
 //
 // Called once per finding, with `ctx` as given. The finding is valid

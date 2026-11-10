@@ -1457,6 +1457,46 @@ This is the shape that led to candidate 8, and it is the reason the
 family the number is large and unremarkable, and split on what the
 second instruction writes it is one dominant idiom plus nothing.
 
+### The guides' other recommendations -- six shapes, none worth a check
+
+The ISA manual's non-normative advice and RISE's RISC-V Optimization
+Guide were read for recommendations a binary can be checked against
+that riscvlint did not already cover. Two became checks, entries 56 and
+57. The other six were sized with a throwaway probe over the package
+corpus and the two JetStream dumps, and, where the question was the
+hardware's, on the K3's X100:
+
+| recommendation | package | V8 | SpiderMonkey |
+|---|---:|---:|---:|
+| `mulh[[s]u]` then `mul` of the same sources, adjacent, so a core can fuse them: pairs not so | 1,767 of 6,836 | 2 of 2 | 2 of 2 |
+| `div[u]` then `rem[u]`, likewise | 88 of 111 | 0 of 37 | 0 of 90 |
+| `auipc rd,0` rather than `jal rd,.+4` to read the pc | 24 | 0 | 0 |
+| no frm write around operations that could carry a static rounding mode | 0 | 0 | 0 |
+| no jump through ra or t0 that is not a return, which pops | 24 | 0 | 2 |
+| no return through another register, `ld rX,0(sp)` ... `jr rX`, which leaves its entry | 258 | 0 | 3 |
+
+The multiply pair is the only one with a population, and it is mostly
+clang's and rustc's: libxul 692, the clang-built libLLVMs 363 and the
+Rust tools 529, against 62 in Debian's GCC-built libLLVM. The common
+shape is an overflow check that computes the low half first and then
+the high half into one of the sources, libxul's `mul s10,s0,s9; mulhu
+a0,s0,s9`. Go's `bits.Mul64` is in the fusible order 98% of the time.
+But on the X100 eight multiplies cost eight cycles in every order --
+`mulhu` then `mul` of the same sources, the reverse, the sources
+swapped, or two unrelated products -- so it fuses none of them, and
+LLVM's RISCVMacroFusion.td has no such pair for any core. A check would
+report a fusion no measured or modelled core performs. The division
+pair is a tenth the size, and V8's and SpiderMonkey's are all in order
+already.
+
+The rest are too few. The frm row is zero outside SpiderMonkey, whose
+546 writes are of fcsr, clearing the flags around a conversion it then
+tests, with no dynamic-rounding operation between. The two
+return-address-stack rows came out of entry 55's probe, and
+SpiderMonkey's two jumps through t0 are in its trampolines: the
+bailout tail's jump into Baseline code and the debug-mode OSR handler's
+jump to the resume address.
+
 ## The JetStream corpus -- V8's riscv64 JIT, 37,896,111 instructions
 
 A corpus of a different kind: not what compilers wrote into packages
@@ -2328,9 +2368,11 @@ hand, so the 9,988 above stays the miner's figure.
 
 # Remaining candidates
 
-None. Fifty-one checks and the two audits of entry 53 are implemented,
-36 to 47 being the twelve from the JetStream corpus above and 48 to 52
-the five from the SpiderMonkey corpus, and
+None. Fifty-five checks and the two audits of entry 53 are implemented,
+36 to 47 being the twelve from the JetStream corpus above, 48 to 52
+the five from the SpiderMonkey corpus, 54 a SpiderMonkey patch's, 55 a
+probe for what only RISC-V has, and 56 and 57 the ISA manual's and
+RISE's optimization guide's advice, and
 everything this file sized over the package corpus is either written or
 recorded as rejected with the evidence that rejected it. Thirteen of
 the package entries, 23 to 35, did not come from a corpus probe at all:
@@ -4789,6 +4831,123 @@ no test slower beyond noise; richards-wasm gains 39%, hash-map 27%,
 ai-astar 17% and richards 12%. A chain of four Wasm `call_indirect`
 calls takes 38.6% less time, `call_ref` 52.3%, and recursive fib in Ion
 52.9%.
+
+## 56. A move or zeroing spelled other than mv or li -- 834, 37,944 and 2,732  [implemented]
+
+From RISE's RISC-V Optimization Guide, whose "Use Canonical Move
+Idioms" and "Make effective use of the x0 register" ask for `mv rd,rs`
+and `li rd,0` -- `addi rd,rs,0` and `addi rd,x0,0`, the ISA manual's
+pseudo-instructions -- over every other spelling, on the ground that
+those are what a core recognizes. Whether one does is the hardware's
+question, so the X100 was asked before the check was written.
+
+### What it costs on the X100
+
+Each block below runs 16 times over in a loop of 10 million
+iterations, pinned to one X100 core at 2.15 GHz; user-mode cycles from
+perf, the fastest of three runs. The move block is the chain `addi
+a0,a0,1; MOVE a1,a0; addi a1,a1,1; MOVE a0,a1`: two cycles if both
+moves vanish at rename, four if each is a one-cycle operation.
+
+| move | cycles per block |
+|---|---:|
+| `addi rd,rs,0`, which is `mv` | 3.07 |
+| `c.mv` | 3.27 |
+| `add rd,x0,rs`, c.mv's own expansion in four bytes | 4.00 |
+| `or rd,rs,x0` | 4.01 |
+| `ori rd,rs,0` | 4.02 |
+| `xor rd,rs,x0` | 4.01 |
+| `slli rd,rs,0` | 4.01 |
+| `addi rd,rs,1`, an add rather than a move | 4.01 |
+
+The zeroing block is `mul a0,a0,a2; mul a0,a0,a2; ZERO a0; addi
+a0,a0,3`. If the zeroing does not wait for a0, the blocks overlap and
+the multiplier, one a cycle, sets the cost at two; if it does, the cost
+is two multiply latencies of three cycles and two more.
+
+| zeroing | cycles per block |
+|---|---:|
+| `li a0,0`, which is `addi a0,x0,0` | 2.00 |
+| `xor a0,a0,a0` | 8.00 |
+| `sub a0,a0,a0` | 8.00 |
+| `andi a0,a0,0` | 8.00 |
+| `addi a0,a0,0`, which keeps the chain | 8.00 |
+
+So the X100 eliminates most canonical moves -- 3.07 rather than 2, not
+every one, but about half a cycle saved per move in a chain -- and
+recognizes nothing else as a move, not even the four-byte encoding of
+c.mv. It has no zeroing idiom but `li`: x86's `xor reg,reg` habit costs
+a full dependency on the register's last writer here.
+
+### Who emits it
+
+| corpus | moves | zeroings | |
+|---|---:|---:|---|
+| package, C++ | 677 | 122 | libxul 636, libllvm20 142 |
+| package, Rust | 1 | 22 | 20 `sub rd,rs,rs` |
+| package, Go | 0 | 12 | `xor rd,rd,rd` |
+| V8 JetStream dump | 2,706 | 26 | 2,704 `slli rd,rs,0`, all in regexp code |
+| SpiderMonkey JetStream dump | 27,425 | 10,519 | 27,131 `or rd,sp,zero`, 10,500 `xor rd,rd,rd` |
+
+libxul's are LLVM's 8- and 16-bit compare-and-exchange: it expands the
+`lr.w`/`sc.w` loop after register allocation, and the masked merge's
+first `xor` keeps the x0 that a zero being stored arrived in, `xor
+a3,a2,zero`, 591 times. SpiderMonkey's `or rd,sp,zero` is
+`setupUnalignedABICall`'s copy of sp before every call into C++ that
+needs realigning (`or_(scratch, StackPointer, zero)`,
+MacroAssembler-riscv64.cpp), in every tier -- Ion 12,746, Baseline
+10,757, regexp 3,153, trampolines 769 -- and its `xor rd,rd,rd` is
+mostly Wasm code's, 7,544, with Ion 2,713 and Baseline 243. Both are
+one-line fixes in the riscv64 macro-assembler.
+
+### What check_odd_move reports
+
+The table above is the check's own output. A zeroing is reported only
+when it reads a register other than x0, since the dependency is what
+it costs: one from x0 alone -- `or rd,x0,x0`, `lui rd,0` -- waits for
+nothing, and leaving it alone also leaves alone the `lui rd,0` opening
+each of SpiderMonkey's fixed-length patchable constants, 295,108 of
+them, which the probe that sized this counted. A move onto its own
+source or a write to x0 is check_no_effect's. `add rd,x0,rs` is c.mv's
+expansion: where C is available check_c_compressible already offers
+c.mv, and the check reports it only where C is not.
+
+## 57. A conditional branch whose operands fix its outcome -- 1,502  [implemented]
+
+From the ISA manual's advice on unconditional branches: a jump is
+`jal x0`, not a conditional branch whose condition always holds, so
+that it is predicted as a jump. `beq`, `bge` or `bgeu` of a register
+with itself, or `bgeu r,x0`, is always taken; `bne`, `blt` or `bltu`
+of a register with itself, or `bltu r,x0`, never is. The first becomes
+`j`, two bytes within c.j's reach; the second is deleted.
+
+| object | compiler | always | never |
+|---|---|---:|---:|
+| ubuntu-libllvm22 | clang | 170 | 370 |
+| libllvm20 | clang | 241 | 117 |
+| libxul | clang | 77 | 76 |
+| libgkcodecs, libmozsqlite3 | clang | 2 | 1 |
+| debian-libllvm22 | GCC | 222 | 184 |
+| Rust | rustc | 4 | 15 |
+| Go | gc | 0 | 23 |
+| SpiderMonkey JetStream dump | | 1 | 8 |
+| V8 JetStream dump | | 0 | 0 |
+
+The compilers are the corpus's attribution, from codegen rather than
+from a producer string (README.md, "The libllvm22 pair"). Ubuntu's
+libLLVM shows where they come from:
+
+```
+ 4dfe630: mv s10, s11
+ 4dfe632: mv a1, s11
+ 4dfe634: bne s11, s11, 0x4dfe684
+```
+
+a comparison of two registers that a copy has made one, and nothing
+after the copy folded the branch. 169 of libllvm20's compare x0 with
+itself, `beq zero,zero` and `bne zero,zero`, which no other object
+has. A branch to the next instruction is check_transfer_to_next's,
+which deletes it whatever it compares, and is not reported here.
 
 # Ranked for C++ and Rust specifically
 

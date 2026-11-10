@@ -1,0 +1,23 @@
+conditional branch whose operands fix its outcome at offset: 0x2: -> delete; never taken (4 bytes) (1 instructions)
+  bne s11, s11, 0x16
+
+conditional branch whose operands fix its outcome at offset: 0x6: -> delete; never taken (4 bytes) (1 instructions)
+  bltu a0, zero, 0x16
+
+conditional branch whose operands fix its outcome at offset: 0xa: -> j 0x16 (4 -> 2 bytes) (1 instructions)
+  beq a0, a0, 0x16
+
+conditional branch whose operands fix its outcome at offset: 0xe: -> j 0x16 (4 -> 2 bytes) (1 instructions)
+  bgeu a1, zero, 0x16
+
+transfer to the instruction that follows it at offset: 0x12: -> delete; the branch goes where control already goes (4 bytes) (1 instructions)
+  bge a2, a2, 0x16
+
+transfer to the instruction that follows it at offset: 0x1e: -> delete; the branch goes where control already goes (4 bytes) (1 instructions)
+  bltu zero, a0, 0x22
+
+Optimization opportunities by type:
+       4  conditional branch whose operands fix its outcome
+       2  transfer to the instruction that follows it
+
+6 optimization opportunities in 10 instructions

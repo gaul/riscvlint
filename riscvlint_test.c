@@ -7366,6 +7366,136 @@ static void test_t0_call(csh handle)
     CHECK(run_words(handle, check_t0_call, walk, 19, 0x1000, NULL) == 0);
 }
 
+// check_odd_move: a move spelled other than `addi rd,rs,0`, or a zeroing
+// other than `li rd,0` that reads a register.
+static void test_odd_move(csh handle)
+{
+    riscvlint_finding f;
+    const unsigned no_c = RISCVLINT_EXT_DECLARED;
+    const uint32_t ret = 0x00008067u;
+
+    // Moves, each to `mv`, which compresses where C is available.
+    uint32_t or0[] = { 0x0005e533u /* or a0,a1,zero */, ret };
+    CHECK(run_words(handle, check_odd_move, or0, 2, 0x1000, &f) == 1);
+    CHECK(f.address == 0x1000 && f.insn_count == 1);
+    CHECK(strcmp(f.title, "move or zeroing spelled other than mv or li")
+          == 0);
+    CHECK(strcmp(f.replacement, "mv a0, a1 (4 -> 2 bytes)") == 0);
+    CHECK(run_window_exts(handle, check_odd_move, (const uint8_t *)or0, 8,
+                          0x1000, no_c, &f) == 1);
+    CHECK(strcmp(f.replacement, "mv a0, a1 (4 -> 4 bytes)") == 0);
+    // SpiderMonkey's copy of sp before an unaligned ABI call.
+    uint32_t sp[] = { 0x00016633u /* or a2,sp,zero */, ret };
+    CHECK(run_words(handle, check_odd_move, sp, 2, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "mv a2, sp (4 -> 2 bytes)") == 0);
+    uint32_t moves[] = {
+        0x0005e513u,                       // ori a0,a1,0
+        0x00059513u,                       // slli a0,a1,0
+        0x0ab5e533u,                       // max a0,a1,a1
+        ret,
+    };
+    CHECK(run_words(handle, check_odd_move, moves, 4, 0x1000, NULL) == 3);
+
+    // Zeroings that read a register, each to `li rd,0`.
+    uint32_t xz[] = { 0x00b5c533u /* xor a0,a1,a1 */, ret };
+    CHECK(run_words(handle, check_odd_move, xz, 2, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "li a0, 0 (4 -> 2 bytes)") == 0);
+    CHECK(run_window_exts(handle, check_odd_move, (const uint8_t *)xz, 8,
+                          0x1000, no_c, &f) == 1);
+    CHECK(strcmp(f.replacement, "li a0, 0 (4 -> 4 bytes)") == 0);
+    uint32_t zeros[] = {
+        0x40b58533u,                       // sub a0,a1,a1
+        0x0005f513u,                       // andi a0,a1,0
+        0x02058533u,                       // mul a0,a1,zero
+        0x0005b533u,                       // sltu a0,a1,zero
+        ret,
+    };
+    CHECK(run_words(handle, check_odd_move, zeros, 5, 0x1000, NULL) == 4);
+    // c.sub, c.xor and `c.andi rd',0` stay two bytes as c.li.
+    static const uint8_t csub[] = {
+        0x09, 0x8d,                        // c.sub a0,a0
+        0x29, 0x8d,                        // c.xor a0,a0
+        0x01, 0x89,                        // c.andi a0,0
+        0x0d, 0x8d,                        // c.sub a0,a1: not a zeroing
+        0x82, 0x80,                        // ret
+    };
+    CHECK(run_window(handle, check_odd_move, csub, sizeof csub, 0x1000, &f)
+          == 3);
+    CHECK(f.address == 0x1000);
+    CHECK(strcmp(f.replacement, "li a0, 0 (2 -> 2 bytes)") == 0);
+
+    // Not reported: the canonical spellings; zeroings from x0 alone,
+    // which wait for nothing, the `lui rd,0` heading a patchable
+    // constant among them; a move onto its own source and a write to x0,
+    // which are check_no_effect's; `sltu a0,zero,a1`, which is snez.
+    uint32_t fine[] = {
+        0x00058513u,                       // mv a0,a1
+        0x00000513u,                       // li a0,0
+        0x00000537u,                       // lui a0,0
+        0x00006533u,                       // or a0,zero,zero
+        0x00056513u,                       // ori a0,a0,0
+        0x00b5c033u,                       // xor zero,a1,a1
+        0x00b03533u,                       // snez a0,a1
+        ret,
+    };
+    CHECK(run_words(handle, check_odd_move, fine, 8, 0x1000, NULL) == 0);
+    // `add a0,zero,a1` is c.mv's expansion: check_c_compressible's where
+    // C is available, this check's where it is not.
+    uint32_t addz[] = { 0x00b00533u /* add a0,zero,a1 */, ret };
+    CHECK(run_words(handle, check_odd_move, addz, 2, 0x1000, NULL) == 0);
+    CHECK(run_window_exts(handle, check_odd_move, (const uint8_t *)addz, 8,
+                          0x1000, no_c, &f) == 1);
+    CHECK(strcmp(f.replacement, "mv a0, a1 (4 -> 4 bytes)") == 0);
+}
+
+// check_fixed_branch: a conditional branch whose operands decide it.
+static void test_fixed_branch(csh handle)
+{
+    riscvlint_finding f;
+    const uint32_t ret = 0x00008067u;
+    const uint32_t nop = 0x00000013u;
+
+    // LLVM's leftover after copy propagation, never taken.
+    uint32_t never[] = { 0x01bd9463u /* bne s11,s11,+8 */, nop, ret };
+    CHECK(run_words(handle, check_fixed_branch, never, 3, 0x1000, &f) == 1);
+    CHECK(f.address == 0x1000 && f.insn_count == 1);
+    CHECK(strcmp(f.title, "conditional branch whose operands fix its "
+                          "outcome") == 0);
+    CHECK(strcmp(f.replacement, "delete; never taken (4 bytes)") == 0);
+    uint32_t bltu0[] = { 0x00056463u /* bltu a0,zero,+8 */, nop, ret };
+    CHECK(run_words(handle, check_fixed_branch, bltu0, 3, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "delete; never taken (4 bytes)") == 0);
+
+    // Always taken, to `j`: two bytes in c.j's reach where C is
+    // available, four otherwise.
+    uint32_t always[] = { 0x00a50463u /* beq a0,a0,+8 */, nop, ret };
+    CHECK(run_words(handle, check_fixed_branch, always, 3, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "j 0x1008 (4 -> 2 bytes)") == 0);
+    CHECK(run_window_exts(handle, check_fixed_branch,
+                          (const uint8_t *)always, 12, 0x1000,
+                          RISCVLINT_EXT_DECLARED, &f) == 1);
+    CHECK(strcmp(f.replacement, "j 0x1008 (4 -> 4 bytes)") == 0);
+    uint32_t bgeu0[] = { 0x00057463u /* bgeu a0,zero,+8 */, nop, ret };
+    CHECK(run_words(handle, check_fixed_branch, bgeu0, 3, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "j 0x1008 (4 -> 2 bytes)") == 0);
+    uint32_t far[] = { 0x7aa500e3u /* beq a0,a0,+4000 */, ret };
+    CHECK(run_words(handle, check_fixed_branch, far, 2, 0x1000, &f) == 1);
+    CHECK(strcmp(f.replacement, "j 0x1fa0 (4 -> 4 bytes)") == 0);
+
+    // Not reported: to the next instruction, which
+    // check_transfer_to_next deletes; two registers, `bgez`, and `bltu
+    // zero,a0`, which is bnez.
+    uint32_t next[] = { 0x00a50263u /* beq a0,a0,+4 */, ret };
+    CHECK(run_words(handle, check_fixed_branch, next, 2, 0x1000, NULL) == 0);
+    uint32_t open[] = {
+        0x00b51463u,                       // bne a0,a1,+8
+        0x00055463u,                       // bgez a0,+8
+        0x00a06463u,                       // bltu zero,a0,+8
+        ret,
+    };
+    CHECK(run_words(handle, check_fixed_branch, open, 4, 0x1000, NULL) == 0);
+}
+
 int main(void)
 {
     csh handle;
@@ -7442,6 +7572,8 @@ int main(void)
     test_scratch_call_to_jal(handle);
     test_cross_jump(handle);
     test_t0_call(handle);
+    test_odd_move(handle);
+    test_fixed_branch(handle);
     test_census(handle);
     test_regs(handle);
     test_fusion(handle);

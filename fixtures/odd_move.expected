@@ -1,0 +1,72 @@
+move or zeroing spelled other than mv or li at offset: 0x0: -> mv a2, sp (4 -> 2 bytes) (1 instructions)
+  or a2, sp, zero
+
+move or zeroing spelled other than mv or li at offset: 0x4: -> mv a0, a1 (4 -> 2 bytes) (1 instructions)
+  ori a0, a1, 0
+
+move or zeroing spelled other than mv or li at offset: 0x8: -> mv t1, a1 (4 -> 2 bytes) (1 instructions)
+  slli t1, a1, 0
+
+dead register definition at offset: 0xc: -> delete; nothing reads a3 (4 bytes) (1 instructions)
+  xor a3, zero, a4
+
+move or zeroing spelled other than mv or li at offset: 0xc: -> mv a3, a4 (4 -> 2 bytes) (1 instructions)
+  xor a3, zero, a4
+
+dead register definition at offset: 0x10: -> delete; nothing reads a5 (4 bytes) (1 instructions)
+  sub a5, a1, zero
+
+move or zeroing spelled other than mv or li at offset: 0x10: -> mv a5, a1 (4 -> 2 bytes) (1 instructions)
+  sub a5, a1, zero
+
+dead register definition at offset: 0x14: -> delete; nothing reads a0 (4 bytes) (1 instructions)
+  xor a0, a0, a0
+
+instruction compressible to a base C form at offset: 0x14: -> c.xor (4 -> 2 bytes) (1 instructions)
+  xor a0, a0, a0
+
+move or zeroing spelled other than mv or li at offset: 0x14: -> li a0, 0 (4 -> 2 bytes) (1 instructions)
+  xor a0, a0, a0
+
+move or zeroing spelled other than mv or li at offset: 0x18: -> li a1, 0 (4 -> 2 bytes) (1 instructions)
+  sub a1, a2, a2
+
+move or zeroing spelled other than mv or li at offset: 0x1c: -> li a3, 0 (4 -> 2 bytes) (1 instructions)
+  andi a3, a4, 0
+
+move or zeroing spelled other than mv or li at offset: 0x20: -> li a5, 0 (4 -> 2 bytes) (1 instructions)
+  sltu a5, a6, zero
+
+dead register definition at offset: 0x24: -> delete; nothing reads a0 (4 bytes) (1 instructions)
+  mv a0, a1
+
+instruction compressible to a base C form at offset: 0x24: -> c.mv (4 -> 2 bytes) (1 instructions)
+  mv a0, a1
+
+dead register definition at offset: 0x28: -> delete; nothing reads a0 (4 bytes) (1 instructions)
+  li a0, 0
+
+instruction compressible to a base C form at offset: 0x28: -> c.li (4 -> 2 bytes) (1 instructions)
+  li a0, 0
+
+constant built in more instructions than li needs at offset: 0x2c: -> li a0, 0x0 in 1 instructions: addi (8 -> 4 bytes) (2 instructions)
+  lui a0, 0
+  ori a0, a0, 0
+
+instruction with no architectural effect at offset: 0x30: -> delete; an or with zero (4 bytes) (1 instructions)
+  ori a0, a0, 0
+
+move or zeroing spelled other than mv or li at offset: 0x34: -> li a0, 0 (2 -> 2 bytes) (1 instructions)
+  sub a0, a0, a0
+
+move or zeroing spelled other than mv or li at offset: 0x36: -> li a1, 0 (2 -> 2 bytes) (1 instructions)
+  xor a1, a1, a1
+
+Optimization opportunities by type:
+      11  move or zeroing spelled other than mv or li
+       5  dead register definition
+       3  instruction compressible to a base C form
+       1  constant built in more instructions than li needs
+       1  instruction with no architectural effect
+
+21 optimization opportunities in 16 instructions
