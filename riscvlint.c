@@ -6459,8 +6459,12 @@ static bool rv_decode_no_effect(uint32_t w, unsigned size, const char **what)
             *what = "a write to x0";
             return true;
         case 0x53u:                                   // OP-FP: fsgnj with one source is fmv
-            if (f3 != 0 || rs1 != rd || rs2 != rd) return false;
-            if (f7 != 0x10u && f7 != 0x11u && f7 != 0x12u) return false;
+            // fmv.d only. fmv.s and fmv.h read their source as a single
+            // or a half, and one that is not NaN-boxed -- a double in the
+            // register, say -- reads as the canonical NaN, which is what
+            // they then write: a change wherever the boxing is broken,
+            // which nothing at the instruction can rule out.
+            if (f3 != 0 || rs1 != rd || rs2 != rd || f7 != 0x11u) return false;
             *what = "a floating-point move onto itself";
             return true;
         default:

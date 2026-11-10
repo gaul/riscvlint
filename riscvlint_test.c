@@ -5731,6 +5731,12 @@ static void test_no_effect(csh handle)
     CHECK(run_words(handle, check_no_effect, yes, 9, 0x1000, &f) == 8);
     CHECK(strcmp(f.replacement, "delete; a move onto itself (4 bytes)") == 0);
     CHECK(f.insn_count == 1 && f.address == 0x1000);
+    // fmv.s and fmv.h are not: a source that is not NaN-boxed, a double
+    // in the register, reads as the canonical NaN, and that is what they
+    // write.
+    uint32_t boxed[] = { 0x20a50553u /* fsgnj.s fa0,fa0,fa0 */,
+                         0x24a50553u /* fsgnj.h fa0,fa0,fa0 */, 0x00008067u };
+    CHECK(run_words(handle, check_no_effect, boxed, 3, 0x1000, NULL) == 0);
     uint32_t stop[] = { 0x54321037u, 0x00008067u };
     CHECK(run_words(handle, check_no_effect, stop, 2, 0x1000, &f) == 1);
     CHECK(strcmp(f.replacement, "delete; a write to x0 (4 bytes)") == 0);
