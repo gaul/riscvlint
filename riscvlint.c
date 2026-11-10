@@ -951,6 +951,11 @@ unsigned rv_result_guarantees(uint32_t w, unsigned size, unsigned *rd)
             if (f3 == 1 && ((w >> 20) & 0xfffu) == 0x605u) return G_LH;
             return 0;
         case 0x1bu:                                   // OP-IMM-32
+            // Zba's slli.uw shares the opcode with addiw and the W
+            // shifts, but shifts a zero-extended word and keeps all 64
+            // bits of the result -- a zext.w at a shift of zero.
+            if (f3 == 1 && (w >> 26) == 0x02u)
+                return ((w >> 20) & 0x3fu) == 0 ? G_LWU : 0;
             return G_S32;                             // addiw/slliw/sr*iw
         case 0x37u:                                   // lui
             return guarantees_for_range(sign_extend(w & 0xfffff000u, 32),
@@ -961,6 +966,9 @@ unsigned rv_result_guarantees(uint32_t w, unsigned size, unsigned *rd)
                 if (f3 == 4 && rs2 == 0) return G_LHU;   // zext.h
                 return 0;                                // add.uw: 64-bit
             }
+            // sh1add.uw, sh2add.uw and sh3add.uw add the scaled word to
+            // a 64-bit register, and their result is 64 bits too.
+            if (f7 == 0x10u) return 0;
             return G_S32;                             // addw/subw/mulw/...
         default:
             return 0;

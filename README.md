@@ -62,7 +62,7 @@ the row where no finding does and the arithmetic is uniform instead.
 | constant re-materialization | 16,410 | 571 | 1,457 | 18,438 | 36,876 | all |
 | slli + srli foldable to zext.w | 2 | 52 | 18,071 | 18,125 | 50,178 | all |
 | slli + add foldable to shNadd | 73 | 165 | 13,180 | 13,418 | 23,842 | all |
-| redundant sign or zero extension | 8,285 | 333 | 1,593 | 10,211 | 25,078 | all |
+| redundant sign or zero extension | 8,283 | 333 | 1,593 | 10,209 | 25,074 | all |
 | copy its only reader could do without | 4,307 | 1,027 | 4,399 | 9,733 | 22,428 | all |
 | conditional branch over an unconditional jump | 9,031 | 340 | 331 | 9,702 | 28,072 | all |
 | load of a just-stored value | 5,244 | 267 | 4,041 | 9,552 | 8,200 | all |
@@ -97,7 +97,7 @@ the row where no finding does and the arithmetic is uniform instead.
 | pushes one stack adjustment would do | 0 | 0 | 12 | 12 | 28 | all |
 | zero loaded for an equality branch | 9 | 0 | 0 | 9 | 24 | all |
 | slli + srli foldable to andi | 0 | 1 | 0 | 1 | 4 | all |
-| **total** | **521,648** | **196,633** | **3,147,682** | **3,865,963** | **8,782,240** | |
+| **total** | **521,646** | **196,633** | **3,147,682** | **3,865,961** | **8,782,236** | |
 
 Do not read the total row as a result. One row is 78% of it, and that
 row is Go's assembler declining to select RVC at all, which is a
@@ -1614,8 +1614,8 @@ except a handful of `jalr ra,0(ra)` that were already two.
   check and unlike everything else here it needs no liveness query at
   all; where it writes elsewhere it becomes a `mv`.
 
-  Population: 10,211 sites -- 8,285 C++, 1,593 Go, 333 Rust. Within C++
-  it is 3,433 libQt6Core, 2,253 libxul and 817 libLLVM, and libQt6Core
+  Population: 10,209 sites -- 8,283 C++, 1,593 Go, 333 Rust. Within C++
+  it is 3,433 libQt6Core, 2,253 libxul and 815 libLLVM, and libQt6Core
   against libLLVM is the contrast worth keeping: this is GCC's residue
   where the stack-restore check is clang's -- the same corpus, the other
   compiler's habit, and neither would have been visible with one C++

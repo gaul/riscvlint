@@ -52,7 +52,7 @@ scans are not rerun per corpus change.
 | 15 | a load into the register that still holds it | 20,068 | - | **implemented** |
 | 2 | Zba shift-add | 13,418 | 180,591 | **implemented** |
 | 6 | constant re-materialization | 18,438 | 329,926 | **implemented** |
-| 9 | extension the producer already guarantees | 10,211 | - | **implemented** |
+| 9 | extension the producer already guarantees | 10,209 | - | **implemented** |
 | 14 | a slot stored and then loaded back | 9,552 | 162,811 | **implemented** |
 | 18 | a store of bytes the slot already holds | 7,118 | 7,330 | **implemented** |
 | 17 | a run of zero stores one wider store would do | 7,377 | 30,321 | **implemented** |

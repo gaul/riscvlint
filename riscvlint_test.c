@@ -720,9 +720,20 @@ static void test_result_guarantees(void)
     g = rv_result_guarantees(0x7ff5f513u, 4, &rd);          // andi a0,a1,2047
     CHECK(!(g & RISCVLINT_G_ZEXT8) && (g & RISCVLINT_G_ZEXT16));
 
-    // Every OP-IMM-32 result is sign-extended from bit 31 by definition.
+    // The W forms are sign-extended from bit 31 by definition.
     g = rv_result_guarantees(0x0015051bu, 4, &rd);          // addiw a0,a0,1
     CHECK(g == RISCVLINT_G_SEXT32);
+    g = rv_result_guarantees(0x00c5853bu, 4, &rd);          // addw a0,a1,a2
+    CHECK(g == RISCVLINT_G_SEXT32);
+
+    // Zba's slli.uw and shNadd.uw share the W forms' opcodes and are not
+    // W forms: they zero-extend a word, scale it and keep all 64 bits.
+    // slli.uw by zero is zext.w.
+    CHECK(rv_result_guarantees(0x0835951bu, 4, &rd) == 0);  // slli.uw a0,a1,3
+    g = rv_result_guarantees(0x0805951bu, 4, &rd);          // slli.uw a0,a1,0
+    CHECK(g == RISCVLINT_G_ZEXT32);
+    CHECK(rv_result_guarantees(0x20c5a53bu, 4, &rd) == 0);  // sh1add.uw a0,a1,a2
+    CHECK(rv_result_guarantees(0x20c5c53bu, 4, &rd) == 0);  // sh2add.uw a0,a1,a2
 
     // c.lbu, two bytes: the same guarantee as its wide spelling.
     g = rv_result_guarantees(0x8188u, 2, &rd);
@@ -863,6 +874,16 @@ static void test_redundant_ext_check(csh handle)
         0x67, 0x80, 0x00, 0x00,        // ret
     };
     CHECK(run_redundant_ext(handle, far, sizeof far, 0x1000, NULL) == 0);
+
+    // slli.uw shifts a zero-extended word and keeps the bits it shifts
+    // past 31, so a sext.w after it changes the value.
+    static const uint8_t slli_uw[] = {
+        0x1b, 0x95, 0x35, 0x08,        // slli.uw a0,a1,3
+        0x1b, 0x05, 0x05, 0x00,        // sext.w a0,a0
+        0x67, 0x80, 0x00, 0x00,        // ret
+    };
+    CHECK(run_redundant_ext(handle, slli_uw, sizeof slli_uw, 0x1000,
+                            NULL) == 0);
 }
 
 // ---- Zcb encodability ----
