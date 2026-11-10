@@ -5867,7 +5867,7 @@ static li_step_kind li_chain_step(uint32_t w, unsigned size, int64_t cur,
         case 3:                                                 // c.lui
             if (d == 2 || imm6 == 0) return LI_NONE;
             *rd = d;
-            *val = imm6 << 12;
+            *val = ci_imm6_lui(w);
             return LI_START;
         case 0:                                                 // c.addi
             if (imm6 == 0) return LI_NONE;                      // a hint
