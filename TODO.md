@@ -4733,10 +4733,11 @@ SpiderMonkey's JIT loads a callee's code into t0 and calls through it,
 `CallTempReg0` is t0, but no call goes through that name, so the
 register is each call path's own choice.
 
-LLVM never has. Its GPRJALR register class, which indirect calls are
-allocated from, is GPR without x0-x5, so neither link register, sp, gp
-nor tp can be a call's target. GCC's output in the corpus has none
-either, and V8 calls through t6 and a2.
+LLVM has not since 2021. D105875 (July 2021) created its GPRJALR
+register class, which indirect calls are allocated from, as GPR without
+x0-x5, so neither link register, sp, gp nor tp can be a call's target.
+GCC's output in the corpus has none either, and V8 calls through t6
+and a2.
 
 ### What check_t0_call reports
 
@@ -4769,6 +4770,25 @@ other pop-then-push spelling, jumps to a return address and links t0,
 which is a coroutine yielding rather than a call. `jalr t0,lo(t0)`,
 the machine outliner's call, names one link register twice and only
 pushes, and its `jr t0` return pops it.
+
+### Fixed elsewhere
+
+HotSpot used t0 as its main scratch register, and JDK-8340241 (October
+2024, JDK 24) moved its calls and jumps off it, measuring up to 16% on
+Renaissance on a VisionFive 2.
+
+SpiderMonkey's fix is bug 2091213, D341209 (November 2026). It swaps t0
+and t3 in every riscv64 register definition that names either, so
+CallTempReg0 and ABINonArgReg0, the registers its calls load a target
+into, become t3, and `MacroAssembler::call(Register)` moves a target
+still in t0 to t6 first. A JetStream 3 dump of the patched shell has no
+call through t0, where the base build's has 107,960 and the check
+reports 105,092 of them. On the K3 at 2.15 GHz, six alternating pairs
+of JetStream 3 runs score 3.77% higher (pair sd 0.51%, t = 17.9), with
+no test slower beyond noise; richards-wasm gains 39%, hash-map 27%,
+ai-astar 17% and richards 12%. A chain of four Wasm `call_indirect`
+calls takes 38.6% less time, `call_ref` 52.3%, and recursive fib in Ion
+52.9%.
 
 # Ranked for C++ and Rust specifically
 

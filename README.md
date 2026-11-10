@@ -198,11 +198,11 @@ except a handful of `jalr ra,0(ra)` that were already two.
 * **call through t0 that pops the return-address stack** -- `jalr
   ra,lo(t0)`, or `c.jalr t0`, the same instruction in two bytes. The
   return-address stack takes its hints from the registers a jalr names
-  (the unprivileged spec, section 2.5.1): ra and t0 are the link
-  registers, and a jalr naming two different ones pops and then pushes.
-  A call through t0 therefore throws away its caller's return
-  prediction, and every return above it mispredicts until calls refill
-  the stack. This is Go 1.26 calling a closure:
+  (the unprivileged spec, section 2.5.1, "Unconditional Jumps"): ra and
+  t0 are the link registers, and a jalr naming two different ones pops
+  and then pushes. A call through t0 therefore throws away its caller's
+  return prediction, and every return above it mispredicts until calls
+  refill the stack. This is Go 1.26 calling a closure:
 
   ```
      1a308: ld t0, 0(s10)
@@ -226,10 +226,21 @@ except a handful of `jalr ra,0(ra)` that were already two.
   The package corpus has 48,208. 48,207 are Go's closure and interface
   calls, which Go 1.27 moved off X5 (golang/go#76654), and the other is
   Firefox's hand-written XPCOM invoke stub, `xptcinvoke_asm_riscv64.S`,
-  which loads the method into t0. LLVM's GPRJALR class, the registers an
-  indirect call is allocated from, has never included x0-x5. The
-  SpiderMonkey dump has 105,240, 67,594 in Wasm code and 37,646 in
-  Ion's; V8, which calls through t6, has none.
+  which loads the method into t0. The SpiderMonkey dump has 105,240,
+  67,594 in Wasm code and 37,646 in Ion's; V8, which calls through t6,
+  has none.
+
+  Others have fixed it. LLVM has kept indirect calls off t0 since 2021
+  ([D105875]): GPRJALR, the register class they are allocated from, is
+  GPR without x0-x5. HotSpot used t0 as its main scratch register, and
+  JDK 24 moved its calls and jumps off it ([JDK-8340241]), up to 16%
+  faster on Renaissance on a VisionFive 2. SpiderMonkey moves its calls
+  to t3 in bug 2091213 ([D341209]): the check reports none in a JetStream
+  3 dump of that build, which scores 3.77% higher on the K3.
+
+  [D105875]: https://reviews.llvm.org/D105875
+  [JDK-8340241]: https://bugs.openjdk.org/browse/JDK-8340241
+  [D341209]: https://phabricator.services.mozilla.com/D341209
 
 * **slli + add foldable to shNadd** -- `slli rd,rs,{1,2,3}` +
   `add rd,rd,rs2` computes a scaled-index address in two dependent
@@ -3189,6 +3200,7 @@ python3 tools/rank.py results/pairsx-all.txt
 
 * [RISC-V Instruction Set Manual](https://github.com/riscv/riscv-isa-manual) - per-instruction reference
 * [RISC-V Profiles (RVA23)](https://github.com/riscv/riscv-profiles) - the extension set Ubuntu 26.04 targets
+* [RISC-V Optimization Guide](https://riscv-optimization-guide.riseproject.dev/) - RISE's vendor-neutral code-generation advice; the return-address-stack hints are not in it but in the ISA manual's section 2.5.1
 * [RISC-V ELF psABI](https://github.com/riscv-non-isa/riscv-elf-psabi-doc) - relocations and linker relaxation
 * [LLVM RISCVMacroFusion.td](https://github.com/llvm/llvm-project/blob/main/llvm/lib/Target/RISCV/RISCVMacroFusion.td) and [RISCVProcessors.td](https://github.com/llvm/llvm-project/blob/main/llvm/lib/Target/RISCV/RISCVProcessors.td) - the fusion pairs and which cores enable them; the X100's came in [#178594](https://github.com/llvm/llvm-project/pull/178594)
 * [Capstone disassembly framework](https://www.capstone-engine.org/) - library to parse instructions
