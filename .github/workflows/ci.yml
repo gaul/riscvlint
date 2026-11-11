@@ -61,7 +61,7 @@ jobs:
     # the fixtures. Dependencies (git included, so actions/checkout
     # clones) go in before checkout, since the base image is minimal:
     # diffutils for the fixture comparison, tar and zstd for the cache.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     container: fedora:45
     steps:
       - name: Install toolchain
