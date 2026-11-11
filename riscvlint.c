@@ -5487,6 +5487,13 @@ bool check_cas_loop_to_amocas(riscvlint_state *state, const cs_insn *insn,
         return false;
     // Same location, same width, and a result register to retry on.
     if (sa != ra || swidth != width || rs == 0) return false;
+    // On RV64 amocas.w compares the word with the low 32 bits of rt,
+    // where the bne compares all 64 bits of the word lr.w sign-extended
+    // with rexp. The two agree only when rexp is itself sign-extended,
+    // which x0 is and nothing here can prove of another register: the
+    // loop head is a branch target, so no producer before it is known to
+    // have run. Elsewhere the loop never stores where amocas.w may.
+    if (width == 4 && rexp != 0) return false;
 
     uint64_t fourth = third + 4;
     uint32_t w4;

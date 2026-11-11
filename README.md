@@ -335,17 +335,23 @@ except a handful of `jalr ra,0(ra)` that were already two.
   become two. The ordering bits are the union of the pair's, which is at
   least as strong as what it replaces and never weaker.
 
-  Population: **469** sites under `-m zacas` -- 279 C++, 140 Go, 50
-  Rust, the most even split of any check here -- worth 2,156 bytes: 106
-  at `(12 -> 8)`, 223 at `(14 -> 10)` and 140 at `(16 -> 10)`. 254 are
-  in libxul, 36 in go `compile`, 27 in `asm`, 17 in libQt6Core, 16 in
-  fd, 12 each in `link` and uutils, 11 in ripgrep. 356 need a `mv` to
-  place the expected value and 113 a `li`, the comparison there having
-  been against zero.
+  Population: **321** sites under `-m zacas` -- 194 C++, 93 Go, 34
+  Rust -- worth 1,470 bytes: 106 at `(12 -> 8)`, 122 at `(14 -> 10)`
+  and 93 at `(16 -> 10)`. 175 are in libxul, 12 in fd, 11 in
+  libQt6Core, 10 in go `compile`, and 9 in ripgrep, in uutils and in
+  most of the other Go tools. 208 need a `mv` to place the expected
+  value and 113 a `li`, the comparison there having been against zero.
+
+  A word-sized loop compared against a register is not reported, which
+  costs 148 sites. On RV64 `amocas.w` compares the word with the low 32
+  bits of rt, where the loop's `bne` compares all 64 bits of the word
+  `lr.w` sign-extended with the expected value; the two agree only when
+  the expected value is itself sign-extended, which x0 is and which
+  nothing here proves of another register.
 
   The corpus holds **14,655** LR/SC loops and 14,499 of them are
-  compare-exchanges, so 469 is 3% of the shape. The rest go to one
-  precondition that cannot be relaxed: the store-conditional's result
+  compare-exchanges, so 321 is 2% of the shape. Most of the rest go to
+  one precondition that cannot be relaxed: the store-conditional's result
   register disappears with the fold, nothing writes it afterwards, and
   deadness here can only be proved by a redefinition before any read --
   which a loop followed by a call or a return does not give. Offering

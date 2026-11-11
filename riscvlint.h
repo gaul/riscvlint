@@ -1397,7 +1397,15 @@ bool check_slli_srai_to_sext(riscvlint_state *state, const cs_insn *insn,
 // Scoped to a body of exactly one instruction, 13,072 of the corpus's
 // 14,655 LR/SC loops; a longer body is a read-modify-write around the
 // comparison and a different claim. `beq` in the body is refused, since
-// it leaves on a match rather than a mismatch.
+// it leaves on a match rather than a mismatch, and so is a `bne` of the
+// loaded value with itself, which never leaves.
+//
+// A word-sized loop is reported only where it compares against x0. On
+// RV64 `amocas.w` compares the word with the low 32 bits of rt, where
+// the loop's `bne` compares all 64 bits of the sign-extended word with
+// the expected value, and the two agree only for an expected value that
+// is itself sign-extended -- which nothing before a loop head, a branch
+// target, can be shown to have made it.
 //
 // The ordering bits are the union of the pair's, so an `lr.aq` with an
 // `sc.rl` becomes `amocas.aqrl`: at least as strong as what it replaces

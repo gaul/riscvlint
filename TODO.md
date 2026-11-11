@@ -4205,7 +4205,7 @@ themselves, as OP-IMM funct3 001 with immediates 0x604 and 0x605, so
 that check_redundant_extension could recognise them as guarantees. What
 was missing was only the two-instruction producer.
 
-## 34. A compare-exchange loop foldable to amocas -- 469  [implemented]
+## 34. A compare-exchange loop foldable to amocas -- 321  [implemented]
 
 ```
 L: lr.d.aq  rt, (ra)
@@ -4249,25 +4249,36 @@ worth an hour before they were measured, and neither survives it.
 What is left is compare-exchange, for which the A extension has no
 single instruction and Zacas does.
 
-### What the check reports -- 469 under `-m zacas`
+### What the check reports -- 321 under `-m zacas`
 
 | language | objects | sites |
 |---|---:|---:|
-| C++ | 13 | 279 |
-| Rust | 6 | 50 |
-| Go | 12 | 140 |
-| **total** | **31** | **469** |
+| C++ | 13 | 194 |
+| Rust | 6 | 34 |
+| Go | 12 | 93 |
+| **total** | **31** | **321** |
 
-The most even language split of any entry here; everything else in this
-file is dominated by one toolchain. 254 are in libxul, 36 in go
-`compile`, 27 in `asm`, 17 in libQt6Core, 16 in fd, 12 each in `link`
-and uutils, 11 in ripgrep, 9 in most of the remaining Go tools.
+175 are in libxul, 12 in fd, 11 in libQt6Core, 10 in go `compile`, and
+9 in ripgrep, in uutils and in most of the other Go tools.
 
-2,156 bytes: 106 sites at `(12 -> 8)`, 223 at `(14 -> 10)` and 140 at
-`(16 -> 10)`. 356 need a `mv` to place the expected value and 113 a
+1,470 bytes: 106 sites at `(12 -> 8)`, 122 at `(14 -> 10)` and 93 at
+`(16 -> 10)`. 208 need a `mv` to place the expected value and 113 a
 `li`, the comparison there having been against zero.
 
-### 469 of 14,499, and the precondition that takes the rest
+It reported 469 until tools/rwfuzz's emu mode, which runs amocas as the
+ratified specification defines it, showed the word form unsound. On
+RV64 `amocas.w` compares the word with the low 32 bits of rt, where the
+loop's `bne` compares all 64 bits of the word `lr.w` sign-extended with
+the expected value. The two agree only when the expected value is
+itself sign-extended. x0 is; of another register nothing here can say
+so, since the loop head is a branch target and no producer before it is
+known to have run. With the expected value 0x100000000 and the word 0,
+the loop stores nothing and `amocas.w` stores. So a word-sized loop
+compared against a register is no longer reported: 148 sites, 79 of
+them in libxul and 26 in go `compile`. Every word form left compares
+against zero.
+
+### 321 of 14,499, and the preconditions that take the rest
 
 The store-conditional's result register disappears with the fold --
 nothing writes it afterwards -- so it has to be dead on both ways out of

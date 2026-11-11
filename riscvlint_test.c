@@ -5100,6 +5100,35 @@ static void test_cas_loop_to_amocas(csh handle)
         0x82, 0x80,                  // c.ret
     };
     CHECK(!run_cas(handle, selfcmp, sizeof selfcmp, Z, NULL));
+    // The word form compares the low 32 bits of a3 with the word, where
+    // the bne compares all 64 bits of the word lr.w sign-extended with
+    // a2, which nothing proves sign-extended; with a2 holding
+    // 0x100000000 and the word 0, the loop stores nothing and amocas.w
+    // stores a4. Against zero the two agree.
+    static const uint8_t word[] = {
+        0xaf, 0x26, 0x05, 0x10,      // lr.w a3,(a0)
+        0x63, 0x97, 0xc6, 0x00,      // bne a3,a2,F
+        0xaf, 0x27, 0xe5, 0x1a,      // sc.w.rl a5,a4,(a0)
+        0xf5, 0xfb,                  // c.bnez a5,L
+        0x81, 0x47,                  // c.li a5,0
+        0x82, 0x80,                  // c.ret
+        0x85, 0x47,                  // c.li a5,1
+        0x82, 0x80,                  // c.ret
+    };
+    CHECK(!run_cas(handle, word, sizeof word, Z, NULL));
+    static const uint8_t wordzero[] = {
+        0xaf, 0x26, 0x05, 0x10,      // lr.w a3,(a0)
+        0x91, 0xe6,                  // c.bnez a3,F
+        0xaf, 0x27, 0xe5, 0x1a,      // sc.w.rl a5,a4,(a0)
+        0xfd, 0xfb,                  // c.bnez a5,L
+        0x81, 0x47,                  // c.li a5,0
+        0x82, 0x80,                  // c.ret
+        0x85, 0x47,                  // c.li a5,1
+        0x82, 0x80,                  // c.ret
+    };
+    CHECK(run_cas(handle, wordzero, sizeof wordzero, Z, &f));
+    CHECK(strcmp(f.replacement,
+                 "li a3, 0 ; amocas.w.rl a3, a4, (a0) (12 -> 8 bytes)") == 0);
     // Positive presence, as the Zilx and Zibi checks want: Zacas is
     // ratified but in no profile, so declaring nothing is not enough.
     CHECK(!run_cas(handle, cas, sizeof cas, 0, NULL));
