@@ -162,8 +162,8 @@ jobs:
     # rwfuzz again on programs no run has drawn before: the seed is this
     # run's id, which the log prints with the command that replays a
     # failure. On pushes to master, weekly and on demand, not on every
-    # pull request. 8000 per mode is about fifteen minutes: under qemu the
-    # 4-core runner takes about 0.1s per program per mode.
+    # pull request. 10000 per mode is about fifteen minutes: under qemu the
+    # 4-core runner takes 0.06-0.11s per program per mode.
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-26.04
     timeout-minutes: 60
@@ -171,7 +171,7 @@ jobs:
       QEMU_LD_PREFIX: /usr/riscv64-linux-gnu
       RWFUZZ_EXEC: qemu-riscv64 -cpu max
       RWFUZZ_SEED: ${{ github.run_id }}
-      RWFUZZ_PROGRAMS: 8000
+      RWFUZZ_PROGRAMS: 10000
     steps:
       - uses: actions/checkout@v7
 
