@@ -1,0 +1,199 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  # Weekly and on demand for rwfuzz-long, which draws programs no run has
+  # drawn before.
+  schedule:
+    - cron: '0 6 * * 1'   # Mondays 06:00 UTC
+  workflow_dispatch:
+
+env:
+  # Capstone 6 is built from source in every job: distros ship 5.0.x,
+  # which decodes RISC-V too thinly (see Building in README.md). Pinned
+  # to the commit the fixtures were generated against, since they pin
+  # Capstone's rendering; bump it deliberately and regenerate them.
+  CAPSTONE_REV: 9c99098963809f8e59f1f088cd5384980a288d6e
+
+jobs:
+  build:
+    # riscvlint reads RISC-V binaries on any host, and the suites
+    # assemble their inputs with clang's cross assembler, so none of
+    # this needs RISC-V hardware. Two host architectures, since nothing
+    # in riscvlint should depend on the one it runs on.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04, ubuntu-26.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # lld for the linked fixtures; g++ because Capstone's cmake project
+      # enables C++ even though nothing in it is.
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc g++ clang lld cmake python3
+
+      - name: Cache Capstone
+        uses: actions/cache@v6
+        with:
+          path: capstone
+          key: capstone-${{ env.CAPSTONE_REV }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build Capstone
+        run: scripts/build_capstone.sh "$CAPSTONE_REV" "$PWD/capstone"
+
+      - name: Build
+        run: make CAPSTONE_PREFIX="$PWD/capstone"
+
+      - name: Run tests
+        run: >
+          make CAPSTONE_PREFIX="$PWD/capstone"
+          test integration-test driver-test json-test gopclntab-test
+
+  build-fedora:
+    # Fedora 45 in a container -- a newer clang than Ubuntu's assembling
+    # the fixtures. Dependencies (git included, so actions/checkout
+    # clones) go in before checkout, since the base image is minimal:
+    # diffutils for the fixture comparison, tar and zstd for the cache.
+    runs-on: ubuntu-latest
+    container: fedora:45
+    steps:
+      - name: Install toolchain
+        run: >
+          dnf install -y git gcc gcc-c++ clang lld cmake make python3
+          diffutils tar zstd
+
+      - uses: actions/checkout@v7
+
+      - name: Cache Capstone
+        uses: actions/cache@v6
+        with:
+          path: capstone
+          key: capstone-${{ env.CAPSTONE_REV }}-fedora45-${{ runner.arch }}
+
+      - name: Build Capstone
+        run: scripts/build_capstone.sh "$CAPSTONE_REV" "$PWD/capstone"
+
+      - name: Build
+        run: make CAPSTONE_PREFIX="$PWD/capstone"
+
+      - name: Run tests
+        run: >
+          make CAPSTONE_PREFIX="$PWD/capstone"
+          test integration-test driver-test json-test gopclntab-test
+
+  sweep:
+    # The exhaustive decoder sweep: 2^30 four-byte decodes checked
+    # against capstone. A few minutes across a runner's cores, so it
+    # runs with everything else rather than only on a schedule.
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc g++ cmake
+
+      - name: Cache Capstone
+        uses: actions/cache@v6
+        with:
+          path: capstone
+          key: capstone-${{ env.CAPSTONE_REV }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build Capstone
+        run: scripts/build_capstone.sh "$CAPSTONE_REV" "$PWD/capstone"
+
+      - name: Run the sweep
+        run: >
+          RISCVLINT_SWEEP=1 RISCVLINT_SWEEP_THREADS="$(nproc)"
+          make CAPSTONE_PREFIX="$PWD/capstone" test
+
+  rwfuzz:
+    # tools/rwfuzz runs every finding's rewrite against the original on
+    # random programs, which is the one part of the testing that executes
+    # RISC-V code. GitHub hosts no RISC-V runners, so rwfuzz is cross-built
+    # and run under qemu-user, whose max CPU has the Zba, Zbb, Zbs and Zfa
+    # the programs use. The default seed, so a failure reproduces with the
+    # same command anywhere; rwfuzz-long draws fresh programs.
+    runs-on: ubuntu-26.04
+    env:
+      QEMU_LD_PREFIX: /usr/riscv64-linux-gnu
+      RWFUZZ_EXEC: qemu-riscv64 -cpu max
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install cross toolchain and qemu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-riscv64-linux-gnu \
+            g++-riscv64-linux-gnu qemu-user cmake
+
+      - name: Cache Capstone
+        uses: actions/cache@v6
+        with:
+          path: capstone-riscv64
+          key: capstone-${{ env.CAPSTONE_REV }}-${{ runner.os }}-riscv64
+
+      - name: Build Capstone for riscv64
+        run: >
+          scripts/build_capstone.sh "$CAPSTONE_REV" "$PWD/capstone-riscv64"
+          -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=riscv64
+          -DCMAKE_C_COMPILER=riscv64-linux-gnu-gcc
+          -DCMAKE_CXX_COMPILER=riscv64-linux-gnu-g++
+
+      - name: Build rwfuzz for riscv64
+        run: >
+          make CC=riscv64-linux-gnu-gcc AR=riscv64-linux-gnu-ar
+          CAPSTONE_PREFIX="$PWD/capstone-riscv64" tools/rwfuzz
+
+      - name: Run rwfuzz
+        run: ./scripts/rwfuzz_test.sh
+
+  rwfuzz-long:
+    # rwfuzz again on programs no run has drawn before: the seed is this
+    # run's id, which the log prints with the command that replays a
+    # failure, and five times the programs. On pushes to master, weekly
+    # and on demand, not on every pull request.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-26.04
+    env:
+      QEMU_LD_PREFIX: /usr/riscv64-linux-gnu
+      RWFUZZ_EXEC: qemu-riscv64 -cpu max
+      RWFUZZ_SEED: ${{ github.run_id }}
+      RWFUZZ_PROGRAMS: 50000
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install cross toolchain and qemu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-riscv64-linux-gnu \
+            g++-riscv64-linux-gnu qemu-user cmake
+
+      - name: Cache Capstone
+        uses: actions/cache@v6
+        with:
+          path: capstone-riscv64
+          key: capstone-${{ env.CAPSTONE_REV }}-${{ runner.os }}-riscv64
+
+      - name: Build Capstone for riscv64
+        run: >
+          scripts/build_capstone.sh "$CAPSTONE_REV" "$PWD/capstone-riscv64"
+          -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=riscv64
+          -DCMAKE_C_COMPILER=riscv64-linux-gnu-gcc
+          -DCMAKE_CXX_COMPILER=riscv64-linux-gnu-g++
+
+      - name: Build rwfuzz for riscv64
+        run: >
+          make CC=riscv64-linux-gnu-gcc AR=riscv64-linux-gnu-ar
+          CAPSTONE_PREFIX="$PWD/capstone-riscv64" tools/rwfuzz
+
+      - name: Run rwfuzz
+        run: ./scripts/rwfuzz_test.sh

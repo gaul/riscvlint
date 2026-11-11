@@ -30,7 +30,7 @@ CAPSTONE_LIBS := $(CAPSTONE_LIBDIR)/libcapstone.a
 riscvlint.o main.o riscvlint_test.o: riscvlint.h
 
 libriscvlint.a: riscvlint.o
-	ar -crs $@ $<
+	$(AR) -crs $@ $<
 
 lib: libriscvlint.a
 
@@ -94,6 +94,12 @@ tools/tblgen_probe: tools/tblgen_probe.c riscvlint.o
 	$(CC) $(CFLAGS) $(CAPSTONE_CFLAGS) $< riscvlint.o $(CAPSTONE_LIBS) \
 		-lpthread -o $@
 
+# tools/rwfuzz over every mode; see scripts/rwfuzz_test.sh. The programs
+# run natively, so this needs a riscv64 rwfuzz on a riscv64 host or
+# under the emulator RWFUZZ_EXEC names.
+rwfuzz-test: tools/rwfuzz
+	./scripts/rwfuzz_test.sh
+
 # Runs the scan and then the code it scanned, so it links the library.
 # The programs run natively: on a host other than riscv64 this builds a
 # stub that says so.
@@ -112,4 +118,4 @@ clean:
 		tools/rwfuzz *.o
 
 .PHONY: all build clean lib test integration-test integration-test-regen \
-	driver-test json-test gopclntab-test tools
+	driver-test json-test gopclntab-test rwfuzz-test tools

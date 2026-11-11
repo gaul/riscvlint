@@ -2930,6 +2930,22 @@ cannot find a clang that targets riscv64 -- and, for the linked
 fixtures, an lld that can link it -- so a missing toolchain cannot pass
 by testing nothing.
 
+CI (`.github/workflows/ci.yml`) runs those suites on x86-64 and arm64
+Ubuntu and in a Fedora container, and the decoder sweep below, none of
+which needs RISC-V hardware. `tools/rwfuzz` does, and GitHub hosts no
+RISC-V runners, so CI cross-builds it and runs `make rwfuzz-test` under
+qemu-user:
+
+```sh
+make CC=riscv64-linux-gnu-gcc AR=riscv64-linux-gnu-ar \
+    CAPSTONE_PREFIX=/path/to/riscv64/install tools/rwfuzz
+QEMU_LD_PREFIX=/usr/riscv64-linux-gnu \
+    RWFUZZ_EXEC="qemu-riscv64 -cpu max" make rwfuzz-test
+```
+
+`scripts/build_capstone.sh` builds the pinned Capstone as the start of
+this section does, for the host or, given cmake cross arguments, riscv64.
+
 ### The exhaustive decoder sweep
 
 riscvlint's checks decode raw encodings; capstone decodes the same
@@ -3109,8 +3125,8 @@ the categories built around them have flagless replacements.
   encoders; a new rewrite gets a mode, or a shape in one. It is armlint's `tools/rwfuzz` with a program made of
   slots rather than words, laid out again after each rewrite, since a
   RISC-V rewrite changes sizes as often as not. Needs a riscv64 host
-  with Zba, Zbb and Zbs, since the programs run natively, and links
-  `libriscvlint.a`.
+  with Zba, Zbb and Zbs, or qemu-user, since the programs run natively,
+  and links `libriscvlint.a`. `make rwfuzz-test` runs every mode.
 
 * `tools/rank.py` groups `pairscan` output into candidate-check families
   and prints each family's population, because raw frequency ranking
