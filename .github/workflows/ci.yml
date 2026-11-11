@@ -121,11 +121,13 @@ jobs:
     # RISC-V code. GitHub hosts no RISC-V runners, so rwfuzz is cross-built
     # and run under qemu-user, whose max CPU has the Zba, Zbb, Zbs and Zfa
     # the programs use. The default seed, so a failure reproduces with the
-    # same command anywhere; rwfuzz-long draws fresh programs.
+    # same command anywhere; rwfuzz-long draws fresh programs. 2000 per
+    # mode keeps a PR check near four minutes; 10000 took twenty.
     runs-on: ubuntu-26.04
     env:
       QEMU_LD_PREFIX: /usr/riscv64-linux-gnu
       RWFUZZ_EXEC: qemu-riscv64 -cpu max
+      RWFUZZ_PROGRAMS: 2000
     steps:
       - uses: actions/checkout@v7
 
